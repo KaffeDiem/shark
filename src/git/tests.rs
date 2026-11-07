@@ -1901,6 +1901,10 @@ fn root_headers_include_agent_instructions_with_and_without_repos() {
     let text = header(&task);
     assert!(text.contains("## Agent: Designer\n\nAlways use Mobbin."));
     assert!(text.find("- `api/`: worktree of ").unwrap() < text.find("## Agent:").unwrap());
+    assert!(
+        text.contains("Don't create more git worktrees"),
+        "harnesses stay in the task Shark already isolated"
+    );
 }
 
 #[test]

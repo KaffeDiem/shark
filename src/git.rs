@@ -1380,7 +1380,7 @@ fn header(ws: &Task) -> String {
                 r.base
             );
         }
-        s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\n";
+        s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\nThis task is already an isolated worktree managed by Shark. Don't create more git worktrees (no `isolation: \"worktree\"`, `--worktree` or EnterWorktree); split parallel work by file instead.\n\n";
         s
     };
     if let Some(agent) = &ws.agent {
