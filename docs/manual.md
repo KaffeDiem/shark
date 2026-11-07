@@ -2,7 +2,7 @@
 
 Shark is a native macOS app for working with reusable coding agents. Give an agent a name, instructions, skills and repository defaults; start an isolated task when you have work for it; review the result and take it through to merge. You choose when tasks start and which changes ship.
 
-An **agent** lasts across tasks. A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. A **task group** organizes the All tasks view; it never changes a task's agent or instructions. Claude and Codex are the **harnesses** that run a chat.
+An **agent** lasts across tasks. A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. A **task group** organizes Home's task list; it never changes a task's agent or instructions. Claude and Codex are the **harnesses** that run a chat.
 
 Use `cmd-k` for the complete command list and current shortcuts. This guide covers the workflow and behaviors that matter when using it. See the [README](../README.md) for installation, [Git workflows](git-feature.md) for the Git artifact, and [Language intelligence](language-intelligence.md) for editor tooling.
 
@@ -22,21 +22,21 @@ Worktrees isolate branches, not the filesystem. Coding sessions can write outsid
 
 ## Agents and navigation
 
-The sidebar gives direct access to Home, All tasks and each agent. An agent's page has a task prompt above **Tasks**, **Settings** and **History**. **Settings** edits its name, icon, instructions, default repositories, model and thinking level in place; each change saves immediately. Its slug is stable even when its name changes.
+The sidebar gives direct access to Home and each agent. An agent's header is its settings: click the icon to change it, click the name to rename it, and type into the instructions under the name. The chips below set default repositories, model, thinking level and skills; **Attach** adds a default repository, jumps to the instructions or opens the skills folder. Each change saves immediately. The header's **…** and a right-click on the agent in the sidebar offer New task, Rename, Change icon, Edit instructions, Open skills folder, Refresh skills, Open in… and Delete agent. Its slug is stable even when its name changes. Below the header are the task prompt, the agent's tasks and its history.
 
-Type into an agent page's prompt and press `enter` to start a task with that agent; `cmd-n`, `i` and `a` focus that prompt. Each agent keeps its own draft. Elsewhere `cmd-n` opens an empty standalone task. The Home picker and `@slug` shortcut share the same selection, so changing the picker preserves the prompt's body. A cancelled or failed creation keeps the draft.
+Type into an agent page's prompt and press `enter` to start a task with that agent; `cmd-n`, `i` and `a` focus that prompt. Each agent keeps its own draft. Elsewhere `cmd-n` opens an empty standalone task. The Home picker and `@slug` shortcut share the same selection, so changing the picker preserves the prompt's body. Typing `@` on Home lists matching agents; `up`/`down` move and `tab` or `enter` completes. A cancelled or failed creation keeps the draft.
 
-The agent selected on Home or its own page also follows **New task from branch or PR…** and **Start from Linear issue**. The branch dialog starts with its default repositories selected. A Home draft is passed along only while that prompt is visible; opening a task dialog from another overview does not send a hidden draft.
+The agent selected on Home or its own page also follows **New task from branch or PR…** and **Linear issue…** in the composer. The branch dialog starts with its default repositories selected. A Home draft is passed along only while that prompt is visible; opening a task dialog from another overview does not send a hidden draft.
 
 Several tasks can run for one agent, including in the same repository. Each has separate worktrees. Chats receive a sibling note listing the agent's other open tasks and their changed files, refreshed after turns. The note lists at most 20 files per task, plus a count of others. It is context: each task can freely edit its own copies of those files.
 
-Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through `AGENTS.md`. Open tasks refresh shortly after you stop typing on **Settings**; existing chats receive changed instructions with their next normal message. A failed refresh is reported so you can retry. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
+Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through `AGENTS.md`. Open tasks refresh shortly after you stop typing the instructions; existing chats receive changed instructions with their next normal message. A failed refresh is reported so you can retry. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
 
 History keeps the latest 100 deleted tasks, with their titles, PR links, merge status and dates. **PR state unknown** means Shark lacked enough reliable status to determine the result for the whole task, even if some repositories had known PR states. Deleting an agent requires finishing or deleting its open tasks first; confirmation then removes its instructions, history and skills folder.
 
 ### Skills
 
-On **Settings**, **Open skills folder** creates:
+The skills chip, or **Attach › Skill…**, opens (and creates):
 
 ```text
 ~/Library/Application Support/shark/agents/<slug>/skills/
@@ -46,11 +46,11 @@ Create a `<skill>/SKILL.md` file inside that folder for each skill, then choose 
 
 **Skills from repos** in Settings › General controls repository skills only; agent skills stay enabled. Claude discovers repository skills and commands through its added repository directories. Codex receives links to repository skills from `.agents/skills` or `.claude/skills`. Agent skills get the plain names first; collisions from repositories use prefixed names. Turning repository skills off removes only Shark's recorded repository links. Skill refresh preserves user files and links it does not own.
 
-### Home and All tasks
+### Home
 
-Home groups work by **Needs you**, **Running**, **Unread** and **Idle**. Needs you includes questions, plan approvals, attachment problems and actionable git status. The sidebar and Dock badge also mark work needing attention; notifications announce completed turns and tasks that need you.
+Home starts tasks and lists every task, grouped by **Needs you**, **Running**, **Unread** and **Idle**. Needs you includes questions, plan approvals, attachment problems and actionable git status. The sidebar and Dock badge also mark work needing attention; notifications announce completed turns and tasks that need you.
 
-**All tasks** includes every task. Choose grouping by status or by task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
+The control on the first group heading switches grouping between status and task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
 
 `cmd-0` opens Home; from Home it returns to the active task. `esc` leaves an overview for the active task, or returns to Home if none is active. The task picker (`cmd-shift-o`) searches task titles and repositories. With no query it selects the most recent task from Home, or the most recent other task while a task is open. The app switcher (`cmd-o`, held) cycles tasks until you release Command.
 

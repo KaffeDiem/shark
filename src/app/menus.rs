@@ -13,53 +13,61 @@ pub(super) fn tilde(path: &Path) -> String {
     }
 }
 
-/// "Open in <app>" for each installed app with something to open in `folder` (the
-/// task's, if any) and `repos`: one target opens directly, several make a submenu.
-pub(super) fn open_in_entries(
+/// One "Open in…" that folds out into every app. Menus nest one level, so an app with several
+/// targets (the task folder and each repo) opens a picker of them.
+pub(super) fn open_in(
     folder: Option<&(String, PathBuf)>,
     repos: &[(String, PathBuf)],
     cx: &Context<Shark>,
-) -> Vec<Entry> {
+) -> Option<Entry> {
     let mut entries = vec![];
     for app in apps::installed() {
         let mut targets = app.targets(folder, repos);
-        if targets.is_empty() {
-            continue;
-        }
-        let label = format!("Open in {}", app.name);
         let image = app.icon.clone();
-        if targets.len() == 1 {
-            let (hint, path) = targets.remove(0);
-            let item = menu::item(
-                app_icon(app),
-                label,
-                on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
-            );
-            entries.push(item.hint(hint).image(image));
-            continue;
-        }
-        let rows = targets.into_iter().map(|(name, path)| {
-            let is_folder = folder.is_some_and(|f| f.1 == path);
-            let icon = match app.kind {
-                _ if is_folder => IconName::Folder,
-                Kind::Xcode => IconName::FileCode,
-                _ => IconName::FolderGit2,
-            };
-            let hint = if is_folder {
-                tilde(&path)
-            } else {
-                String::new()
-            };
-            menu::item(
-                icon,
-                name,
-                on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
-            )
-            .hint(hint)
-        });
-        entries.push(menu::sub(app_icon(app), label, rows.collect()).image(image));
+        let entry = match targets.len() {
+            0 => continue,
+            1 => {
+                let (hint, path) = targets.remove(0);
+                menu::item(
+                    app_icon(app),
+                    app.name.clone(),
+                    on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
+                )
+                .hint(hint)
+            }
+            _ => {
+                let folder = folder.map(|f| f.1.clone());
+                menu::item(
+                    app_icon(app),
+                    format!("{}…", app.name),
+                    on_shark(cx, move |_, w, cx| {
+                        let items = (targets.iter())
+                            .map(|(name, path)| {
+                                let icon = match app.kind {
+                                    _ if folder.as_ref() == Some(path) => IconName::Folder,
+                                    Kind::Xcode => IconName::FileCode,
+                                    _ => IconName::FolderGit2,
+                                };
+                                CommandItem::new().label(name.clone()).icon(icon)
+                            })
+                            .collect();
+                        let paths: Vec<PathBuf> = targets.iter().map(|t| t.1.clone()).collect();
+                        open_menu(
+                            cx.entity().downgrade(),
+                            "Open in…",
+                            items,
+                            0,
+                            move |s, i, _, _| s.launch_app(app, &paths[i]),
+                            w,
+                            cx,
+                        );
+                    }),
+                )
+            }
+        };
+        entries.push(entry.image(image));
     }
-    entries
+    (!entries.is_empty()).then(|| menu::sub(IconName::AppWindow, "Open in…", entries))
 }
 
 /// "Task folder", its path muted on the right, plus one row per repo.
@@ -142,7 +150,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
             |p, _, cx| cx.reveal_path(p),
         ),
     ]);
-    entries.extend(open_in_entries(Some(&paths[0]), &paths[1..], cx));
+    entries.extend(open_in(Some(&paths[0]), &paths[1..], cx));
     entries.extend([path_submenu(
         IconName::Copy,
         "Copy path",
@@ -503,7 +511,7 @@ pub(super) fn branch_entries(
         "Reveal in Finder",
         move |_, cx| cx.reveal_path(&reveal),
     ));
-    menu.extend(open_in_entries(None, &[(name.to_string(), path)], cx));
+    menu.extend(open_in(None, &[(name.to_string(), path)], cx));
     menu.extend(worktree);
     let repo = name.to_string();
     menu.push(menu::item(
@@ -680,7 +688,7 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
     if !rows.is_empty() {
         entries.insert(2, menu::sub(IconName::FolderPlus, "Attach to task", rows));
     }
-    entries.extend(open_in_entries(None, &[(name, path.clone())], cx));
+    entries.extend(open_in(None, &[(name, path.clone())], cx));
     entries.push(
         menu::item(IconName::Copy, "Copy path", move |w, cx| {
             copy(p3.display().to_string(), w, cx)

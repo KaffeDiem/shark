@@ -619,15 +619,8 @@ pub(super) const COMMANDS: &[Row] = &[
         "Go to Home",
         IconName::House,
         Some(&ToggleHome),
-        "start overview dashboard",
+        "start overview dashboard all tasks list",
         Some(|s, w, cx| s.enter_home(w, cx)),
-    ),
-    Row(
-        "All tasks",
-        IconName::List,
-        None,
-        "overview groups running needs attention",
-        Some(|s, w, cx| s.enter_all_tasks(w, cx)),
     ),
     Row(
         "Hide Get started",

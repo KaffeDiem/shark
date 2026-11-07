@@ -32,11 +32,13 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.try_find("agent-settings").is_some());
-        w.click(("agent-repo", 0usize), cx);
         w.click("agent-instructions", cx);
         w.input("Always use Mobbin to ground your research", cx);
+        // Attach › Repository › api makes it a default repository.
+        w.click("agent-attach", cx);
     })
     .unwrap();
+    press_in(window)(cx, &["r", "right", "enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         let a = &s.state.agents[0];
@@ -50,8 +52,11 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         );
         assert_eq!(s.state.sections[0].agent, None);
     });
-    cx.update_window(window, |_, w, cx| w.click("agent-name", cx))
-        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("agent-name", cx)
+    })
+    .unwrap();
     press_in(window)(cx, &["cmd-a"]);
     cx.update_window(window, |_, w, cx| w.input("Design team", cx))
         .unwrap();
@@ -72,16 +77,10 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
             "settings are edited on the agent's page"
         );
         assert!(w.try_find("agent-skills").is_some());
-        w.click("Tasks", cx);
-        w.render_frame(cx);
+        assert!(w.try_find("agent-repo-api").is_some(), "the default shows as a chip");
         assert!(w.try_find("agent-empty-tasks").is_some());
         assert!(w.try_find("agent-composer").is_some());
-        w.click("History", cx);
-        w.render_frame(cx);
-        assert!(w.try_find("agent-page").is_some());
-        w.click("Settings", cx);
-        w.render_frame(cx);
-        assert!(w.try_find("agent-settings").is_some());
+        assert!(w.try_find("agent-settings").is_some(), "settings sit in the header");
     })
     .unwrap();
     let saved = State::load();
@@ -115,9 +114,10 @@ async fn agents_do_not_create_sections_and_deletion_rechecks_open_tasks(cx: &mut
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("delete-agent", cx);
+        w.click("agent-more", cx);
     })
     .unwrap();
+    press_in(window)(cx, &["d", "enter"]);
     on(cx, &|s, _, _| {
         s.state.tasks.push(Task {
             name: "pending".into(),
@@ -151,21 +151,22 @@ async fn agents_do_not_create_sections_and_deletion_rechecks_open_tasks(cx: &mut
         s.creating.clear();
         s.sel = SideRow::Agent(1);
     });
+    // The sidebar row's right-click offers the same actions.
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("delete-agent", cx);
+        w.within("sidebar").right_click(("agent", 0usize), cx);
     })
     .unwrap();
+    // The cursor on the other agent follows its identity through the deletion.
+    on(cx, &|s, _, _| s.sel = SideRow::Agent(1));
+    press_in(window)(cx, &["d", "enter"]);
     press_in(window)(cx, &["enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.agents.len(), 1);
         assert_eq!(s.sel, SideRow::Agent(0));
         assert_eq!(s.state.agents[0].slug, "designer-2");
-        assert_eq!(
-            s.home.destination,
-            super::super::home::Destination::AllTasks
-        );
+        assert_eq!(s.home.destination, super::super::home::Destination::Home);
         assert!(!s.collapsed_agents.contains("designer"));
         assert_eq!(
             s.state.sections[0].agent, None,
@@ -261,22 +262,24 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(!w.has_active_dialog(cx), "agent is a page, not a dialog");
-        w.click("Settings", cx);
-        let s = shark.read(cx);
-        assert!(s.home.focus.is_focused(w));
-        assert_eq!(s.home.page.offset(), point(px(0.), px(0.)));
-        w.render_frame(cx);
         let skill = crate::state::agent_skills_dir("designer").join("research");
         fs::create_dir_all(&skill).unwrap();
         fs::write(skill.join("SKILL.md"), "# Research").unwrap();
-        w.click("agent-refresh-skills", cx);
+        w.click("agent-skills", cx);
+    })
+    .unwrap();
+    // The skills chip's menu: Refresh skills links the new skill into the agent's tasks.
+    press_in(window)(cx, &["r", "enter"]);
+    cx.update_window(window, |_, w, cx| {
+        let skill = crate::state::agent_skills_dir("designer").join("research");
         for folder in [".agents/skills", ".claude/skills"] {
             assert_eq!(
                 fs::read_link(tasks_dir().join("current").join(folder).join("research")).unwrap(),
                 skill
             );
         }
-        w.click("History", cx);
+        let header = shark.read(cx).home.agent_header.clone().unwrap();
+        assert_eq!(header.read(cx).skills, ["research"]);
         w.render_frame(cx);
         for (i, status) in ["Merged", "Not merged", "PR state unknown"]
             .into_iter()
@@ -288,8 +291,6 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
             assert!(label.contains("2023"), "history includes its date: {label}");
         }
         assert!(w.try_find("agent-history-pr-0-0").is_some());
-        w.click("Tasks", cx);
-        w.render_frame(cx);
         w.click(("home-ws", 0usize), cx);
         w.render_frame(cx);
         assert!(!w.has_active_dialog(cx), "task selection opens directly");
@@ -395,7 +396,7 @@ async fn failed_agent_doc_refresh_preserves_instruction_snapshots_until_retry(
     });
 }
 
-/// Typing on the Settings tab reaches open tasks' CLAUDE.md once typing pauses.
+/// Typing in the header's instructions reaches open tasks' CLAUDE.md once typing pauses.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn inline_instruction_edits_reach_open_tasks_after_a_pause(cx: &mut TestAppContext) {

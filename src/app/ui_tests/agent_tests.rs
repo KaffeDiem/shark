@@ -661,10 +661,6 @@ async fn agent_pages_do_not_target_hidden_tasks(cx: &mut TestAppContext) {
         s.open_task_now(1, w, cx);
         s.open_agent("designer", w, cx);
         assert_eq!(s.target(w).unwrap().name, "design");
-        s.home.agent_tab = agent_settings::AgentTab::Instructions;
-        assert!(s.target(w).is_none());
-        s.home.agent_tab = agent_settings::AgentTab::History;
-        assert!(s.target(w).is_none());
         s.sidebar_focus.focus(w, cx);
         s.sel = SideRow::Task(1);
         assert_eq!(

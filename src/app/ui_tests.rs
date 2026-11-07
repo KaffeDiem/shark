@@ -3245,42 +3245,36 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     };
     let last = || OPENED.lock().unwrap().last().cloned();
 
-    // The right-click menu: (label, hint, submenu rows) per "Open in" entry.
+    // The right-click menu's "Open in…": (label, hint) per app. An app with several targets
+    // ends in "…" and opens a picker of them.
     let menu_of = |cx: &mut TestAppContext, ws: &str| {
         shark.update(cx, |s, cx| {
             let ws = s.task(ws).unwrap().clone();
             (ws_menu(s, &ws, cx).into_iter())
-                .filter_map(|e| match e {
-                    Entry::Item { label, hint, .. } if label.starts_with("Open in") => {
-                        Some((label.to_string(), hint.map(|h| h.to_string()), vec![]))
-                    }
-                    Entry::Sub { label, entries, .. } if label.starts_with("Open in") => {
-                        let rows = (entries.iter())
+                .find_map(|e| match e {
+                    Entry::Sub { label, entries, .. } if label == "Open in…" => Some(
+                        (entries.iter())
                             .filter_map(|r| match r {
-                                Entry::Item { label, .. } => Some(label.to_string()),
+                                Entry::Item { label, hint, .. } => {
+                                    Some((label.to_string(), hint.as_ref().map(|h| h.to_string())))
+                                }
                                 _ => None,
                             })
-                            .collect();
-                        Some((label.to_string(), None, rows))
-                    }
+                            .collect::<Vec<_>>(),
+                    ),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
+                .unwrap()
         })
     };
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    let all = s(&["Task folder", "ios", "web"]);
     assert_eq!(
         menu_of(cx, "both"),
         [
-            ("Open in Terminal".into(), None, all.clone()),
-            ("Open in Code".into(), None, all),
-            ("Open in Fork".into(), None, s(&["ios", "web"])),
-            (
-                "Open in Xcode".into(),
-                Some("ios/App.xcodeproj".into()),
-                vec![]
-            ),
+            ("Terminal…".into(), None),
+            ("Code…".into(), None),
+            ("Fork…".into(), None),
+            ("Xcode".into(), Some("ios/App.xcodeproj".into())),
         ]
     );
     // "Add repo" lists only the repos the task lacks, and hides when there are none.
@@ -3304,11 +3298,11 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     assert_eq!(add_repo(cx, "both"), None);
     let web_only = menu_of(cx, "web-only");
     assert!(
-        web_only.iter().all(|e| e.0 != "Open in Xcode"),
+        web_only.iter().all(|e| e.0 != "Xcode"),
         "no project, no Xcode"
     );
     assert!(
-        web_only.contains(&("Open in Fork".into(), Some("web".into()), vec![])),
+        web_only.contains(&("Fork".into(), Some("web".into()))),
         "one repo opens directly"
     );
 

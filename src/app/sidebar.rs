@@ -694,14 +694,19 @@ impl Shark {
             theme.sidebar_foreground
         };
         let attn = self.attention_of(&w.name, cx);
+        let needs = match &attn {
+            Attn::Needs(step) => Some(step.clone()),
+            _ => None,
+        };
         let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
         let ws = w.clone();
         sidebar_row(rail, theme)
             .id(ix)
             .test_support()
-            // The rail shows only the icon, so rows keep the one-line height there.
-            // Agent tasks indent one step, so their status icon lines up with the agent's name.
-            .when(!rail, |d| d.h(px(44.)))
+            // One line; a task waiting on you adds what it waits on beneath, as Devin's
+            // sessions do. Agent tasks indent one step, so their status icon lines up with the
+            // agent's name.
+            .when(!rail && needs.is_some(), |d| d.h(px(44.)))
             .when(section.is_some() && !rail, |d| d.ml(px(32.)))
             .map(|d| cursor_row(d, active, selected, focused, theme))
             .text_color(foreground)
@@ -745,34 +750,13 @@ impl Shark {
                                 .when(active, |d| d.font_weight(FontWeight::MEDIUM))
                                 .child(w.display_title().to_string()),
                         )
-                        .child(
+                        .children(needs.map(|step| {
                             div()
                                 .truncate()
                                 .text_xs()
-                                .text_color(if bright {
-                                    theme.muted_foreground
-                                } else {
-                                    theme.sidebar_foreground
-                                })
-                                .child({
-                                    let mut repos = (w.repos.iter())
-                                        .map(|r| r.name.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(" · ");
-                                    if repos.is_empty() {
-                                        repos = "No repository".into();
-                                    }
-                                    if self.running(&w.name) {
-                                        repos = format!("Scripts running · {repos}");
-                                    }
-                                    match (&attn, running) {
-                                        // The step says where, and that it's waiting on you.
-                                        (Attn::Needs(step), _) => step.clone(),
-                                        (_, 0 | 1) => repos,
-                                        (_, n) => format!("{n} chats running · {repos}"),
-                                    }
-                                }),
-                        ),
+                                .text_color(theme.warning_foreground)
+                                .child(step)
+                        })),
                 )
             })
             .when(rail, |d| {
@@ -823,17 +807,63 @@ impl Shark {
             .collect();
         let needs = tasks
             .iter()
-            .any(|t| matches!(self.attention_of(&t.name, cx), Attn::Needs(_)));
+            .filter(|t| matches!(self.attention_of(&t.name, cx), Attn::Needs(_)))
+            .count();
         let running = tasks
             .iter()
             .filter(|t| self.running_chats(&t.name, cx) > 0)
             .count();
         let slug = agent.slug.clone();
+        let (menu_slug, new_slug) = (slug.clone(), slug.clone());
         let tip: SharedString = format!("{} · {} tasks", agent.name, tasks.len()).into();
+        let group = SharedString::from(format!("agent-row-{i}"));
+        let bright = active || (selected && focused);
+        let quiet = if bright {
+            theme.foreground
+        } else {
+            theme.sidebar_foreground
+        };
+        // One fact on the right, the most urgent: tasks waiting on you, else running ones,
+        // else (folded) how many it has.
+        let badge = match (needs, running) {
+            (1.., _) => Some(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.warning_foreground)
+                    .child(Icon::new(IconName::CircleAlert).with_size(px(12.)))
+                    .child(needs.to_string())
+                    .into_any_element(),
+            ),
+            (_, 1..) => Some(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(Spinner::new().with_size(px(12.)).color(theme.primary))
+                    .child(running.to_string())
+                    .into_any_element(),
+            ),
+            _ if collapsed && !tasks.is_empty() => Some(
+                div()
+                    .text_xs()
+                    .child(tasks.len().to_string())
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
         sidebar_row(rail, theme)
             .id(("agent", i))
+            .group(group.clone())
             .role(gpui_kit::accesskit::Role::Button)
-            .aria_label(format!("Open {} agent, {} tasks", agent.name, tasks.len()))
+            .aria_label(format!(
+                "Open {} agent, {} tasks{}",
+                agent.name,
+                tasks.len(),
+                match needs {
+                    0 => String::new(),
+                    n => format!(", {n} need you"),
+                }
+            ))
             .test_support()
             .map(|d| cursor_row(d, active, selected, focused, theme))
             .when(selected && focused, |d| d.text_color(theme.foreground))
@@ -841,10 +871,18 @@ impl Shark {
                 this.sel = SideRow::Agent(i);
                 this.open_agent(&slug, w, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    this.sel = SideRow::Agent(i);
+                    let entries = this.agent_menu(&menu_slug, cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
             .child(
                 Icon::new(section_icon(&agent.icon))
                     .with_size(ISZ)
-                    .when(needs, |i| i.text_color(theme.warning_foreground)),
+                    .when(needs > 0, |i| i.text_color(theme.warning_foreground)),
             )
             .when(!rail, |d| {
                 d.child(
@@ -855,13 +893,26 @@ impl Shark {
                         .font_weight(FontWeight::MEDIUM)
                         .child(agent.name.clone()),
                 )
-                // Expanded, the task rows show these themselves.
-                .when(collapsed && running > 0, |d| {
-                    d.child(Spinner::new().with_size(px(12.)).color(theme.primary))
-                })
-                .when(collapsed && !tasks.is_empty(), |d| {
-                    d.child(div().text_xs().child(tasks.len().to_string()))
-                })
+                .children(badge)
+                // New task, shown while the row is hovered: Linear's "+" on a team.
+                .child(
+                    div()
+                        .invisible()
+                        .group_hover(group.clone(), |s| s.visible())
+                        .child(
+                            Button::new(("new-agent-task", i))
+                                .accessibility_label(format!("New task for {}", agent.name))
+                                .ghost()
+                                .xsmall()
+                                .text_color(quiet)
+                                .icon(IconName::Plus)
+                                .tooltip("New task")
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    cx.stop_propagation();
+                                    this.prefill_agent_task(&new_slug, w, cx);
+                                })),
+                        ),
+                )
                 .child(
                     Button::new(("collapse-agent", i))
                         .accessibility_label(format!(
@@ -872,11 +923,7 @@ impl Shark {
                         .ghost()
                         .xsmall()
                         // The button's own foreground would outshine the label it belongs to.
-                        .text_color(if active || (selected && focused) {
-                            theme.foreground
-                        } else {
-                            theme.sidebar_foreground
-                        })
+                        .text_color(quiet)
                         .icon(if collapsed {
                             IconName::ChevronRight
                         } else {
@@ -935,7 +982,7 @@ impl Shark {
                             .position(|agent| agent.slug == a.slug)
                     });
                     if agent.is_none() && !other_header {
-                        items.push(header("Other tasks").into_any_element());
+                        items.push(header("Unassigned").into_any_element());
                         other_header = true;
                     }
                     items.push(self.reorder_item(
@@ -979,19 +1026,6 @@ impl Shark {
                     .tooltip("New agent")
                     .on_click(cx.listener(|this, _, w, cx| this.new_agent_dialog(w, cx))),
             );
-        let all_tasks = self.home_shown() && self.home.destination == home::Destination::AllTasks;
-        let all_tasks_row = sidebar_row(rail, theme)
-            .id("all-tasks-row")
-            .role(gpui_kit::accesskit::Role::Button)
-            .aria_label("All tasks")
-            .test_support()
-            .map(|d| cursor_row(d, all_tasks, false, false, theme))
-            .child(Icon::new(IconName::List).with_size(ISZ))
-            .when(!rail, |d| d.child("All tasks"))
-            .when(rail, |d| {
-                d.tooltip(|w, cx| Tooltip::new("All tasks").build(w, cx))
-            })
-            .on_click(cx.listener(|this, _, w, cx| this.enter_all_tasks(w, cx)));
         let add_repo_row = sidebar_row(rail, theme)
             .id("add-repo-row")
             .hover(|d| d.bg(side_hover(theme)))
@@ -1075,7 +1109,6 @@ impl Shark {
                         )
                     }),
             )
-            .child(all_tasks_row)
             .child(
                 // Children are indexed by `move_sel`: the header, then one per `side_rows` row.
                 v_flex()

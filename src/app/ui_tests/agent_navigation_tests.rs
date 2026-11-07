@@ -89,28 +89,12 @@ async fn agent_pages_do_not_mutate_hidden_chats_or_run_hidden_tasks(cx: &mut Tes
             assert_eq!(s.task("work").unwrap().chats.len(), 1);
             assert_eq!(s.task("work").unwrap().closed.len(), 1);
         };
-        for tab in [
-            agent_settings::AgentTab::Instructions,
-            agent_settings::AgentTab::History,
-        ] {
-            s.open_agent("designer", w, cx);
-            s.home.agent_tab = tab;
-            blocked_chat_commands(s, w, cx);
-            s.toggle_run(w, cx);
-            assert!(s.runs.is_empty());
-        }
+        s.open_agent("designer", w, cx);
+        blocked_chat_commands(s, w, cx);
         s.open_agent("empty", w, cx);
         // Even stale selection cannot make an empty agent target another agent's task.
         s.home.sel = Some("work".into());
         blocked_chat_commands(s, w, cx);
-        s.toggle_run(w, cx);
-        assert!(s.runs.is_empty());
-        s.enter_all_tasks(w, cx);
-        blocked_chat_commands(s, w, cx);
-        // A task selected in All tasks can run scripts explicitly.
-        s.home.sel = Some("work".into());
-        s.toggle_run(w, cx);
-        assert!(s.runs.contains_key("work"));
         s.toggle_run(w, cx);
         assert!(s.runs.is_empty());
         s.enter_home(w, cx);
@@ -150,16 +134,14 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
     let on = on_app(window, shark.clone());
     for (destination, branch) in [
         (home::Destination::Agent("designer".into()), "from-agent"),
-        (home::Destination::AllTasks, "from-all-tasks"),
     ] {
         on(cx, &|s, w, cx| {
             s.enter_home(w, cx);
             s.home
                 .prompt
                 .update(cx, |p, cx| p.set_value("Keep this draft", w, cx));
-            match &destination {
-                home::Destination::Agent(slug) => s.open_agent(slug, w, cx),
-                _ => s.enter_all_tasks(w, cx),
+            if let home::Destination::Agent(slug) = &destination {
+                s.open_agent(slug, w, cx)
             }
             s.new_task_default(w, cx);
         });

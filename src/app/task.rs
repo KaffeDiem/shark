@@ -1152,8 +1152,7 @@ impl Shark {
         if !self.sidebar_focus.is_focused(window)
             && self.home_shown()
             && let home::Destination::Agent(slug) = &self.home.destination
-            && (self.home.agent_tab != agent_settings::AgentTab::Tasks
-                || task.agent.as_ref().is_none_or(|a| &a.slug != slug))
+            && task.agent.as_ref().is_none_or(|a| &a.slug != slug)
         {
             return None;
         }

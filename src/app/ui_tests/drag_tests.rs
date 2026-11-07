@@ -309,7 +309,7 @@ async fn sidebar_drag_reorders_only_within_agent_and_group(cx: &mut TestAppConte
             collapsed: false,
         });
         s.active = Some("Gamma".into());
-        s.enter_all_tasks(w, cx);
+        s.enter_home(w, cx);
         s.home.sel = Some("Alpha".into());
         let mut target = None;
         s.with_section(w, cx, |_, i, _, _| target = Some(i));
@@ -317,14 +317,6 @@ async fn sidebar_drag_reorders_only_within_agent_and_group(cx: &mut TestAppConte
             target,
             Some(1),
             "group actions follow the selected task, not hidden active task"
-        );
-        s.open_agent("developer", w, cx);
-        s.home.agent_tab = agent_settings::AgentTab::Instructions;
-        let mut called = false;
-        s.with_section(w, cx, |_, _, _, _| called = true);
-        assert!(
-            !called,
-            "instructions page has no implicit task group target"
         );
     });
 }

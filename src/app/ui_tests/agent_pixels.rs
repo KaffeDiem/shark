@@ -97,13 +97,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             s.set_agent_collapsed(0, true, cx);
         }),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
-        ("agent-settings-end", |s, w, cx| {
-            s.edit_agent("designer", w, cx);
-            s.home.page.set_offset(point(px(0.), px(-2000.)));
-        }),
-        ("agent-history", |s, w, cx| {
+        ("agent-rename", |s, w, cx| s.rename_agent("designer", w, cx)),
+        ("agent-menu", |s, w, cx| {
             s.open_agent("designer", w, cx);
-            s.home.agent_tab = super::super::agent_settings::AgentTab::History;
+            let entries = s.agent_menu("designer", cx);
+            s.show_menu(point(px(120.), px(250.)), entries, w, cx);
         }),
         ("home", |s, w, cx| s.enter_home(w, cx)),
         ("home-agent", |s, w, cx| {
@@ -115,7 +113,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .prompt
                 .update(cx, |p, cx| p.set_value("@designer Tighten spacing", w, cx));
         }),
-        ("all-tasks", |s, w, cx| s.enter_all_tasks(w, cx)),
+        ("home-mention", |s, w, cx| {
+            s.enter_home(w, cx);
+            s.home.prompt.update(cx, |p, cx| {
+                p.set_value("@d", w, cx);
+                p.focus(w, cx)
+            });
+        }),
         ("new-agent", |s, w, cx| {
             s.enter_home(w, cx);
             s.new_agent_dialog(w, cx);

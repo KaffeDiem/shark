@@ -267,6 +267,11 @@ fn bind_keys(cx: &mut App) {
         // the prompt between new task and Ask Shark; i/a jump from the list to it.
         KeyBinding::new("escape", CancelEdit, Some("HomeView")),
         KeyBinding::new("tab", SwitchField, Some("HomePrompt")),
+        // Up and down move through the `@agent` completions under Home's prompt.
+        KeyBinding::new("down", SelectNext, Some("HomePrompt > Input")),
+        KeyBinding::new("up", SelectPrev, Some("HomePrompt > Input")),
+        KeyBinding::new("ctrl-n", SelectNext, Some("HomePrompt > Input")),
+        KeyBinding::new("ctrl-p", SelectPrev, Some("HomePrompt > Input")),
         KeyBinding::new(
             "i",
             FocusComposer,

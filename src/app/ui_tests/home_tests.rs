@@ -583,7 +583,7 @@ async fn home_agent_picker_preserves_draft_and_standalone_choice(cx: &mut TestAp
             "@designer fix spacing"
         )
     });
-    pick(cx, "Repository defaults");
+    pick(cx, "No agent");
     cx.read(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), "fix spacing"));
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -663,7 +663,7 @@ async fn all_tasks_groups_keep_ungrouped_separate_and_agent_instructions(cx: &mu
         WindowOptions::default(),
     );
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| s.enter_all_tasks(w, cx));
+    on(cx, &|s, w, cx| s.enter_home(w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("task-grouping", cx);

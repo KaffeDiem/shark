@@ -18,7 +18,7 @@
 |---|---|
 | **Agent** | Keeps a name, instructions, skills, default repositories and model settings across tasks. Lives in the sidebar, with its own task list and history. |
 | **Task** | One piece of work, with separate branches, worktrees, conversations and review state. Several tasks can run under the same agent. |
-| **Task group** | Optional organization under **All tasks**. Moving a task between groups never changes its agent or instructions. |
+| **Task group** | Optional organization of Home's task list. Moving a task between groups never changes its agent or instructions. |
 
 You start each task and decide what ships. Tasks of the same agent share instructions and sibling activity notes; conversations stay separate. Shark does not schedule or automatically start work.
 

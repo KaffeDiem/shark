@@ -1,4 +1,5 @@
-//! Home starts tasks; All tasks and agent pages review work without leaving the open task.
+//! Home starts tasks and lists every task; agent pages do both for one agent. Neither leaves
+//! the open task.
 use super::ask::Ask;
 use super::*;
 use crate::state::AgentLink;
@@ -14,7 +15,6 @@ const RELEASES: &str = "https://github.com/KaffeDiem/shark/releases/tag/v";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Destination {
     Home,
-    AllTasks,
     Agent(String),
 }
 
@@ -93,7 +93,6 @@ pub(crate) struct Home {
     /// Shown over the open task. With none open, Home shows anyway.
     pub(super) on: bool,
     pub(super) destination: Destination,
-    pub(super) agent_tab: super::agent_settings::AgentTab,
     group_tasks: bool,
     /// The task list, which takes j/k/enter.
     pub(super) focus: FocusHandle,
@@ -105,8 +104,10 @@ pub(crate) struct Home {
     pub(super) agent_prompt: Entity<InputState>,
     pub(super) agent_prompt_for: Option<String>,
     pub(super) agent_drafts: HashMap<String, String>,
-    /// The agent page's Settings tab.
-    pub(super) agent_editor: Option<Entity<super::agent_settings::AgentSettingsView>>,
+    /// The agent page's header fields.
+    pub(super) agent_header: Option<Entity<super::agent_settings::AgentHeader>>,
+    /// The highlighted `@agent` completion under Home's prompt.
+    pub(super) mention: usize,
     /// The prompt asks Shark instead of starting a task.
     pub(super) asking: bool,
     pub(super) ask: Option<Ask>,
@@ -130,8 +131,14 @@ impl Home {
         let agent_prompt = cx.new(|cx| InputState::new(window, cx));
         let _subs = vec![
             cx.subscribe_in(&prompt, window, |s, _, ev: &InputEvent, w, cx| match ev {
-                InputEvent::PressEnter { .. } => s.submit_prompt(w, cx),
-                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => match s.mentions(cx).is_empty() {
+                    true => s.submit_prompt(w, cx),
+                    false => s.complete_mention(None, w, cx),
+                },
+                InputEvent::Change => {
+                    s.home.mention = 0;
+                    cx.notify()
+                }
                 _ => {}
             }),
             cx.subscribe_in(&agent_prompt, window, |s, field, ev: &InputEvent, w, cx| {
@@ -146,7 +153,6 @@ impl Home {
         Home {
             on: false,
             destination: Destination::Home,
-            agent_tab: super::agent_settings::AgentTab::Tasks,
             group_tasks: false,
             focus: cx.focus_handle(),
             sel: None,
@@ -154,7 +160,8 @@ impl Home {
             agent_prompt,
             agent_prompt_for: None,
             agent_drafts: HashMap::new(),
-            agent_editor: None,
+            agent_header: None,
+            mention: 0,
             asking: false,
             ask: None,
             waiting: HashMap::new(),
@@ -274,13 +281,6 @@ impl Shark {
             self.home.sel = (rows.first()).map(|r| self.state.tasks[r.ix].name.clone());
         }
         self.focus_fallback(window, cx);
-        cx.notify();
-    }
-
-    pub(super) fn enter_all_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.enter_home(window, cx);
-        self.home.destination = Destination::AllTasks;
-        self.home.focus.focus(window, cx);
         cx.notify();
     }
 
@@ -404,7 +404,7 @@ impl Shark {
             })
             .collect();
         rows.sort_by_key(|r| r.bucket);
-        if self.home.destination == Destination::AllTasks && self.home.group_tasks {
+        if self.home.destination == Destination::Home && self.home.group_tasks {
             rows.sort_by_key(|r| {
                 self.plain_task_group(r)
                     .unwrap_or(self.state.sections.len())
@@ -420,7 +420,7 @@ impl Shark {
     }
 
     fn home_group_key(&self, row: &HomeRow) -> (Option<usize>, Option<Bucket>) {
-        if self.home.destination == Destination::AllTasks && self.home.group_tasks {
+        if self.home.destination == Destination::Home && self.home.group_tasks {
             (self.plain_task_group(row), None)
         } else {
             (None, Some(row.bucket))
@@ -428,7 +428,7 @@ impl Shark {
     }
 
     fn home_row_group(&self, row: &HomeRow) -> String {
-        if self.home.destination == Destination::AllTasks && self.home.group_tasks {
+        if self.home.destination == Destination::Home && self.home.group_tasks {
             self.plain_task_group(row)
                 .map(|i| self.state.sections[i].name.clone())
                 .unwrap_or_else(|| "Ungrouped".into())
@@ -457,13 +457,9 @@ impl Shark {
         let to = nav.to(self.home_at(&rows).unwrap_or(0), rows.len(), 10);
         self.home.sel = Some(self.state.tasks[rows[to].ix].name.clone());
         // The list's children are the rows with a heading before each group's first.
-        let headings = if matches!(self.home.destination, Destination::Agent(_)) {
-            0
-        } else {
-            rows[..=to]
-                .chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b))
-                .count()
-        };
+        let headings = rows[..=to]
+            .chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b))
+            .count();
         self.home_scroll_to(to + headings);
         cx.notify();
     }
@@ -502,6 +498,9 @@ impl Shark {
     }
 
     pub(super) fn toggle_ask_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.mentions(cx).is_empty() {
+            return self.complete_mention(None, window, cx);
+        }
         self.home.asking = !self.home.asking;
         let placeholder = if self.home.asking { ASK } else { BUILD };
         self.home
@@ -555,8 +554,8 @@ impl Shark {
             .map_or(0, |i| i + 1);
         let mut rows = vec![
             CommandItem::new()
-                .label("Repository defaults")
-                .icon(IconName::GitBranch),
+                .label("No agent")
+                .icon(IconName::AtSign),
         ];
         rows.extend(agents.iter().map(|agent| {
             CommandItem::new()
@@ -565,7 +564,7 @@ impl Shark {
         }));
         open_menu(
             cx.entity().downgrade(),
-            "Choose an agent or repository defaults",
+            "Start the task with an agent…",
             rows,
             selected,
             move |s, i, w, cx| {
@@ -585,6 +584,60 @@ impl Shark {
             window,
             cx,
         );
+    }
+
+    /// Agents matching the `@` Home's prompt starts with, while that mention is being typed:
+    /// prefix matches first, at most six.
+    pub(super) fn mentions(&self, cx: &App) -> Vec<usize> {
+        if self.home.asking {
+            return vec![];
+        }
+        let text = self.home.prompt.read(cx).value();
+        let Some(q) = text.strip_prefix('@') else {
+            return vec![];
+        };
+        if q.contains(char::is_whitespace) {
+            return vec![];
+        }
+        let q = q.to_lowercase();
+        let mut hits: Vec<(bool, usize)> = (self.state.agents.iter().enumerate())
+            .filter_map(|(i, a)| {
+                let name = a.name.to_lowercase();
+                let prefix = a.slug.starts_with(&q) || name.starts_with(&q);
+                (prefix || a.slug.contains(&q) || name.contains(&q)).then_some((!prefix, i))
+            })
+            .collect();
+        hits.sort();
+        hits.into_iter().map(|(_, i)| i).take(6).collect()
+    }
+
+    /// Puts `@slug ` for agent `pick`, or the highlighted completion, at the prompt's start.
+    pub(super) fn complete_mention(
+        &mut self,
+        pick: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hits = self.mentions(cx);
+        let at = self.home.mention.min(hits.len().saturating_sub(1));
+        let Some(i) = pick.or(hits.get(at).copied()) else {
+            return;
+        };
+        let value = format!("@{} ", self.state.agents[i].slug);
+        self.home.mention = 0;
+        self.home.prompt.update(cx, |p, cx| {
+            p.set_value(value, window, cx);
+            p.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn move_mention(&mut self, by: isize, cx: &mut Context<Self>) {
+        let n = self.mentions(cx).len();
+        if n > 0 {
+            self.home.mention = (self.home.mention as isize + by).rem_euclid(n as isize) as usize;
+            cx.notify();
+        }
     }
 
     fn start_agent_task(
@@ -784,7 +837,6 @@ impl Shark {
 
     pub(super) fn render_home(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.home.destination {
-            Destination::AllTasks => return self.render_all_tasks(window, cx),
             Destination::Agent(slug) => return self.render_agent_page(slug, window, cx),
             Destination::Home => {}
         }
@@ -902,98 +954,6 @@ impl Shark {
         );
     }
 
-    fn render_all_tasks(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let list = self.render_ws_list(window, cx);
-        let theme = cx.theme();
-        v_flex()
-            .key_context("HomeView")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .on_action(cx.listener(|s, _: &CancelEdit, w, cx| s.home_escape(w, cx)))
-            .child(
-                h_flex()
-                    .h(px(44.))
-                    .px_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(Icon::new(IconName::List).with_size(px(14.)))
-                    .child(div().text_sm().child("All tasks"))
-                    .child(div().flex_1())
-                    .when(self.active.is_some(), |d| {
-                        d.child(
-                            Button::new("all-tasks-back")
-                                .ghost()
-                                .xsmall()
-                                .label("Back to task")
-                                .on_click(cx.listener(|s, _, w, cx| s.leave_home(w, cx))),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .id("all-tasks-page")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.home.page)
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .max_w(px(760.))
-                            .mx_auto()
-                            .px_4()
-                            .py_6()
-                            .gap_4()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("task-grouping")
-                                            .small()
-                                            .outline()
-                                            .label(if self.home.group_tasks {
-                                                "Group by task group"
-                                            } else {
-                                                "Group by status"
-                                            })
-                                            .on_click(cx.listener(|s, _, w, cx| {
-                                                open_menu(
-                                                    cx.entity().downgrade(),
-                                                    "Group tasks",
-                                                    vec![
-                                                        CommandItem::new().label("Status"),
-                                                        CommandItem::new().label("Task group"),
-                                                    ],
-                                                    usize::from(s.home.group_tasks),
-                                                    |s, i, _, cx| {
-                                                        s.home.group_tasks = i == 1;
-                                                        cx.notify();
-                                                    },
-                                                    w,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("task-groups")
-                                            .small()
-                                            .ghost()
-                                            .label("Task groups…")
-                                            .on_click(
-                                                cx.listener(|s, _, w, cx| {
-                                                    s.pick_task_groups(w, cx)
-                                                }),
-                                            ),
-                                    ),
-                            )
-                            .child(list),
-                    ),
-            )
-            .into_any_element()
-    }
-
     fn render_prompt(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let focused = self
@@ -1006,24 +966,76 @@ impl Shark {
             true => ("Ask Shark", "ask", "new task"),
             false => ("What do you want to build?", "start task", "ask Shark"),
         };
-        // The agent picker sits in the composer's footer, as Codex puts its repo picker.
-        let picker = (!self.home.asking).then(|| {
+        // The agent picker and Linear sit in the composer's footer, as Codex puts its repo picker.
+        let footer = (!self.home.asking).then(|| {
             let text = self.home.prompt.read(cx).value();
             let (slug, _) = agent_prompt(text.trim(), &self.state.agents);
             let selected = slug.and_then(|slug| self.state.agents.iter().find(|a| a.slug == slug));
-            h_flex().child(
-                Button::new("home-agent-picker")
-                    .xsmall()
-                    .ghost()
-                    .icon(selected.map_or(IconName::GitBranch, |a| {
-                        super::sidebar::section_icon(&a.icon)
-                    }))
-                    .label(selected.map_or_else(
-                        || "Repository defaults".to_string(),
-                        |a| format!("Agent: {}", a.name),
-                    ))
-                    .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
-            )
+            h_flex()
+                .gap_1()
+                .ml(px(-6.))
+                .child(
+                    Button::new("home-agent-picker")
+                        .xsmall()
+                        .ghost()
+                        .icon(selected.map_or(IconName::AtSign, |a| {
+                            super::sidebar::section_icon(&a.icon)
+                        }))
+                        .label(selected.map_or_else(
+                            || "No agent".to_string(),
+                            |a| a.name.clone(),
+                        ))
+                        .tooltip("Pick an agent, or type @")
+                        .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
+                )
+                .when(self.linear_in_use(), |d| {
+                    d.child(
+                        Button::new("home-linear-issue")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::TagPlus)
+                            .label("Linear issue…")
+                            .tooltip("Start a task from a Linear issue, for the picked agent")
+                            .on_click(cx.listener(|s, _, w, cx| s.start_from_issue(w, cx))),
+                    )
+                })
+        });
+        let hits = self.mentions(cx);
+        let at = self.home.mention.min(hits.len().saturating_sub(1));
+        let suggestions = (!hits.is_empty()).then(|| {
+            v_flex()
+                .id("home-mentions")
+                .test_support()
+                .mx(px(-6.))
+                .py_1()
+                .border_t_1()
+                .border_color(theme.border)
+                .children(hits.iter().enumerate().map(|(row, &i)| {
+                    let a = &self.state.agents[i];
+                    h_flex()
+                        .id(("home-mention", i))
+                        .role(gpui_kit::accesskit::Role::Button)
+                        .aria_label(format!("Start with {}", a.name))
+                        .test_support()
+                        .h(px(32.))
+                        .px_2()
+                        .gap_2()
+                        .rounded(theme.radius)
+                        .text_sm()
+                        .when(row == at, |d| d.bg(theme.list_hover))
+                        .hover(|d| d.bg(theme.list_hover))
+                        .child(Icon::new(super::sidebar::section_icon(&a.icon)).with_size(px(16.)))
+                        .child(div().child(a.name.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("@{}", a.slug)),
+                        )
+                        .on_click(cx.listener(move |s, _, w, cx| {
+                            s.complete_mention(Some(i), w, cx)
+                        }))
+                }))
         });
         v_flex()
             .gap_2()
@@ -1034,6 +1046,8 @@ impl Shark {
                     .on_action(
                         cx.listener(|this, _: &SwitchField, w, cx| this.toggle_ask_mode(w, cx)),
                     )
+                    .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_mention(1, cx)))
+                    .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_mention(-1, cx)))
                     .px_3()
                     .py_2()
                     .gap_1()
@@ -1043,7 +1057,8 @@ impl Shark {
                     .bg(theme.secondary)
                     .text_size(px(14.))
                     .child(Input::new(&self.home.prompt).appearance(false))
-                    .children(picker),
+                    .children(suggestions)
+                    .children(footer),
             )
             .child(
                 h_flex()
@@ -1051,16 +1066,9 @@ impl Shark {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(crate::ui::hint("enter", enter))
-                    .child(crate::ui::hint("tab", other))
-                    .child(div().flex_1())
-                    .when(!self.home.asking && self.linear_in_use(), |d| {
-                        d.child(
-                            Button::new("home-linear-issue")
-                                .ghost()
-                                .xsmall()
-                                .label("Start from Linear issue")
-                                .on_click(cx.listener(|s, _, w, cx| s.start_from_issue(w, cx))),
-                        )
+                    .child(crate::ui::hint("tab", if hits.is_empty() { other } else { "complete" }))
+                    .when(!self.home.asking && hits.is_empty(), |d| {
+                        d.child(crate::ui::hint("@", "agent"))
                     }),
             )
             .into_any_element()
@@ -1207,27 +1215,82 @@ impl Shark {
             .into_any_element()
     }
 
-    fn render_ws_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The task list, grouped by what each task needs; Home can group by task group instead.
+    pub(super) fn render_ws_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.home_rows(cx);
         let theme = cx.theme();
         let focused = self.home.focus.is_focused(window);
+        let on_home = self.home.destination == Destination::Home;
         let list = v_flex()
             .id("home-list")
             .key_context("Home")
             .track_focus(&self.home.focus)
-            .track_scroll(&self.home.rows)
-            .gap_1();
+            .track_scroll(&self.home.rows);
         let list = nav_actions(list, true, cx, Shark::home_move)
             .on_action(cx.listener(|this, _: &Confirm, w, cx| this.home_confirm(w, cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, w, cx| {
-                this.enter_home(w, cx);
-                this.home.prompt.update(cx, |p, cx| p.focus(w, cx))
+                match this.home.destination.clone() {
+                    Destination::Agent(slug) => this.prefill_agent_task(&slug, w, cx),
+                    Destination::Home => {
+                        this.enter_home(w, cx);
+                        this.home.prompt.update(cx, |p, cx| p.focus(w, cx))
+                    }
+                }
             }));
         if rows.is_empty() {
-            return self.render_empty(list, cx);
+            return match on_home {
+                true => self.render_empty(list, cx),
+                false => list
+                    .child(super::agent_settings::empty_state(
+                        theme,
+                        "agent-empty-tasks",
+                        IconName::Inbox,
+                        "No tasks yet",
+                        "Describe the work above and press enter. Each task gets its own branch and chat.",
+                    ))
+                    .into_any_element(),
+            };
         }
         let now = SystemTime::now();
         let mut items: Vec<AnyElement> = vec![];
+        let grouping = on_home.then(|| {
+            Button::new("task-grouping")
+                .ghost()
+                .xsmall()
+                .icon(IconName::ListFilter)
+                .label(if self.home.group_tasks {
+                    "Task group"
+                } else {
+                    "Status"
+                })
+                .tooltip("Group tasks by")
+                .on_click(cx.listener(|s, _, w, cx| {
+                    open_menu(
+                        cx.entity().downgrade(),
+                        "Group tasks by…",
+                        vec![
+                            CommandItem::new().label("Status").checked(!s.home.group_tasks),
+                            CommandItem::new()
+                                .label("Task group")
+                                .checked(s.home.group_tasks),
+                            CommandItem::new()
+                                .label("Task groups…")
+                                .icon(IconName::FolderPlus),
+                        ],
+                        usize::from(s.home.group_tasks),
+                        |s, i, w, cx| match i {
+                            2 => s.pick_task_groups(w, cx),
+                            _ => {
+                                s.home.group_tasks = i == 1;
+                                cx.notify();
+                            }
+                        },
+                        w,
+                        cx,
+                    );
+                }))
+        });
+        let mut grouping = grouping;
         for group in rows.chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b)) {
             items.push(
                 h_flex()
@@ -1238,8 +1301,9 @@ impl Shark {
                         group.len()
                     ))
                     .test_support()
-                    .pt(if items.is_empty() { px(0.) } else { px(12.) })
-                    .pb_1()
+                    .h(px(28.))
+                    .mt(if items.is_empty() { px(0.) } else { px(12.) })
+                    .px_3()
                     .gap_2()
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
@@ -1251,25 +1315,24 @@ impl Shark {
                             .child(group.len().to_string()),
                     )
                     .child(div().flex_1())
-                    .when(
-                        self.home.destination == Destination::AllTasks && self.home.group_tasks,
-                        |d| {
-                            if let Some(i) = self.plain_task_group(&group[0]) {
-                                d.child(
-                                    Button::new(("task-group-actions", i))
-                                        .ghost()
-                                        .xsmall()
-                                        .label("Group actions…")
-                                        .on_click(cx.listener(move |s, _, w, cx| {
-                                            let entries = super::sidebar::section_menu(s, i, cx);
-                                            s.show_menu(w.mouse_position(), entries, w, cx);
-                                        })),
-                                )
-                            } else {
-                                d
-                            }
-                        },
-                    )
+                    .when(on_home && self.home.group_tasks, |d| {
+                        if let Some(i) = self.plain_task_group(&group[0]) {
+                            d.child(
+                                Button::new(("task-group-actions", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Group actions…")
+                                    .on_click(cx.listener(move |s, _, w, cx| {
+                                        let entries = super::sidebar::section_menu(s, i, cx);
+                                        s.show_menu(w.mouse_position(), entries, w, cx);
+                                    })),
+                            )
+                        } else {
+                            d
+                        }
+                    })
+                    // The first heading carries the list's grouping control.
+                    .children(grouping.take())
                     .into_any_element(),
             );
             items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
@@ -1277,7 +1340,8 @@ impl Shark {
         list.children(items)
             .child(
                 h_flex()
-                    .pt_2()
+                    .pt_3()
+                    .px_3()
                     .gap_3()
                     .text_xs()
                     .text_color(faint(theme))
@@ -1320,7 +1384,9 @@ impl Shark {
             .into_any_element()
     }
 
-    /// One task's row on the list.
+    /// One task's row on the list: one line, Linear-style. Status icon and title; what it waits
+    /// on in warning text; its agent (on Home), repositories and age on the right. The branch and
+    /// chat count are in the tooltip and accessible label.
     pub(super) fn home_ws_row(
         &self,
         r: &HomeRow,
@@ -1338,35 +1404,50 @@ impl Shark {
         let when = (self.home.activity.get(&w.name))
             .and_then(|t| now.duration_since(*t).ok())
             .map(crate::sync::ago);
-        // Each repo's status replaces its bare name once checked, so the row keeps two lines.
+        // Each repo's status replaces its bare name once checked.
         let names = match repos {
             Some(repos) => repos.iter().map(home_summary).collect::<Vec<_>>(),
             None => w.repos.iter().map(|r| r.name.clone()).collect(),
         }
         .join(" · ");
+        let names = match names.is_empty() {
+            true => "No repository".to_string(),
+            false => names,
+        };
         let chats = match w.chats.len() {
             1 => "1 chat".to_string(),
             n => format!("{n} chats"),
         };
+        let status = r.label.clone().or_else(|| match r.running {
+            0 | 1 => None,
+            n => Some(format!("{n} chats running")),
+        });
+        let agent = (self.home.destination == Destination::Home)
+            .then(|| {
+                let link = w.agent.as_ref()?;
+                self.state.agents.iter().find(|a| a.slug == link.slug)
+            })
+            .flatten();
         let name = w.name.clone();
         let title = w.display_title().to_string();
-        let on = match w.repos.is_empty() {
-            // Long repo statuses truncate last; the branch stays visible.
-            true => format!("No repository · {chats}"),
-            false => format!("{} · {chats} · {names}", w.branch),
-        };
+        let detail = format!("{} · {chats} · {names}", w.branch);
+        let tip: SharedString = detail.clone().into();
         let ws = w.clone();
         h_flex()
             .id(("home-ws", ix))
             .role(gpui_kit::accesskit::Role::Button)
-            .aria_label(format!("Open task {title}: {on}"))
+            .aria_label(format!(
+                "Open task {title}{}: {detail}",
+                status.as_deref().map(|s| format!(", {s}")).unwrap_or_default()
+            ))
             .test_support()
-            .items_start()
+            .h(px(36.))
             .px_3()
-            .py_2()
             .gap_3()
             .rounded(theme.radius)
+            .text_sm()
             .map(|d| list_cursor_row(d, selected, focused, theme))
+            .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
             .on_mouse_down(MouseButton::Left, {
                 let name = name.clone();
                 cx.listener(move |this, _, _, cx| {
@@ -1384,71 +1465,72 @@ impl Shark {
                     this.show_menu(e.position, entries, w, cx);
                 }),
             )
-            .child(div().mt(px(3.)).child(super::sidebar::indicator(
+            .child(div().flex_none().child(super::sidebar::indicator(
                 r.bucket,
                 theme.muted_foreground,
                 px(14.),
                 theme,
             )))
             .child(
-                v_flex()
-                    .flex_1()
+                div()
                     .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .text_sm()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(title),
-                            )
-                            .when(merged, |d| {
-                                d.child(
-                                    h_flex()
-                                        .gap_1()
-                                        .text_xs()
-                                        .text_color(theme.success_foreground)
-                                        .child(Icon::new(IconName::GitMerge).with_size(px(12.)))
-                                        .child("Merged"),
-                                )
-                            })
-                            .child(div().flex_1())
-                            .children(when.map(|t| {
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(t)
-                            })),
-                    )
-                    .children(r.label.clone().map(|l| {
-                        div()
-                            .text_xs()
-                            .text_color(theme.warning_foreground)
-                            .child(l)
-                    }))
-                    .when(r.running > 1, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{} chats running", r.running)),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1p5()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                            .child(div().min_w_0().truncate().child(on)),
-                    ),
+                    .flex_shrink(1.)
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
             )
+            .children(status.map(|l| {
+                div()
+                    .flex_none()
+                    .max_w(px(260.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(match r.label.is_some() {
+                        true => theme.warning_foreground,
+                        false => theme.muted_foreground,
+                    })
+                    .child(l)
+            }))
+            .when(merged, |d| {
+                d.child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(theme.success_foreground)
+                        .child(Icon::new(IconName::GitMerge).with_size(px(12.)))
+                        .child("Merged"),
+                )
+            })
+            .child(div().flex_1().min_w(px(12.)))
+            .children(agent.map(|a| {
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(super::sidebar::section_icon(&a.icon)).with_size(px(12.)))
+                    .child(a.name.clone())
+            }))
+            .child(
+                div()
+                    .min_w_0()
+                    .max_w(px(240.))
+                    .flex_shrink(1.)
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(names),
+            )
+            .children(when.map(|t| {
+                div()
+                    .flex_none()
+                    .w(px(56.))
+                    .text_right()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t)
+            }))
             .into_any_element()
     }
 

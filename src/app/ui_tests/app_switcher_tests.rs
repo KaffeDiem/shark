@@ -42,34 +42,30 @@ async fn app_switcher_recents(cx: &mut TestAppContext) {
     press(cx, &["cmd-o", "right", "escape"]);
     assert_eq!(history(cx), [apps[1].path.clone()]);
 
-    // Both direct repo entries and task submenus use the same launch path.
+    // A single target launches from "Open in…"; several open a picker of them first.
     for folder in [false, true] {
         let action = shark.update(cx, |_, cx| {
             let dir = ("Task folder".into(), PathBuf::from("/workspace"));
-            let entries = crate::app::menus::open_in_entries(
+            let Some(Entry::Sub { entries, .. }) = crate::app::menus::open_in(
                 folder.then_some(&dir),
                 &[("repo".into(), PathBuf::from("/repo"))],
                 cx,
-            );
+            ) else {
+                panic!("expected Open in…")
+            };
             let entry = entries
                 .into_iter()
-                .find(|entry| match entry {
-                    Entry::Item { label, .. } | Entry::Sub { label, .. } => {
-                        label == "Open in Terminal"
-                    }
-                    _ => false,
-                })
+                .find(|entry| matches!(entry, Entry::Item { label, .. } if label.starts_with("Terminal")))
                 .unwrap();
-            let entry = match entry {
-                Entry::Sub { mut entries, .. } => entries.remove(0),
-                entry => entry,
-            };
             let Entry::Item { on_click, .. } = entry else {
                 panic!("expected launch action")
             };
             on_click
         });
         cx.update_window(window, |_, w, cx| action(w, cx)).unwrap();
+        if folder {
+            press(cx, &["enter"]);
+        }
     }
     assert_eq!(history(cx), [apps[0].path.clone(), apps[1].path.clone()]);
 
