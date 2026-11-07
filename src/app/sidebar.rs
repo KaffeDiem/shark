@@ -700,8 +700,9 @@ impl Shark {
             .id(ix)
             .test_support()
             // The rail shows only the icon, so rows keep the one-line height there.
+            // Agent tasks indent one step, so their status icon lines up with the agent's name.
             .when(!rail, |d| d.h(px(44.)))
-            .when(section.is_some() && !rail, |d| d.ml(px(24.)))
+            .when(section.is_some() && !rail, |d| d.ml(px(32.)))
             .map(|d| cursor_row(d, active, selected, focused, theme))
             .text_color(foreground)
             // The cursor moves on press, not release: a held or dragged row is the one ringed.
@@ -854,10 +855,13 @@ impl Shark {
                         .font_weight(FontWeight::MEDIUM)
                         .child(agent.name.clone()),
                 )
-                .when(running > 0, |d| {
+                // Expanded, the task rows show these themselves.
+                .when(collapsed && running > 0, |d| {
                     d.child(Spinner::new().with_size(px(12.)).color(theme.primary))
                 })
-                .child(div().text_xs().child(tasks.len().to_string()))
+                .when(collapsed && !tasks.is_empty(), |d| {
+                    d.child(div().text_xs().child(tasks.len().to_string()))
+                })
                 .child(
                     Button::new(("collapse-agent", i))
                         .accessibility_label(format!(
@@ -867,6 +871,12 @@ impl Shark {
                         ))
                         .ghost()
                         .xsmall()
+                        // The button's own foreground would outshine the label it belongs to.
+                        .text_color(if active || (selected && focused) {
+                            theme.foreground
+                        } else {
+                            theme.sidebar_foreground
+                        })
                         .icon(if collapsed {
                             IconName::ChevronRight
                         } else {
@@ -952,17 +962,19 @@ impl Shark {
                 this.show_menu(e.position, entries, w, cx);
             })
         };
-        let agents_header = h_flex()
+        // "+" sits on the label's line, right-aligned with the agent rows' chevrons.
+        let agents_header = header("Agents")
             .id("agents-header")
             .test_support()
+            .when(!rail, |d| d.flex())
             .justify_between()
             .items_center()
-            .child(header("Agents"))
             .child(
                 Button::new("new-agent")
                     .accessibility_label("New agent")
                     .ghost()
                     .xsmall()
+                    .text_color(theme.sidebar_foreground)
                     .icon(IconName::Plus)
                     .tooltip("New agent")
                     .on_click(cx.listener(|this, _, w, cx| this.new_agent_dialog(w, cx))),

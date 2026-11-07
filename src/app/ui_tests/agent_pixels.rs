@@ -85,9 +85,17 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     for task in &tasks {
         fs::create_dir_all(task.dir()).unwrap();
     }
-    let cases: [(&str, Setup); 9] = [
+    let cases: &[(&str, Setup)] = &[
         ("agent-tasks", |s, w, cx| s.open_agent("designer", w, cx)),
         ("agent-empty", |s, w, cx| s.open_agent("test", w, cx)),
+        ("rail", |s, w, cx| {
+            s.rail = true;
+            s.open_agent("designer", w, cx);
+        }),
+        ("agent-collapsed", |s, w, cx| {
+            s.open_agent("test", w, cx);
+            s.set_agent_collapsed(0, true, cx);
+        }),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
         ("agent-settings-end", |s, w, cx| {
             s.edit_agent("designer", w, cx);
@@ -117,7 +125,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         (crate::state::Mode::Dark, "dark"),
         (crate::state::Mode::Light, "light"),
     ] {
-        for (case, setup) in cases {
+        for &(case, setup) in cases {
             let mut state = State {
                 repos: repos.clone(),
                 tasks: tasks.clone(),
