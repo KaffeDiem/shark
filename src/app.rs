@@ -173,6 +173,7 @@ pub struct Shark {
 
 impl Shark {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        crate::attention::init(window, cx);
         let mut state = State::load();
         crate::prompts::set_overrides(&state.prompts);
         crate::git::set_repo_skills(!state.no_repo_skills);
@@ -445,7 +446,9 @@ impl Shark {
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat().cloned() {
-                    self.unread.remove(&chat.read(cx).meta.id);
+                    if self.unread.remove(&chat.read(cx).meta.id) {
+                        self.refresh_attention(cx);
+                    }
                     let focus = chat.read(cx).focus.clone();
                     focus.focus(window, cx);
                 }

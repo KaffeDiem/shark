@@ -98,13 +98,14 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_task_then(name, window, cx, |_, _, _| {});
+        self.open_task_then(name, None, window, cx, |_, _, _| {});
     }
 
     /// Opens `name`, then runs `then`: at once, or once a discard dialog is confirmed.
     pub(super) fn open_task_then(
         &mut self,
         name: &str,
+        chat: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
@@ -112,7 +113,30 @@ impl Shark {
         if self.archiving.contains(name) || self.task(name).is_none() {
             return notify_err(window, cx, "The selected task is no longer available");
         }
+        let instance = self.task(name).unwrap().instance_id.clone();
+        // Pick after confirmation, before showing anything: the previous chat must stay unread.
+        let prepare_chat = move |s: &mut Self, name: &str| {
+            let Some(id) = chat else { return true };
+            let Some(ws) = s.task_mut(name) else {
+                return false;
+            };
+            let Some(ix) = ws.chats.iter().position(|c| c.id == id).or_else(|| {
+                let ix = ws.closed.iter().position(|c| c.id == id)?;
+                let meta = ws.closed.remove(ix);
+                Some(ws.push_chat(meta))
+            }) else {
+                return false;
+            };
+            if ws.active_chat != ix {
+                ws.active_chat = ix;
+                let _ = s.state.save();
+            }
+            true
+        };
         if self.active.as_deref() == Some(name) {
+            if !prepare_chat(self, name) {
+                return notify_err(window, cx, "The selected chat is no longer available");
+            }
             if self.home.on {
                 self.leave_home(window, cx);
             }
@@ -128,11 +152,14 @@ impl Shark {
                 .state
                 .tasks
                 .iter()
-                .position(|w| w.name == name)
+                .position(|w| w.name == name && w.instance_id == instance)
                 .filter(|_| !s.archiving.contains(&name))
             else {
                 return notify_err(window, cx, "The selected task is no longer available");
             };
+            if !prepare_chat(s, &name) {
+                return notify_err(window, cx, "The selected chat is no longer available");
+            }
             s.open_task_now(ix, window, cx);
             s.record_interaction(&name, cx);
             then(s, window, cx);
@@ -637,7 +664,7 @@ impl Shark {
                         // A dirty file tab in the task left behind asks first: send once opened.
                         let deferred = Rc::new(std::cell::Cell::new(false));
                         let (later, setup_ws, key) = (deferred.clone(), ws.clone(), name.clone());
-                        s.open_task_then(&name.clone(), window, cx, move |s, window, cx| {
+                        s.open_task_then(&key, None, window, cx, move |s, window, cx| {
                             s.home_prompt_used(
                                 prompt.as_deref(),
                                 ws.agent.as_ref().map(|a| a.slug.as_str()),

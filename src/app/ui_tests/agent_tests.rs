@@ -672,7 +672,7 @@ async fn agent_pages_do_not_target_hidden_tasks(cx: &mut TestAppContext) {
             "other",
             "explicit sidebar selection wins"
         );
-        s.open_task_then("other", w, cx, |_, _, _| {});
+        s.open_task_then("other", None, w, cx, |_, _, _| {});
         assert!(
             !s.home_shown(),
             "opening the active task leaves the agent page"
@@ -857,7 +857,7 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
     }
     fs::remove_file(tasks[0].dir().join("api/first.rs")).unwrap();
     fs::write(tasks[0].dir().join("api/second.rs"), "second").unwrap();
-    on_app(window, shark.clone())(cx, &|s, _, cx| s.turn_done(&tasks[0].name, cx));
+    on_app(window, shark.clone())(cx, &|s, _, cx| s.turn_done(&tasks[0].name, "", cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.tasks[1]
             .agent
@@ -1027,7 +1027,7 @@ async fn agent_tasks_reuse_known_files_and_attachment_updates_siblings(cx: &mut 
         )
     });
     fs::write(dir.join("known.rs"), "known").unwrap();
-    on(cx, &|s, _, cx| s.turn_done(&first, cx));
+    on(cx, &|s, _, cx| s.turn_done(&first, "", cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.tasks[1]
             .agent

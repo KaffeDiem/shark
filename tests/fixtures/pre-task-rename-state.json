@@ -5,6 +5,7 @@
   "repos": [],
   "workspaces": [
     {
+      "instance_id": "",
       "last_interacted_at": null,
       "name": "agent-123",
       "title": "New agent",
@@ -23,6 +24,7 @@
         }
       ],
       "closed": [],
+      "chat_sequence": 0,
       "active_chat": 0,
       "diff_closed": true,
       "git_closed": true,

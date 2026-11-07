@@ -327,7 +327,8 @@ async fn task_interaction_excludes_background_and_flushes(cx: &mut TestAppContex
     });
     press_in(window)(cx, &["cmd-shift-o", "down", "escape"]);
     on(cx, &|s, _, cx| {
-        s.turn_done("current", cx);
+        let chat = s.active_task().unwrap().chats[0].id.clone();
+        s.turn_done("current", &chat, cx);
         assert_eq!(s.state.tasks[0].last_interacted_at, Some(30));
     });
     press_in(window)(cx, &["a"]);

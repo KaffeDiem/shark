@@ -15,6 +15,7 @@ mod agent_settings_tests;
 mod agent_tests;
 mod app_switcher_tests;
 mod attach_tests;
+mod attention_tests;
 mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;

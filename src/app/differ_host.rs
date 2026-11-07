@@ -249,10 +249,11 @@ impl Shark {
                 let meta = match &request.target {
                     differ::Target::Chat(id) => ws.chats.iter().find(|m| &m.id == id).cloned(),
                     differ::Target::New(pick) => {
+                        let id = self.active_task_mut().unwrap().next_chat_id();
                         let meta = ChatMeta {
                             model: pick.model.clone(),
                             effort: pick.effort.clone(),
-                            ..self.state.new_chat(&ws, ws.next_chat_id())
+                            ..self.state.new_chat(&ws, id)
                         };
                         self.active_task_mut().unwrap().push_chat(meta.clone());
                         let _ = self.state.save();

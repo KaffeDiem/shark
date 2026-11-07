@@ -537,6 +537,7 @@ fn main() {
     application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
+            cx.set_app_identity("io.github.kaffediem.shark", "Shark");
             set_dock_icon();
             gpui_kit::init(cx);
             cx.on_app_quit(|_| async {

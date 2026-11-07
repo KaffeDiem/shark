@@ -239,6 +239,9 @@ pub fn agent_skills_dir(slug: &str) -> PathBuf {
 pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentLink>,
+    /// Distinguishes this task from later tasks that reuse its name.
+    #[serde(default)]
+    pub instance_id: String,
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
     pub last_interacted_at: Option<u64>,
@@ -272,6 +275,9 @@ pub struct Task {
     /// Closed tabs, newest last, so cmd-shift-t can bring one back with its transcript.
     #[serde(default)]
     pub closed: Vec<ChatMeta>,
+    /// Highest reserved chat number, retained after closed history is evicted.
+    #[serde(default)]
+    pub chat_sequence: u64,
     #[serde(default)]
     pub active_chat: usize,
     /// Closed by default, until an explicit Diff action opens it.
@@ -314,10 +320,17 @@ fn diff_closed_by_default() -> bool {
     true
 }
 
+fn task_instance_id() -> String {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).expect("task identity randomness");
+    format!("{:032x}", u128::from_be_bytes(bytes))
+}
+
 impl Default for Task {
     fn default() -> Self {
         Self {
             agent: None,
+            instance_id: task_instance_id(),
             last_interacted_at: None,
             name: String::new(),
             title: String::new(),
@@ -330,6 +343,7 @@ impl Default for Task {
             model: None,
             chats: Vec::new(),
             closed: Vec::new(),
+            chat_sequence: 0,
             active_chat: 0,
             diff_closed: diff_closed_by_default(),
             git_closed: true,
@@ -855,6 +869,9 @@ impl Task {
 
     /// Gives a task saved before chat tabs (or a new one) its first chat.
     pub fn migrate(&mut self) {
+        if self.instance_id.is_empty() {
+            self.instance_id = task_instance_id();
+        }
         if self.chats.is_empty() {
             self.chats.push(ChatMeta {
                 id: self.name.clone(),
@@ -920,6 +937,7 @@ impl Task {
     ) -> Option<RemovedChat> {
         let ix = self.chats.iter().position(|c| c.id == id)?;
         let selected = self.chats[self.active_chat].id.clone();
+        // Reserve before removing history so evicted IDs cannot be reused.
         let fresh_id = self.next_chat_id();
         let meta = self.chats.remove(ix);
         let last = self.chats.is_empty();
@@ -1017,13 +1035,14 @@ impl Task {
         }
     }
 
-    /// A fresh chat id, unique among open and closed tabs: `<ws>~2`, `<ws>~3`, …
-    pub fn next_chat_id(&self) -> String {
+    /// Reserves a fresh chat id, never reused after history eviction: `<ws>~2`, `<ws>~3`, …
+    pub fn next_chat_id(&mut self) -> String {
         let n = (self.chats.iter().chain(&self.closed))
-            .filter_map(|c| c.id.rsplit_once('~')?.1.parse::<u32>().ok())
+            .filter_map(|c| c.id.rsplit_once('~')?.1.parse::<u64>().ok())
             .max()
             .unwrap_or(1);
-        format!("{}~{}", self.name, n + 1)
+        self.chat_sequence = n.max(self.chat_sequence) + 1;
+        format!("{}~{}", self.name, self.chat_sequence)
     }
 }
 
@@ -1126,6 +1145,7 @@ impl State {
                 ..State::default()
             }
         });
+        let migrated_instances = state.tasks.iter().any(|ws| ws.instance_id.is_empty());
         let (model, effort) = (state.new_model(), state.last_effort.clone());
         for ws in &mut state.tasks {
             ws.migrate();
@@ -1134,6 +1154,9 @@ impl State {
                 // Unreadable shows as missing snapshots; `put_snapshot` still won't overwrite it.
                 ws.issues = crate::linear::read_snapshots(&ws.name).unwrap_or_default();
             }
+        }
+        if migrated_instances {
+            let _ = state.save_at(path);
         }
         state
     }
@@ -1954,6 +1977,44 @@ mod tests {
         assert_eq!(ws.tab_order, [TabId::Chat("w~2".into()), TabId::Diff]);
         assert_eq!(ws.closed, [chat("w")]);
         assert!(ws.remove_chat("gone", chat(""), |_| false).is_none());
+    }
+
+    #[test]
+    fn workspace_instance_migration_is_saved_and_stable() {
+        let dir = std::env::temp_dir().join(format!("shark-instance-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"repos":[],"workspaces":[{"name":"one","branch":"one","repos":[]}]}"#,
+        )
+        .unwrap();
+        let first = State::load_at(&path);
+        let id = &first.tasks[0].instance_id;
+        assert!(!id.is_empty());
+        assert_eq!(State::load_at(&path).tasks[0].instance_id, *id);
+        assert_ne!(Task::default().instance_id, *id);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chat_ids_stay_reserved_after_history_eviction_and_reload() {
+        let mut ws: Task = serde_json::from_value(serde_json::json!({
+            "name": "one", "branch": "one", "repos": [],
+            "chats": (1..=22).map(|n| serde_json::json!({"id": format!("one~{n}")})).collect::<Vec<_>>()
+        })).unwrap();
+        ws.migrate();
+        ws.remove_chat("one~22", chat(""), |_| false).unwrap();
+        for n in 2..=21 {
+            ws.remove_chat(&format!("one~{n}"), chat(""), |_| false)
+                .unwrap();
+        }
+        assert!(!ws.closed.iter().any(|c| c.id == "one~22"));
+        let mut ws: Task = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        ws.migrate();
+        let id = ws.next_chat_id();
+        assert!(id.rsplit_once('~').unwrap().1.parse::<u64>().unwrap() > 22);
+        assert_ne!(ws.next_chat_id(), id, "each allocation reserves its ID");
     }
 
     #[test]
