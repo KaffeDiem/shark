@@ -202,6 +202,51 @@ async fn notification_stale_targets_are_safe(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn notification_for_evicted_chat_keeps_current_view(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.state.workspaces[0].chats[0].session_id = Some("finished".into());
+        s.open_workspace(0, w, cx);
+        s.close_chat(w, cx);
+        assert_eq!(s.active_ws().unwrap().closed[0].id, "one-first");
+        s.open_workspace(1, w, cx);
+        s.turn_done("one", "one-first", cx);
+        s.state.workspaces[0].closed.clear(); // Its retained history has since been evicted.
+    });
+    let tag = cx.shown_system_notifications().last().unwrap().tag.clone();
+    for home in [false, true] {
+        on(cx, &|s, w, cx| {
+            if home {
+                s.open_workspace(0, w, cx);
+                s.enter_home(w, cx);
+            }
+            s.unread.insert("one-second".into());
+        });
+        let before = cx
+            .update_window(window, |_, w, cx| w.notifications(cx).len())
+            .unwrap();
+        click(cx, tag.clone());
+        on(cx, &|s, w, cx| {
+            assert_eq!(s.active.as_deref(), Some(if home { "one" } else { "two" }));
+            assert_eq!(s.home_shown(), home);
+            assert!(s.unread.contains("one-second"));
+            assert_eq!(
+                w.notifications(cx).len(),
+                before + 1,
+                "unavailable-chat message"
+            );
+        });
+    }
+    on(cx, &|s, w, cx| {
+        s.open_notification("one", None, w, cx);
+        assert!(!s.home_shown());
+        assert_eq!(s.active_chat().unwrap().read(cx).meta.id, "one-second");
+    });
+}
+
+#[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn notification_respects_unsaved_edits(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());

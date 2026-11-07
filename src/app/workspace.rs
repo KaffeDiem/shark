@@ -39,22 +39,27 @@ impl Shark {
         }
         // Pick after confirmation, before showing anything: the previous chat must stay unread.
         let prepare_chat = move |s: &mut Self, name: &str| {
-            let Some(id) = chat else { return };
-            let Some(ws) = s.ws_mut(name) else { return };
-            let ix = ws.chats.iter().position(|c| c.id == id).or_else(|| {
+            let Some(id) = chat else { return true };
+            let Some(ws) = s.ws_mut(name) else {
+                return false;
+            };
+            let Some(ix) = ws.chats.iter().position(|c| c.id == id).or_else(|| {
                 let ix = ws.closed.iter().position(|c| c.id == id)?;
                 let meta = ws.closed.remove(ix);
                 Some(ws.push_chat(meta))
-            });
-            if let Some(ix) = ix
-                && ws.active_chat != ix
-            {
+            }) else {
+                return false;
+            };
+            if ws.active_chat != ix {
                 ws.active_chat = ix;
                 let _ = s.state.save();
             }
+            true
         };
         if self.active.as_deref() == Some(name) {
-            prepare_chat(self, name);
+            if !prepare_chat(self, name) {
+                return notify_err(window, cx, "The selected chat is no longer available");
+            }
             if self.home.on {
                 self.toggle_home(window, cx);
             }
@@ -75,7 +80,9 @@ impl Shark {
             else {
                 return notify_err(window, cx, "The selected agent is no longer available");
             };
-            prepare_chat(s, &name);
+            if !prepare_chat(s, &name) {
+                return notify_err(window, cx, "The selected chat is no longer available");
+            }
             s.open_workspace_now(ix, window, cx);
             s.record_interaction(&name, cx);
             then(s, window, cx);
