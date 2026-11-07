@@ -1,4 +1,4 @@
-//! Right-click menus drawn after Linear's: 32px rows in an inset rounded highlight,
+//! Right-click menus drawn after Linear's: 36px rows in an inset rounded highlight,
 //! muted 16px icons, 1px separators, metadata right-aligned in the muted colour.
 //! gpui-kit's `PopupMenu` hard-codes its row height, 2px separators and icon colour.
 #[cfg(test)]
@@ -11,6 +11,7 @@ use gpui_kit::*;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 type OnClick = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -459,7 +460,7 @@ impl Menu {
                 .h(ROW_H)
                 .flex_none()
                 .px(px(10.))
-                .gap(px(8.))
+                .gap(px(10.))
                 .rounded(theme.radius)
                 .when(selected, |d| d.bg(highlight(theme)))
                 .when(icons, |d| {
@@ -478,7 +479,11 @@ impl Menu {
                                     .into_any_element(),
                                 (None, Some(i)) => Icon::new(i)
                                     .with_size(px(16.))
-                                    .text_color(crate::ui::faint(theme))
+                                    .text_color(if theme.is_dark() {
+                                        theme.popover.blend(theme.foreground.alpha(0.61))
+                                    } else {
+                                        theme.muted_foreground
+                                    })
                                     .into_any_element(),
                                 (None, None) => div().size(px(16.)).into_any_element(),
                             }),
@@ -543,7 +548,7 @@ impl Menu {
             .role(Role::Menu)
             .occlude()
             .relative()
-            .rounded(theme.radius_lg)
+            .text_size(px(14.))
             .w(width)
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .when(back, |d| {
@@ -556,7 +561,7 @@ impl Menu {
                         .h(ROW_H)
                         .flex_none()
                         .px(px(10.))
-                        .gap(px(8.))
+                        .gap(px(10.))
                         .rounded(theme.radius)
                         .hover(|s| s.bg(highlight(theme)))
                         .child(Icon::new(IconName::ChevronLeft).with_size(px(16.)))
@@ -607,6 +612,15 @@ impl Menu {
                 )
             })
             .test_support()
+            .with_animation(
+                if in_sub {
+                    "menu-child-enter"
+                } else {
+                    "menu-parent-enter"
+                },
+                Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                |panel, progress| panel.opacity(progress),
+            )
     }
 }
 
@@ -637,7 +651,7 @@ fn text_width(text: &SharedString, window: &Window, theme: &Theme) -> Pixels {
 
 /// Includes panel/row padding and fixed icon/control columns with their gaps.
 fn fixed_width(icons: bool, controls: bool) -> Pixels {
-    px(32. + if icons { 24. } else { 0. } + if controls { 24. } else { 0. })
+    px(32. + if icons { 26. } else { 0. } + if controls { 26. } else { 0. })
 }
 
 fn measured_panel_width(
@@ -662,7 +676,7 @@ fn panel_width(entries: &[Entry], window: &Window, cx: &App) -> Pixels {
         if let Entry::Item { label, hint, .. } | Entry::Sub { label, hint, .. } = entry {
             let label = text_width(label, window, cx.theme());
             // Keep the column gap even when metadata has yielded all of its width.
-            let gap = if hint.is_some() { px(8.) } else { px(0.) };
+            let gap = if hint.is_some() { px(10.) } else { px(0.) };
             longest_label = longest_label.max(label + gap);
             let hint = hint
                 .as_ref()
@@ -682,13 +696,14 @@ fn text_columns(
     has_hint: bool,
 ) -> (Pixels, Pixels) {
     let available =
-        (width - fixed_width(icons, controls) - if has_hint { px(8.) } else { px(0.) }).max(px(0.));
+        (width - fixed_width(icons, controls) - if has_hint { px(10.) } else { px(0.) })
+            .max(px(0.));
     let hint = hint.min(px(180.)).min((available - label).max(px(0.)));
     (available - hint, hint)
 }
 
 /// The look every floating menu shares (this one and the composer's completions): `popover`,
-/// 6px inset, 14px text, 8px corners, and a translucent ring instead of a border, so the shadow shows
+/// 6px inset, 14px text, 14px corners, and a translucent ring instead of a border, so the shadow shows
 /// through the edge.
 pub(crate) fn chrome(theme: &Theme) -> Div {
     let ink = hsla(0., 0., 0., if theme.is_dark() { 0.5 } else { 0.12 });
@@ -697,16 +712,23 @@ pub(crate) fn chrome(theme: &Theme) -> Div {
         .bg(theme.popover)
         .text_color(theme.popover_foreground)
         .text_size(px(14.))
-        .rounded(theme.radius)
+        .rounded(px(14.))
         .shadow(vec![
-            BoxShadow::new(px(0.), px(0.), theme.foreground.alpha(0.1)).spread_radius(px(1.)),
-            BoxShadow::new(px(0.), px(4.), ink).blur_radius(px(8.)),
+            BoxShadow::new(
+                px(0.),
+                px(0.),
+                theme
+                    .foreground
+                    .alpha(if theme.is_dark() { 0.14 } else { 0.1 }),
+            )
+            .spread_radius(px(1.)),
+            BoxShadow::new(px(0.), px(8.), ink).blur_radius(px(24.)),
             BoxShadow::new(px(0.), px(1.), ink.alpha(ink.a / 2.)).blur_radius(px(1.)),
         ])
 }
 
-/// A menu row's height; the composer's completions use it too.
-pub(crate) const ROW_H: Pixels = px(32.);
+/// Shared tap target height for action menus and composer completions.
+pub(crate) const ROW_H: Pixels = px(36.);
 
 /// The highlighted row uses a translucent fill, leaving the text colour unchanged.
 pub(crate) fn highlight(theme: &Theme) -> Hsla {
@@ -916,7 +938,7 @@ mod tests {
         );
         assert_eq!(
             measured_panel_width(px(800.), px(500.), fixed, px(1000.)),
-            px(580.)
+            px(584.)
         );
         assert_eq!(
             measured_panel_width(px(800.), px(500.), fixed, px(300.)),
@@ -929,17 +951,17 @@ mod tests {
         let fixed = fixed_width(true, true);
         for width in [px(200.), px(340.), px(440.)] {
             let (label, hint) = text_columns(width, true, true, px(250.), px(180.), true);
-            assert_eq!(label + hint + px(8.) + fixed, width);
-            assert!(label >= px(250.).min(width - fixed - px(8.)));
+            assert_eq!(label + hint + px(10.) + fixed, width);
+            assert!(label >= px(250.).min(width - fixed - px(10.)));
             assert!(hint >= px(0.));
         }
         assert_eq!(
             text_columns(px(340.), true, true, px(250.), px(180.), true),
-            (px(250.), px(2.))
+            (px(246.), px(0.))
         );
         assert_eq!(
             text_columns(px(200.), true, true, px(250.), px(180.), true),
-            (px(112.), px(0.))
+            (px(106.), px(0.))
         );
     }
 

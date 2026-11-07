@@ -1,5 +1,24 @@
 use super::*;
-use gpui_kit::test::TestEventExt;
+use gpui_kit::test::{TestEventExt, TestQueryExt};
+
+fn assert_command_spacing(w: &mut Window) {
+    let rows = w.find_all_by_role(Role::ListBoxOption);
+    assert!(rows.len() > 2, "the palette renders its command rows");
+    let first = rows[0].bounds();
+    for row in rows {
+        let bounds = row.bounds();
+        assert!(
+            (bounds.size.height - px(36.)).abs() <= px(0.5),
+            "command rows keep 36px targets within device-pixel rounding: {bounds:?}"
+        );
+        assert_eq!(bounds.left(), first.left());
+        assert_eq!(bounds.right(), first.right());
+    }
+    let dialog = w.within("dialog").find(0usize).bounds();
+    let command = w.find("command").bounds();
+    assert!((px(6.)..=px(8.)).contains(&(command.left() - dialog.left())));
+    assert!((px(6.)..=px(8.)).contains(&(dialog.right() - command.right())));
+}
 
 /// Both themes keep compact Home chrome and a fixed Features rail at either width.
 #[gpui_kit::test]
@@ -71,6 +90,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                             w.find("new-chat").bounds().right()
                                 <= w.find("content-island").bounds().right()
                         );
+                        assert_eq!(w.find("new-chat").bounds().size, size(px(28.), px(28.)));
                         assert!(w.find("feature-differ").visible());
                         assert!(w.try_find("show-tree").is_none());
                         assert!(w.try_find("hide-tree").is_none());
@@ -84,7 +104,8 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                             assert!(files.top() >= island.top());
                             assert!(files.bottom() <= island.bottom());
                         }
-                        assert_eq!(left.top(), px(8.));
+                        assert_eq!(left.size.height, px(32.));
+                        assert_eq!(left.top(), px(6.), "centered in the 44px titlebar");
                         let commands = w.find("commands");
                         assert!(commands.visible());
                         let commands = commands.bounds();
@@ -105,6 +126,9 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                         }
                         w.click("commands", cx);
                         assert!(w.has_active_dialog(cx), "Commands opens the palette");
+                        w.render_frame(cx);
+                        w.render_frame(cx);
+                        assert_command_spacing(w);
                         w.close_dialog(cx);
                     })
                     .unwrap();
@@ -240,6 +264,8 @@ pub(crate) fn render_pixels() {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::install_fonts(cx);
+        // Capture settled surfaces; motion behavior is covered by interaction tests.
+        cx.set_reduce_motion(true);
     });
     if std::env::var_os("SHARK_RENDER_USAGE_ONLY").is_some() {
         super::super::usage::render_pixels(&mut cx);
@@ -249,7 +275,9 @@ pub(crate) fn render_pixels() {
         super::super::linear_connection::tests::render_pixels(&mut cx);
         return;
     }
+    crate::ui::toolbar_pixels::render_pixels(&mut cx);
     crate::chat::ui_tests::render_activity_pixels(&mut cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
     if std::env::var_os("SHARK_RENDER_ACTIVITY_ONLY").is_some() {
         return;
     }
@@ -386,6 +414,7 @@ pub(crate) fn render_pixels() {
     }
     println!("tab fade pixels: 12 passed (real offscreen renderer)");
     render_menu_pixels(&mut cx);
+    render_command_pixels(&mut cx);
     super::menu_pixels::render_pixels(&mut cx);
     render_app_switcher_pixels(&mut cx);
     super::usage_tests::render_pixels(&mut cx);
@@ -398,6 +427,82 @@ pub(crate) fn render_pixels() {
     super::attach_tests::render_pixels(&mut cx);
     super::issue_tests::render_pixels(&mut cx);
     super::super::linear_connection::tests::render_pixels(&mut cx);
+}
+
+fn render_command_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    for (mode, label) in [
+        (crate::state::Mode::Dark, "dark"),
+        (crate::state::Mode::Light, "light"),
+    ] {
+        for width in [800., 1440.] {
+            let mut state = State::default();
+            state.appearance.mode = mode;
+            state.save().unwrap();
+            let (window, shark) = cx
+                .update(|cx| {
+                    gpui_kit::open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(0.), px(0.)),
+                                size(px(width), px(700.)),
+                            ))),
+                            focus: false,
+                            show: false,
+                            ..Default::default()
+                        },
+                        cx,
+                        |w, cx| cx.new(|cx| Shark::new(w, cx)),
+                    )
+                })
+                .unwrap();
+            cx.update_window(window, |_, w, cx| {
+                cx.set_reduce_motion(true);
+                shark.update(cx, |s, cx| s.toggle_palette(w, cx));
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.render_frame(cx);
+                assert_command_spacing(w);
+            })
+            .unwrap();
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                cx.capture_screenshot(window)
+                    .expect("real command renderer")
+                    .save(dir.join(format!("commands-{label}-{}.png", width as usize)))
+                    .unwrap();
+            }
+            cx.update_window(window, |_, w, cx| w.input("Toggle sidebar", cx))
+                .unwrap();
+            cx.run_until_parked();
+            let before = cx.update(|cx| shark.read(cx).rail);
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let rows = w.find_all_by_role(Role::ListBoxOption);
+                assert_eq!(rows.len(), 1, "filtering keeps the matching action");
+                assert!((rows[0].bounds().size.height - px(36.)).abs() <= px(0.5));
+                w.press("enter", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| {
+                assert!(!w.has_active_dialog(cx));
+                assert_eq!(
+                    shark.read(cx).rail,
+                    !before,
+                    "Enter executes the filtered command"
+                );
+                w.remove_window();
+            })
+            .unwrap();
+        }
+    }
+    println!("command palettes: 4 rendered; spacing, search and keyboard activation passed");
 }
 
 /// Render the real Shark overlay, including scrolling the last app into a narrow window.

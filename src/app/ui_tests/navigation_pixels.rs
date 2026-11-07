@@ -198,9 +198,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 },
                             ));
                         }
-                        checks.push(("repo", w.find(("repo", 0usize)).bounds(), dim));
+                        let toolbar_ink = if cx.theme().is_dark() {
+                            cx.theme()
+                                .background
+                                .blend(cx.theme().foreground.alpha(0.61))
+                        } else {
+                            cx.theme().muted_foreground
+                        };
                         for id in ["toggle-sidebar", "new-workspace"] {
-                            checks.push((id, w.find(id).bounds(), dim));
+                            checks.push((id, w.find(id).bounds(), toolbar_ink));
                         }
                         checks
                     })

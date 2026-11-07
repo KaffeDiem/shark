@@ -72,7 +72,10 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     let sync = cx.new(|cx| GitSync::new(ws.clone(), w, cx));
                     sync.update(cx, |sync, _| {
                         sync.set_merged_parent("shark", 1, "head", "main");
-                        sync.action.as_mut().unwrap().label = "Commit and push · frontend, api".into();
+                        let action = sync.action.as_mut().unwrap();
+                        action.label = "Commit and push · frontend, api".into();
+                        // Cover both the filled and attention variants of the split button.
+                        action.attention = !rail;
                     });
                     s.syncs.insert(ws.name.clone(), sync);
                     s.rail = rail;
@@ -150,14 +153,13 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         assert!(island.right() <= features.left());
                         assert!(w.try_find("show-tree").is_none());
                         assert!(w.try_find("hide-tree").is_none());
-                        let branch = w.find("branch").bounds();
                         let scope = w.find("uncommitted-only").bounds();
                         let layout = w.find("diff-mode").bounds();
                         let toggle = w.find("files-toggle").bounds();
                         let sync = w.find("git-next").bounds();
                         let menu = w.find("git-menu").bounds();
+                        assert_eq!(menu.size, size(px(32.), px(32.)), "round split-button cap");
                         for id in [
-                            "branch",
                             "uncommitted-only",
                             "diff-mode",
                             "files-toggle",
@@ -171,12 +173,27 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 b.left() >= island.left() && b.right() <= island.right(),
                                 "{label}, {width}, rail={rail}: {id} {b:?} outside {island:?}"
                             );
-                            assert_eq!(b.size.height, px(28.), "{id}");
+                            assert_eq!(b.size.height, px(32.), "{id}");
                             assert_eq!(b.top(), scope.top(), "one row: {id}");
                         }
-                        assert!(branch.size.width >= px(28.), "branch icon stays visible");
-                        assert!(branch.right() <= scope.left());
-                        assert_eq!(layout.size, size(px(28.), px(28.)));
+                        assert!(
+                            w.try_find("branch").is_none(),
+                            "branch lives in the repository chip"
+                        );
+                        let chip = w.find("repo-chip-shark");
+                        if chip.visible() {
+                            let b = chip.bounds();
+                            assert!(b.size.width <= px(280.));
+                            assert_eq!(b.size.height, px(32.));
+                            assert!(b.left() >= island.left() && b.right() <= scope.left());
+                            assert_eq!(b.center().y, scope.center().y);
+                        } else {
+                            assert!(
+                                w.find("attach-more").visible(),
+                                "hidden branch stays reachable"
+                            );
+                        }
+                        assert_eq!(layout.size, size(px(32.), px(32.)));
                         assert_eq!(scope.right() + px(8.), layout.left());
                         assert_eq!(layout.right() + px(8.), toggle.left());
                         assert_eq!(toggle.right() + px(8.), sync.left());
@@ -240,6 +257,35 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         assert!(w.try_find("menu-parent").is_none());
                     })
                     .unwrap();
+                }
+                // Hover detail sits on the menu's surface, under the chip like its menu.
+                if width == 1440. && !rail {
+                    cx.update_window(window, |_, w, cx| w.hover("repo-chip-shark", cx))
+                        .unwrap();
+                    cx.advance_clock(std::time::Duration::from_secs(1));
+                    cx.run_until_parked();
+                    cx.update_window(window, |_, w, cx| {
+                        w.render_frame(cx);
+                        w.render_frame(cx);
+                        let chip = w.find("repo-chip-shark").bounds();
+                        let card = w.find("repo-chip-shark-card").bounds();
+                        assert_eq!(card.left(), chip.left());
+                        assert_eq!(card.top(), chip.bottom() + px(4.));
+                    })
+                    .unwrap();
+                    let shot = cx.capture_screenshot(window).expect("chip hover card");
+                    if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                        let dir = PathBuf::from(dir);
+                        fs::create_dir_all(&dir).unwrap();
+                        shot.save(dir.join(format!("chip-card-{label}.png")))
+                            .unwrap();
+                    }
+                    cx.update_window(window, |_, w, cx| {
+                        w.pointer_move(point(px(width - 1.), px(719.)), None, cx);
+                    })
+                    .unwrap();
+                    cx.advance_clock(std::time::Duration::from_secs(1));
+                    cx.run_until_parked();
                 }
                 // Review is an artifact overlay, so a narrow diff column cannot clip it.
                 cx.update_window(window, |_, w, cx| {

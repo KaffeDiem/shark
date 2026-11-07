@@ -82,17 +82,6 @@ pub fn chain(
     (down, ix)
 }
 
-/// `logic ← ui` when all of `bases` are the same, else the branch.
-pub fn title(branch: &str, parents: &[&str]) -> String {
-    let mut ps = parents.to_vec();
-    ps.sort();
-    ps.dedup();
-    match ps[..] {
-        [p] => format!("{p} ← {branch}"),
-        _ => branch.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,13 +231,5 @@ mod tests {
             names(&chain("b", "origin/main", &local, &prs)),
             (vec!["b"], 0)
         );
-    }
-
-    #[test]
-    fn title_shows_one_shared_parent() {
-        assert_eq!(title("ui", &["logic"]), "logic ← ui");
-        assert_eq!(title("ui", &["logic", "logic"]), "logic ← ui");
-        assert_eq!(title("ui", &["logic", "api-x"]), "ui");
-        assert_eq!(title("ui", &[]), "ui");
     }
 }

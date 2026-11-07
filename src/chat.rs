@@ -1842,6 +1842,7 @@ impl Chat {
                                     .icon(IconName::ClipboardList)
                                     .label("Plan")
                                     .selected(self.meta.plan)
+                                    .toggled(self.meta.plan)
                                     .tooltip(if self.meta.plan {
                                         "Plan mode on: the agent plans and edits nothing (shift-tab)"
                                     } else {
@@ -1849,7 +1850,8 @@ impl Chat {
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_plan_mode(!this.meta.plan, cx)
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("plan-mode", b)),
                             )
                             .when(self.codex(), |d| d.child(
                                 Button::new("fast-mode")
@@ -1858,6 +1860,7 @@ impl Chat {
                                     .icon(IconName::Zap)
                                     .label("Fast")
                                     .selected(self.fast())
+                                    .toggled(self.fast())
                                     .tooltip_with_action(
                                         "Fast: quicker replies that use more of your plan's usage",
                                         &ToggleFastMode,
@@ -1865,7 +1868,8 @@ impl Chat {
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_fast(!this.fast(), cx)
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("fast-mode", b)),
                             ))
                             .child(
                                 div().relative().min_w_0().child(
@@ -1875,6 +1879,7 @@ impl Chat {
                                     .icon(IconName::Sparkles)
                                     .label(self.model_chip())
                                     .dropdown_caret(true)
+                                    .open(self.model_menu.is_some())
                                     // Shrinks to an ellipsis before the footer overflows.
                                     .flex_shrink(1.)
                                     .min_w_0()
@@ -1889,7 +1894,8 @@ impl Chat {
                                     )
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(PickModel.boxed_clone(), cx)
-                                    }),
+                                    })
+                                    .map(|b| crate::ui::toolbar("model", b)),
                                 )
                                 .child({
                                     let at = self.model_at.clone();
@@ -3167,6 +3173,136 @@ exec cat >>"$0.stdin"
             })
             .unwrap();
         chat
+    }
+
+    /// Toolbar controls keep their hit targets, keyboard activation and model-menu focus
+    /// when the composer has little room or the app changes theme.
+    #[gpui_kit::test]
+    fn composer_toolbar_interactions_and_layout(cx: &mut TestAppContext) {
+        struct ComposerControls(Entity<Chat>);
+        impl Render for ComposerControls {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .tab_group()
+                    .on_action(cx.listener(|s, _: &PickModel, w, cx| {
+                        s.0.update(cx, |c, cx| c.open_model_menu(w, cx));
+                    }))
+                    .child(self.0.clone())
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
+            for width in [420., 800.] {
+                let (window, host) = cx
+                    .update(|cx| {
+                        crate::theme::apply(
+                            &crate::state::Appearance {
+                                mode,
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(500.)),
+                                ))),
+                                ..Default::default()
+                            },
+                            cx,
+                            |w, cx| {
+                                let fixture =
+                                    format!("composer-toolbar-{}-{width}", std::process::id());
+                                let chat = cx.new(|cx| {
+                                    let mut chat = Chat::new(
+                                        Workspace {
+                                            name: fixture.clone(),
+                                            ..Default::default()
+                                        },
+                                        ChatMeta {
+                                            id: fixture,
+                                            model: Some("codex:gpt-6.1-sol".into()),
+                                            fast: Some(false),
+                                            ..Default::default()
+                                        },
+                                        false,
+                                        w,
+                                        cx,
+                                    );
+                                    chat.plan_open = false;
+                                    chat
+                                });
+                                cx.new(|_| ComposerControls(chat))
+                            },
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let plan = w.find("plan-mode");
+                    let fast = w.find("fast-mode");
+                    let model = w.find("model");
+                    assert_eq!(plan.role(), Some(Role::Button));
+                    assert_eq!(fast.role(), Some(Role::Button));
+                    for button in [&plan, &fast, &model] {
+                        assert!(button.visible());
+                        assert_eq!(button.bounds().size.height, px(32.));
+                        assert!(button.bounds().left() >= px(16.));
+                        assert!(button.bounds().right() <= px(width - 16.));
+                        assert_eq!(button.bounds().top(), plan.bounds().top());
+                    }
+                    assert!(plan.bounds().right() <= fast.bounds().left());
+                    assert!(fast.bounds().right() <= model.bounds().left());
+                    w.click("fast-mode", cx);
+                    let chat = host.read(cx).0.clone();
+                    assert!(chat.read(cx).fast(), "click enables Fast");
+                    for _ in 0..6 {
+                        w.focus_next(cx);
+                        w.render_frame(cx);
+                        if w.find("fast-mode").focused() == Some(true) {
+                            break;
+                        }
+                    }
+                    assert_eq!(w.find("fast-mode").focused(), Some(true));
+                    w.press("space", cx);
+                    assert!(!chat.read(cx).fast(), "Space toggles the focused button");
+                    w.focus_next(cx);
+                    w.render_frame(cx);
+                    assert_eq!(w.find("model").focused(), Some(true));
+                    w.click("model", cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let chat = host.read(cx).0.clone();
+                    assert!(chat.read(cx).model_menu.is_some());
+                    assert!(w.find("menu-parent").visible());
+                    w.press("escape", cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let chat = host.read(cx).0.clone();
+                    assert!(
+                        chat.read(cx).model_menu.is_none(),
+                        "Escape closes the model menu before moving to the transcript (transcript focused: {})",
+                        chat.read(cx).focus.is_focused(w)
+                    );
+                    assert_eq!(w.find("model").focused(), Some(true));
+                    w.remove_window();
+                })
+                .unwrap();
+            }
+        }
     }
 
     /// Copy buttons: a message's shows on hover without moving, the latest reply's always

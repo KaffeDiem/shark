@@ -1,4 +1,4 @@
-//! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
+//! Root view: sidebar of workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent};
 use crate::checkbox::Checkbox;
@@ -13,7 +13,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
@@ -54,7 +53,7 @@ mod new_workspace;
 mod palette;
 mod picker;
 mod reorder;
-mod repo_settings;
+pub(crate) mod repo_settings;
 mod run;
 mod sidebar;
 mod storage;
@@ -157,8 +156,6 @@ pub struct Shark {
     usage_due: Option<std::time::Instant>,
     content_focus: FocusHandle,
     interaction_save: Option<Task<()>>,
-    /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
-    branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
     pub(crate) deps: Vec<crate::deps::Dep>,
     deps_check: Option<Task<()>>,
@@ -314,7 +311,6 @@ impl Shark {
             usage_due: None,
             content_focus: cx.focus_handle(),
             interaction_save: None,
-            branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
             linear: Default::default(),
@@ -364,17 +360,6 @@ impl Shark {
     ) {
         let m = menu::open_at(entries, pos, anchor, window, cx);
         menu::hold(self, m, |s| &mut s.menu, cx);
-    }
-
-    /// "Branch menu…": the header's branch menu, hanging from the button, from the keyboard.
-    fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open an agent first");
-        };
-        let entries = menus::branch_entries(self, ws, cx);
-        let b = self.branch_at.get();
-        let pos = point(b.right(), b.bottom() + px(4.));
-        self.show_menu_at(entries, pos, Anchor::TopRight, window, cx);
     }
 
     fn ws(&self, name: &str) -> Option<&Workspace> {
@@ -613,7 +598,7 @@ impl Shark {
         })
     }
 
-    fn render_sidebar_toggle(&self, cx: &Context<Self>) -> Button {
+    fn render_sidebar_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle(
             "toggle-sidebar",
             if self.rail {
@@ -623,20 +608,20 @@ impl Shark {
             },
             "Toggle sidebar (cmd-b)",
         )
-        .text_color(cx.theme().sidebar_foreground)
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+        .map(|b| quiet_toolbar("toggle-sidebar", b))
     }
 
-    fn render_commands(&self, cx: &Context<Self>) -> Button {
+    fn render_commands(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("commands", IconName::Command, "Commands (cmd-k)")
-            .text_color(cx.theme().sidebar_foreground)
             .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)))
+            .map(|b| quiet_toolbar("commands", b))
     }
 
-    fn render_new_workspace(&self, cx: &Context<Self>) -> Button {
+    fn render_new_workspace(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("new-workspace", IconName::SquarePen, "New agent (cmd-n)")
-            .text_color(cx.theme().sidebar_foreground)
             .on_click(cx.listener(|this, _, window, cx| this.new_empty_agent(window, cx)))
+            .map(|b| quiet_toolbar("new-workspace", b))
     }
 
     fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
@@ -706,14 +691,17 @@ impl Shark {
                         d.child(
                             Button::new("new-chat")
                                 .ghost()
-                                .xsmall()
                                 .icon(IconName::Plus)
-                                .w(px(24.))
+                                .size(px(28.))
+                                .min_w_0()
+                                .rounded_l(cx.theme().radius)
+                                .rounded_r(cx.theme().radius)
                                 .flex_none()
                                 .tooltip("New chat (cmd-t)")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
-                                ),
+                                )
+                                .map(|b| quiet_toolbar("new-chat", b)),
                         )
                     }),
             )
@@ -729,14 +717,14 @@ impl Shark {
             .test_support()
     }
 
-    fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.home_shown() {
             return self.render_home(window, cx);
         }
         let controls = self.render_feature_controls(cx);
         let has_controls = controls.is_some();
         let no_repos = self.no_repos();
-        let attachments = self.render_attachments(cx);
+        let attachments = self.render_attachments(window, cx);
         let theme = cx.theme();
         v_flex()
             .flex_1()
@@ -752,15 +740,6 @@ impl Shark {
                     .border_color(theme.border)
                     .child(self.render_run(cx))
                     .child(attachments)
-                    .when(!no_repos, |d| {
-                        d.child(
-                            div()
-                                .flex_shrink_1()
-                                .min_w(px(28.))
-                                .overflow_hidden()
-                                .child(self.render_branch(cx)),
-                        )
-                    })
                     .child(
                         div()
                             .flex_1()
@@ -776,7 +755,7 @@ impl Shark {
                             d.child(
                                 div()
                                     .min_w_0()
-                                    .flex_shrink_0()
+                                    .flex_shrink_1()
                                     .when(has_controls, |d| d.max_w(relative(0.4)))
                                     .child(sync),
                             )
@@ -808,109 +787,6 @@ impl Shark {
         }
     }
 
-    /// The header's branch label, `base ← branch`, with a stack icon and the branch's place in
-    /// its stack (`2/3`) when it is part of one; hovering lists each repo's branch, linked to
-    /// GitHub once pushed, and the base it targets. Either click opens the branch menu.
-    fn render_branch(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let branch = self
-            .active_ws()
-            .map(|w| w.branch.clone())
-            .unwrap_or_default();
-        let links = self
-            .active_sync()
-            .map(|s| s.read(cx).branches())
-            .unwrap_or_default();
-        let stacks = (self.active_ws())
-            .map(|w| menus::stacks(self, w, cx))
-            .unwrap_or_default();
-        let label = (self.active_ws())
-            .map(|w| menus::branch_label(self, w, cx))
-            .unwrap_or_default();
-        let place = |s: &menus::RepoStack| format!("{}/{}", s.me + 1, s.nodes.len());
-        let position = stacks.first().map(place);
-        let per_repo: Vec<(String, String)> =
-            stacks.iter().map(|s| (s.repo.clone(), place(s))).collect();
-        HoverCard::new("branch-card")
-            .anchor(Anchor::TopRight)
-            .trigger(
-                Button::new("branch")
-                    .ghost()
-                    .xsmall()
-                    .w_full()
-                    .h(px(28.))
-                    .min_w_0()
-                    .gap_1p5()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .accessibility_label(label.clone())
-                    .child(
-                        Icon::new(match position {
-                            Some(_) => IconName::Layers,
-                            None => IconName::GitBranch,
-                        })
-                        .with_size(px(12.))
-                        .flex_none(),
-                    )
-                    .child(div().min_w_0().truncate().child(label))
-                    .children(position.map(|p| div().flex_shrink_0().child(p)))
-                    .child({
-                        let at = self.branch_at.clone();
-                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                    })
-                    .on_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                        if !matches!(e.button, MouseButton::Left | MouseButton::Right) {
-                            return;
-                        }
-                        let Some(ws) = this.active_ws() else { return };
-                        let entries = menus::branch_entries(this, ws, cx);
-                        this.show_menu(e.position, entries, w, cx);
-                    })),
-            )
-            .content(move |_, _, cx| {
-                let theme = cx.theme();
-                v_flex()
-                    .gap_1()
-                    .text_xs()
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Branch {branch}")),
-                    )
-                    .children(links.iter().enumerate().map(|(ix, b)| {
-                        h_flex()
-                            .gap_1p5()
-                            .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
-                            .child(match &b.url {
-                                Some(u) => Link::new(("branch-link", ix))
-                                    .href(u.clone())
-                                    .child(b.repo.clone())
-                                    .into_any_element(),
-                                None => h_flex()
-                                    .gap_1p5()
-                                    .child(b.repo.clone())
-                                    .child(
-                                        div()
-                                            .text_color(theme.muted_foreground)
-                                            .child("not on GitHub"),
-                                    )
-                                    .into_any_element(),
-                            })
-                            .child(div().text_color(theme.muted_foreground).child(
-                                match per_repo.iter().find(|(r, _)| *r == b.repo) {
-                                    Some((_, at)) => {
-                                        format!("{} → {} · stack {at}", b.name, b.base)
-                                    }
-                                    None => format!("{} → {}", b.name, b.base),
-                                },
-                            ))
-                    }))
-            })
-    }
     /// Zen (cmd-.): the shown tab alone on the content background. Its bar keeps the traffic
     /// lights clear, drags the window and holds the tab's own controls (Diff's).
     fn render_zen(&self, cx: &mut Context<Self>) -> Div {

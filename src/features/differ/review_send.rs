@@ -10,9 +10,9 @@ use crate::state::ChatMeta;
 use crate::ui::model_entries;
 use crate::ui::plural;
 use crate::{CycleTarget, PickModel};
-use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Escape};
 use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::{Disableable as _, Selectable as _};
 
 /// Where a review goes: a chat of the workspace, or a new one on the picked model and
 /// thinking level (only `model` and `effort` of the meta are read).
@@ -413,17 +413,12 @@ impl Differ {
                 .any(|c| self.pr_of(c).is_some_and(|(_, pushed)| !pushed));
         let n = s.rows.len();
         let new_chat = s.targets.get(s.target).is_some_and(|t| t.0.is_none());
-        let sheet = v_flex()
+        let sheet = crate::menu::chrome(theme)
             .id("review-sheet")
             .test_support()
             .w(px(500.))
             .max_w_full()
-            .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .shadow_lg()
-            .text_sm()
+            .p_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // cmd-/ anywhere in the sheet (the note too) picks the new chat's model, not the
             // shown chat's.
@@ -516,6 +511,9 @@ impl Differ {
                                     Button::new("sheet-model")
                                         .outline()
                                         .xsmall()
+                                        .dropdown_caret(true)
+                                        .open(self.menu.is_some())
+                                        .accessibility_label("Model and thinking level")
                                         .label(format!(
                                             "{} · {} ⌘/",
                                             model_label(s.pick.model()),
@@ -523,7 +521,8 @@ impl Differ {
                                         ))
                                         .on_click(cx.listener(|this, _, w, cx| {
                                             this.sheet_model_menu(w, cx)
-                                        })),
+                                        }))
+                                        .map(|b| crate::ui::toolbar("sheet-model", b)),
                                 )
                             }),
                     )
@@ -576,6 +575,7 @@ impl Differ {
                         Button::new("sheet-preview-toggle")
                             .ghost()
                             .small()
+                            .selected(s.preview)
                             .label(if s.preview {
                                 "Hide prompt"
                             } else {
@@ -586,7 +586,8 @@ impl Differ {
                                     s.preview = !s.preview;
                                 }
                                 cx.notify();
-                            })),
+                            }))
+                            .map(|b| crate::ui::toolbar("sheet-preview-toggle", b)),
                     )
                     .child(div().flex_1())
                     .child(

@@ -28,8 +28,8 @@
 //!   the horizontal scroll and clipped to its column, which reaches as far as the narrower
 //!   column needs; selection hit tests use the clipped bounds. Annotations fill their column or
 //!   row and don't scroll.
-//! - Each file's rows form a rounded, bordered card (`CARD_INSET`, `CARD_GAP`, `LIST_PAD`) with
-//!   a tinted header bar; spacing follows Shark's design in whole pixels.
+//! - Each file's rows form a full-width section between top and bottom borders (`CARD_GAP`,
+//!   `LIST_PAD`) with a tinted header bar; spacing follows Shark's design in whole pixels.
 //! - A body resize found while painting defers its `notify` (GPUI drops one made during paint).
 //! - The add-annotation button is drawn for the hovered line only, tracked in the state.
 //! - The hunk separator reads "↑ N unchanged lines".
@@ -442,8 +442,6 @@ fn render_diff(
         .min_h_0()
         .min_w_0()
         .flex_1()
-        // The scrollbar gets its own strip under the rows.
-        .when(overflow > px(0.), |this| this.pb(px(16.)))
         // Only tracks the sideways scroll: the code rows shift their text by it. Without
         // GPUI's single-axis wheel remapping; the sibling mask owns X input.
         .child(
@@ -468,11 +466,10 @@ fn render_diff(
                         let last = rows
                             .get(ix + 1)
                             .is_none_or(|next| next.file() != row.file());
-                        let (radius, border) = (px(8.), cx.theme().border);
-                        // The rows of a file form one rounded card, with a gap between cards.
+                        let border = cx.theme().border;
+                        // The rows of a file form one edge-to-edge card, with a gap between cards.
                         div()
                             .w_full()
-                            .px(CARD_INSET - px(1.))
                             .when(first, |this| {
                                 this.pt(if ix == 0 { LIST_PAD } else { CARD_GAP })
                             })
@@ -481,10 +478,9 @@ fn render_diff(
                                 div()
                                     .id(("diff-file", row.file()))
                                     .w_full()
-                                    .border_x_1()
                                     .border_color(border)
-                                    .when(first, |this| this.border_t_1().rounded_t(radius))
-                                    .when(last, |this| this.border_b_1().rounded_b(radius))
+                                    .when(first, |this| this.border_t_1())
+                                    .when(last, |this| this.border_b_1())
                                     .child(reveal_row(
                                         render_row(row, code.clone(), window, cx),
                                         ix,
@@ -658,11 +654,11 @@ fn column_widths(
     ratio: f32,
     mode: DiffMode,
 ) -> (Pixels, Pixels, Pixels) {
-    let content = match viewport > px(0.) {
-        true => viewport - CARD_INSET * 2.,
-        false => measured,
-    }
-    .max(px(0.));
+    let content = if viewport > px(0.) {
+        viewport
+    } else {
+        measured
+    };
     let (needed, narrow) = match mode {
         DiffMode::Split => (measured * 0.5, content * ratio.min(1. - ratio)),
         DiffMode::Unified => (measured, content),
@@ -700,10 +696,9 @@ impl CodePresentation {
     }
 }
 
-/// Each file is a bordered card, this far in from each side of the list (gap and border).
-const CARD_INSET: Pixels = px(17.);
 const CARD_GAP: Pixels = px(12.);
-/// Above the first card and below the last.
+/// Above the first card and below the last, where it also clears the horizontal scrollbar that
+/// overlays the rows.
 const LIST_PAD: Pixels = px(16.);
 
 /// Total row width for code of `width` in the current mode.
@@ -1053,8 +1048,6 @@ fn render_file_header(
             h_flex()
                 .w_full()
                 .min_w_0()
-                .rounded_t(px(7.))
-                .when(collapsed, |this| this.rounded_b(px(7.)))
                 .bg(cx.theme().muted.opacity(0.35))
                 .h(px(40.))
                 .px(px(12.))
@@ -1759,15 +1752,15 @@ mod column_widths_tests {
         let widths = |viewport, measured, ratio, mode| {
             column_widths(px(viewport), px(measured), ratio, mode)
         };
-        // Cards lose their inset on both sides; the Split column takes its share.
+        // Cards fill the view; the Split column takes its share.
         assert_eq!(
             widths(1000., 2000., 0.5, DiffMode::Unified),
-            (px(966.), px(483.), px(1034.))
+            (px(1000.), px(500.), px(1000.))
         );
         // Split rows measure two columns: half the widest row has to fit the narrower one.
         assert_eq!(
             widths(1000., 2000., 0.25, DiffMode::Split),
-            (px(966.), px(241.5), px(758.5))
+            (px(1000.), px(250.), px(750.))
         );
         // Nothing scrolls when the widest row fits.
         assert_eq!(widths(1000., 500., 0.5, DiffMode::Unified).2, px(0.));

@@ -70,6 +70,13 @@ pub(super) const COMMANDS: &[Row] = &[
         "add repo folder git",
     ),
     Row(
+        "Repository settings…",
+        IconName::FolderGit2,
+        None,
+        "repos scripts setup run archive model order",
+        Some(|s, w, cx| crate::settings::open_repos(&s.state, w, cx)),
+    ),
+    Row(
         "Start from Linear issue…",
         IconName::Plus,
         None,
@@ -484,7 +491,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Target,
         None,
         "git rebase retarget main target onto",
-        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.change_base(ws.name, w, cx))),
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.change_base(ws.name, None, w, cx))),
     ),
     Row(
         "New agent on top…",
@@ -505,7 +512,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::GitCompareArrows,
         None,
         "stack restack parent agent",
-        Some(|s, w, cx| s.with_sync(w, cx, GitSync::restack_onto_parent)),
+        Some(|s, w, cx| s.with_sync(w, cx, |g, w, cx| g.restack_onto_parent(None, w, cx))),
     ),
     Row(
         "Go to stack…",

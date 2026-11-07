@@ -1,4 +1,4 @@
-//! The sidebar: sections, workspace and repo rows, the cursor, drag and drop.
+//! The sidebar: sections, workspace rows, the cursor, drag and drop.
 use super::*;
 
 /// A workspace's status icon: a spinner while an agent runs, else by what it needs from you.
@@ -616,46 +616,6 @@ impl Shark {
         })
     }
 
-    /// A repo's row; dragging it reorders the repos, right-click opens its menu.
-    fn repo_row(&self, ix: usize, r: &Repo, cx: &Context<Self>) -> impl IntoElement {
-        let (theme, rail) = (cx.theme(), self.rail);
-        let name = r.name.clone();
-        let repo = r.clone();
-        let tip: SharedString = name.clone().into();
-        sidebar_row(rail, theme)
-            .id(("repo", ix))
-            .test_support()
-            .hover(|d| d.bg(side_hover(theme)))
-            // Drag to reorder: scripts run in this order across a workspace's repos.
-            .on_drag(RepoDrag(ix, name.clone().into()), |d, _, _, cx| {
-                cx.new(|_| d.clone())
-            })
-            .drag_over::<RepoDrag>(|s, _, _, cx| s.bg(cx.theme().accent))
-            .on_drop(cx.listener(move |this, d: &RepoDrag, _, cx| {
-                if d.0 != ix && d.0 < this.state.repos.len() {
-                    move_item(&mut this.state.repos, d.0, ix);
-                    let _ = this.state.save();
-                    cx.notify();
-                }
-            }))
-            .child(Icon::new(IconName::FolderGit2).with_size(ISZ))
-            .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
-            .when(rail, |d| {
-                d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-            })
-            .on_click({
-                let repo = r.clone();
-                cx.listener(move |this, _, w, cx| repo_settings::open(this, repo.clone(), w, cx))
-            })
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                    let entries = menus::repo_menu(this, &repo, cx);
-                    this.show_menu(e.position, entries, w, cx);
-                }),
-            )
-    }
-
     /// A workspace's row; `order` is the visible workspaces, whose first nine have a cmd-N.
     fn ws_row(
         &self,
@@ -878,7 +838,6 @@ impl Shark {
                 .text_color(theme.sidebar_foreground)
                 .child(t)
         };
-        let repos = (self.state.repos.iter().enumerate()).map(|(ix, r)| self.repo_row(ix, r, cx));
         let order = self.ws_order(false);
         let accent = theme.sidebar_accent;
         let name_row = |input: &Entity<InputState>, icon: IconName| {
@@ -987,41 +946,6 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu(false));
-        // Like the Agents header: the + shows on hover; right-click offers the same.
-        let repo_header = h_flex()
-            .id("repo-header")
-            .group("repo-header")
-            .justify_between()
-            .items_end()
-            .child(header("Repos"))
-            .when(!rail, |d| {
-                d.child(
-                    div()
-                        .mr_3()
-                        .invisible()
-                        .group_hover("repo-header", |s| s.visible())
-                        .child(
-                            Button::new("add-repo")
-                                .ghost()
-                                .text_color(theme.sidebar_foreground)
-                                .xsmall()
-                                .icon(IconName::Plus)
-                                .tooltip("Add repo, or drop folders here")
-                                .on_click(cx.listener(|this, _, w, cx| this.add_repo(w, cx))),
-                        ),
-                )
-            })
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                    let entries = vec![menu::item(
-                        IconName::FolderPlus,
-                        "Add repo…",
-                        on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
-                    )];
-                    this.show_menu(e.position, entries, w, cx);
-                }),
-            );
         let add_repo_row = sidebar_row(rail, theme)
             .id("add-repo-row")
             .hover(|d| d.bg(side_hover(theme)))
@@ -1096,7 +1020,6 @@ impl Shark {
                                 .flex_none()
                                 .gap(px(4.))
                                 .mr(px(8.))
-                                .mb_0p5()
                                 .child(self.render_commands(cx))
                                 .child(self.render_new_workspace(cx)),
                         )
@@ -1118,8 +1041,6 @@ impl Shark {
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),
                         |d| d.child(hint("cmd-n to create")),
                     )
-                    .child(repo_header)
-                    .children(repos)
                     .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))
                     // The empty space below takes a right-click too.
                     .child(
@@ -1132,24 +1053,5 @@ impl Shark {
             )
             .child(self.render_usage_footer(cx))
             .test_support()
-    }
-}
-
-/// A repo row being dragged: its index and name, shown under the pointer.
-#[derive(Clone)]
-struct RepoDrag(usize, SharedString);
-
-impl Render for RepoDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.border)
-            .text_sm()
-            .child(self.1.clone())
     }
 }

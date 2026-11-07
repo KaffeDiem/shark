@@ -23,9 +23,6 @@ fn entries(case: &str) -> Vec<Entry> {
             action(IconName::GitBranch, "feature/menu-layout").hint("#124 · open"),
             Entry::Sep,
             action(IconName::GitBranch, "Rebase onto feature/menu-layout").hint("3 commits behind"),
-            action(IconName::Plus, "New workspace on top…"),
-            action(IconName::Plus, "Insert workspace below…")
-                .hint("between feature/menu-layout and branch-from-feature"),
             action(IconName::Copy, "Copy branch name")
                 .hint("feature/a-very-long-branch-name-that-must-yield-to-the-action"),
             action(IconName::Target, "Change base…").hint("origin/master"),
@@ -68,6 +65,11 @@ fn entries(case: &str) -> Vec<Entry> {
 }
 
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let reduce_motion = cx.update(|cx| {
+        let previous = cx.reduce_motion();
+        cx.set_reduce_motion(true);
+        previous
+    });
     for (mode, mode_name) in [
         (crate::state::Mode::Dark, "dark"),
         (crate::state::Mode::Light, "light"),
@@ -173,4 +175,5 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     }
     println!("menu previews: 12 rendered (both themes; shared production model entries)");
     crate::chat::completion_pixels::render_pixels(cx);
+    cx.update(|cx| cx.set_reduce_motion(reduce_motion));
 }

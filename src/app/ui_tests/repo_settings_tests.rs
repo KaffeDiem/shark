@@ -1,6 +1,53 @@
 use super::*;
 use crate::state::RepoSettings;
 
+/// Repos live in Settings, not the sidebar; leaving for a new agent closes Settings too.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn repositories_page_lists_repos_and_new_agent_closes_settings(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api", "web"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find(("repo", 0usize)).is_none(), "not in the sidebar");
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| crate::settings::open_repos(&s.state, w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.right_click(("repo", 1usize), cx);
+    })
+    .unwrap();
+    cx.read(|cx| assert!(shark.read(cx).menu.is_some(), "right-click opens its menu"));
+    on(cx, &|s, _, cx| {
+        s.menu = None;
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click(("repo", 1usize), cx);
+        w.render_frame(cx);
+        assert!(
+            w.try_find("settings-page").is_some(),
+            "Settings stays underneath"
+        );
+        w.click("repo-new-workspace", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("settings-page").is_none());
+        assert!(w.try_find("repo-new-workspace").is_none());
+    })
+    .unwrap();
+}
+
 /// A queued attachment must keep its setup configuration, including while removal is open.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -97,11 +144,16 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
 
+    on(cx, &|s, w, cx| crate::settings::open_repos(&s.state, w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click(("repo", 0usize), cx);
-        assert!(w.has_active_dialog(cx), "a repo row opens its settings");
-        w.close_dialog(cx);
+        w.render_frame(cx);
+        assert!(
+            w.try_find("repo-new-workspace").is_some(),
+            "a repo row opens its settings"
+        );
+        w.close_all_dialogs(cx);
     })
     .unwrap();
 

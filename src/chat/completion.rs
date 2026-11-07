@@ -257,9 +257,9 @@ impl Chat {
                         .id(ix)
                         .when_some(aria, |d, label| d.aria_label(label))
                         .h(crate::menu::ROW_H)
-                        .px_2()
-                        .gap_2()
-                        .rounded(px(4.))
+                        .px(px(10.))
+                        .gap(px(10.))
+                        .rounded(theme.radius)
                         .when(ix == m.sel && m.armed, |d| {
                             d.bg(crate::menu::highlight(theme))
                         })
@@ -280,13 +280,13 @@ impl Chat {
                             }),
                         )
                         .child(match file_icon {
-                            // 16px matches a 14px glyph, as app icons in `menu.rs`.
+                            // File icons include padding; 18px matches the menu's 16px glyphs.
                             Some(i) => img(i)
-                                .size(px(16.))
+                                .size(px(18.))
                                 .mx(px(-1.))
                                 .flex_none()
                                 .into_any_element(),
-                            None => icon.with_size(px(14.)).into_any_element(),
+                            None => icon.with_size(px(16.)).into_any_element(),
                         })
                         .child(
                             div()

@@ -345,7 +345,7 @@ fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),
-        KeyBinding::new("escape", FocusTranscript, Some("Composer")),
+        KeyBinding::new("escape", FocusTranscript, Some("Composer && !SharkMenu")),
         KeyBinding::new("e", EditQueued, Some("Queue")),
         KeyBinding::new("d", DeleteQueued, Some("Queue")),
         KeyBinding::new("backspace", DeleteQueued, Some("Queue")),

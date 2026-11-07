@@ -181,7 +181,7 @@ fn open_page(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Sh
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
         w.render_frame(cx);
-        for _ in 0..3 {
+        for _ in 0..4 {
             w.press("ctrl-tab", cx);
         }
         w.render_frame(cx);

@@ -792,10 +792,7 @@ impl Differ {
             .child(
                 Button::new("uncommitted-only")
                     .xsmall()
-                    .h(px(28.))
                     .px(px(10.))
-                    .rounded(px(6.))
-                    .outline()
                     .selected(self.preferences.uncommitted_only)
                     .toggled(self.preferences.uncommitted_only)
                     .accessibility_label("Uncommitted changes only")
@@ -809,14 +806,13 @@ impl Differ {
                     } else {
                         format!("Agent base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
                     })
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx)))
+                    .map(|b| crate::ui::toolbar("uncommitted-only", b)),
             )
             .child(
                 Button::new("diff-mode")
                     .xsmall()
-                    .size(px(28.))
                     .px_0()
-                    .rounded(px(6.))
                     .icon(if self.preferences.unified {
                         IconName::Rows2
                     } else {
@@ -829,16 +825,13 @@ impl Differ {
                     } else {
                         "Split view · Click for Unified (s)"
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx)))
+                    .map(|b| crate::ui::toolbar("diff-mode", b)),
             )
             .child(
                 Button::new("files-toggle")
                     .xsmall()
-                    .h(px(28.))
-                    .rounded(px(6.))
-                    .outline()
                     .selected(self.show_tree)
-                    .w(px(28.))
                     .px_0()
                     .icon(IconName::PanelRight)
                     .toggled(self.show_tree)
@@ -848,7 +841,8 @@ impl Differ {
                         if self.show_tree { "Hide" } else { "Show" },
                         self.viewed_now.len(),
                     ))
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx)))
+                    .map(|b| crate::ui::toolbar("files-toggle", b)),
             )
     }
 

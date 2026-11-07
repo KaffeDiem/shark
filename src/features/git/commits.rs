@@ -580,7 +580,8 @@ impl Commits {
                     .ghost()
                     .on_click(cx.listener(|s, _, _, cx| {
                         s.close_commit(cx);
-                    })),
+                    }))
+                    .map(|b| crate::ui::toolbar("git-commit-back", b)),
             )
             .child(div().flex_1())
             .child(
@@ -590,7 +591,8 @@ impl Commits {
                     .small()
                     .ghost()
                     .disabled(at.is_none_or(|a| a == 0))
-                    .on_click(cx.listener(|s, _, _, cx| s.step(false, cx))),
+                    .on_click(cx.listener(|s, _, _, cx| s.step(false, cx)))
+                    .map(|b| crate::ui::toolbar("git-commit-newer", b)),
             )
             .child(
                 Button::new("git-commit-older")
@@ -599,7 +601,8 @@ impl Commits {
                     .small()
                     .ghost()
                     .disabled(at.is_none_or(|a| a + 1 >= self.summaries.len()))
-                    .on_click(cx.listener(|s, _, _, cx| s.step(true, cx))),
+                    .on_click(cx.listener(|s, _, _, cx| s.step(true, cx)))
+                    .map(|b| crate::ui::toolbar("git-commit-older", b)),
             );
         let body = match (&self.commit, &self.commit_error) {
             (_, Some(e)) => div()
@@ -803,6 +806,7 @@ impl Commits {
                 .selected(self.view == view)
                 .disabled(!enabled)
                 .on_click(cx.listener(move |s, _, _, cx| s.set_view(view, cx)))
+                .map(|b| crate::ui::toolbar(id, b))
         };
         let toolbar = v_flex()
             .px_4()
@@ -823,7 +827,8 @@ impl Commits {
                             .on_click(cx.listener(|s, _, _, cx| {
                                 s.leave_file(cx);
                                 cx.notify();
-                            })),
+                            }))
+                            .map(|b| crate::ui::toolbar("git-file-back", b)),
                     )
                     .child(
                         div()
@@ -866,7 +871,8 @@ impl Commits {
                                         s.source = false;
                                         s.focus.focus(w, cx);
                                         cx.notify();
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("git-file-preview", b)),
                             )
                             .child(
                                 Button::new("git-file-source")
@@ -882,7 +888,8 @@ impl Commits {
                                         // A cached editor isn't refocused by render_file.
                                         s.focus_target(cx).focus(w, cx);
                                         cx.notify();
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("git-file-source", b)),
                             )
                     })
                     .child(div().flex_1())
@@ -1107,7 +1114,8 @@ impl Render for Commits {
                                 .ghost()
                                 .tooltip("Refresh commits")
                                 .disabled(self.loading)
-                                .on_click(cx.listener(|s, _, _, cx| s.refresh(cx))),
+                                .on_click(cx.listener(|s, _, _, cx| s.refresh(cx)))
+                                .map(|b| crate::ui::toolbar("git-commits-refresh", b)),
                         ),
                 )
                 .child(

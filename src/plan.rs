@@ -358,7 +358,8 @@ impl Render for PlanPane {
                         .label("Changes")
                         .selected(self.changes)
                         .tooltip(format!("Mark changes from v{} (d)", self.shown))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_changes(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_changes(cx)))
+                        .map(|b| crate::ui::toolbar("plan-changes", b)),
                 )
             })
             .when(n > 0, |d| {
