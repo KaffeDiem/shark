@@ -10,6 +10,7 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 mod agent_navigation_tests;
+mod agent_pixels;
 mod agent_settings_tests;
 mod agent_tests;
 mod app_switcher_tests;
