@@ -55,11 +55,7 @@ impl Shark {
                     return;
                 };
                 if !ws.repos.iter().any(|r| r.name == repo) {
-                    return notify_err(
-                        window,
-                        cx,
-                        "This file is not in a repository of this task",
-                    );
+                    return notify_err(window, cx, "This file is not in a repository of this task");
                 }
                 // shortcut: restore blocks app saves; add editor write locks and a worker if Git filters make it slow.
                 if let Err(e) = git::discard_file(&ws.dir().join(repo), rel) {

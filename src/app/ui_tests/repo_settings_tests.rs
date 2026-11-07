@@ -211,7 +211,9 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
         );
     }
 
-    on(cx, &|s, w, cx| s.archive_task("scripts".into(), false, w, cx));
+    on(cx, &|s, w, cx| {
+        s.archive_task("scripts".into(), false, w, cx)
+    });
     press_in(window)(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.tasks.is_empty()

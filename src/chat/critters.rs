@@ -16,7 +16,10 @@ pub(super) const CRITTERS: [IconName; 10] = [
 pub(super) const PARADE_LIMIT: usize = 6;
 pub(super) const HOP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
-pub(super) fn assign_critters(critters: &mut HashMap<String, usize>, tasks: &[harness::BackgroundTask]) {
+pub(super) fn assign_critters(
+    critters: &mut HashMap<String, usize>,
+    tasks: &[harness::BackgroundTask],
+) {
     critters.retain(|id, _| tasks.iter().any(|t| &t.id == id));
     for task in tasks {
         if !critters.contains_key(&task.id) {
@@ -47,7 +50,11 @@ pub(super) fn critter_color(ix: usize, theme: &ThemeColor) -> Hsla {
 }
 
 impl Chat {
-    pub(super) fn set_background(&mut self, tasks: Vec<harness::BackgroundTask>, cx: &mut Context<Self>) {
+    pub(super) fn set_background(
+        &mut self,
+        tasks: Vec<harness::BackgroundTask>,
+        cx: &mut Context<Self>,
+    ) {
         assign_critters(&mut self.critters, &tasks);
         self.background = tasks;
         if self.background.is_empty() || cx.reduce_motion() || self.replaying {

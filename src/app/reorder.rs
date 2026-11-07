@@ -293,12 +293,7 @@ impl Shark {
                     preview
                         .tasks
                         .iter()
-                        .filter(|ws| {
-                            !preview
-                                .sections
-                                .iter()
-                                .any(|s| s.tasks.contains(&ws.name))
-                        })
+                        .filter(|ws| !preview.sections.iter().any(|s| s.tasks.contains(&ws.name)))
                         .map(|ws| Item::Task(ws.name.clone())),
                 );
             }
@@ -352,9 +347,7 @@ impl Shark {
                     self.move_tab(ws, from, &to, cx)
                 }
                 (Item::Task(ws), Some(Item::Task(to))) => self.drop_task(ws, &to, cx),
-                (Item::Task(ws), Some(Item::Section(to))) => {
-                    self.move_to_section(ws, Some(to), cx)
-                }
+                (Item::Task(ws), Some(Item::Section(to))) => self.move_to_section(ws, Some(to), cx),
                 (Item::Task(ws), Some(Item::Ungrouped)) => self.move_to_section(ws, None, cx),
                 (Item::Section(from), Some(Item::Section(to))) => self.drop_section(*from, to, cx),
                 _ => {}

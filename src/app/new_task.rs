@@ -778,7 +778,13 @@ impl NewTaskForm {
         let insert = self.insert.clone();
         self.shark
             .update(cx, |s, cx| {
-                s.create_task_on(branch, repos, prs, parents, insert, prompt, window, cx)
+                let title = prompt
+                    .as_deref()
+                    .map(crate::chat::title_of)
+                    .unwrap_or_default();
+                s.create_task_on(
+                    branch, repos, prs, parents, insert, prompt, title, None, window, cx,
+                )
             })
             .ok();
         true
@@ -1041,11 +1047,9 @@ impl Render for NewTaskForm {
             .on_action(
                 cx.listener(|this, _: &BranchFromSource, window, cx| this.branch_from(window, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &RefreshTaskSources, window, cx| {
-                    this.refresh(true, window, cx);
-                }),
-            )
+            .on_action(cx.listener(|this, _: &RefreshTaskSources, window, cx| {
+                this.refresh(true, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SubmitForm, window, cx| {
                 if this.submit(window, cx) {
                     window.close_dialog(cx);

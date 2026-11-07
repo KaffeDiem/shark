@@ -1,15 +1,64 @@
 //! Creating, opening, growing and deleting agents (`Task` in the code).
 use super::new_task::NewTaskForm;
 use super::*;
-use crate::state::AttachStage;
+use crate::state::{AgentLink, AttachStage, Sibling};
 
 impl Shark {
-    pub(crate) fn open_task(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn sync_agent(&mut self, slug: &str, docs: bool, cx: &mut Context<Self>) {
+        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
+            return;
+        };
+        let tasks: Vec<_> = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == slug))
+            .cloned()
+            .collect();
+        for task in &tasks {
+            let siblings = tasks
+                .iter()
+                .filter(|other| other.name != task.name)
+                .map(|other| {
+                    let dirs: Vec<_> = other
+                        .repos
+                        .iter()
+                        .map(|r| other.dir().join(&r.name).to_string_lossy().into_owned())
+                        .collect();
+                    let files = task
+                        .agent
+                        .as_ref()
+                        .and_then(|a| {
+                            a.siblings
+                                .iter()
+                                .find(|s| s.branch == other.branch && s.dirs == dirs)
+                        })
+                        .map(|s| s.files.clone())
+                        .unwrap_or_default();
+                    Sibling {
+                        title: other.display_title().into(),
+                        branch: other.branch.clone(),
+                        dirs,
+                        files,
+                    }
+                })
+                .collect();
+            let current = self.task_mut(&task.name).unwrap();
+            current.agent = Some(AgentLink {
+                slug: agent.slug.clone(),
+                name: agent.name.clone(),
+                instructions: agent.instructions.clone(),
+                siblings,
+            });
+            if docs {
+                git::write_claude_md(current);
+            }
+            self.publish_task(&task.name, cx);
+        }
+        let _ = self.state.save();
+    }
+
+    pub(crate) fn open_task(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.state.tasks.get(ix).map(|w| w.name.clone()) else {
             return;
         };
@@ -63,12 +112,7 @@ impl Shark {
         });
     }
 
-    pub(super) fn open_task_now(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn open_task_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.state.tasks.get(ix).cloned() else {
             return;
         };
@@ -229,12 +273,13 @@ impl Shark {
         &mut self,
         first: Option<String>,
         issue: Option<(String, Snapshot)>,
+        agent: Option<AgentLink>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let editors = self.file_tabs.iter().map(|t| t.editor.clone()).collect();
         self.confirm_editors(editors, true, false, window, cx, move |s, window, cx| {
-            s.create_task(first, issue, window, cx)
+            s.create_task(first, issue, agent, window, cx)
         });
     }
 
@@ -244,6 +289,7 @@ impl Shark {
         &mut self,
         first: Option<String>,
         issue: Option<(String, Snapshot)>,
+        agent: Option<AgentLink>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -267,7 +313,7 @@ impl Shark {
             (None, None) => crate::state::NEW_TASK.into(),
         };
         let dir = tasks_dir().join(&name);
-        let mut ws = match git::create_empty_task(&dir, &name, &title) {
+        let mut ws = match git::create_empty_task(&dir, &name, &title, agent) {
             Ok(ws) => ws,
             Err(e) => return notify_err(window, cx, e),
         };
@@ -288,6 +334,11 @@ impl Shark {
             let _ = git::remove_task(&ws, &dir, false);
             crate::linear::delete_snapshots(&name);
             return notify_err(window, cx, format!("Couldn't save the new task: {e}"));
+        }
+        if let Some(agent) = &ws.agent {
+            let section = self.ensure_agent_section(&agent.slug, cx);
+            self.move_to_section(&name, section, cx);
+            self.sync_agent(&agent.slug, false, cx);
         }
         self.open_task_now(self.state.tasks.len() - 1, window, cx);
         self.record_interaction(&name, cx);
@@ -338,6 +389,10 @@ impl Shark {
         let edited = |w: &&mut Task| !title.is_empty() && title != w.display_title();
         if let Some(ws) = self.task_mut(name).filter(edited) {
             ws.title = title;
+            let agent = ws.agent.as_ref().map(|a| a.slug.clone());
+            if let Some(slug) = agent {
+                self.sync_agent(&slug, false, cx);
+            }
             let _ = self.state.save();
             cx.notify();
         }
@@ -401,7 +456,22 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.create_task_on(branch, repos, prs, vec![], None, prompt, window, cx)
+        let title = prompt
+            .as_deref()
+            .map(crate::chat::title_of)
+            .unwrap_or_default();
+        self.create_task_on(
+            branch,
+            repos,
+            prs,
+            vec![],
+            None,
+            prompt,
+            title,
+            None,
+            window,
+            cx,
+        )
     }
 
     /// `create_workspace` with repos' new branches stacked on `parents` `(repo, branch)`. With
@@ -416,6 +486,8 @@ impl Shark {
         parents: Vec<(String, String)>,
         insert: Option<String>,
         prompt: Option<String>,
+        title: String,
+        agent: Option<AgentLink>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -461,7 +533,7 @@ impl Shark {
                 .background_executor()
                 .spawn(async move {
                     let ws = git::create_task_with_prs(
-                        &dir, &name, &branch, &repos, &prs, &parents,
+                        &dir, &name, &branch, &repos, &prs, &parents, &title, agent,
                     );
                     // The base a PR targets must exist on GitHub.
                     let pushed = ws.is_ok().then(|| {
@@ -498,6 +570,19 @@ impl Shark {
                         ws.fill_models(&model, effort.as_ref());
                         let name = ws.name.clone();
                         s.state.tasks.push(ws.clone());
+                        if let Some(agent) = &ws.agent {
+                            let section = s.ensure_agent_section(&agent.slug, cx);
+                            s.move_to_section(&name, section, cx);
+                            s.sync_agent(&agent.slug, false, cx);
+                            let current = s.task(&name).unwrap().clone();
+                            if current.agent.as_ref().is_some_and(|a| {
+                                a.name != agent.name || a.instructions != agent.instructions
+                            }) {
+                                // Settings may have changed while the worktrees were created.
+                                git::write_claude_md(&current);
+                            }
+                            ws = current;
+                        }
                         let _ = s.state.save();
                         // A dirty file tab in the task left behind asks first: send once opened.
                         let deferred = Rc::new(std::cell::Cell::new(false));
@@ -551,10 +636,18 @@ impl Shark {
         };
         self.open_task_now(ix, window, cx);
         match tab.as_str() {
-            "diff" if self.active_task().is_some_and(|ws| Feature::Diff.is_open(ws)) => {
+            "diff"
+                if self
+                    .active_task()
+                    .is_some_and(|ws| Feature::Diff.is_open(ws)) =>
+            {
                 self.show(Tab::Feature(Feature::Diff), window, cx)
             }
-            "git" if self.active_task().is_some_and(|ws| Feature::Git.is_open(ws)) => {
+            "git"
+                if self
+                    .active_task()
+                    .is_some_and(|ws| Feature::Git.is_open(ws)) =>
+            {
                 self.show(Tab::Feature(Feature::Git), window, cx)
             }
             "home" => self.enter_home(window, cx),
@@ -1251,7 +1344,14 @@ impl Shark {
                 let repoless = self.task(name).is_some_and(|w| w.repos.is_empty());
                 let before = self.cursors(cx);
                 self.forget_task_views(name, cx);
+                let agent = self
+                    .task(name)
+                    .and_then(|t| t.agent.as_ref())
+                    .map(|a| a.slug.clone());
                 self.state.remove_task(name);
+                if let Some(slug) = agent {
+                    self.sync_agent(&slug, false, cx);
+                }
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));
                 // Names come back around, and a later agent must not find these.

@@ -2,7 +2,7 @@
 //! with the user's own `codex login` (a ChatGPT subscription or an API key). Its notifications
 //! become the same `Ev`s claude's stream-json does; tool items take claude's tool names so the
 //! chat summarizes them the same way.
-use crate::harness::{self, Harness, Ev, SESSION_GONE, text_of};
+use crate::harness::{self, Ev, Harness, SESSION_GONE, text_of};
 use crate::state::{ChatMeta, Task};
 use crate::transcript::{clip_output, clip_strings, output, transcript_path};
 use gpui_kit::base::async_util::Receiver;
@@ -202,7 +202,10 @@ pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> 
 }
 
 /// Codex keys answers by question id and uses its TUI's free-text convention.
-pub(crate) fn question_reply(qs: &[harness::Question], answers: Option<&[harness::Answer]>) -> Value {
+pub(crate) fn question_reply(
+    qs: &[harness::Question],
+    answers: Option<&[harness::Answer]>,
+) -> Value {
     let by_id: serde_json::Map<String, Value> = match answers {
         Some(answers) => harness::given(qs, answers)
             .map(|(q, (labels, note), _)| {

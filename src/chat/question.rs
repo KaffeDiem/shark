@@ -462,13 +462,7 @@ mod tests {
                             cx,
                             |w, cx| {
                                 cx.new(|cx| {
-                                    Chat::new(
-                                        Task::default(),
-                                        ChatMeta::default(),
-                                        false,
-                                        w,
-                                        cx,
-                                    )
+                                    Chat::new(Task::default(), ChatMeta::default(), false, w, cx)
                                 })
                             },
                         )

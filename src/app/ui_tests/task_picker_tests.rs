@@ -24,6 +24,7 @@ fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
                 })
                 .collect(),
             sections: vec![Section {
+                agent: None,
                 name: "Folded".into(),
                 icon: "folder".into(),
                 collapsed: true,

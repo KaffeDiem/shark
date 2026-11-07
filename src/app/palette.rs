@@ -38,11 +38,20 @@ impl Row {
 
 /// Grouped the way people reach for them; `GROUPS` names each group by its first row.
 pub(super) const COMMANDS: &[Row] = &[
-    Row::key(
-        "New task",
-        IconName::Plus,
-        &NewTask,
-        "create start chat",
+    Row::key("New task", IconName::Plus, &NewTask, "create start chat"),
+    Row(
+        "New task for agent…",
+        IconName::Bot,
+        None,
+        "instructions",
+        Some(|s, w, cx| s.pick_agent(true, w, cx)),
+    ),
+    Row(
+        "Open agent…",
+        IconName::Bot,
+        None,
+        "instructions settings",
+        Some(|s, w, cx| s.pick_agent(false, w, cx)),
     ),
     Row::key(
         "New task from branch or PR…",

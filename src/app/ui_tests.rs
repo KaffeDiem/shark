@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod agent_settings_tests;
 mod agent_tests;
 mod app_switcher_tests;
 mod attach_tests;
@@ -29,11 +30,11 @@ mod repo_menu_tests;
 mod repo_settings_tests;
 mod storage_tests;
 mod tab_tests;
+mod task_picker_tests;
+mod task_review_tests;
 mod tree_pixels;
 mod usage_regression_tests;
 mod usage_tests;
-mod task_picker_tests;
-mod task_review_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make task dirs take it too: `test_home` wipes them.
@@ -944,9 +945,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     let viewed = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).differ.read(cx).viewed(0));
     assert_eq!(viewed(cx), Viewed::Yes);
     assert!(
-        State::load().tasks[0]
-            .viewed
-            .contains_key("api/new.txt"),
+        State::load().tasks[0].viewed.contains_key("api/new.txt"),
         "viewed is saved"
     );
     refresh(cx);
@@ -1822,11 +1821,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
                 );
             }
             let saved = State::load();
-            let saved = saved
-                .tasks
-                .iter()
-                .find(|w| w.name == "drag-tabs")
-                .unwrap();
+            let saved = saved.tasks.iter().find(|w| w.name == "drag-tabs").unwrap();
             assert_eq!(
                 saved.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 expected.iter().map(|&i| &ids[i]).collect::<Vec<_>>()
@@ -1890,12 +1885,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
         ("drag-tabs", ids[0].as_str(), "closed-chat"),
     ] {
         on(cx, &|s, _, cx| {
-            s.move_tab(
-                task,
-                &TabId::Chat(from.into()),
-                &TabId::Chat(to.into()),
-                cx,
-            )
+            s.move_tab(task, &TabId::Chat(from.into()), &TabId::Chat(to.into()), cx)
         });
         order(cx, &[0, 2, 1]);
     }
@@ -4701,12 +4691,8 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
-    let chat_tab = cx.update(|cx| {
-        format!(
-            "chat-tab-{}",
-            shark.read(cx).state.tasks[0].chats[0].id
-        )
-    });
+    let chat_tab =
+        cx.update(|cx| format!("chat-tab-{}", shark.read(cx).state.tasks[0].chats[0].id));
     let bounds = |cx: &mut TestAppContext, id: &'static str| {
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
@@ -6380,9 +6366,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         .await;
     }
     on(cx, &|s, w, cx| {
-        let ix = (s.state.tasks.iter())
-            .position(|w| w.name == "ed")
-            .unwrap();
+        let ix = (s.state.tasks.iter()).position(|w| w.name == "ed").unwrap();
         s.open_task(ix, w, cx)
     });
     let file = home.join("shark/workspaces/ed/api/f.txt");

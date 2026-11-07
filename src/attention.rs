@@ -139,9 +139,7 @@ fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
                     .collect();
                 let now = Instant::now();
                 let name = s.attn.due(&names, s.active.as_deref(), now)?;
-                let ws = (s.state.tasks.iter())
-                    .find(|w| w.name == name)
-                    .cloned()?;
+                let ws = (s.state.tasks.iter()).find(|w| w.name == name).cloned()?;
                 let last = (s.attn.checked.get(&name)).map(|c| c.repos.clone());
                 // Backing off skips gh only: local git state keeps refreshing.
                 let gh = s.attn.paused_until.is_none_or(|t| now >= t);
@@ -243,12 +241,7 @@ impl Shark {
 
     /// Recounts the Dock badge and notifies when a task off screen starts needing you.
     pub(crate) fn refresh_attention(&mut self, cx: &mut Context<Self>) {
-        let names: Vec<String> = self
-            .state
-            .tasks
-            .iter()
-            .map(|w| w.name.clone())
-            .collect();
+        let names: Vec<String> = self.state.tasks.iter().map(|w| w.name.clone()).collect();
         self.attn.checked.retain(|n, _| names.contains(n));
         self.attn.unread.retain(|n| names.contains(n));
         let mut count = 0;
@@ -279,11 +272,7 @@ impl Shark {
         let from = self
             .active
             .as_ref()
-            .and_then(|a| {
-                order
-                    .iter()
-                    .position(|&ix| &self.state.tasks[ix].name == a)
-            })
+            .and_then(|a| order.iter().position(|&ix| &self.state.tasks[ix].name == a))
             .map_or(0, |i| i + 1);
         let hit = (0..n).map(|i| order[(from + i) % n]).find(|&ix| {
             let name = &self.state.tasks[ix].name;

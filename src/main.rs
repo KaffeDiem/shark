@@ -1,4 +1,3 @@
-mod harness;
 mod app;
 mod apps;
 mod attention;
@@ -15,6 +14,7 @@ mod features;
 mod file_icon;
 mod files;
 mod git;
+mod harness;
 mod linear;
 mod lsp;
 mod media;
@@ -469,9 +469,7 @@ fn bind_keys(cx: &mut App) {
         (0..models::MODELS.len())
             .map(|i| KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None)),
     );
-    cx.bind_keys(
-        (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenTask(i), None)),
-    );
+    cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenTask(i), None)));
     cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenTab(i), None)));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let scroll = [

@@ -1,7 +1,7 @@
 //! A chat's stored transcript and stderr log: what is clipped on the way in, appended,
 //! read back, and what the stored events say about the chat's state.
-use crate::harness::{Ev, parse_record, text_of};
 use crate::codex;
+use crate::harness::{Ev, parse_record, text_of};
 use crate::state::{Task, support_dir};
 use serde_json::Value;
 use std::{

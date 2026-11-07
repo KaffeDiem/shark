@@ -118,7 +118,9 @@ async fn archive_keeps_cursors_on_their_rows(cx: &mut TestAppContext) {
     let names = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            let SideRow::Task(ix) = s.sel else { return None };
+            let SideRow::Task(ix) = s.sel else {
+                return None;
+            };
             Some(s.state.tasks[ix].name.clone())
         })
     };
@@ -345,12 +347,10 @@ async fn home_offers_linear_only_while_it_is_in_use(cx: &mut TestAppContext) {
     });
     assert!(!offered(cx), "disconnected, nothing attached");
     on(cx, &|s, _, cx| {
-        s.state.tasks[0]
-            .linear
-            .attach(crate::linear::IssueRef {
-                org: "acme-uuid".into(),
-                issue: "uuid-1".into(),
-            });
+        s.state.tasks[0].linear.attach(crate::linear::IssueRef {
+            org: "acme-uuid".into(),
+            issue: "uuid-1".into(),
+        });
         cx.notify();
     });
     assert!(offered(cx), "disconnected, with an issue");
@@ -411,8 +411,7 @@ async fn palette_rows_dispatch_their_actions(cx: &mut TestAppContext) {
             .unwrap();
         press(cx, &["enter"]);
     };
-    let chats =
-        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.tasks[0].chats.len());
+    let chats = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.tasks[0].chats.len());
     let before = chats(cx);
     pick(cx, "New chat");
     assert_eq!(chats(cx), before + 1, "New chat");

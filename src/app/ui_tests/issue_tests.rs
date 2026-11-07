@@ -1,8 +1,8 @@
 //! Linear issues on an agent, against a fake Linear behind the `http` seam.
-use super::attach_tests::{agent, chat_of, recording_claude, result, wire, task_of};
+use super::attach_tests::{agent, chat_of, recording_claude, result, task_of, wire};
 use super::*;
-use crate::harness::Ev;
 use crate::chat::Chat;
+use crate::harness::Ev;
 use crate::linear::{self, IssueRef, Req, Resp, fake};
 use crate::linear::{Connection, Method};
 use gpui_kit::test::TestQueryExt as _;
@@ -1317,12 +1317,15 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     shark.update(cx, |s, cx| {
         attach_directly(s, &name, 1);
         attach_directly(s, &name, 2);
-        s.task_mut(&name).unwrap().repos.push(crate::state::TaskRepo {
-            name: "api".into(),
-            src: "/src/api".into(),
-            base: "main".into(),
-            branch: None,
-        });
+        s.task_mut(&name)
+            .unwrap()
+            .repos
+            .push(crate::state::TaskRepo {
+                name: "api".into(),
+                src: "/src/api".into(),
+                base: "main".into(),
+                branch: None,
+            });
         cx.notify();
     });
     let on = on_app(window, shark.clone());
@@ -1459,7 +1462,10 @@ async fn details_act_in_place_and_refresh_repairs_a_missing_snapshot(cx: &mut Te
     in_flight(cx, asked + 1);
     press(cx, &["escape"]);
     assert!(!dialog_open(cx, window));
-    assert_eq!(task_of(cx, &shark).issues[1].description, "Closed meanwhile");
+    assert_eq!(
+        task_of(cx, &shark).issues[1].description,
+        "Closed meanwhile"
+    );
 
     on(cx, &|s, w, cx| {
         s.issue_details(name.clone(), issue_ref(2), w, cx)
@@ -1497,7 +1503,10 @@ async fn primary_changes_leave_branches_and_titles_alone(cx: &mut TestAppContext
     for id in ["ENG-1", "ENG-2", "ENG-3"] {
         attach(cx, window, &shark, id);
     }
-    assert_eq!(task_of(cx, &shark).default_branch(), format!("eng-1-{name}"));
+    assert_eq!(
+        task_of(cx, &shark).default_branch(),
+        format!("eng-1-{name}")
+    );
 
     on(cx, &|s, _, cx| s.make_primary(&name, &issue_ref(3), cx));
     let ws = task_of(cx, &shark);
@@ -1958,14 +1967,20 @@ async fn deleting_an_agent_removes_its_snapshots_once_it_is_gone(cx: &mut TestAp
     let gone = shark.clone();
     until(cx, window, move |_, cx| gone.read(cx).archiving.is_empty()).await;
     cx.run_until_parked();
-    assert!(cx.read(|cx| shark.read(cx).task(&name).is_some()), "refused");
+    assert!(
+        cx.read(|cx| shark.read(cx).task(&name).is_some()),
+        "refused"
+    );
     assert_eq!(linear::read_snapshots(&name).unwrap().len(), 2);
 
     fs::remove_file(dir.join("notes.txt")).unwrap();
     on(cx, &|s, w, cx| s.remove_task(&name, false, w, cx));
     let gone = shark.clone();
     let agent = name.clone();
-    until(cx, window, move |_, cx| gone.read(cx).task(&agent).is_none()).await;
+    until(cx, window, move |_, cx| {
+        gone.read(cx).task(&agent).is_none()
+    })
+    .await;
     assert!(linear::read_snapshots(&name).unwrap().is_empty());
     let saved = fs::read_dir(crate::state::support_dir().join("linear")).unwrap();
     assert_eq!(saved.count(), 0, "nothing left");

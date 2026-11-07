@@ -43,7 +43,7 @@ pub(super) fn task_indicator(
 }
 
 /// Icons a section can have, by Lucide name (what `Section::icon` stores).
-const SECTION_ICONS: &[(&str, IconName)] = &[
+pub(super) const SECTION_ICONS: &[(&str, IconName)] = &[
     ("folder", IconName::Folder),
     ("star", IconName::Star),
     ("briefcase", IconName::Briefcase),
@@ -119,7 +119,7 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
 /// Right-click menu of a section header.
 fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
     let collapsed = this.state.sections.get(i).is_some_and(|s| s.collapsed);
-    vec![
+    let mut entries = vec![
         menu::item(
             if collapsed {
                 IconName::ChevronDown
@@ -150,7 +150,18 @@ fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
             "Delete section",
             on_shark(cx, move |s, w, cx| s.delete_section(i, w, cx)),
         ),
-    ]
+    ];
+    if let Some(slug) = this.state.sections.get(i).and_then(|s| s.agent.clone()) {
+        entries.insert(
+            0,
+            menu::item(
+                IconName::Settings,
+                "Agent settings…",
+                on_shark(cx, move |s, w, cx| s.open_agent(&slug, w, cx)),
+            ),
+        );
+    }
+    entries
 }
 
 /// Cursor state taken by [`Shark::cursors`]: sidebar row, its task's name, home row.
@@ -276,9 +287,7 @@ impl Shark {
         if self.home.sel.as_deref() == Some(name) {
             let rows = self.home_rows(cx);
             let at = before.home.unwrap_or(0).min(rows.len().saturating_sub(1));
-            self.home.sel = rows
-                .get(at)
-                .map(|r| self.state.tasks[r.ix].name.clone());
+            self.home.sel = rows.get(at).map(|r| self.state.tasks[r.ix].name.clone());
         }
     }
 
@@ -391,9 +400,7 @@ impl Shark {
             SideRow::Section(_) => None,
         };
         self.state.drop_task(ws, target);
-        if let Some(ix) =
-            cursor.and_then(|n| self.state.tasks.iter().position(|w| w.name == n))
-        {
+        if let Some(ix) = cursor.and_then(|n| self.state.tasks.iter().position(|w| w.name == n)) {
             self.sel = SideRow::Task(ix);
         }
         let _ = self.state.save();
@@ -510,6 +517,7 @@ impl Shark {
                 }
                 None => {
                     self.state.sections.push(Section {
+                        agent: None,
                         name,
                         icon: "folder".into(),
                         collapsed: false,
@@ -537,10 +545,62 @@ impl Shark {
     }
 
     pub(super) fn pick_icon(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(current) = self.state.sections.get(i).map(|s| s.icon.clone()) else {
+        let Some(section) = self.state.sections.get(i) else {
             return;
         };
-        // Named by keyword, so typing "bug" or "star" finds the icon.
+        if let Some(slug) = section.agent.clone() {
+            return self.pick_agent_icon(&slug, window, cx);
+        }
+        self.pick_named_icon(
+            section.icon.clone(),
+            move |s, icon, cx| {
+                if let Some(section) = s.state.sections.get_mut(i) {
+                    section.icon = icon;
+                    let _ = s.state.save();
+                    cx.notify();
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn pick_agent_icon(
+        &mut self,
+        slug: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(a) = self.state.agents.iter().find(|a| a.slug == slug) else {
+            return;
+        };
+        let slug = slug.to_string();
+        self.pick_named_icon(
+            a.icon.clone(),
+            move |s, icon, cx| {
+                if let Some(a) = s.state.agents.iter_mut().find(|a| a.slug == slug) {
+                    a.icon = icon.clone();
+                    for section in &mut s.state.sections {
+                        if section.agent.as_deref() == Some(&slug) {
+                            section.icon = icon.clone();
+                        }
+                    }
+                    let _ = s.state.save();
+                    cx.notify();
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn pick_named_icon(
+        &mut self,
+        current: String,
+        set: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let items = SECTION_ICONS
             .iter()
             .map(|(name, icon)| {
@@ -559,13 +619,7 @@ impl Shark {
             "Pick an icon…",
             items,
             selected,
-            move |s, row, _, cx| {
-                if let Some(sec) = s.state.sections.get_mut(i) {
-                    sec.icon = SECTION_ICONS[row].0.into();
-                    let _ = s.state.save();
-                    cx.notify();
-                }
-            },
+            move |s, row, _, cx| set(s, SECTION_ICONS[row].0.into(), cx),
             window,
             cx,
         );

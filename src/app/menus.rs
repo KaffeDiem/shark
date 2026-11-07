@@ -103,9 +103,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
         entries.push(menu::item(
             IconName::MessageSquare,
             "Open task",
-            on_task(cx, &ws.name, |s, n, w, cx| {
-                s.open_task_named(&n, w, cx)
-            }),
+            on_task(cx, &ws.name, |s, n, w, cx| s.open_task_named(&n, w, cx)),
         ));
     }
     entries.push(menu::item(

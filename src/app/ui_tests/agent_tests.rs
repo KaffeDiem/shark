@@ -162,7 +162,7 @@ async fn first_message_titles_an_old_untitled_agent(cx: &mut TestAppContext) {
     let home = test_home();
     let name = "agent-19a2b";
     let dir = home.join("shark/workspaces").join(name);
-    let ws = git::create_empty_task(&dir, name, NEW_TASK).unwrap();
+    let ws = git::create_empty_task(&dir, name, NEW_TASK, None).unwrap();
     let state = State {
         tasks: vec![ws],
         ..Default::default()
@@ -243,7 +243,7 @@ async fn failed_save_leaves_no_orphan(cx: &mut TestAppContext) {
 
     let on = on_app(window, shark.clone());
     on(cx, &|s, _, _| s.state.read_only = true);
-    on(cx, &|s, w, cx| s.new_task(None, None, w, cx));
+    on(cx, &|s, w, cx| s.new_task(None, None, None, w, cx));
     cx.update(|cx| assert!(shark.read(cx).state.tasks.is_empty()));
     assert_eq!(entries(home.join("shark/workspaces")), 0);
 }
@@ -260,7 +260,7 @@ async fn generated_identities_never_collide(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
         for _ in 0..3 {
-            s.new_task(None, None, w, cx);
+            s.new_task(None, None, None, w, cx);
         }
     });
     let mut names: Vec<String> = cx.update(|cx| {
@@ -360,7 +360,11 @@ async fn every_way_out_of_plan_mode_needs_a_repository(cx: &mut TestAppContext) 
             assert!(c.meta.plan, "{what}: Plan mode stays");
             assert_eq!(c.plan.read(cx).approved, None, "{what}: not approved");
             assert!(c.sent_texts().is_empty(), "{what}: nothing sent");
-            assert_eq!(shark.read(cx).active_task().unwrap().chats.len(), 1, "{what}");
+            assert_eq!(
+                shark.read(cx).active_task().unwrap().chats.len(),
+                1,
+                "{what}"
+            );
         })
     };
     let offered = |cx: &mut TestAppContext, what: &str| {
@@ -622,4 +626,102 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
     let repos = repos(&home, &["api"]);
     on_app(window, shark.clone())(cx, &|s, _, _| s.state.repos = repos.clone());
     assert!(run(cx));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let instructions = "Always use Mobbin to ground your research";
+    let state = State {
+        repos: repos(&home, &["api"]),
+        agents: vec![crate::state::Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            icon: "palette".into(),
+            instructions: instructions.into(),
+            repos: vec!["api".into()],
+            model: None,
+            effort: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.run_until_parked();
+    for (count, prompt) in [(1, "one"), (2, "two")] {
+        on_app(window, shark.clone())(cx, &|s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.prompt.update(cx, |p, cx| {
+                p.set_value(format!("@designer {prompt}"), w, cx)
+            });
+        });
+        press_in(window)(cx, &["enter"]);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            let s = shark.read(cx);
+            s.state.tasks.len() == count && s.creating.is_empty()
+        })
+        .await;
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), ""));
+    }
+    let tasks = cx.update(|cx| shark.read(cx).state.tasks.clone());
+    assert_eq!(
+        tasks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    assert_ne!(tasks[0].branch, tasks[1].branch);
+    cx.update(|cx| {
+        let section = shark
+            .read(cx)
+            .state
+            .sections
+            .iter()
+            .find(|s| s.agent.as_deref() == Some("designer"))
+            .unwrap();
+        assert_eq!(section.tasks.len(), 2);
+        for task in &tasks {
+            assert!(section.tasks.contains(&task.name));
+        }
+    });
+    for (i, task) in tasks.iter().enumerate() {
+        let agent = task.agent.as_ref().unwrap();
+        assert_eq!(agent.slug, "designer");
+        assert_eq!(agent.siblings.len(), 1);
+        assert_eq!(agent.siblings[0].title, tasks[1 - i].title);
+        assert!(task.branch.starts_with("designer/"));
+        for doc in ["CLAUDE.md", "AGENTS.md"] {
+            assert!(
+                fs::read_to_string(task.dir().join(doc))
+                    .unwrap()
+                    .contains(instructions)
+            );
+        }
+    }
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        s.state.agents[0].instructions = "Use the design system".into();
+        s.sync_agent("designer", true, cx);
+        s.set_title(&tasks[0].name, "renamed".into(), cx);
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.state.tasks[1].agent.as_ref().unwrap().siblings[0].title,
+            "renamed"
+        );
+        for task in &s.state.tasks {
+            assert_eq!(
+                task.agent.as_ref().unwrap().instructions,
+                "Use the design system"
+            );
+            assert!(
+                fs::read_to_string(task.dir().join("AGENTS.md"))
+                    .unwrap()
+                    .contains("Use the design system")
+            );
+        }
+    });
 }

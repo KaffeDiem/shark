@@ -540,9 +540,8 @@ impl Shark {
             used,
         });
         let shark = cx.entity().downgrade();
-        let form = cx.new(|cx| {
-            NewTaskForm::new(repos, &picked, None, &[], None, attach, shark, window, cx)
-        });
+        let form = cx
+            .new(|cx| NewTaskForm::new(repos, &picked, None, &[], None, attach, shark, window, cx));
         let opened = form.clone();
         window.open_dialog(cx, move |d, _, cx| {
             let f = form.clone();
@@ -614,7 +613,9 @@ impl Shark {
         if self.archiving.contains(&name) {
             return notify_err(window, cx, format!("{title} is being deleted"));
         }
-        let Some(ws) = self.task_mut(&name) else { return };
+        let Some(ws) = self.task_mut(&name) else {
+            return;
+        };
         if !ws.attaching.is_empty() {
             let msg = format!("{title}: a repository is already being attached");
             return notify_err(window, cx, msg);
@@ -716,7 +717,9 @@ impl Shark {
         {
             return;
         }
-        let Some(ws) = self.task_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         let Some(a) = ws.attaching.iter_mut().find(|a| queued(a)) else {
             return;
         };
@@ -759,12 +762,10 @@ impl Shark {
                 a.fresh.then_some(a.base.clone()),
             );
             let branch = a.branch.clone();
-            let result =
-                cx.background_executor()
-                    .spawn(async move {
-                        git::add_to_task(&ws, &dir, &repo, &branch, fresh.as_deref())
-                    })
-                    .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { git::add_to_task(&ws, &dir, &repo, &branch, fresh.as_deref()) })
+                .await;
             this.update_in(cx, |s, window, cx| {
                 s.adding_repos.remove(&name);
                 match result {
@@ -808,13 +809,7 @@ impl Shark {
 
     /// Saves the new repo and its branch together, then runs its setup scripts. Readiness waits
     /// for them.
-    fn repo_added(
-        &mut self,
-        ws: Task,
-        repo: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn repo_added(&mut self, ws: Task, repo: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(slot) = self.task_mut(&ws.name) else {
             return;
         };
@@ -937,7 +932,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.task_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         let had = ws.attaching.len();
         (ws.attaching)
             .retain(|a| a.stage != AttachStage::Queued || repo.is_some_and(|r| r != a.repo));
@@ -983,7 +980,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.task_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         let Some(a) = ws
             .attaching
             .iter()

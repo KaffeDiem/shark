@@ -384,9 +384,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn git_feature_description_conflict_and_task_changes_keep_drafts(
-    cx: &mut TestAppContext,
-) {
+async fn git_feature_description_conflict_and_task_changes_keep_drafts(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let state = fixture(&home);
@@ -1243,11 +1241,7 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     let home = test_home();
     let state = fixture(&home);
     fs::write(state.tasks[0].dir().join("api/login.rs"), "retry();\n").unwrap();
-    fs::write(
-        state.tasks[0].dir().join("api/other.rs"),
-        "original();\n",
-    )
-    .unwrap();
+    fs::write(state.tasks[0].dir().join("api/other.rs"), "original();\n").unwrap();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     until(cx, window, |_, cx| {

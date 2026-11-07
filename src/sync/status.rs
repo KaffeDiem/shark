@@ -2342,8 +2342,17 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let repo = crate::git::add_repo(&src, &[]).unwrap();
         let on = crate::git::on_branch(&[repo], "ui");
         let parents = [("ios".to_string(), "logic".to_string())];
-        let ws =
-            create_task_with_prs(&root.join("ws/ui"), "ui", "ui", &on, &[], &parents).unwrap();
+        let ws = create_task_with_prs(
+            &root.join("ws/ui"),
+            "ui",
+            "ui",
+            &on,
+            &[],
+            &parents,
+            "",
+            None,
+        )
+        .unwrap();
         let wt = root.join("ws/ui/ios");
         assert_eq!(ws.repos[0].base, "origin/logic");
         let own = edit(&wt, "c.txt", "c");

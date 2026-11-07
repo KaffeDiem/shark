@@ -376,7 +376,9 @@ impl RepoSettingsView {
         // Settings may be open underneath.
         window.close_all_dialogs(cx);
         (self.shark)
-            .update(cx, |s, cx| s.new_task_from_repos(vec![name], None, window, cx))
+            .update(cx, |s, cx| {
+                s.new_task_from_repos(vec![name], None, window, cx)
+            })
             .ok();
     }
 

@@ -12,8 +12,8 @@ mod side;
 mod tools;
 
 use self::queue::Queued;
-use crate::harness::{self, Harness, Ev};
 use crate::complete::{self, Item};
+use crate::harness::{self, Ev, Harness};
 use crate::models::EFFORT;
 use crate::models::{effort_label, model_label};
 use crate::plan::{self, PlanPane};
@@ -727,7 +727,9 @@ impl Chat {
             // A session starting now reads the repos from the root docs, and has nothing else.
             if self.meta.session_id.is_none() {
                 let mut context = self.ws.context();
-                context.retain(|k, _| k.starts_with(REPO_CONTEXT));
+                context.retain(|k, _| {
+                    k.starts_with(REPO_CONTEXT) || k.starts_with(crate::state::AGENT_CONTEXT)
+                });
                 let known = context_record(&context);
                 if self.meta.delivered != known {
                     self.meta.delivered = known;

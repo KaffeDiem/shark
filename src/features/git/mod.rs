@@ -149,12 +149,7 @@ impl GitFeature {
     }
 
     /// A base change (the host passes its effective bases) resets only the history.
-    pub(crate) fn set_task(
-        &mut self,
-        task: Task,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn set_task(&mut self, task: Task, window: &mut Window, cx: &mut Context<Self>) {
         let identity = |ws: &Task| {
             ws.repos
                 .iter()
@@ -164,9 +159,7 @@ impl GitFeature {
         let changed = identity(&self.task) != identity(&task);
         self.task = task;
         if changed {
-            self.selected = self
-                .selected
-                .min(self.task.repos.len().saturating_sub(1));
+            self.selected = self.selected.min(self.task.repos.len().saturating_sub(1));
             self.clear_selection(cx);
             self.refresh(window, cx);
         }

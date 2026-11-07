@@ -1341,7 +1341,10 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Task<()> {
-        let Some(ws) = self.task(name).filter(|w| w.linear.ordered().any(|x| x == r)) else {
+        let Some(ws) = self
+            .task(name)
+            .filter(|w| w.linear.ordered().any(|x| x == r))
+        else {
             return gpui_kit::Task::ready(());
         };
         let old = r.of(&ws.issues).cloned().unwrap_or_else(|| Snapshot {
@@ -1385,7 +1388,9 @@ impl Shark {
 
     /// Stops it going into later turns; what chats were already told stays in them.
     pub(super) fn remove_issue(&mut self, name: &str, r: &IssueRef, cx: &mut Context<Self>) {
-        let Some(ws) = self.task_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         ws.linear.remove(r);
         ws.issues.retain(|s| IssueRef::from(s) != *r);
         let _ = self.state.save();
@@ -1497,7 +1502,7 @@ impl Shark {
             window.close_dialog(cx);
             let issue = Some((title, issue.clone()));
             shark
-                .update(cx, |s, cx| s.new_task(first, issue, window, cx))
+                .update(cx, |s, cx| s.new_task(first, issue, None, window, cx))
                 .ok();
         });
         window.open_dialog(cx, move |d, _, cx| {

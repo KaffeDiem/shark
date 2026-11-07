@@ -46,6 +46,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 }
                 s.state.repos = vec![Repo { name: "api".into(), path: home.join("api") }];
                 s.state.sections = vec![Section {
+                    agent: None,
                     name: "Projects".into(), icon: "folder".into(), collapsed: false,
                     tasks: vec!["Warning".into()],
                 }];

@@ -294,7 +294,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let ws = format!("scripts-test-{}", std::process::id());
         let jobs = [
-            job(&dir, "echo first >> out; echo $SHARK_WORKSPACE >> out; test \"$SHARK_TASK\" = \"$SHARK_WORKSPACE\" && test \"$SHARK_TASK_PATH\" = \"$SHARK_WORKSPACE_PATH\" || exit 9"),
+            job(
+                &dir,
+                "echo first >> out; echo $SHARK_WORKSPACE >> out; test \"$SHARK_TASK\" = \"$SHARK_WORKSPACE\" && test \"$SHARK_TASK_PATH\" = \"$SHARK_WORKSPACE_PATH\" || exit 9",
+            ),
             job(&dir, "exit 3"),
             job(&dir, "echo never >> out"),
         ];

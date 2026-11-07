@@ -256,9 +256,7 @@ async fn discard_dialog_cannot_clear_a_replacement_buffer_with_the_same_path(
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn overwrite_dialog_cannot_save_another_task_same_relative_path(
-    cx: &mut TestAppContext,
-) {
+async fn overwrite_dialog_cannot_save_another_task_same_relative_path(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let state = fixture(&home);
@@ -354,7 +352,11 @@ async fn discard_revalidates_editors_that_changed_while_the_dialog_was_open(
     })
     .await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        fs::write(s.active_task().unwrap().dir().join("api/other.rs"), "other\n").unwrap();
+        fs::write(
+            s.active_task().unwrap().dir().join("api/other.rs"),
+            "other\n",
+        )
+        .unwrap();
         s.open_path_tab("api/other.rs".into(), w, cx);
         s.edit_working_copy(Some("api/shared.rs".into()), w, cx);
         s.differ

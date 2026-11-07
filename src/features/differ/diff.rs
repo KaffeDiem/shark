@@ -1351,9 +1351,7 @@ impl Differ {
             menu::item(
                 IconName::FileDiff,
                 "Uncommitted only",
-                on_differ(self.task_name(), cx, |s, w, cx| {
-                    s.toggle_uncommitted(w, cx)
-                }),
+                on_differ(self.task_name(), cx, |s, w, cx| s.toggle_uncommitted(w, cx)),
             )
             .checked(self.preferences.uncommitted_only),
             menu::item(

@@ -1,8 +1,8 @@
 use super::super::attach::{Fit, setup_tail};
 use super::*;
-use crate::harness::{Ev, BackgroundTask};
 use crate::attention::Attn;
 use crate::chat::Chat;
+use crate::harness::{BackgroundTask, Ev};
 use crate::state::{AttachStage, Attachment, ChatMeta, RepoSettings};
 
 /// Wrapped so a test can't forget what the guards need: the lock and the quiet claude.
@@ -106,10 +106,7 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
         s.queue_attachment(name.clone(), vec![first.clone()], w, cx);
         // One update: idle, so it started, and it is saved, before Git has run.
         let saved = State::load();
-        assert_eq!(
-            saved.tasks[0].attaching[0].stage,
-            AttachStage::Creating
-        );
+        assert_eq!(saved.tasks[0].attaching[0].stage, AttachStage::Creating);
         assert!(s.adding_repos.contains(&name));
         assert!(!ws.dir().join("api").exists());
     });
@@ -150,7 +147,11 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
         s.queue_attachment(name.clone(), vec![docs_repo.clone()], w, cx)
     });
     settled(cx, window, &shark).await;
-    assert_eq!(task_of(cx, &shark).repos[2].branch, None, "the inherited one");
+    assert_eq!(
+        task_of(cx, &shark).repos[2].branch,
+        None,
+        "the inherited one"
+    );
 }
 
 /// The dialog shows the branch and base before anything happens: cmd-b opens Change, cmd-b again
@@ -384,10 +385,7 @@ async fn setup_failure_keeps_the_worktree_until_retry(cx: &mut TestAppContext) {
     assert!(failed.dir().join("api").exists(), "the worktree stays");
     assert!(!marker.exists(), "the other repo's scripts didn't run");
     let saved = State::load();
-    assert_eq!(
-        saved.tasks[0].attaching[0].stage,
-        AttachStage::SetupFailed
-    );
+    assert_eq!(saved.tasks[0].attaching[0].stage, AttachStage::SetupFailed);
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(
@@ -875,7 +873,7 @@ async fn chats_opened_during_attachment_inherit_the_hold(cx: &mut TestAppContext
 /// exists too, and with `saved`, `Task::repos` knows it.
 fn interrupted(name: &str, repo: &Repo, stage: AttachStage, made: bool, saved: bool) -> Task {
     let dir = tasks_dir().join(name);
-    let empty = git::create_empty_task(&dir, name, name).unwrap();
+    let empty = git::create_empty_task(&dir, name, name, None).unwrap();
     let branch = format!("{name}-branch");
     let mut ws = match made {
         true => git::add_to_task(&empty, &dir, repo, &branch, Some("")).unwrap(),
@@ -1007,11 +1005,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     assert_eq!(needs(cx, "foreign"), Attn::Needs("Recover api".into()));
     assert!(git::has_ref(&api.path, "refs/heads/branch-only-branch"));
     let saved = State::load();
-    let saved = saved
-        .tasks
-        .iter()
-        .find(|w| w.name == "finished")
-        .unwrap();
+    let saved = saved.tasks.iter().find(|w| w.name == "finished").unwrap();
     assert!(
         saved.attaching.is_empty() && saved.repos.len() == 1,
         "saved"
@@ -1523,12 +1517,15 @@ async fn failures_stay_reachable_under_overflow(cx: &mut TestAppContext) {
         results.failed = (failed.iter())
             .map(|r| (r.clone(), "branch exists".into()))
             .collect();
-        s.task_mut(&name).unwrap().repos.push(crate::state::TaskRepo {
-            name: "settled".into(),
-            src: "/src/settled".into(),
-            base: "main".into(),
-            branch: None,
-        });
+        s.task_mut(&name)
+            .unwrap()
+            .repos
+            .push(crate::state::TaskRepo {
+                name: "settled".into(),
+                src: "/src/settled".into(),
+                base: "main".into(),
+                branch: None,
+            });
     });
     cx.update_window(window, |_, w, _| w.resize(size(px(900.), px(600.))))
         .unwrap();

@@ -20,6 +20,7 @@ fn fixture() -> State {
         fs::create_dir_all(ws.dir()).unwrap();
         state.tasks.push(ws);
         state.sections.push(Section {
+            agent: None,
             name: format!("{name} section"),
             icon: "folder".into(),
             collapsed: false,
@@ -258,10 +259,7 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
         w.pointer_move(target, Some(MouseButton::Left), cx);
         assert_eq!(shark.read(cx).section_of("Alpha"), Some(2));
         w.pointer_up(target, MouseButton::Left, cx);
-        assert_eq!(
-            shark.read(cx).state.sections[0].tasks,
-            ["Beta", "Alpha"]
-        );
+        assert_eq!(shark.read(cx).state.sections[0].tasks, ["Beta", "Alpha"]);
         assert!(shark.read(cx).state.sections[0].collapsed);
         assert!(shark.read(cx).state.sections[2].tasks.is_empty());
         assert_eq!(State::load().sections, shark.read(cx).state.sections);
@@ -290,10 +288,7 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
             "own section header is a live-preview no-op"
         );
         w.pointer_up(header, MouseButton::Left, cx);
-        assert_eq!(
-            shark.read(cx).state.sections[0].tasks,
-            ["Beta", "Alpha"]
-        );
+        assert_eq!(shark.read(cx).state.sections[0].tasks, ["Beta", "Alpha"]);
     })
     .unwrap();
     cx.update_window(window, |_, w, cx| {

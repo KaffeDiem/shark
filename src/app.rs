@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(crate) mod agent_settings;
 mod app_switcher;
 mod ask;
 mod attach;
@@ -57,11 +58,11 @@ pub(crate) mod repo_settings;
 mod run;
 mod sidebar;
 mod storage;
+mod task;
+mod task_picker;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
 mod usage;
-mod task;
-mod task_picker;
 
 use crate::features::{Feature, FeatureFocus, differ, git as git_feature};
 use crate::ui::*;
@@ -874,26 +875,18 @@ impl Render for Shark {
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &NewTask, w, cx| this.new_empty_task(w, cx)))
-            .on_action(cx.listener(|this, _: &NewTaskFromBranch, w, cx| {
-                this.new_task_default(w, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ArchiveTask, w, cx| this.archive(false, w, cx)))
             .on_action(
-                cx.listener(|this, _: &ForceArchiveTask, w, cx| this.archive(true, w, cx)),
+                cx.listener(|this, _: &NewTaskFromBranch, w, cx| this.new_task_default(w, cx)),
             )
+            .on_action(cx.listener(|this, _: &ArchiveTask, w, cx| this.archive(false, w, cx)))
+            .on_action(cx.listener(|this, _: &ForceArchiveTask, w, cx| this.archive(true, w, cx)))
             .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
             .on_action(
                 cx.listener(|this, _: &CycleOpenApp, w, cx| this.cycle_open_app(false, w, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &OpenTaskPicker, w, cx| {
-                    this.open_task_picker(w, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &OpenTaskPicker, w, cx| this.open_task_picker(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
-            .on_action(cx.listener(|this, _: &AddRepoToTask, w, cx| {
-                this.pick_repo_for_task(w, cx)
-            }))
+            .on_action(cx.listener(|this, _: &AddRepoToTask, w, cx| this.pick_repo_for_task(w, cx)))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowUsage, w, cx| this.show_usage(w, cx)))

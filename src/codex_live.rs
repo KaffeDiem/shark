@@ -1,7 +1,7 @@
 //! QA against the real `codex app-server`: `cargo test codex_live -- --ignored --test-threads=1`.
 //! Each test uses a ChatGPT subscription turn or two; prompts are kept tiny.
-use crate::harness::{self, Harness, Ev};
 use crate::git;
+use crate::harness::{self, Ev, Harness};
 use crate::state::{Repo, Task};
 use gpui_kit::base::async_util::Receiver;
 use std::{

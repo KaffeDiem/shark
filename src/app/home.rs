@@ -152,7 +152,7 @@ pub(super) struct HomeRow {
 impl Shark {
     /// cmd-n: an agent with an empty conversation.
     pub(super) fn new_empty_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_task(None, None, window, cx)
+        self.new_task(None, None, None, window, cx)
     }
 
     /// The branch and PR dialog on the repos of the last one, with Home's typed prompt as the
@@ -388,7 +388,101 @@ impl Shark {
             }
             return;
         }
-        self.new_task((!text.is_empty()).then_some(text), None, window, cx);
+        let (agent, prompt) = agent_prompt(&text, &self.state.agents);
+        if let Some(slug) = agent {
+            let slug = slug.to_string();
+            let prompt = prompt.to_string();
+            self.home
+                .prompt
+                .update(cx, |p, cx| p.set_value("", window, cx));
+            self.start_agent_task(&slug, prompt, window, cx);
+        } else {
+            self.new_task((!text.is_empty()).then_some(text), None, None, window, cx);
+        }
+    }
+
+    pub(super) fn prefill_agent_task(
+        &mut self,
+        slug: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        self.enter_home(window, cx);
+        if self.home.asking {
+            self.toggle_ask_mode(window, cx);
+        }
+        self.home.prompt.update(cx, |p, cx| {
+            p.set_value(format!("@{slug} "), window, cx);
+            p.focus(window, cx);
+        });
+    }
+
+    fn start_agent_task(
+        &mut self,
+        slug: &str,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
+            return;
+        };
+        let link = crate::state::AgentLink {
+            slug: agent.slug.clone(),
+            name: agent.name,
+            instructions: agent.instructions,
+            siblings: Vec::new(),
+        };
+        let repos: Vec<_> = self
+            .state
+            .repos
+            .iter()
+            .filter(|r| agent.repos.contains(&r.name))
+            .cloned()
+            .collect();
+        let first = (!prompt.is_empty()).then_some(prompt);
+        if repos.is_empty() {
+            self.new_task(first, None, Some(link), window, cx);
+            return;
+        }
+        let title = first
+            .as_deref()
+            .map(crate::chat::title_of)
+            .unwrap_or_default();
+        let title_slug = crate::state::slug(&title);
+        let prefix = format!(
+            "{slug}/{}",
+            if title_slug.is_empty() {
+                "task"
+            } else {
+                &title_slug
+            }
+        );
+        let sea = crate::state::task_name(interaction::now_ms(), |sea| {
+            let name = format!("{prefix}-{sea}").replace('/', "-");
+            self.creating.contains(&name)
+                || self.task(&name).is_some()
+                || tasks_dir().join(&name).exists()
+                || crate::transcript::transcript_path(&name).exists()
+        });
+        let branch = format!("{prefix}-{sea}");
+        let repos = repos
+            .into_iter()
+            .map(|repo| (repo, branch.clone()))
+            .collect();
+        self.create_task_on(
+            branch,
+            repos,
+            vec![],
+            vec![],
+            None,
+            first,
+            title,
+            Some(link),
+            window,
+            cx,
+        );
     }
 
     /// A task was created with `first` as its first message: clear the prompt if it
@@ -590,6 +684,24 @@ impl Shark {
         v_flex()
             .gap_2()
             .child(div().text_base().text_color(theme.foreground).child(title))
+            .when(!self.home.asking && !self.state.agents.is_empty(), |d| {
+                d.child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(self.state.agents.iter().map(|agent| {
+                            let slug = agent.slug.clone();
+                            Self::chip(
+                                SharedString::from(format!("home-agent-{slug}")),
+                                super::sidebar::section_icon(&agent.icon),
+                                agent.name.clone(),
+                            )
+                            .on_click(
+                                cx.listener(move |s, _, w, cx| s.prefill_agent_task(&slug, w, cx)),
+                            )
+                        })),
+                )
+            })
             .child(
                 div()
                     .key_context("HomePrompt")
@@ -1083,5 +1195,48 @@ mod tests {
         assert_eq!(bucket(0, &Attn::Unread, None), (Bucket::Unread, None));
         assert_eq!(bucket(0, &Attn::None, None), (Bucket::Idle, None));
         assert!(Bucket::Needs < Bucket::Running && Bucket::Unread < Bucket::Idle);
+    }
+}
+
+/// Only a registered leading mention starts an agent task; unknown mentions remain text.
+fn agent_prompt<'a>(text: &'a str, agents: &[crate::state::Agent]) -> (Option<&'a str>, &'a str) {
+    let Some(mention) = text.strip_prefix('@') else {
+        return (None, text);
+    };
+    let end = mention.find(char::is_whitespace).unwrap_or(mention.len());
+    let slug = &mention[..end];
+    if agents.iter().any(|a| a.slug == slug) {
+        (Some(slug), mention[end..].trim_start())
+    } else {
+        (None, text)
+    }
+}
+
+#[cfg(test)]
+mod agent_prompt_tests {
+    use super::agent_prompt;
+
+    #[test]
+    fn known_mentions_start_tasks_and_unknown_mentions_stay_text() {
+        let agents = vec![crate::state::Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            icon: "bot".into(),
+            instructions: String::new(),
+            repos: vec![],
+            model: None,
+            effort: None,
+            ..Default::default()
+        }];
+        assert_eq!(
+            agent_prompt("@designer fix x", &agents),
+            (Some("designer"), "fix x")
+        );
+        assert_eq!(agent_prompt("@nobody x", &agents), (None, "@nobody x"));
+        assert_eq!(agent_prompt("@designer", &agents), (Some("designer"), ""));
+        assert_eq!(
+            agent_prompt("hello @designer", &agents),
+            (None, "hello @designer")
+        );
     }
 }

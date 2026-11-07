@@ -1,5 +1,5 @@
 use crate::proc::{finish, finish_bytes};
-use crate::state::{Attachment, Repo, Task, TaskRepo};
+use crate::state::{AgentLink, Attachment, Repo, Task, TaskRepo};
 mod changes;
 mod copy;
 pub mod history;
@@ -153,7 +153,7 @@ pub fn create_task(
     branch: &str,
     repos: &[(Repo, String)],
 ) -> Result<Task, String> {
-    create_task_with_prs(dir, name, branch, repos, &[], &[])
+    create_task_with_prs(dir, name, branch, repos, &[], &[], "", None)
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +165,7 @@ pub struct PullRequest {
 
 /// PR selections use fresh local review branches, preserving colleagues' branches. `parents`
 /// `(repo, branch)` stack a repo's new branch on another branch: it starts there and targets it.
+#[allow(clippy::too_many_arguments)]
 pub fn create_task_with_prs(
     dir: &Path,
     name: &str,
@@ -172,6 +173,8 @@ pub fn create_task_with_prs(
     repos: &[(Repo, String)],
     prs: &[(String, PullRequest)],
     parents: &[(String, String)],
+    title: &str,
+    agent: Option<AgentLink>,
 ) -> Result<Task, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
@@ -195,8 +198,7 @@ pub fn create_task_with_prs(
     })
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?)
-        .map_err(|e| e.to_string())?;
+    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?).map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let root_identity = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
     let attempts = crate::proc::par_map(repos.iter().zip(&plans), |((r, b), p)| {
@@ -213,6 +215,8 @@ pub fn create_task_with_prs(
             .map(|(result, _)| result.clone())
             .collect::<Result<Vec<_>, _>>()?;
         let mut ws = Task {
+            title: title.into(),
+            agent,
             name: name.into(),
             branch: branch.into(),
             repos: done,
@@ -240,11 +244,16 @@ pub fn create_task_with_prs(
 
 /// An agent with no repositories yet: its directory, root docs and first chat, in Plan mode.
 /// Nothing is left behind on failure.
-pub fn create_empty_task(dir: &Path, name: &str, title: &str) -> Result<Task, String> {
-    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?)
-        .map_err(|e| e.to_string())?;
+pub fn create_empty_task(
+    dir: &Path,
+    name: &str,
+    title: &str,
+    agent: Option<AgentLink>,
+) -> Result<Task, String> {
+    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?).map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut ws = Task {
+        agent,
         name: name.into(),
         title: title.into(),
         branch: name.into(),
@@ -1271,42 +1280,47 @@ fn listed(repo: &str) -> String {
 }
 
 fn header(ws: &Task) -> String {
-    if ws.repos.is_empty() {
-        return format!(
+    let mut s = if ws.repos.is_empty() {
+        format!(
             "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
             ws.name
+        )
+    } else {
+        let first = ws
+            .repos
+            .first()
+            .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
+        let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
+        let mut s = format!(
+            "# Task `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
+            ws.name,
+            match shared {
+                true => format!(" on branch `{first}`"),
+                false => String::new(),
+            }
         );
-    }
-    let first = ws
-        .repos
-        .first()
-        .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
-    let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
-    let mut s = format!(
-        "# Task `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
-        ws.name,
-        match shared {
-            true => format!(" on branch `{first}`"),
-            false => String::new(),
+        for r in &ws.repos {
+            let on = match shared {
+                true => String::new(),
+                false => format!(" on `{}`", ws.branch_of(r)),
+            };
+            // A PR URL names the GitHub repo, which needn't match the folder.
+            let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
+                .and_then(|o| crate::pr::github_url(&o))
+                .map_or(String::new(), |u| format!(", GitHub {u}"));
+            s += &format!(
+                "{}{}{on} (base `{}`{gh})\n",
+                listed(&r.name),
+                r.src.display(),
+                r.base
+            );
         }
-    );
-    for r in &ws.repos {
-        let on = match shared {
-            true => String::new(),
-            false => format!(" on `{}`", ws.branch_of(r)),
-        };
-        // A PR URL names the GitHub repo, which needn't match the folder.
-        let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
-            .and_then(|o| crate::pr::github_url(&o))
-            .map_or(String::new(), |u| format!(", GitHub {u}"));
-        s += &format!(
-            "{}{}{on} (base `{}`{gh})\n",
-            listed(&r.name),
-            r.src.display(),
-            r.base
-        );
+        s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\n";
+        s
+    };
+    if let Some(agent) = &ws.agent {
+        s += &format!("## Agent: {}\n\n{}\n\n", agent.name, agent.instructions);
     }
-    s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\n";
     s
 }
 

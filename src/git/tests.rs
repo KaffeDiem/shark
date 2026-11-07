@@ -467,7 +467,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     let picked = [(repo.clone(), "pr/7".into())];
     let prs = [(repo.name.clone(), pr.clone())];
     let dir = root.join("ws/review");
-    let ws = create_task_with_prs(&dir, "review", "pr/7", &picked, &prs, &[]).unwrap();
+    let ws = create_task_with_prs(&dir, "review", "pr/7", &picked, &prs, &[], "", None).unwrap();
     let wt = dir.join("api");
     assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
     assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
@@ -482,10 +482,19 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     );
     let collision = root.join("ws/collision");
     assert!(
-        create_task_with_prs(&collision, "collision", "pr/7", &picked, &prs, &[])
-            .err()
-            .unwrap()
-            .contains("already exists")
+        create_task_with_prs(
+            &collision,
+            "collision",
+            "pr/7",
+            &picked,
+            &prs,
+            &[],
+            "",
+            None
+        )
+        .err()
+        .unwrap()
+        .contains("already exists")
     );
     assert!(!collision.exists());
     assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
@@ -505,7 +514,9 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
             "pr/404",
             &[(repo.clone(), "pr/404".into())],
             &missing,
-            &[]
+            &[],
+            "",
+            None
         )
         .is_err()
     );
@@ -517,7 +528,17 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
         (other, "blocked/child".into()),
     ];
     assert!(
-        create_task_with_prs(&failed, "rollback", "review-again", &picked, &prs, &[]).is_err()
+        create_task_with_prs(
+            &failed,
+            "rollback",
+            "review-again",
+            &picked,
+            &prs,
+            &[],
+            "",
+            None
+        )
+        .is_err()
     );
     assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
     assert_eq!(review_pr_url(&repo.path, "review-again"), None);
@@ -587,6 +608,8 @@ fn review_base_refresh_follows_target_and_preserves_worktree() {
         &[(repo.clone(), "review-7".into())],
         &[(repo.name.clone(), pr.clone())],
         &[],
+        "",
+        None,
     )
     .unwrap();
     let wt = dir.join("api");
@@ -675,6 +698,8 @@ fn stacked_diff_uses_target_merge_base_and_preserves_index() {
         &on_branch(std::slice::from_ref(&repo), "child"),
         &[],
         &[("api".into(), "parent".into())],
+        "",
+        None,
     )
     .unwrap();
     let wt = dir.join("api");
@@ -1020,6 +1045,8 @@ fn stacks_new_branches_on_a_parent() {
             &on_branch(&[api.clone(), web.clone()], &name),
             &[],
             &parents,
+            "",
+            None,
         )
         .unwrap();
         assert_eq!(head(&dir.join("api")), tip, "{parent}");
@@ -1045,7 +1072,7 @@ fn stacks_new_branches_on_a_parent() {
         let dir = root.join("ws").join(name);
         let parents = [("api".to_string(), parent.to_string())];
         let picked = on_branch(&[web.clone(), api.clone()], name);
-        let err = create_task_with_prs(&dir, name, name, &picked, &[], &parents)
+        let err = create_task_with_prs(&dir, name, name, &picked, &[], &parents, "", None)
             .err()
             .unwrap();
         assert!(err.contains(want), "{err}");
@@ -1496,7 +1523,7 @@ fn empty_task_says_no_repositories_are_attached() {
     let root = std::env::temp_dir().join(format!("shark-empty-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let dir = root.join("agent-1");
-    let ws = create_empty_task(&dir, "agent-1", "Plan it").unwrap();
+    let ws = create_empty_task(&dir, "agent-1", "Plan it", None).unwrap();
     assert_eq!(
         (ws.branch.as_str(), ws.title.as_str()),
         ("agent-1", "Plan it")
@@ -1509,7 +1536,7 @@ fn empty_task_says_no_repositories_are_attached() {
         assert!(!text.contains("worktree"), "{text}");
     }
     fs::write(dir.join("keep"), "x").unwrap();
-    assert!(create_empty_task(&dir, "agent-1", "").is_err());
+    assert!(create_empty_task(&dir, "agent-1", "", None).is_err());
     assert_eq!(fs::read_to_string(dir.join("keep")).unwrap(), "x");
     // Nothing of a repo to clean up, and no worktree stops it.
     fs::remove_file(dir.join("keep")).unwrap();
@@ -1526,7 +1553,7 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn empty_agent(root: &Path, name: &str) -> (Task, PathBuf) {
     let dir = root.join("ws").join(name);
-    (create_empty_task(&dir, name, name).unwrap(), dir)
+    (create_empty_task(&dir, name, name, None).unwrap(), dir)
 }
 
 /// The fresh path takes the branch and base it's given, and the first repo's branch becomes the
@@ -1611,9 +1638,7 @@ fn fresh_attach_rolls_back_only_what_it_made() {
     // The root docs can't be written.
     fs::remove_file(dir.join("AGENTS.md")).unwrap();
     fs::create_dir(dir.join("AGENTS.md")).unwrap();
-    let e = add_to_task(&ws, &dir, &web, "b", Some(""))
-        .err()
-        .unwrap();
+    let e = add_to_task(&ws, &dir, &web, "b", Some("")).err().unwrap();
     assert!(!e.message.is_empty() && !e.preserved);
     assert!(!dir.join("web").exists(), "its worktree went");
     assert!(!has_ref(&web.path, "refs/heads/b"), "its branch went");
@@ -1639,7 +1664,7 @@ fn find_attachment_tells_states_apart() {
     let name = format!("find-{}", std::process::id());
     let dir = crate::state::tasks_dir().join(&name);
     let _ = fs::remove_dir_all(&dir);
-    let ws = create_empty_task(&dir, &name, &name).unwrap();
+    let ws = create_empty_task(&dir, &name, &name, None).unwrap();
     let a = Attachment::fresh(&api, "feat", "");
     assert!(matches!(find_attachment(&ws, &a), Found::Nothing));
 
@@ -1678,6 +1703,12 @@ fn find_attachment_tells_states_apart() {
         panic!("the finished worktree");
     };
     assert_eq!((found.name.as_str(), found.base.as_str()), ("api", "main"));
+    let doc = dir.join("AGENTS.md");
+    let current = fs::read_to_string(&doc).unwrap();
+    for heading in ["Workspace", "Task"] {
+        fs::write(&doc, current.replacen("# Task", &format!("# {heading}"), 1)).unwrap();
+        assert!(matches!(find_attachment(&ws, &a), Found::Worktree(_)));
+    }
     let other = Attachment::fresh(&api, "other", "");
     assert!(matches!(find_attachment(&ws, &other), Found::Unclear(_)));
     // Git keeps the source's registration even if the directory now contains another repository.
@@ -1688,4 +1719,29 @@ fn find_attachment_tells_states_apart() {
     assert!(matches!(find_attachment(&ws, &a), Found::Unclear(_)));
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn root_headers_include_agent_instructions_with_and_without_repos() {
+    let mut task = Task {
+        name: "design".into(),
+        branch: "design/one".into(),
+        agent: Some(AgentLink {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            instructions: "Always use Mobbin.".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(header(&task).contains("## Agent: Designer\n\nAlways use Mobbin."));
+    task.repos.push(TaskRepo {
+        name: "api".into(),
+        src: "/missing".into(),
+        base: "main".into(),
+        branch: None,
+    });
+    let text = header(&task);
+    assert!(text.contains("## Agent: Designer\n\nAlways use Mobbin."));
+    assert!(text.find("- `api/`: worktree of ").unwrap() < text.find("## Agent:").unwrap());
 }

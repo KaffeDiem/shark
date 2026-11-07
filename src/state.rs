@@ -21,6 +21,8 @@ pub struct State {
     pub repos: Vec<Repo>,
     #[serde(rename = "workspaces")]
     pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<Agent>,
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
@@ -138,6 +140,8 @@ impl RepoSettings {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Section {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub name: String,
     /// Lucide icon name from `app::sidebar::SECTION_ICONS`, e.g. `folder`.
     pub icon: String,
@@ -187,8 +191,42 @@ pub struct Repo {
     pub path: PathBuf,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Agent {
+    pub slug: String,
+    pub name: String,
+    pub icon: String,
+    pub instructions: String,
+    pub repos: Vec<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct AgentLink {
+    pub slug: String,
+    pub name: String,
+    pub instructions: String,
+    #[serde(default)]
+    pub siblings: Vec<Sibling>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Sibling {
+    pub title: String,
+    pub branch: String,
+    pub dirs: Vec<String>,
+    pub files: Vec<String>,
+}
+
+pub fn agent_skills_dir(slug: &str) -> PathBuf {
+    support_dir().join("agents").join(slug).join("skills")
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentLink>,
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
     pub last_interacted_at: Option<u64>,
@@ -267,6 +305,7 @@ fn diff_closed_by_default() -> bool {
 impl Default for Task {
     fn default() -> Self {
         Self {
+            agent: None,
             last_interacted_at: None,
             name: String::new(),
             title: String::new(),
@@ -427,6 +466,7 @@ pub const NEW_TASK: &str = "New agent";
 /// The key prefix of a repository in `Task::context`. A session reads these from the root
 /// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
 pub const REPO_CONTEXT: &str = "repo:";
+pub const AGENT_CONTEXT: &str = "agent:";
 
 /// The key prefix of a Linear issue in `Task::context`, before its UUID. Unlike repositories
 /// these are in no root doc, so every session gets them with its first normal turn.
@@ -641,6 +681,23 @@ pub fn task_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
         .expect("numbers outlast the agents")
 }
 
+/// A short, branch-safe name shared by agent identities and task titles.
+pub fn slug(source: &str) -> String {
+    let mut slug = String::new();
+    for word in source
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        if slug.len() + word.len() > 40 {
+            break;
+        }
+        slug += &word.to_ascii_lowercase();
+        slug.push('-');
+    }
+    slug.pop();
+    slug
+}
+
 impl Task {
     pub fn dir(&self) -> PathBuf {
         tasks_dir().join(&self.name)
@@ -684,17 +741,13 @@ impl Task {
             None if self.title == NEW_TASK => "",
             None => &title,
         };
-        let mut slug = String::new();
-        for w in (source.split(|c: char| !c.is_ascii_alphanumeric())).filter(|w| !w.is_empty()) {
-            if slug.len() + w.len() > 40 {
-                break;
-            }
-            slug += &w.to_ascii_lowercase();
-            slug.push('-');
-        }
-        match slug.is_empty() {
+        let title = slug(source);
+        match title.is_empty() {
             true => self.name.clone(),
-            false => slug + self.name.strip_prefix("agent-").unwrap_or(&self.name),
+            false => format!(
+                "{title}-{}",
+                self.name.strip_prefix("agent-").unwrap_or(&self.name)
+            ),
         }
     }
 
@@ -702,7 +755,7 @@ impl Task {
     /// `repo:<name>` for each repository, `issue:<uuid>` for each attached issue. A chat gets what
     /// it hasn't received (`ChatMeta::delivered`) with its next normal message.
     pub fn context(&self) -> BTreeMap<String, ContextNote> {
-        (self.repos.iter())
+        let mut notes: BTreeMap<_, _> = (self.repos.iter())
             .map(|r| {
                 let rules = crate::git::rules_file(&self.dir().join(&r.name))
                     .map_or(String::new(), |f| format!(" Read {}/{f} for its rules.", r.name));
@@ -720,7 +773,21 @@ impl Task {
                 )
             })
             .chain(crate::linear::context_notes(&self.linear, &self.issues))
-            .collect()
+            .collect();
+        if let Some(agent) = &self.agent {
+            let text = format!(
+                "[shark] Your instructions as {} changed: {}",
+                agent.name, agent.instructions
+            );
+            notes.insert(
+                format!("{AGENT_CONTEXT}{}", agent.slug),
+                ContextNote {
+                    fingerprint: crate::files::fingerprint(&agent.instructions),
+                    text,
+                },
+            );
+        }
+        notes
     }
 
     /// Its repos as (name, worktree path).
@@ -1025,8 +1092,16 @@ impl State {
     pub fn defaults_for(&self, ws: &Task) -> (String, Option<String>) {
         let valid = |m: &String| crate::models::MODELS.contains(&m.as_str());
         let mut settings = (ws.repos.iter()).filter_map(|r| self.repo_settings.get(&r.name));
-        let model = settings.clone().find_map(|s| s.model.clone().filter(valid));
-        let effort = settings.find_map(|s| s.effort.clone());
+        let agent = ws
+            .agent
+            .as_ref()
+            .and_then(|link| self.agents.iter().find(|a| a.slug == link.slug));
+        let model = agent
+            .and_then(|a| a.model.clone().filter(valid))
+            .or_else(|| settings.clone().find_map(|s| s.model.clone().filter(valid)));
+        let effort = agent
+            .and_then(|a| a.effort.clone())
+            .or_else(|| settings.find_map(|s| s.effort.clone()));
         (
             model.unwrap_or_else(|| self.new_model()),
             effort.or(self.last_effort.clone()),
@@ -1150,10 +1225,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_defaults_and_instruction_context() {
+        let mut state = State::default();
+        state.repo_settings.insert(
+            "api".into(),
+            RepoSettings {
+                model: Some(crate::models::MODELS[1].into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        state.agents.push(Agent {
+            slug: "designer".into(),
+            model: Some(crate::models::MODELS[0].into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        });
+        let mut task = Task {
+            agent: Some(AgentLink {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                instructions: "Use Mobbin".into(),
+                ..Default::default()
+            }),
+            repos: vec![TaskRepo {
+                name: "api".into(),
+                src: "/missing".into(),
+                base: "main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            state.defaults_for(&task),
+            (crate::models::MODELS[0].into(), Some("high".into()))
+        );
+        state.agents[0].model = Some("invalid model".into());
+        state.agents[0].effort = None;
+        assert_eq!(
+            state.defaults_for(&task),
+            (crate::models::MODELS[1].into(), Some("low".into()))
+        );
+        let before = task.context()["agent:designer"].clone();
+        assert!(before.text.contains("Use Mobbin"));
+        task.agent.as_mut().unwrap().name = "Design".into();
+        assert_eq!(
+            task.context()["agent:designer"].fingerprint,
+            before.fingerprint
+        );
+        task.agent.as_mut().unwrap().instructions = "Read the manual".into();
+        assert_ne!(
+            task.context()["agent:designer"].fingerprint,
+            before.fingerprint
+        );
+        assert_eq!(slug("  Design / UI! "), "design-ui");
+        assert_eq!(slug("!!!"), "");
+    }
+
+    #[test]
     fn pre_rename_state_round_trips_unchanged() {
         let saved = include_str!("../tests/fixtures/pre-task-rename-state.json");
         let state: State = serde_json::from_str(saved).unwrap();
         assert_eq!(state.tasks[0].name, "agent-123");
+        assert!(state.tasks[0].agent.is_none());
         assert_eq!(state.sections[0].tasks, ["agent-123"]);
         assert_eq!(serde_json::to_string_pretty(&state).unwrap(), saved);
     }
@@ -1729,9 +1863,7 @@ mod tests {
             ws.diff_closed = closed;
             let saved = serde_json::to_string(&ws).unwrap();
             assert_eq!(
-                serde_json::from_str::<Task>(&saved)
-                    .unwrap()
-                    .diff_closed,
+                serde_json::from_str::<Task>(&saved).unwrap().diff_closed,
                 closed
             );
         }
@@ -1742,6 +1874,7 @@ mod tests {
         let mut st = State {
             tasks: ["a", "b", "c", "d"].map(task).into(),
             sections: vec![Section {
+                agent: None,
                 name: "S".into(),
                 icon: "folder".into(),
                 collapsed: false,
@@ -1749,12 +1882,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let names = |st: &State| {
-            st.tasks
-                .iter()
-                .map(|w| w.name.clone())
-                .collect::<Vec<_>>()
-        };
+        let names = |st: &State| st.tasks.iter().map(|w| w.name.clone()).collect::<Vec<_>>();
         st.drop_task("a", "b"); // down within the ungrouped: takes b's slot
         assert_eq!(names(&st), ["b", "a", "c", "d"]);
         st.drop_task("a", "b"); // and back up
@@ -1781,6 +1909,7 @@ mod tests {
         let mut st = State {
             tasks: vec![task("a"), task("b")],
             sections: vec![Section {
+                agent: None,
                 name: "S".into(),
                 icon: "folder".into(),
                 collapsed: false,
@@ -1849,6 +1978,7 @@ mod tests {
     #[test]
     fn move_to_section_is_idempotent_and_ungroups() {
         let section = |n: &str, ws: &[&str]| Section {
+            agent: None,
             name: n.into(),
             icon: "folder".into(),
             collapsed: false,

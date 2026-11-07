@@ -1,6 +1,6 @@
 //! Ask Shark: a question to claude about Shark, answered below Home's prompt.
 use super::*;
-use crate::harness::{self, Harness, Ev};
+use crate::harness::{self, Ev, Harness};
 use gpui_kit::component::text::TextViewState;
 
 const ASK_PROMPT: &str = "You answer questions about Shark, a macOS app for running Claude Code \

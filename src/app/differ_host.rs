@@ -97,11 +97,7 @@ impl Shark {
             self.active.clone(),
             self.differ.read(cx).edit_target(path, window, cx),
         ) {
-            self.differ_event(
-                &DifferEvent::EditWorkingCopy { task, path },
-                window,
-                cx,
-            );
+            self.differ_event(&DifferEvent::EditWorkingCopy { task, path }, window, cx);
         }
     }
 
@@ -166,9 +162,7 @@ impl Shark {
                     self.open_path(path.clone(), window, cx);
                 }
             }
-            DifferEvent::OpenChat { task, chat }
-                if self.active.as_ref() == Some(task) =>
-            {
+            DifferEvent::OpenChat { task, chat } if self.active.as_ref() == Some(task) => {
                 if let Some(ix) = self
                     .active_task()
                     .and_then(|ws| ws.chats.iter().position(|m| Some(&m.id) == chat.as_ref()))
@@ -177,9 +171,7 @@ impl Shark {
                 }
                 self.show(Tab::Chat, window, cx);
             }
-            DifferEvent::EditWorkingCopy { task, path }
-                if self.active.as_ref() == Some(task) =>
-            {
+            DifferEvent::EditWorkingCopy { task, path } if self.active.as_ref() == Some(task) => {
                 let (task, path) = (task.clone(), path.clone());
                 if self
                     .differ
