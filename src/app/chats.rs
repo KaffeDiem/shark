@@ -154,7 +154,7 @@ impl Shark {
                             this.unread.insert(id.clone());
                         }
                         this.refresh_home(Some(&name), cx);
-                        this.turn_done(&name, cx);
+                        this.turn_done(&name, &id, cx);
                         if let Some(ws) = this.ws(&name) {
                             let dir = ws.dir();
                             let c = chat.read(cx);
@@ -217,6 +217,24 @@ impl Shark {
         }
     }
 
+    /// Notification targets use saved identities: tabs may have moved since delivery.
+    pub(crate) fn open_notification(
+        &mut self,
+        name: &str,
+        instance: &str,
+        chat: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if instance.is_empty() || self.ws(name).is_none_or(|ws| ws.instance_id != instance) {
+            return notify_err(window, cx, "The selected agent is no longer available");
+        }
+        self.open_workspace_then(name, chat, window, cx, |s, window, cx| {
+            let Some(ws) = s.active_ws() else { return };
+            s.select_chat(ws.active_chat, window, cx);
+        });
+    }
+
     /// Shows the workspace's `ix`th chat tab.
     pub(super) fn select_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws_mut() else {
@@ -231,9 +249,6 @@ impl Shark {
         }
         let ws = self.active_ws().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
-        if self.unread.remove(&meta.id) {
-            self.refresh_attention(cx); // the dock badge counts it
-        }
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
         }
@@ -345,7 +360,7 @@ impl Shark {
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
-        let Some(id) = self.active_ws().map(Workspace::next_chat_id) else {
+        let Some(id) = self.active_ws_mut().map(Workspace::next_chat_id) else {
             return notify_err(window, cx, "Open an agent first");
         };
         let meta = ChatMeta {

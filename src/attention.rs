@@ -225,7 +225,7 @@ impl Shark {
         }
     }
 
-    pub(crate) fn turn_done(&mut self, name: &str, cx: &mut Context<Self>) {
+    pub(crate) fn turn_done(&mut self, name: &str, chat: &str, cx: &mut Context<Self>) {
         // Home covers the open workspace: its turns end unseen.
         let shown = self.active.as_deref() == Some(name) && !self.home_shown();
         if !shown {
@@ -236,7 +236,7 @@ impl Shark {
             }
         }
         if !shown || !self.attn.window_active {
-            notify(&self.ws_title(name), "The agent finished its turn");
+            self.notify(name, Some(chat), "The agent finished its turn", cx);
         }
         self.refresh_attention(cx);
     }
@@ -265,7 +265,7 @@ impl Shark {
                 && prev != &needs
                 && !on_screen
             {
-                notify(&self.ws_title(name), l);
+                self.notify(name, None, l, cx);
             }
         }
         set_badge(count);
@@ -320,31 +320,41 @@ fn set_badge(n: usize) {
     BADGE.store(n, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// An OS notification. UNUserNotificationCenter throws in a binary without a bundle (`cargo run`),
-/// so this goes through osascript: it shows as Script Editor's, and a failure is only lost.
-/// Text travels as arguments, never inside the script.
-#[cfg(not(test))]
-fn notify(title: &str, body: &str) {
-    let (title, body) = (format!("shark · {title}"), body.to_string());
-    std::thread::spawn(move || {
-        let script = [
-            "-e",
-            "on run argv",
-            "-e",
-            "display notification (item 2 of argv) with title (item 1 of argv)",
-            "-e",
-            "end run",
-        ];
-        let args: Vec<&str> = script
-            .into_iter()
-            .chain([title.as_str(), body.as_str()])
-            .collect();
-        let _ = crate::git::cmd_bounded(std::path::Path::new("/"), "osascript", &args, 10);
+/// GPUI owns the native notification delegate and safely skips unbundled development builds.
+pub(crate) fn init(window: &Window, cx: &mut Context<Shark>) {
+    let (window, shark) = (window.window_handle(), cx.entity().downgrade());
+    cx.on_system_notification_response(move |response, cx| {
+        let Ok((instance, name, chat)) =
+            serde_json::from_str::<(String, String, Option<String>)>(&response.tag)
+        else {
+            return;
+        };
+        cx.dismiss_system_notification(&response.tag);
+        cx.activate(true);
+        let _ = window.update(cx, |_, window, cx| {
+            window.activate_window();
+            shark.update(cx, |s, cx| {
+                s.open_notification(&name, &instance, chat, window, cx)
+            })
+        });
     });
 }
 
-#[cfg(test)]
-fn notify(_: &str, _: &str) {}
+impl Shark {
+    fn notify(&self, name: &str, chat: Option<&str>, body: &str, cx: &App) {
+        let Some(ws) = self.state.workspaces.iter().find(|ws| ws.name == name) else {
+            return;
+        };
+        cx.show_system_notification(SystemNotification {
+            tag: serde_json::to_string(&(&ws.instance_id, name, chat))
+                .expect("notification identity")
+                .into(),
+            title: format!("shark · {}", ws.display_title()).into(),
+            body: body.to_string().into(),
+            actions: vec![],
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {
