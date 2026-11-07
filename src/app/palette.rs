@@ -70,6 +70,13 @@ pub(super) const COMMANDS: &[Row] = &[
         "add repo folder git",
     ),
     Row(
+        "Repository settings…",
+        IconName::FolderGit2,
+        None,
+        "repos scripts setup run archive model order",
+        Some(|s, w, cx| crate::settings::open_repos(&s.state, w, cx)),
+    ),
+    Row(
         "Start from Linear issue…",
         IconName::Plus,
         None,

@@ -635,7 +635,7 @@ pub(super) fn base_hint(ws: &Workspace) -> String {
     }
 }
 
-/// Right-click menu of a sidebar repo row.
+/// Right-click menu of a repo row in Settings › Repositories.
 pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<Entry> {
     let (name, path) = (repo.name.clone(), repo.path.clone());
     let (settings, picked, p1, p3) = (repo.clone(), vec![name.clone()], path.clone(), path.clone());
@@ -651,6 +651,7 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
             IconName::Plus,
             "New agent from this repo…",
             on_shark(cx, move |s, w, cx| {
+                w.close_all_dialogs(cx);
                 s.new_workspace(picked.clone(), None, w, cx)
             }),
         ),
@@ -672,6 +673,7 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
                 IconName::MessageSquare,
                 w.display_title().to_string(),
                 on_shark(cx, move |s, win, cx| {
+                    win.close_all_dialogs(cx);
                     s.attach_form(ws.clone(), vec![repo.name.clone()], win, cx)
                 }),
             )

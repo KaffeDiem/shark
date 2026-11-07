@@ -1,4 +1,4 @@
-//! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
+//! Root view: sidebar of workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent};
 use crate::checkbox::Checkbox;
@@ -53,7 +53,7 @@ mod new_workspace;
 mod palette;
 mod picker;
 mod reorder;
-mod repo_settings;
+pub(crate) mod repo_settings;
 mod run;
 mod sidebar;
 mod storage;

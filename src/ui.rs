@@ -153,7 +153,7 @@ pub(crate) fn side_row(theme: &Theme) -> Div {
         .text_color(theme.muted_foreground)
 }
 
-/// A side pane's group header: "Workspaces", "Repos", "Files".
+/// A side pane's group header: "Workspaces", "Files".
 pub(crate) fn side_header(theme: &Theme, label: &'static str) -> Div {
     div()
         .px_4()

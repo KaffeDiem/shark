@@ -198,7 +198,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 },
                             ));
                         }
-                        checks.push(("repo", w.find(("repo", 0usize)).bounds(), dim));
                         let toolbar_ink = if cx.theme().is_dark() {
                             cx.theme()
                                 .background
