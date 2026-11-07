@@ -193,6 +193,17 @@ impl Shark {
         let differ = cx.new(|cx| Differ::new(differ::Preferences::from(&state), window, cx));
         cx.defer_in(window, move |s, window, cx| {
             s.reconcile_attachments(window, cx);
+            // Settings save while typing; a quit before dialog close can leave older task docs.
+            let changed_agents: Vec<_> = s.state.agents.iter().filter(|agent| {
+                s.state.tasks.iter().any(|task| task.agent.as_ref().is_some_and(|link| {
+                    link.slug == agent.slug && (link.name != agent.name || link.instructions != agent.instructions)
+                }))
+            }).map(|agent| agent.slug.clone()).collect();
+            for slug in changed_agents {
+                if let Err(e) = s.sync_agent(&slug, true, cx) {
+                    notify_err(window, cx, format!("Couldn't refresh agent instructions: {e}"));
+                }
+            }
             s.restore_last_open(window, cx);
             s.check_deps(cx);
             s.usage_polling(window, cx);

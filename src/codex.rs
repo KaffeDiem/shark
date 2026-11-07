@@ -56,7 +56,7 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
         ..Default::default()
     }));
     if !ws.dir().join("AGENTS.md").exists() {
-        crate::git::write_claude_md(ws); // a workspace from before codex chats
+        let _ = crate::git::write_claude_md(ws); // a workspace from before codex chats
     }
     // Also catches skills a pull brought in since the links were last written.
     crate::git::link_skills(ws, &ws.dir());

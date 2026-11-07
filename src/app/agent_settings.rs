@@ -230,10 +230,14 @@ impl Shark {
             crate::ui::dialog(d)
                 .w(px(640.))
                 .child(view.clone())
-                .on_close(move |_, _, cx| {
+                .on_close(move |_, window, cx| {
                     let (gone, slug) = (gone.clone(), slug.clone());
-                    cx.defer(move |cx| {
-                        gone.update(cx, |s, cx| s.sync_agent(&slug, true, cx)).ok();
+                    window.defer(cx, move |window, cx| {
+                        gone.update(cx, |s, cx| {
+                            if let Err(e) = s.sync_agent(&slug, true, cx) {
+                                notify_err(window, cx, format!("Couldn't refresh agent instructions: {e}. Reopen agent settings and close them to retry."));
+                            }
+                        }).ok();
                     });
                 })
         });
@@ -599,9 +603,15 @@ impl Render for AgentSettingsView {
             (
                 s.state.agents.iter().find(|a| a.slug == self.slug).cloned(),
                 s.state.repos.clone(),
+                s.state
+                    .tasks
+                    .iter()
+                    .filter(|task| task.agent.as_ref().is_some_and(|a| a.slug == self.slug))
+                    .map(|task| (task.name.clone(), task.display_title().into_owned()))
+                    .collect::<Vec<_>>(),
             )
         });
-        let (agent, repos) = state.unwrap_or_default();
+        let (agent, repos, tasks) = state.unwrap_or_default();
         let Some(agent) = agent else {
             return div().into_any_element();
         };
@@ -619,6 +629,85 @@ impl Render for AgentSettingsView {
                     }))
             })
             .collect::<Vec<_>>();
+        let open_tasks = v_flex()
+            .gap_2()
+            .child(section(theme, "Open tasks"))
+            .when(tasks.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child("No open tasks"),
+                )
+            })
+            .children(tasks.into_iter().enumerate().map(|(i, (name, title))| {
+                Button::new(("agent-open-task", i))
+                    .ghost()
+                    .small()
+                    .label(title)
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        let shark = this.shark.clone();
+                        w.close_all_dialogs(cx);
+                        shark
+                            .update(cx, |s, cx| s.open_task_named(&name, w, cx))
+                            .ok();
+                    }))
+            }));
+        let history = v_flex()
+            .gap_2()
+            .child(section(theme, "History"))
+            .when(agent.history.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child("No task history yet"),
+                )
+            })
+            .children(agent.history.iter().enumerate().map(|(i, record)| {
+                let status = match record.merged {
+                    Some(true) => "Merged",
+                    Some(false) => "Not merged",
+                    None => "PR state unknown",
+                };
+                let date = i64::try_from(record.at)
+                    .ok()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map_or_else(
+                        || "Date unknown".into(),
+                        |at| {
+                            at.with_timezone(&chrono::Local)
+                                .format("%b %-d, %Y")
+                                .to_string()
+                        },
+                    );
+                v_flex()
+                    .id(("agent-history", i))
+                    .aria_label(format!("{}, {status}, {date}", record.title))
+                    .test_support()
+                    .gap_1()
+                    .py_2()
+                    .when(i > 0, |d| d.border_t_1().border_color(theme.border))
+                    .child(div().text_sm().child(record.title.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{status} · {date}")),
+                    )
+                    .child(h_flex().gap_2().children(record.prs.iter().enumerate().map(
+                        |(j, (repo, url))| {
+                            let url = url.clone();
+                            Button::new(SharedString::from(format!("agent-history-pr-{i}-{j}")))
+                                .ghost()
+                                .xsmall()
+                                .role(Role::Link)
+                                .label(format!("{repo} PR"))
+                                .tooltip(url.clone())
+                                .on_click(move |_, _, cx| cx.open_url(&url))
+                        },
+                    )))
+            }));
         v_flex()
             .id("agent-settings")
             .test_support()
@@ -725,6 +814,8 @@ impl Render for AgentSettingsView {
                             })),
                     ),
             )
+            .child(open_tasks)
+            .child(history)
             .into_any_element()
     }
 }

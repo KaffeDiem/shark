@@ -1,12 +1,17 @@
-//! Creating, opening, growing and deleting agents (`Task` in the code).
+//! Creating, opening, growing and deleting tasks.
 use super::new_task::NewTaskForm;
 use super::*;
 use crate::state::{AgentLink, AttachStage, Sibling};
 
 impl Shark {
-    pub(crate) fn sync_agent(&mut self, slug: &str, docs: bool, cx: &mut Context<Self>) {
+    pub(crate) fn sync_agent(
+        &mut self,
+        slug: &str,
+        docs: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
-            return;
+            return Ok(());
         };
         let tasks: Vec<_> = self
             .state
@@ -15,6 +20,7 @@ impl Shark {
             .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == slug))
             .cloned()
             .collect();
+        let mut errors = vec![];
         for task in &tasks {
             let siblings = tasks
                 .iter()
@@ -33,6 +39,16 @@ impl Shark {
                                 .iter()
                                 .find(|s| s.branch == other.branch && s.dirs == dirs)
                         })
+                        .or_else(|| {
+                            tasks.iter().find_map(|known| {
+                                known
+                                    .agent
+                                    .as_ref()?
+                                    .siblings
+                                    .iter()
+                                    .find(|s| s.branch == other.branch && s.dirs == dirs)
+                            })
+                        })
                         .map(|s| s.files.clone())
                         .unwrap_or_default();
                     Sibling {
@@ -43,19 +59,30 @@ impl Shark {
                     }
                 })
                 .collect();
-            let current = self.task_mut(&task.name).unwrap();
-            current.agent = Some(AgentLink {
-                slug: agent.slug.clone(),
-                name: agent.name.clone(),
-                instructions: agent.instructions.clone(),
-                siblings,
-            });
+            let mut link = task.agent.clone().unwrap();
+            // Instruction snapshots change only once the root docs can deliver them too.
             if docs {
-                git::write_claude_md(current);
+                link.name = agent.name.clone();
+                link.instructions = agent.instructions.clone();
             }
+            link.siblings = siblings;
+            let mut current = task.clone();
+            current.agent = Some(link);
+            if docs && let Err(e) = git::write_claude_md(&current) {
+                errors.push(format!("{}: {e}", task.display_title()));
+                continue;
+            }
+            self.task_mut(&task.name).unwrap().agent = current.agent;
             self.publish_task(&task.name, cx);
         }
-        let _ = self.state.save();
+        if let Err(e) = self.state.save() {
+            errors.push(e.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
     }
 
     pub(crate) fn open_task(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -207,7 +234,7 @@ impl Shark {
                             r.base = new.clone();
                         }
                     }
-                    git::write_claude_md(ws);
+                    let _ = git::write_claude_md(ws);
                 }
                 let _ = self.state.save();
                 self.refresh_diff_if_active(name, cx);
@@ -338,13 +365,18 @@ impl Shark {
         if let Some(agent) = &ws.agent {
             let section = self.ensure_agent_section(&agent.slug, cx);
             self.move_to_section(&name, section, cx);
-            self.sync_agent(&agent.slug, false, cx);
+            let _ = self.sync_agent(&agent.slug, false, cx);
             self.refresh_agent_files(&agent.slug, cx);
         }
         self.open_task_now(self.state.tasks.len() - 1, window, cx);
         self.record_interaction(&name, cx);
+        self.home_prompt_used(
+            first.as_deref(),
+            ws.agent.as_ref().map(|a| a.slug.as_str()),
+            window,
+            cx,
+        );
         let Some(first) = first else { return };
-        self.home_prompt_used(Some(&first), window, cx);
         if let Some(chat) = self.active_chat().cloned() {
             chat.update(cx, |c, cx| c.ask(&first, window, cx));
         }
@@ -392,7 +424,7 @@ impl Shark {
             ws.title = title;
             let agent = ws.agent.as_ref().map(|a| a.slug.clone());
             if let Some(slug) = agent {
-                self.sync_agent(&slug, false, cx);
+                let _ = self.sync_agent(&slug, false, cx);
             }
             let _ = self.state.save();
             cx.notify();
@@ -574,14 +606,23 @@ impl Shark {
                         if let Some(agent) = &ws.agent {
                             let section = s.ensure_agent_section(&agent.slug, cx);
                             s.move_to_section(&name, section, cx);
-                            s.sync_agent(&agent.slug, false, cx);
-                            let current = s.task(&name).unwrap().clone();
-                            if current.agent.as_ref().is_some_and(|a| {
-                                a.name != agent.name || a.instructions != agent.instructions
-                            }) {
-                                // Settings may have changed while the worktrees were created.
-                                git::write_claude_md(&current);
+                            // Settings may have changed while the worktrees were created.
+                            let docs = s
+                                .state
+                                .agents
+                                .iter()
+                                .find(|a| a.slug == agent.slug)
+                                .is_some_and(|a| {
+                                    a.name != agent.name || a.instructions != agent.instructions
+                                });
+                            if let Err(e) = s.sync_agent(&agent.slug, docs, cx) {
+                                notify_err(
+                                    window,
+                                    cx,
+                                    format!("Couldn't refresh agent instructions: {e}"),
+                                );
                             }
+                            let current = s.task(&name).unwrap().clone();
                             s.refresh_agent_files(&agent.slug, cx);
                             ws = current;
                         }
@@ -590,7 +631,12 @@ impl Shark {
                         let deferred = Rc::new(std::cell::Cell::new(false));
                         let (later, setup_ws, key) = (deferred.clone(), ws.clone(), name.clone());
                         s.open_task_then(&name.clone(), window, cx, move |s, window, cx| {
-                            s.home_prompt_used(prompt.as_deref(), window, cx);
+                            s.home_prompt_used(
+                                prompt.as_deref(),
+                                ws.agent.as_ref().map(|a| a.slug.as_str()),
+                                window,
+                                cx,
+                            );
                             let chat = (s.active.as_ref() == Some(&name))
                                 .then(|| s.active_chat().cloned())
                                 .flatten();
@@ -983,7 +1029,7 @@ impl Shark {
         let ws = slot.clone();
         self.record_interaction(&ws.name, cx);
         let _ = self.state.save();
-        git::write_claude_md(&ws);
+        let _ = git::write_claude_md(&ws);
         let changed = (moves.iter())
             .map(|(r, o, n)| format!("`{r}` now targets `{n}` (was `{o}`)"))
             .collect::<Vec<_>>()
@@ -1261,6 +1307,21 @@ impl Shark {
                 .get(name)
                 .map_or(vec![], |g| g.read(cx).merged_branches()),
         };
+        let overview = self.overview_repos(name, cx);
+        let known = overview.is_some_and(|repos| {
+            !repos.is_empty()
+                && repos.len() == ws.repos.len()
+                && ws.repos.iter().all(|expected| {
+                    repos.iter().any(|r| {
+                        r.name == expected.name && r.local.is_ok() && matches!(r.pr, Some(Ok(_)))
+                    })
+                })
+        });
+        let prs: Vec<_> = overview
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.pr().map(|pr| (r.name.clone(), pr.url.clone(), pr.state)))
+            .collect();
         // Its dev servers would run on in a removed worktree: stopped (and waited for) first.
         let run = self.runs.remove(name);
         let jobs = crate::scripts::jobs(&self.state, &ws, crate::scripts::Phase::Archive, None);
@@ -1300,6 +1361,34 @@ impl Shark {
                 }
                 if let Some(e) = scripts {
                     super::run::script_failed(&name, e, window, cx);
+                }
+                if let Ok(deleted) = &result
+                    && let Some(task) = s.task(&name)
+                    && let Some(link) = &task.agent
+                {
+                    let slug = link.slug.clone();
+                    let record = crate::state::TaskRecord {
+                        title: task.display_title().into(),
+                        branch: task.branch.clone(),
+                        prs: prs
+                            .iter()
+                            .map(|(repo, url, _)| (repo.clone(), url.clone()))
+                            .collect(),
+                        merged: if !deleted.is_empty()
+                            || prs
+                                .iter()
+                                .any(|(_, _, state)| *state == sync::PrState::Merged)
+                        {
+                            Some(true)
+                        } else {
+                            known.then_some(false)
+                        },
+                        at: interaction::now_ms(),
+                    };
+                    if let Some(agent) = s.state.agents.iter_mut().find(|a| a.slug == slug) {
+                        agent.history.insert(0, record);
+                        agent.history.truncate(100);
+                    }
                 }
                 s.archived(&name, result, window, cx)
             })
@@ -1353,7 +1442,7 @@ impl Shark {
                     .map(|a| a.slug.clone());
                 self.state.remove_task(name);
                 if let Some(slug) = agent {
-                    self.sync_agent(&slug, false, cx);
+                    let _ = self.sync_agent(&slug, false, cx);
                 }
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));

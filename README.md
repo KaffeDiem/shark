@@ -15,6 +15,8 @@
 <img src="docs/images/hero.png" width="800" alt="A Shark task with two repos: sidebar, a Diff artifact containing its changed-files tree and split diff, and the Features rail">
 
 ## Why Shark
+Create reusable agents in **Settings › Agents**, then start isolated tasks from Home with `@slug <prompt>`. Each agent keeps its instructions, skills, defaults and task history.
+
 <table>
 <tr><td width="50%" valign="top"><b>Multi-repo tasks</b><br>One task gets one git worktree per repo on a shared branch, and its chats work across all of them.<br><br><img src="docs/images/multi-repo.png" alt="The new-task dialog with several repos ticked"></td><td width="50%" valign="top"><b>Review the diff like a PR</b><br>Comment on lines across every repo, send the comments to the agent as one review, and track each until it is addressed.<br><br><img src="docs/images/review.png" alt="Send review listing the pending comment threads and the prompt preview"></td></tr>
 <tr><td width="50%" valign="top"><b>Version-controlled plans</b><br>In plan mode each plan revision is saved and diffed against the last one. Press <code>a</code> to approve and build.<br><br><img src="docs/images/plan-versions.png" alt="The plan pane showing a revised plan with added and removed words marked"></td><td width="50%" valign="top"><b>One git button</b><br>It shows the next step for every repo: commit, push, fix checks, address review, merge.<br><br><img src="docs/images/git-menu.png" alt="The git button and its menu with the next step for each repo"></td></tr>

@@ -1,4 +1,4 @@
-//! Linear issues on an agent: attaching one, its details, and starting an agent from one. An
+//! Linear issues on an task: attaching one, its details, and starting an task from one. An
 //! attachment is reference material: it starts no turn and waits for nothing, and chats hear of
 //! it through `Task::context`. Nothing here writes to Linear.
 use super::attach::ChipCard;
@@ -308,8 +308,8 @@ enum Job {
 /// already on the wire: every timer is a task it owns, so closing it stops them.
 pub(super) struct IssuePicker {
     state: Entity<CommandState>,
-    /// The agent to attach to; None starts a new one.
-    agent: Option<String>,
+    /// The task to attach to; None starts a new one.
+    task: Option<String>,
     /// Why nothing can be asked of Linear; the row to Settings replaces the others.
     blocked: Option<Blocked>,
     /// Lists, cached results and marks belong to this connection.
@@ -423,10 +423,10 @@ impl IssuePicker {
         self.groups().get(at.section)?.1.get(at.row).cloned()
     }
 
-    /// The agent's issues as (UUID, identifier).
+    /// The task's issues as (UUID, identifier).
     fn attached(&self, cx: &App) -> Vec<(String, String)> {
         let shark = self.shark.upgrade();
-        let ws = (self.agent.as_ref())
+        let ws = (self.task.as_ref())
             .zip(shark.as_ref())
             .and_then(|(n, s)| s.read(cx).task(n));
         ws.map_or(vec![], |ws| {
@@ -747,7 +747,7 @@ impl IssuePicker {
             Some(Row::Lookup(t)) => t,
             _ => return,
         };
-        if self.agent.is_none() {
+        if self.task.is_none() {
             return;
         }
         let before = self.marks.len();
@@ -794,8 +794,8 @@ impl IssuePicker {
 
     fn finish(&mut self, snapshots: Vec<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.close_dialog(cx);
-        let agent = self.agent.clone();
-        (self.shark.update(cx, |s, cx| match agent {
+        let task = self.task.clone();
+        (self.shark.update(cx, |s, cx| match task {
             Some(name) => s.attach_issues(name, snapshots, window, cx),
             // Nothing can be marked here, so it's the one.
             None => (snapshots.into_iter()).for_each(|one| s.preview_issue(one, window, cx)),
@@ -817,7 +817,7 @@ impl Render for IssuePicker {
         let query = self.query.trim().to_string();
         let marked = self.marks.len();
         let (nav, close) = (("up down", "Navigate"), ("escape", "Close"));
-        let hints = match (&self.blocked, &self.agent, marked) {
+        let hints = match (&self.blocked, &self.task, marked) {
             (Some(b), ..) => vec![("enter", b.action()), close],
             (_, None, _) => vec![nav, ("enter", "Start"), close],
             (_, _, 0) => vec![nav, ("enter", "Attach"), ("cmd-enter", "Mark"), close],
@@ -924,7 +924,7 @@ impl Render for IssuePicker {
     }
 }
 
-/// The first request of an agent started from an issue: to plan, which is all it can do so far.
+/// The first request of an task started from an issue: to plan, which is all it can do so far.
 fn planning_request(s: &Snapshot) -> String {
     format!(
         "Read the attached Linear issue {} and draft a plan for it. List anything unclear before going further.",
@@ -1192,7 +1192,7 @@ impl Shark {
 
     fn open_issue_picker(
         &mut self,
-        agent: Option<String>,
+        task: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1201,7 +1201,7 @@ impl Shark {
         let shark = cx.entity();
         let picker = cx.new(|cx| IssuePicker {
             state: cx.new(|cx| CommandState::new(window, cx)),
-            agent,
+            task,
             blocked,
             connection,
             query: String::new(),
@@ -1274,7 +1274,7 @@ impl Shark {
         }
     }
 
-    /// Writes `snapshots` off the UI thread; once that worked the agent and its chats have them.
+    /// Writes `snapshots` off the UI thread; once that worked the task and its chats have them.
     fn keep_snapshots(
         &mut self,
         name: String,
@@ -1283,9 +1283,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (agent, kept) = (name.clone(), snapshots.clone());
+        let (task, kept) = (name.clone(), snapshots.clone());
         let write = (cx.background_executor())
-            .spawn(async move { (kept.iter()).try_for_each(|s| linear::put_snapshot(&agent, s)) });
+            .spawn(async move { (kept.iter()).try_for_each(|s| linear::put_snapshot(&task, s)) });
         cx.spawn_in(window, async move |this, cx| {
             let written = write.await;
             this.update_in(cx, |s, window, cx| {
@@ -1395,11 +1395,11 @@ impl Shark {
         ws.issues.retain(|s| IssueRef::from(s) != *r);
         let _ = self.state.save();
         self.publish_task(name, cx);
-        let (agent, r) = (name.to_string(), r.clone());
+        let (task, r) = (name.to_string(), r.clone());
         (cx.background_executor())
             .spawn(async move {
-                // A failure leaves it in the file, unused, until the agent is deleted.
-                let _ = linear::remove_snapshot(&agent, &r);
+                // A failure leaves it in the file, unused, until the task is deleted.
+                let _ = linear::remove_snapshot(&task, &r);
             })
             .detach();
     }

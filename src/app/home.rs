@@ -392,9 +392,6 @@ impl Shark {
         if let Some(slug) = agent {
             let slug = slug.to_string();
             let prompt = prompt.to_string();
-            self.home
-                .prompt
-                .update(cx, |p, cx| p.set_value("", window, cx));
             self.start_agent_task(&slug, prompt, window, cx);
         } else {
             self.new_task((!text.is_empty()).then_some(text), None, None, window, cx);
@@ -490,11 +487,23 @@ impl Shark {
     pub(super) fn home_prompt_used(
         &mut self,
         first: Option<&str>,
+        agent: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.home.asking {
+            return;
+        }
         let prompt = self.home.prompt.clone();
-        if first.is_some_and(|f| !self.home.asking && prompt.read(cx).value().trim() == f) {
+        let text = prompt.read(cx).value();
+        let used = match agent {
+            Some(slug) => {
+                let (mentioned, body) = agent_prompt(text.trim(), &self.state.agents);
+                mentioned == Some(slug) && body == first.unwrap_or_default()
+            }
+            None => first.is_some_and(|first| text.trim() == first),
+        };
+        if used {
             prompt.update(cx, |p, cx| p.set_value("", window, cx));
         }
     }

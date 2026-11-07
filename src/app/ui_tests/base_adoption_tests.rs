@@ -19,7 +19,7 @@ fn adopted_pr_base_persists_through_app_subscription(cx: &mut TestAppContext) {
     git::git(&wt, &["update-ref", old, "HEAD"]).unwrap();
     git::git(&wt, &["update-ref", "refs/remotes/origin/release", "HEAD"]).unwrap();
     ws.repos[0].base = old.into();
-    git::write_claude_md(&ws);
+    git::write_claude_md(&ws).unwrap();
     let (window, shark) = boot(
         cx,
         State {

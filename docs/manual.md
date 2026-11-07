@@ -2,7 +2,7 @@
 
 The full reference for [Shark](../README.md): every feature, every key, and how it works underneath.
 
-A **task** is one isolated piece of work: its conversations, attached repositories, worktrees, changes and review state. A **harness** runs Claude or Codex for a chat.
+An **agent** is a named set of instructions, skills and defaults that stays between tasks. A **task** is one isolated piece of work: its conversations, attached repositories, worktrees, changes and review state. A **harness** runs Claude or Codex for a chat.
 
 ## Fast and native
 Shark is built on [GPUI](https://www.gpui.rs), Zed's GPU-rendered UI framework, running on Metal. It is not an Electron app. Everything is in the `cmd-k` palette, which shows each command's shortcut, and an optional Vim mode adds Vim keys to the editor, the composer and every list. The UI stays responsive while agents work. Chat history loads off the UI thread, git status runs with `--no-optional-locks` so it never takes the task's `index.lock`, and `ctrl-c` interrupts a turn while the claude process stays warm.
@@ -48,6 +48,17 @@ A task can start from another branch or an open PR instead of `main` (**New task
 
 ## Home
 Shark opens on Home (`cmd-0`) when no task is open. It shows what's missing (git, gh, claude), every task grouped by what it needs from you (Needs you, Running, Unread, Idle), and a Get started checklist (one line once you have tasks; Hide Get started in `cmd-k` removes it). Type what you want to build in its box and press `enter` to start a task at once with that as the first message (no dialog and no repository needed; the title comes from its first line), or press `tab` to ask Shark how to do something (a one-off Haiku answer from the README, this manual and the live keymap).
+
+## Agents
+Create an agent in **Settings › Agents** with a name, icon, instructions, default repositories, model and thinking level. On Home, click its chip or type `@designer fix the onboarding spacing` to start a task. **New task for agent…** in `cmd-k` opens the same prompt. Unknown `@names` stay ordinary text; Ask Shark mode does not start agent tasks.
+
+Each task gets its own branches and worktrees. Several tasks can run for the same agent, including in the same repository. Their chats receive a note naming the other open tasks and their changed files, refreshed when a turn ends. The note lists at most 20 files per task and asks the model to avoid editing them. It is guidance, not a file lock.
+
+Instructions reach Claude through `CLAUDE.md` and Codex through `AGENTS.md`. Closing the agent settings dialog updates every open task; existing chats receive changed instructions with their next message. New chats use the agent's model and thinking defaults before repository defaults.
+
+**Open skills folder** creates `~/Library/Application Support/shark/agents/<slug>/skills`. Put each skill in `<skill>/SKILL.md`, then close agent settings to refresh its task links. Shark links these skills into both `.agents/skills` and `.claude/skills` in each task. The **Skills from repos** setting controls repository skills only. Agent skills remain enabled. If a harness does not discover a newly added skill during a session, start a new conversation.
+
+The agent dialog lists its open tasks and the latest 100 deleted tasks, including known PR links and merge status. **PR state unknown** means Shark had no successful status to record. Finish or delete all open tasks before deleting the agent; deleting the agent also deletes its instructions, history and skills folder. Its sidebar section remains as a plain section.
 
 ## Linear
 Linear stays out of the way until someone uses it. Until you connect, and unless a task has an issue attached, the header's **Attach** goes straight to the repository dialog, and Home, `cmd-k` and **Delete task** don't mention Linear. Settings › Linear is always there, and this is the way in.
@@ -187,3 +198,5 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex
   - "Create draft PRs" (`cmd-k` or the git menu) opens them with `--draft`; the git button then offers "Ready for review".
   - Each PR body then gets a "Related PRs" section, which is idempotent on re-runs.
   - Refuses to run while any repo has uncommitted changes. Only an open PR is reused; after a merge, new commits get a new PR.
+
+Repository scripts receive `SHARK_TASK` and `SHARK_TASK_PATH`. The older `SHARK_WORKSPACE` and `SHARK_WORKSPACE_PATH` names remain available with identical values.

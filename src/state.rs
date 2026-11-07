@@ -200,6 +200,18 @@ pub struct Agent {
     pub repos: Vec<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<TaskRecord>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TaskRecord {
+    pub title: String,
+    pub branch: String,
+    pub prs: Vec<(String, String)>,
+    pub merged: Option<bool>,
+    /// Archive time in Unix milliseconds.
+    pub at: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]

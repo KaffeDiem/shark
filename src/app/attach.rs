@@ -837,6 +837,12 @@ impl Shark {
     /// Everything reading the repo list picks up a new one.
     fn repos_published(&mut self, ws: &Task, window: &mut Window, cx: &mut Context<Self>) {
         self.publish_task(&ws.name, cx);
+        if let Some(agent) = &ws.agent {
+            if let Err(e) = self.sync_agent(&agent.slug, false, cx) {
+                notify_err(window, cx, e);
+            }
+            self.refresh_sibling_files(&ws.name, cx);
+        }
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_task(ws.clone(), cx));
         }
@@ -998,7 +1004,7 @@ impl Shark {
         let dropped = ws.repos.len() != had;
         let ws = ws.clone();
         if dropped {
-            git::write_claude_md(&ws);
+            let _ = git::write_claude_md(&ws);
         }
         let _ = self.state.save();
         window.push_notification(format!("{repo}: nothing was deleted. {what}"), cx);
@@ -1017,7 +1023,7 @@ impl Shark {
             .map(|w| w.name.clone())
             .collect();
         for name in &names {
-            self.reconcile_agent(name);
+            self.reconcile_task(name);
         }
         if !names.is_empty() {
             if let Err(e) = self.state.save() {
@@ -1029,7 +1035,7 @@ impl Shark {
 
     /// Decides each of `name`'s recorded attachments from what is on disk. Finished work is
     /// adopted, untouched intent cleared, the rest kept for the user. Setup never reruns here.
-    fn reconcile_agent(&mut self, name: &str) {
+    fn reconcile_task(&mut self, name: &str) {
         let Some(mut ws) = self.task(name).cloned() else {
             return;
         };
@@ -1058,7 +1064,7 @@ impl Shark {
                     }
                     wr.branch = (a.branch != ws.branch).then(|| a.branch.clone());
                     ws.repos.push(wr);
-                    git::write_claude_md(&ws);
+                    let _ = git::write_claude_md(&ws);
                 }
                 Found::Worktree(_) => {}
             }
@@ -1081,7 +1087,7 @@ impl Shark {
             return notify_err(window, cx, "Wait for what is running in this task");
         }
         let before = self.task(name).map(|w| w.repos.len());
-        self.reconcile_agent(name);
+        self.reconcile_task(name);
         let _ = self.state.save();
         if let Some(ws) = self
             .task(name)

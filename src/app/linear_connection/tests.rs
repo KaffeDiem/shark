@@ -176,14 +176,10 @@ async fn credential(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Result<Cr
     task.await
 }
 
-/// Opens Settings on the Linear page; `ctrl-tab` walks there as a keyboard user would.
+/// Opens Settings on the Linear page through its shared entry point.
 fn open_page(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
     cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
-        w.render_frame(cx);
-        for _ in 0..4 {
-            w.press("ctrl-tab", cx);
-        }
+        shark.update(cx, |s, cx| crate::settings::open_linear(&s.state, w, cx));
         w.render_frame(cx);
     })
     .unwrap();

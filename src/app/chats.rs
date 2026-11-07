@@ -215,7 +215,7 @@ impl Shark {
             .then(|| ws.agent.as_ref().map(|a| a.slug.clone()))
             .flatten();
         if let Some(slug) = agent {
-            self.sync_agent(&slug, false, cx);
+            let _ = self.sync_agent(&slug, false, cx);
         } else if changed || untitled {
             let _ = self.state.save();
         }

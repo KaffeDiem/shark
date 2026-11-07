@@ -1017,10 +1017,9 @@ fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> V
     remaining
 }
 
-/// Rewrites the root CLAUDE.md and AGENTS.md from the task's repo list; a failure only
-/// leaves them stale.
-pub fn write_claude_md(ws: &Task) {
-    let _ = write_root_docs(ws, &ws.dir());
+/// Rewrites the root CLAUDE.md, AGENTS.md and skill links from the task snapshot.
+pub fn write_claude_md(ws: &Task) -> Result<(), String> {
+    write_root_docs(ws, &ws.dir())
 }
 
 /// The files the agent reads at the task root: CLAUDE.md for claude, AGENTS.md for codex.

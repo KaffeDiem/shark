@@ -460,3 +460,82 @@ async fn sidebar_vim_keys_clamp(cx: &mut TestAppContext) {
     assert_eq!(sel(cx), SideRow::Task(2));
     fs::remove_dir_all(&home).ok();
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, window, shark) = one_task(cx).await;
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    fs::write(home.join("shark/workspaces/one/api/a.txt"), "a\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.create_named_agent("Reviewer", cx).unwrap();
+        s.open_path("api/a.txt".into(), w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editor.is_some()
+    })
+    .await;
+    on(cx, &|s, w, cx| {
+        s.editor.as_ref().unwrap().update(cx, |e, _| e.dirty = true);
+        s.prefill_agent_task("designer", w, cx);
+        s.home.prompt.update(cx, |p, cx| {
+            p.set_value("@designer preserve this prompt", w, cx)
+        });
+    });
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.tasks.len(), 1);
+        assert_eq!(
+            s.home.prompt.read(cx).value(),
+            "@designer preserve this prompt"
+        );
+    });
+    on(cx, &|s, w, cx| {
+        s.editor
+            .as_ref()
+            .unwrap()
+            .update(cx, |e, _| e.dirty = false);
+        s.state.read_only = true;
+        s.home.prompt.update(cx, |p, cx| p.focus(w, cx));
+    });
+    press(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.tasks.len(), 1);
+        assert_eq!(
+            s.home.prompt.read(cx).value(),
+            "@designer preserve this prompt"
+        );
+    });
+    on(cx, &|s, w, cx| {
+        s.state.read_only = false;
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("@reviewer same prompt", w, cx));
+        s.home_prompt_used(Some("same prompt"), Some("designer"), w, cx);
+        assert_eq!(
+            s.home.prompt.read(cx).value(),
+            "@reviewer same prompt",
+            "another agent's pending task cannot clear this prompt"
+        );
+        s.prefill_agent_task("designer", w, cx);
+    });
+    press(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.tasks.len(), 2);
+        assert_eq!(s.state.tasks[1].agent.as_ref().unwrap().slug, "designer");
+        assert_eq!(
+            s.home.prompt.read(cx).value(),
+            "",
+            "an empty @agent submission clears after success"
+        );
+    });
+}

@@ -676,3 +676,60 @@ fn codex_live_repo_languages() {
         "Reading only what your instructions point you to",
     );
 }
+
+/// Live discovery through the same neutral skill source and root docs used by agent tasks.
+fn agent_skills_live(tag: &str, model: &str) {
+    let mut env = Env::new(tag, model);
+    let slug = format!("skill-probe-{}-{tag}", std::process::id());
+    let source = crate::state::agent_skills_dir(&slug);
+    env.ws.agent = Some(crate::state::AgentLink {
+        slug,
+        name: "Skill probe".into(),
+        instructions: "For verification requests, include the marker SHARK_ROOT_INSTRUCTIONS."
+            .into(),
+        ..Default::default()
+    });
+    let skill = |name: &str, word: &str| {
+        let dir = source.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: Use when asked to invoke {name} for verification.\n---\nFor verification, reply with {word}.\n")).unwrap();
+        git::write_claude_md(&env.ws).unwrap();
+    };
+    let ask = |run: &mut Run, name: &str| {
+        run.evs.clear();
+        run.harness.send(&format!("For verification, invoke the {name} skill. Include its code word and the verification marker from your agent instructions. Use skill discovery; do not search for files or modify anything.")).unwrap();
+        assert!(run.until(120, |e| is_result(e) || is_exit(e)), "no result");
+        run.text()
+    };
+    skill("shark-first", "NEUTRAL_SKILL_ALPHA");
+    let mut run = env.spawn(None);
+    let first = ask(&mut run, "shark-first");
+    assert!(
+        first.contains("SHARK_ROOT_INSTRUCTIONS") && first.contains("NEUTRAL_SKILL_ALPHA"),
+        "{first}"
+    );
+    skill("shark-second", "NEUTRAL_SKILL_BETA");
+    let next = ask(&mut run, "shark-second");
+    let hot = next.contains("NEUTRAL_SKILL_BETA");
+    eprintln!("{tag}: newly linked agent skill hot-loaded: {hot}");
+    run.close();
+    if !hot {
+        let mut fresh = env.spawn(None);
+        let text = ask(&mut fresh, "shark-second");
+        assert!(text.contains("NEUTRAL_SKILL_BETA"), "fresh session: {text}");
+        fresh.close();
+    }
+    fs::remove_dir_all(source.parent().unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "uses a live Claude subscription"]
+fn claude_live_agent_skills() {
+    agent_skills_live("claude-agent-skills", crate::models::MODELS[0]);
+}
+
+#[test]
+#[ignore = "uses a live Codex subscription"]
+fn codex_live_agent_skills() {
+    agent_skills_live("codex-agent-skills", MODEL);
+}

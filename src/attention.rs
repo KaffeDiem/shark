@@ -326,7 +326,7 @@ impl Shark {
                     }
                 }
                 if changed {
-                    s.sync_agent(&slug, false, cx);
+                    let _ = s.sync_agent(&slug, false, cx);
                 }
             })
             .ok();
