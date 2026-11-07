@@ -207,14 +207,54 @@ async fn notification_for_evicted_chat_keeps_current_view(cx: &mut TestAppContex
     let (window, shark) = fixture(cx);
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.state.workspaces[0].chats[0].session_id = Some("finished".into());
-        s.open_workspace(0, w, cx);
-        s.close_chat(w, cx);
-        assert_eq!(s.active_ws().unwrap().closed[0].id, "one-first");
+        s.state.workspaces[0].chats = (1..=22)
+            .map(|n| ChatMeta {
+                id: format!("one~{n}"),
+                session_id: Some(format!("finished-{n}")),
+                ..Default::default()
+            })
+            .collect();
+        s.state.workspaces[0].normalize_tabs();
         s.open_workspace(1, w, cx);
-        s.turn_done("one", "one-first", cx);
-        s.state.workspaces[0].closed.clear(); // Its retained history has since been evicted.
+        s.turn_done("one", "one~22", cx);
+        // Close the highest ID first, then enough older chats to evict it from history.
+        s.open_workspace(0, w, cx);
+        for n in std::iter::once(22).chain(2..22) {
+            let id = format!("one~{n}");
+            let ix = s
+                .active_ws()
+                .unwrap()
+                .chats
+                .iter()
+                .position(|c| c.id == id)
+                .unwrap();
+            s.select_chat(ix, w, cx);
+            s.close_chat(w, cx);
+        }
+        assert!(
+            !s.state.workspaces[0]
+                .closed
+                .iter()
+                .any(|c| c.id == "one~22")
+        );
+        s.open_workspace(0, w, cx);
+        s.new_chat(w, cx);
     });
+    let new_id = cx.update(|cx| {
+        shark
+            .read(cx)
+            .active_chat()
+            .unwrap()
+            .read(cx)
+            .meta
+            .id
+            .clone()
+    });
+    assert_ne!(
+        new_id, "one~22",
+        "evicted IDs cannot identify new conversations"
+    );
+    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
     let tag = cx.shown_system_notifications().last().unwrap().tag.clone();
     for home in [false, true] {
         on(cx, &|s, w, cx| {
@@ -222,7 +262,7 @@ async fn notification_for_evicted_chat_keeps_current_view(cx: &mut TestAppContex
                 s.open_workspace(0, w, cx);
                 s.enter_home(w, cx);
             }
-            s.unread.insert("one-second".into());
+            s.unread.insert(new_id.clone());
         });
         let before = cx
             .update_window(window, |_, w, cx| w.notifications(cx).len())
@@ -231,7 +271,7 @@ async fn notification_for_evicted_chat_keeps_current_view(cx: &mut TestAppContex
         on(cx, &|s, w, cx| {
             assert_eq!(s.active.as_deref(), Some(if home { "one" } else { "two" }));
             assert_eq!(s.home_shown(), home);
-            assert!(s.unread.contains("one-second"));
+            assert!(s.unread.contains(&new_id));
             assert_eq!(
                 w.notifications(cx).len(),
                 before + 1,
@@ -242,7 +282,7 @@ async fn notification_for_evicted_chat_keeps_current_view(cx: &mut TestAppContex
     on(cx, &|s, w, cx| {
         s.open_notification("one", None, w, cx);
         assert!(!s.home_shown());
-        assert_eq!(s.active_chat().unwrap().read(cx).meta.id, "one-second");
+        assert_eq!(s.active_chat().unwrap().read(cx).meta.id, new_id);
     });
 }
 

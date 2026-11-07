@@ -356,7 +356,7 @@ impl Shark {
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
-        let Some(id) = self.active_ws().map(Workspace::next_chat_id) else {
+        let Some(id) = self.active_ws_mut().map(Workspace::next_chat_id) else {
             return notify_err(window, cx, "Open an agent first");
         };
         let meta = ChatMeta {
