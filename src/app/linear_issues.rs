@@ -1,6 +1,7 @@
 //! Linear issues on an agent: attaching one, its details, and starting an agent from one. An
 //! attachment is reference material: it starts no turn and waits for nothing, and chats hear of
 //! it through `Workspace::context`. Nothing here writes to Linear.
+use super::attach::ChipCard;
 use super::*;
 use crate::linear::{self, Credential, Error, Hit, Http, IssueRef, Lists, Page, Target};
 use crate::sync::ago;
@@ -1566,7 +1567,7 @@ impl Shark {
     }
 
     /// The header's one mark for `ws`'s disconnected issues, however many: the word on every chip
-    /// pushed them out of the row. Their tooltips and details say it for each.
+    /// pushed them out of the row. Their cards and details say it for each.
     pub(super) fn disconnected_chip(
         &self,
         ws: &Workspace,
@@ -1595,7 +1596,12 @@ impl Shark {
     }
 
     /// The header's issue chips, primary first: state and identifier, a star on the primary.
-    pub(super) fn issue_chips(&self, ws: &Workspace, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn issue_chips(
+        &self,
+        ws: &Workspace,
+        quiet: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let primary = ws.linear.primary();
         (ws.linear.ordered())
             .map(|r| {
@@ -1616,7 +1622,9 @@ impl Shark {
                 }
                 let icon = snapshot.map_or(
                     Icon::new(IconName::TriangleAlert).text_color(theme.warning_foreground),
-                    |s| status_icon(&s.state_type, theme),
+                    // Progress, not a problem: the shape says it, and color stays for what needs
+                    // attention.
+                    |s| status_icon(&s.state_type, theme).text_color(theme.muted_foreground),
                 );
                 let star = Icon::new(IconName::Star)
                     .with_size(px(12.))
@@ -1624,15 +1632,38 @@ impl Shark {
                 let (name, r) = (ws.name.clone(), r.clone());
                 let id = SharedString::from(format!("issue-chip-{}", r.issue));
                 let aria = format!("{label}: {tip}");
-                Self::chip(id.clone(), icon, label)
+                let mut rows: Vec<_> = snapshot.map_or(
+                    vec![("Snapshot", "Missing. Open it to refresh.".to_string())],
+                    |s| {
+                        [
+                            ("Status", Some(&s.status)),
+                            ("Project", s.project.as_ref()),
+                            ("Assignee", s.assignee.as_ref()),
+                        ]
+                        .into_iter()
+                        .filter_map(|(label, value)| Some((label, value?.clone())))
+                        .collect()
+                    },
+                );
+                if is_primary {
+                    rows.push(("Attached as", "Primary".into()));
+                }
+                if disconnected {
+                    rows.push(("Linear", "Disconnected".into()));
+                }
+                let card = ChipCard {
+                    mark: icon.clone(),
+                    title: snapshot.map_or(label.clone(), |s| s.title.clone()),
+                    rows,
+                };
+                let chip = Self::chip(id.clone(), icon, label)
                     .when(is_primary, |c| c.child(star))
                     .accessibility_label(aria)
-                    .tooltip(tip)
                     .on_click(cx.listener(move |s, _, w, cx| {
                         s.issue_details(name.clone(), r.clone(), w, cx)
                     }))
-                    .map(|b| crate::ui::toolbar(id, b))
-                    .into_any_element()
+                    .map(|b| crate::ui::toolbar(id.clone(), b));
+                card.around(&id, chip, quiet)
             })
             .collect()
     }

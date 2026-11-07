@@ -1161,7 +1161,7 @@ async fn delete_copy_mentions_linear_only_with_issues(cx: &mut TestAppContext) {
 }
 
 /// However many issues are disconnected the header says it once, outside the chips; each chip
-/// keeps its plain label and the state in its tooltip, and the mark leads to Settings.
+/// keeps its plain label and the state in its card, and the mark leads to Settings.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn disconnected_issues_share_one_mark(cx: &mut TestAppContext) {

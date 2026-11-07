@@ -1337,6 +1337,18 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         !shown(cx, "branch"),
         "branch actions live in the repository chip"
     );
+    // Hovering shows the card; the click's menu takes its place rather than opening under it.
+    cx.update_window(window, |_, w, cx| w.hover("repo-chip-api", cx))
+        .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(shown(cx, "repo-chip-api-card"), "hover opens the card");
+    cx.update_window(window, |_, w, cx| w.click("repo-chip-api", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
+    assert!(!shown(cx, "repo-chip-api-card"), "the menu replaces it");
+    press_in(window)(cx, &["escape"]);
     // A real button stays reachable through focus traversal and Enter/Space.
     for key in ["enter", "space"] {
         cx.update_window(window, |_, w, cx| {
@@ -1371,12 +1383,20 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
     }
     // A different checkout does not inherit the attached branch's base in its description.
     let saved = ws_of(cx, &shark).repos[0].clone();
+    let plain = cx
+        .update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find("repo-chip-api").bounds().size.width
+        })
+        .unwrap();
     on(cx, &|s, _, cx| {
         s.ws_mut(&name).unwrap().repos[0].branch = Some("attached-branch".into());
         cx.notify();
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        let chip = w.find("repo-chip-api").bounds();
+        assert!(chip.size.width > plain, "only a drifted checkout names it");
         let label = w.find("repo-chip-api").label().unwrap().to_string();
         assert!(label.contains("Checked out: b"), "{label}");
         assert!(

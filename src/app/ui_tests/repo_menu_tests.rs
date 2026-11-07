@@ -70,6 +70,16 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
             .is_some()
     })
     .await;
+    on(cx, &|s, _, cx| {
+        let ws = s.ws("menu-scope").unwrap();
+        let unknown = menus::branch_entries(s, ws, Some("api"), cx);
+        assert!(!has(&unknown, "Create pull request"), "not GitHub");
+        s.syncs["menu-scope"].update(cx, |g, _| g.set_no_pr("api"));
+        let entries = menus::branch_entries(s, ws, Some("api"), cx);
+        assert!(has(&entries, "Create pull request"));
+        assert!(!has(&entries, "Open pull request"));
+        assert!(!has(&entries, "Merge pull request…"));
+    });
     on(cx, &|s, w, cx| {
         s.syncs["menu-scope"].update(cx, |g, _| {
             g.set_pr("api", 11, true);
@@ -79,6 +89,13 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
         let entries = menus::branch_entries(s, ws, Some("api"), cx);
         assert!(!has(&entries, "New agent on top…"));
         assert!(!has(&entries, "Insert agent below…"));
+        assert!(!has(&entries, "Create pull request"));
+        assert!(has(&entries, "Merge pull request…"));
+        assert!(has(&entries, "Reveal in Finder"));
+        assert!(matches!(&entries[0],
+            Entry::Item { label, hint: Some(hint), .. }
+                if label == "Open pull request" && hint == "#11 · Open"
+        ));
         invoke(entries, "Open pull request", w, cx);
     });
     assert_eq!(
@@ -133,6 +150,19 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
             Entry::Item { label, hint: Some(hint), .. }
                 if label == "Change base…" && hint.as_ref() == format!("{} ← menu-scope", ws.repos[0].base)
         )));
+        // A click says what the chip's hover card says.
+        let hint_of = |text: &str| {
+            entries.iter().find_map(|e| match e {
+                Entry::Item { label, hint, .. } if label == text => hint.clone(),
+                _ => None,
+            })
+        };
+        assert_eq!(hint_of("Copy branch name").as_deref(), Some("actual-api"));
+        let path = ws.dir().join("api");
+        assert_eq!(
+            hint_of("Copy path").as_deref(),
+            Some(menus::tilde(&path).as_str())
+        );
         invoke(entries, "Copy branch name", w, cx);
     });
     assert_eq!(
@@ -183,5 +213,16 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
         menus::repo_branch(s, ws, &ws.repos[0], cx).as_deref() == Some("menu-scope")
     })
     .await;
+    on(cx, &|s, _, cx| {
+        let ws = s.ws("menu-scope").unwrap();
+        assert!(has(
+            &menus::branch_entries(s, ws, Some("api"), cx),
+            "Copy Git error"
+        ));
+        assert!(!has(
+            &menus::branch_entries(s, ws, Some("web"), cx),
+            "Copy Git error"
+        ));
+    });
     fs::remove_dir_all(&home).ok();
 }

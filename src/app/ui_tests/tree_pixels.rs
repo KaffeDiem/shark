@@ -258,6 +258,35 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     })
                     .unwrap();
                 }
+                // Hover detail sits on the menu's surface, under the chip like its menu.
+                if width == 1440. && !rail {
+                    cx.update_window(window, |_, w, cx| w.hover("repo-chip-shark", cx))
+                        .unwrap();
+                    cx.advance_clock(std::time::Duration::from_secs(1));
+                    cx.run_until_parked();
+                    cx.update_window(window, |_, w, cx| {
+                        w.render_frame(cx);
+                        w.render_frame(cx);
+                        let chip = w.find("repo-chip-shark").bounds();
+                        let card = w.find("repo-chip-shark-card").bounds();
+                        assert_eq!(card.left(), chip.left());
+                        assert_eq!(card.top(), chip.bottom() + px(4.));
+                    })
+                    .unwrap();
+                    let shot = cx.capture_screenshot(window).expect("chip hover card");
+                    if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                        let dir = PathBuf::from(dir);
+                        fs::create_dir_all(&dir).unwrap();
+                        shot.save(dir.join(format!("chip-card-{label}.png")))
+                            .unwrap();
+                    }
+                    cx.update_window(window, |_, w, cx| {
+                        w.pointer_move(point(px(width - 1.), px(719.)), None, cx);
+                    })
+                    .unwrap();
+                    cx.advance_clock(std::time::Duration::from_secs(1));
+                    cx.run_until_parked();
+                }
                 // Review is an artifact overlay, so a narrow diff column cannot clip it.
                 cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {

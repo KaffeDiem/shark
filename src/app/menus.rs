@@ -2,6 +2,7 @@
 use super::*;
 use crate::apps::{self, Kind};
 use crate::menu::each_or_all;
+use crate::sync::PrState;
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
 pub(super) fn tilde(path: &Path) -> String {
@@ -324,7 +325,8 @@ pub(super) fn branch_entries(
         0 => vec![],
         1 => {
             let b = names.pop().unwrap();
-            let hint = if b == ws.name {
+            // A repository's menu is where its chip's branch is read, so it always names it.
+            let hint = if b == ws.name && repo.is_none() {
                 String::new()
             } else {
                 b.clone()
@@ -365,6 +367,24 @@ pub(super) fn branch_entries(
         }
         None => base_hint(ws),
     });
+    // What a repository's chip card says, each on a row that acts on it.
+    let worktree = repo.map(|name| {
+        let path = ws.dir().join(name);
+        let hint = tilde(&path);
+        menu::item(IconName::Copy, "Copy path", move |w, cx| {
+            copy(path.display().to_string(), w, cx)
+        })
+        .hint(hint)
+    });
+    let scoped = repo.and_then(|name| sync?.repos()?.iter().find(|r| r.name == name));
+    let git_error = scoped.and_then(|r| r.local.as_ref().err()).map(|error| {
+        let error = error.to_string();
+        let hint = error.clone();
+        menu::item(IconName::TriangleAlert, "Copy Git error", move |w, cx| {
+            copy(error.clone(), w, cx)
+        })
+        .hint(hint)
+    });
     let stacks: Vec<_> = stacks(this, ws, cx)
         .into_iter()
         .filter(|s| repo.is_none_or(|name| name == s.repo))
@@ -398,6 +418,7 @@ pub(super) fn branch_entries(
                 },
             ),
             Some(base),
+            git_error,
         ]
         .into_iter()
         .flatten(),
@@ -414,25 +435,89 @@ pub(super) fn branch_entries(
         }
         _ => each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
     };
-    let pr = sync.and_then(|sync| match repo {
-        None => sync.pr_entry(),
-        Some(name) => each_or_all(
+    let Some(name) = repo else {
+        let pr = sync.and_then(|sync| sync.pr_entry());
+        let github: Vec<Entry> = [branch_link, pr].into_iter().flatten().collect();
+        if !github.is_empty() {
+            entries.push(Entry::Sep);
+            entries.extend(github);
+        }
+        return entries;
+    };
+    // A repository's menu leads with its pull request, the next thing to do with a branch.
+    let pr_step = |icon, label: &'static str, kind: crate::sync::Kind| {
+        let name = name.to_string();
+        let step = on_ws(cx, &ws.name, move |s, n, w, cx| {
+            if let Some(g) = s.syncs.get(&n).cloned() {
+                let (kind, repos) = (kind.clone(), vec![name.clone()]);
+                let label = label.trim_end_matches('…');
+                g.update(cx, |g, cx| g.run_kind_in(kind, label, repos, w, cx));
+            }
+        });
+        menu::item(icon, label, step)
+    };
+    let authored = scoped.filter(|r| !r.is_review());
+    let create = authored
+        .filter(|r| matches!(r.pr, Some(Ok(None))))
+        .map(|_| {
+            pr_step(
+                IconName::GitPullRequestCreate,
+                "Create pull request",
+                crate::sync::Kind::CreatePr,
+            )
+        });
+    let pr = scoped.and_then(|r| r.pr()).map(|p| {
+        let state = match p.state {
+            PrState::Open if p.draft => "Draft",
+            PrState::Open => "Open",
+            PrState::Merged => "Merged",
+            PrState::Closed => "Closed",
+        };
+        let url = p.url.clone();
+        menu::item(
             IconName::GitPullRequest,
             "Open pull request",
-            sync.pr_urls()
-                .into_iter()
-                .filter(|(r, _)| r == name)
-                .map(|(r, url)| (r, String::new(), url))
-                .collect(),
-            open_urls,
-        ),
+            move |_, cx| cx.open_url(&url),
+        )
+        .hint(format!("#{} · {state}", p.number))
     });
-    let github: Vec<Entry> = [branch_link, pr].into_iter().flatten().collect();
-    if !github.is_empty() {
-        entries.push(Entry::Sep);
-        entries.extend(github);
+    let merge = authored.and_then(|r| r.open_pr()).map(|p| {
+        pr_step(
+            IconName::GitMerge,
+            "Merge pull request…",
+            crate::sync::Kind::Merge,
+        )
+        .hint(format!("#{}", p.number))
+    });
+    let mut menu: Vec<Entry> = [create, pr, merge, branch_link]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !menu.is_empty() {
+        menu.push(Entry::Sep);
     }
-    entries
+    menu.extend(entries);
+    menu.push(Entry::Sep);
+    let path = ws.dir().join(name);
+    let reveal = path.clone();
+    menu.push(menu::item(
+        IconName::FolderOpen,
+        "Reveal in Finder",
+        move |_, cx| cx.reveal_path(&reveal),
+    ));
+    menu.extend(open_in_entries(None, &[(name.to_string(), path)], cx));
+    menu.extend(worktree);
+    let repo = name.to_string();
+    menu.push(menu::item(
+        IconName::Settings,
+        "Repository settings…",
+        on_shark(cx, move |s, w, cx| {
+            if let Some(r) = s.state.repos.iter().find(|r| r.name == repo).cloned() {
+                repo_settings::open(s, r, w, cx)
+            }
+        }),
+    ));
+    menu
 }
 
 /// Restack onto the parent (the merged parent's base once it merged), new workspace on top,

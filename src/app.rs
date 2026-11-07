@@ -715,14 +715,14 @@ impl Shark {
             .test_support()
     }
 
-    fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.home_shown() {
             return self.render_home(window, cx);
         }
         let controls = self.render_feature_controls(cx);
         let has_controls = controls.is_some();
         let no_repos = self.no_repos();
-        let attachments = self.render_attachments(cx);
+        let attachments = self.render_attachments(window, cx);
         let theme = cx.theme();
         v_flex()
             .flex_1()

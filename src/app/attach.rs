@@ -8,6 +8,7 @@ use crate::scripts::{self, Phase};
 use crate::state::{AttachStage, Attachment};
 use crate::ui::{menu_dialog, open_grouped};
 use git::Found;
+use gpui_kit::base::HoverCard;
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -31,14 +32,15 @@ enum Standing {
 }
 
 impl Standing {
-    /// The status mark, the one colored thing on a chip.
+    /// A chip's mark. Only what needs attention gets color: ready is the normal state, and a green
+    /// check beside a branch reads as passing checks.
     fn mark(self, theme: &Theme) -> Icon {
         let (icon, color) = match self {
             Standing::Failed => (IconName::CircleX, theme.danger_foreground),
             Standing::Waiting => (IconName::CircleAlert, theme.warning_foreground),
             Standing::Running => (IconName::RefreshCw, theme.warning_foreground),
             Standing::Queued => (IconName::Clock, theme.muted_foreground),
-            Standing::Ready => (IconName::CircleCheck, theme.success_foreground),
+            Standing::Ready => (IconName::FolderGit2, theme.muted_foreground),
         };
         Icon::new(icon).text_color(color)
     }
@@ -49,7 +51,61 @@ struct RepoRow {
     repo: String,
     standing: Standing,
     state: &'static str,
-    tip: String,
+    error: Option<String>,
+}
+
+/// What hovering a chip says: a property list, like Linear's Properties, on the surface a click
+/// opens from the same spot. Only a preview: what the click opens says all of it too.
+pub(super) struct ChipCard {
+    pub(super) mark: Icon,
+    pub(super) title: String,
+    pub(super) rows: Vec<(&'static str, String)>,
+}
+
+impl ChipCard {
+    /// `chip` with this card. `quiet` while a menu or dialog is up, as popups paint above both.
+    pub(super) fn around(self, chip_id: &str, chip: impl IntoElement, quiet: bool) -> AnyElement {
+        let id = SharedString::from(format!("{chip_id}-card"));
+        let card = HoverCard::new(id.clone())
+            .anchor(Anchor::TopLeft)
+            .trigger(chip);
+        if quiet {
+            return card.into_any_element();
+        }
+        card.content(move |_, _, cx| {
+            let theme = cx.theme();
+            let surface = menu::chrome(theme)
+                .min_w(px(240.))
+                .max_w(px(440.))
+                .p(px(10.))
+                .gap(px(6.))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(self.mark.size_4().flex_none())
+                        .child(div().min_w_0().child(self.title)),
+                )
+                .children(self.rows.into_iter().map(|(label, value)| {
+                    h_flex()
+                        .items_start()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child(label),
+                        )
+                        .child(div().flex_1().min_w_0().child(value))
+                }));
+            div()
+                .id("chip-card")
+                .pt(px(4.))
+                .child(surface.id(id).test_support())
+        })
+        .into_any_element()
+    }
 }
 
 /// A step of an attachment, as its panel marks it.
@@ -1207,24 +1263,23 @@ impl Shark {
                 AttachStage::SetupFailed => (Standing::Failed, "setup failed"),
                 AttachStage::Uncertain => (Standing::Waiting, "check what happened"),
             };
-            let tip = (a.error.clone()).unwrap_or_else(|| format!("{}: {state}", a.repo));
-            (a.repo.clone(), standing, state, tip)
+            (a.repo.clone(), standing, state, a.error.clone())
         });
         let refused = (self.attach_results.get(&ws.name).into_iter())
             .flat_map(|r| &r.failed)
-            .map(|(r, e)| (r.clone(), Standing::Failed, "couldn't attach", e.clone()));
+            .map(|(r, e)| {
+                let error = Some(e.clone());
+                (r.clone(), Standing::Failed, "couldn't attach", error)
+            });
         let settled = (ws.repos.iter())
             .filter(|r| !ws.attaching.iter().any(|a| a.repo == r.name))
-            .map(|r| {
-                let tip = format!("{} on {}", r.name, ws.branch_of(r));
-                (r.name.clone(), Standing::Ready, "ready", tip)
-            });
+            .map(|r| (r.name.clone(), Standing::Ready, "ready", None));
         let mut rows: Vec<RepoRow> = (pending.chain(refused).chain(settled))
-            .map(|(repo, standing, state, tip)| RepoRow {
+            .map(|(repo, standing, state, error)| RepoRow {
                 repo,
                 standing,
                 state,
-                tip,
+                error,
             })
             .collect();
         rows.sort_by_key(|r| r.standing);
@@ -1332,48 +1387,40 @@ impl Shark {
         self.show_menu(position, entries, window, cx);
     }
 
-    fn repository_tip(
+    /// A ready repository's card, and its accessible details.
+    fn repository_details(
         &self,
         ws: &Workspace,
         repo: &crate::state::WsRepo,
         branch: &str,
         cx: &App,
-    ) -> String {
+    ) -> Vec<(&'static str, String)> {
         let attached = ws.branch_of(repo);
-        let context = if branch == attached {
-            format!("{} ← {branch}", repo.base)
+        let mut rows = if branch == attached {
+            vec![("Branch", branch.into()), ("Base", repo.base.clone())]
         } else {
-            format!("Checked out: {branch}\nBase: {} ← {attached}", repo.base)
+            vec![
+                ("Checked out", branch.into()),
+                ("Base", format!("{} ← {attached}", repo.base)),
+            ]
         };
-        let mut tip = format!(
-            "{}\n{context}\nWorktree: {}",
-            repo.name,
-            ws.dir().join(&repo.name).display()
-        );
+        rows.push(("Worktree", menus::tilde(&ws.dir().join(&repo.name))));
         let probed = self
             .syncs
             .get(&ws.name)
             .and_then(|sync| sync.read(cx).repos())
             .and_then(|repos| repos.iter().find(|r| r.name == repo.name));
-        match probed {
-            None => tip.push_str("\nGit status not yet checked"),
-            Some(r) => {
-                if let Err(error) = &r.local {
-                    tip.push_str(&format!("\nGit status unavailable: {error}"));
-                }
-            }
+        if let Some(Err(error)) = probed.map(|r| &r.local) {
+            rows.push(("Git status", format!("Unavailable: {error}")));
         }
         if let Some(stack) = menus::stacks(self, ws, cx)
             .iter()
             .find(|s| s.repo == repo.name)
         {
-            tip.push_str(&format!(
-                "\nStack: {} of {}",
-                stack.me + 1,
-                stack.nodes.len()
-            ));
+            let position = format!("{} of {}", stack.me + 1, stack.nodes.len());
+            rows.push(("Stack", position));
         }
-        tip
+        rows
     }
 
     /// What the header shows from chip `from` on, grouped with the available Attach offers.
@@ -1476,11 +1523,16 @@ impl Shark {
     /// Linear issue, then Attach, a menu of the two kinds with Linear in use and the repository
     /// dialog without. `+N` lists what doesn't fit; Show attachments in cmd-k lists all of it, and
     /// Attach repository does whenever an attachment needs anything.
-    pub(super) fn render_attachments(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_attachments(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(ws) = self.active_ws() else {
             return div().into_any_element();
         };
         let name = ws.name.clone();
+        let quiet = self.menu.is_some() || window.has_active_dialog(cx);
         let rows = self.repo_rows(ws);
         let failed = rows
             .iter()
@@ -1492,36 +1544,49 @@ impl Shark {
                 let (n, repo) = (name.clone(), r.repo.clone());
                 if !ready {
                     let id = SharedString::from(format!("attach-chip-{}", r.repo));
-                    return Self::chip(id.clone(), r.standing.mark(cx.theme()), r.repo.clone())
+                    let status = format!("{}{}", r.state[..1].to_uppercase(), &r.state[1..]);
+                    let card = ChipCard {
+                        mark: r.standing.mark(cx.theme()),
+                        title: r.repo.clone(),
+                        rows: std::iter::once(("Status", status))
+                            .chain(r.error.map(|e| ("Error", e)))
+                            .collect(),
+                    };
+                    let chip = Self::chip(id.clone(), r.standing.mark(cx.theme()), r.repo.clone())
                         .accessibility_label(format!("{}: {}", r.repo, r.state))
-                        .tooltip(r.tip.clone())
                         .cursor_pointer()
                         .on_click(cx.listener(move |s, _, w, cx| {
                             s.attachment_menu(n.clone(), repo.clone(), w, cx)
                         }))
-                        .map(|b| crate::ui::toolbar(id, b))
-                        .into_any_element();
+                        .map(|b| crate::ui::toolbar(id.clone(), b));
+                    return card.around(&id, chip, quiet);
                 }
                 let attached = ws.repos.iter().find(|repo| repo.name == r.repo).unwrap();
                 let branch = menus::repo_branch(self, ws, attached, cx)
                     .unwrap_or_else(|| "Detached HEAD".into());
-                let tip = self.repository_tip(ws, attached, &branch, cx);
+                let rows = self.repository_details(ws, attached, &branch, cx);
+                let details = (rows.iter())
+                    .map(|(label, value)| format!("{label}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                // Mostly every repository follows the agent's branch, so only a checkout that
+                // has left it earns the room; the card always names the branch.
+                let label = match branch == ws.branch_of(attached) {
+                    true => r.repo.clone(),
+                    false => format!("{} · {branch}", r.repo),
+                };
+                let card = ChipCard {
+                    mark: r.standing.mark(cx.theme()),
+                    title: r.repo.clone(),
+                    rows,
+                };
                 let (right_name, right_repo) = (name.clone(), r.repo.clone());
                 let id = SharedString::from(format!("repo-chip-{}", r.repo));
                 let at = Rc::new(Cell::<Bounds<Pixels>>::default());
                 let click_at = at.clone();
-                let button = Button::new(id.clone())
-                    .ghost()
+                let button = Self::chip(id.clone(), r.standing.mark(cx.theme()), label)
                     .max_w(px(280.))
-                    .icon(r.standing.mark(cx.theme()))
-                    .label(format!("{} · {branch}", r.repo))
-                    .dropdown_caret(true)
-                    .accessibility_label(format!(
-                        "{}: ready · {}",
-                        r.repo,
-                        tip.split_once('\n').unwrap().1
-                    ))
-                    .tooltip(tip)
+                    .accessibility_label(format!("{}: ready · {details}", r.repo))
                     .on_click(cx.listener(move |s, _, w, cx| {
                         let b = click_at.get();
                         let pos = point(b.left(), b.bottom() + px(4.));
@@ -1539,22 +1604,18 @@ impl Shark {
                             )
                         }),
                     )
-                    .map(|b| crate::ui::toolbar(id, b));
-                div()
-                    .relative()
-                    .flex_none()
-                    .child(button)
-                    .child(
-                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full(),
-                    )
-                    .into_any_element()
+                    .map(|b| crate::ui::toolbar(id.clone(), b));
+                let chip = div().relative().flex_none().child(button).child(
+                    canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                );
+                card.around(&id, chip, quiet)
             })
             .collect();
-        chips.extend(self.issue_chips(ws, cx));
+        chips.extend(self.issue_chips(ws, quiet, cx));
         AttachRow {
             name,
             chips,
