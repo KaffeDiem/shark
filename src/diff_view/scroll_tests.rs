@@ -82,3 +82,29 @@ fn the_wheel_scrolls_past_the_rows_rendered_so_far(cx: &mut TestAppContext) {
     // 2000 px of wheel travel crosses far more than the first screen of rows.
     assert!(top > 40, "scrolled to row {top}");
 }
+
+#[gpui_kit::test]
+fn rows_reach_the_bottom_of_the_view_when_code_scrolls_sideways(cx: &mut TestAppContext) {
+    cx.update(super::test_init);
+    let wide = format!("{}\n", "x".repeat(400));
+    let original = wide.repeat(LINES);
+    let modified = original.replace('x', "y");
+    let state =
+        cx.new(|cx| DiffState::new([fixture::modified("wide.txt", &original, &modified)], cx));
+    let (_, cx) = cx.add_window_view({
+        let state = state.clone();
+        move |_, _| Host { state }
+    });
+    for _ in 0..3 {
+        draw(cx);
+    }
+    let (body, list) = cx.update(|_, cx| {
+        let state = state.read(cx);
+        assert!(state.content_width() > state.viewport().width);
+        (
+            state.viewport().height,
+            state.list().viewport_bounds().size.height,
+        )
+    });
+    assert_eq!(list, body);
+}
