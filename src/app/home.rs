@@ -1351,14 +1351,15 @@ impl Shark {
         let name = w.name.clone();
         let title = w.display_title().to_string();
         let on = match w.repos.is_empty() {
-            true => "No repository".to_string(),
-            false => format!("{names} · {}", w.branch),
+            // Long repo statuses truncate last; the branch stays visible.
+            true => format!("No repository · {chats}"),
+            false => format!("{} · {chats} · {names}", w.branch),
         };
         let ws = w.clone();
         h_flex()
             .id(("home-ws", ix))
             .role(gpui_kit::accesskit::Role::Button)
-            .aria_label(format!("Open task {title}: {on}, {chats}"))
+            .aria_label(format!("Open task {title}: {on}"))
             .test_support()
             .items_start()
             .px_3()
@@ -1445,7 +1446,7 @@ impl Shark {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                            .child(div().min_w_0().truncate().child(format!("{on} · {chats}"))),
+                            .child(div().min_w_0().truncate().child(on)),
                     ),
             )
             .into_any_element()
