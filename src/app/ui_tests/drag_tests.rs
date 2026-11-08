@@ -293,6 +293,18 @@ async fn sidebar_drag_reorders_only_within_agent_and_group(cx: &mut TestAppConte
         w.render_frame(cx);
         w.within("sidebar").find(("agent", 2usize));
         w.within("sidebar").find(3usize);
+        let chevron = w.find(("collapse-agent", 0usize)).bounds();
+        w.pointer_move(point(px(0.), px(0.)), None, cx);
+        let new_task = w.find(("new-agent-task", 0usize));
+        assert!(!new_task.visible());
+        w.within("sidebar").hover(("agent", 0usize), cx);
+        assert!(w.find(("new-agent-task", 0usize)).visible());
+        assert_eq!(w.find(("new-agent-task", 0usize)).bounds(), new_task.bounds());
+        assert_eq!(w.find(("collapse-agent", 0usize)).bounds(), chevron);
+        w.pointer_move(point(px(0.), px(0.)), None, cx);
+        assert!(!w.find(("new-agent-task", 0usize)).visible());
+        assert_eq!(w.find(("new-agent-task", 0usize)).bounds(), new_task.bounds());
+        assert_eq!(w.find(("collapse-agent", 0usize)).bounds(), chevron);
         w.within("sidebar").click(("collapse-agent", 0usize), cx);
         assert!(!shark.read(cx).collapsed_agents.contains("designer"));
         assert!(!matches!(&shark.read(cx).home.destination, home::Destination::Agent(slug) if slug == "designer"),
