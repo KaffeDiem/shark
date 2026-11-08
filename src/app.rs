@@ -39,6 +39,7 @@ mod ask;
 mod attach;
 mod chats;
 mod differ_host;
+mod draft_view;
 mod editor_pane;
 mod features;
 mod file_changes;
@@ -61,6 +62,7 @@ mod sidebar;
 mod skill_import;
 mod storage;
 mod task;
+mod task_draft;
 mod task_picker;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
@@ -748,7 +750,7 @@ impl Shark {
         let has_controls = controls.is_some();
         let no_repos = self.no_repos();
         let attachments = self.render_attachments(window, cx);
-        let identity = self.active_task().and_then(|task| {
+        let agent = self.active_task().and_then(|task| {
             let link = task.agent.as_ref()?;
             let name = self
                 .state
@@ -756,41 +758,13 @@ impl Shark {
                 .iter()
                 .find(|a| a.slug == link.slug)
                 .map_or_else(|| link.name.clone(), |a| a.name.clone());
-            Some((link.slug.clone(), name, task.display_title().into_owned()))
+            Some((link.slug.clone(), name))
         });
         let theme = cx.theme();
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
-            .when_some(identity, |d, (slug, name, title)| {
-                d.child(
-                    h_flex()
-                        .id("task-identity")
-                        .h(px(32.))
-                        .flex_none()
-                        .min_w_0()
-                        .px_3()
-                        .gap_1()
-                        .child(
-                            Button::new("task-agent")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Bot)
-                                .label(name)
-                                .on_click(
-                                    cx.listener(move |s, _, w, cx| s.open_agent(&slug, w, cx)),
-                                ),
-                        )
-                        .child(
-                            Icon::new(IconName::ChevronRight)
-                                .with_size(px(12.))
-                                .text_color(theme.muted_foreground),
-                        )
-                        .child(div().min_w_0().text_sm().truncate().child(title))
-                        .test_support(),
-                )
-            })
             .child(
                 h_flex()
                     .h(px(44.))
@@ -800,6 +774,18 @@ impl Shark {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(self.render_run(cx))
+                    .when_some(agent, |d, (slug, name)| {
+                        d.child(
+                            Self::chip("task-agent", IconName::Bot, name.clone())
+                                .max_w(px(160.))
+                                .flex_shrink_1()
+                                .tooltip(format!("Open {name}"))
+                                .on_click(
+                                    cx.listener(move |s, _, w, cx| s.open_agent(&slug, w, cx)),
+                                )
+                                .map(|b| crate::ui::toolbar("task-agent", b)),
+                        )
+                    })
                     .child(attachments)
                     .child(
                         div()

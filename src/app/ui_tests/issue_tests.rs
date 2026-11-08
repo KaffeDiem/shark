@@ -1839,54 +1839,50 @@ async fn a_hostile_description_stays_in_its_note(cx: &mut TestAppContext) {
     assert_eq!(sent.matches("</linear-issue>").count(), 1, "{sent}");
 }
 
-/// Start from Linear issue: the preview confirms before anything exists; then an agent with no
-/// repo in Plan mode, the issue attached before its first turn, and a title of its own.
+/// Picking an issue adds draft context; Enter alone starts its planning request.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestAppContext) {
+async fn starting_from_an_issue_adds_to_the_tray_then_plans_without_repos(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let claude = recording_claude(&quiet);
     let _claude = ClaudeGuard::set(&claude);
-    let _home = test_home();
+    test_home();
     reset();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.run_until_parked();
     connect(cx, &shark);
     let on = on_app(window, shark.clone());
     let press = press_in(window);
-    let agents = |cx: &mut TestAppContext| cx.read(|cx| shark.read(cx).state.tasks.len());
 
-    on(cx, &|s, w, cx| s.start_from_issue(w, cx));
+    on(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        s.start_from_issue(w, cx);
+    });
     type_in(cx, window, "ENG-7");
     press(cx, &["enter"]);
-    assert!(shows(cx, window, "issue-summary"), "the preview");
-    assert!(shows(cx, window, "issue-plan-note"));
-    assert_eq!(field(cx, window), "Issue 7", "an editable title");
-    assert_eq!(agents(cx), 0, "nothing exists yet");
-
-    // Cancelling leaves nothing.
-    press(cx, &["escape"]);
-    assert_eq!(agents(cx), 0);
-    assert!(!dialog_open(cx, window));
-
-    on(cx, &|s, w, cx| s.start_from_issue(w, cx));
-    type_in(cx, window, "ENG-7");
-    press(cx, &["enter"]);
-    type_in(cx, window, "Login work");
-    press(cx, &["tab"]);
     assert!(
-        field(cx, window).contains("draft a plan"),
-        "the request, seeded"
+        shows(cx, window, ("draft-issue", 0usize)),
+        "issue added to the tray"
     );
-    type_in(cx, window, "Edited request: ");
-    press(cx, &["tab", "enter"]);
-    assert_eq!(agents(cx), 1, "the keyboard reaches Start task");
-    let ws = task_of(cx, &shark);
-    assert_eq!(ws.title, "Login work");
+    assert!(!dialog_open(cx, window), "there is no preview dialog");
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.state.tasks.is_empty(),
+            "picking context never starts a task"
+        );
+        assert_eq!(s.home.draft.issues[0].identifier, "ENG-7");
+        assert_eq!(s.home.prompt.read(cx).value(), "");
+    });
+    press(cx, &["enter"]);
+    until(cx, window, |_, cx| shark.read(cx).state.tasks.len() == 1).await;
+    let ws = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
+    assert_eq!(ws.title, "Issue 7");
     assert!(ws.repos.is_empty() && ws.chats[0].plan);
     assert_eq!(ids(&ws), ["uuid-7"]);
     assert_eq!(linear::read_snapshots(&ws.name).unwrap().len(), 1);
+    cx.read(|cx| assert!(shark.read(cx).home.draft.issues.is_empty()));
 
     let sent = wire(&claude, 0);
     assert!(sent.starts_with("[shark] Linear issue ENG-7"), "{sent}");
@@ -1895,7 +1891,6 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
         request.contains("ENG-7") && request.contains("plan"),
         "{request}"
     );
-    assert!(request.contains("Edited request: "), "{request}");
     let lower = request.to_lowercase();
     assert!(
         ["implement", "fix", "build"]
@@ -1904,12 +1899,12 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
         "{request}"
     );
 
-    // The title is the agent's: the first message doesn't replace it, and an edit changes only it.
+    on(cx, &|s, w, cx| s.open_task_named(&ws.name, w, cx));
     let chat = chat_of(cx, &shark);
     play(cx, &chat, init());
     play(cx, &chat, Ev::User(sent));
     play(cx, &chat, result());
-    assert_eq!(task_of(cx, &shark).title, "Login work");
+    assert_eq!(task_of(cx, &shark).title, "Issue 7");
     let name = ws.name.clone();
     on(cx, &|s, _, cx| s.set_title(&name, "Renamed".into(), cx));
     let after = task_of(cx, &shark);
@@ -1923,7 +1918,7 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn starting_from_an_issue_keeps_the_agent_chosen_before_lookup(cx: &mut TestAppContext) {
+async fn starting_from_an_issue_combines_agent_repos_and_typed_notes(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let claude = recording_claude(&quiet);
@@ -1954,19 +1949,24 @@ async fn starting_from_an_issue_keeps_the_agent_chosen_before_lookup(cx: &mut Te
     connect(cx, &shark);
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
+        s.prefill_agent_task("designer", w, cx);
         s.home
-            .prompt
-            .update(cx, |p, cx| p.set_value("@designer Keep this draft", w, cx));
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("Keep this draft", w, cx));
         s.start_from_issue(w, cx);
-        s.home
-            .prompt
-            .update(cx, |p, cx| p.set_value("A newer standalone draft", w, cx));
     });
     type_in(cx, window, "ENG-7");
     press_in(window)(cx, &["enter"]);
-    assert!(shows(cx, window, "issue-summary"));
-    press_in(window)(cx, &["tab", "tab", "enter"]);
-    let task = task_of(cx, &shark);
+    assert!(shows(cx, window, ("draft-issue", 0usize)));
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.state.tasks.is_empty());
+        assert_eq!(s.home.agent_draft.repos[0].repo.name, "web");
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "Keep this draft");
+    });
+    press_in(window)(cx, &["enter"]);
+    until(cx, window, |_, cx| shark.read(cx).state.tasks.len() == 1).await;
+    let task = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
     assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
     assert_eq!(
         task.agent.as_ref().unwrap().instructions,
@@ -1974,7 +1974,9 @@ async fn starting_from_an_issue_keeps_the_agent_chosen_before_lookup(cx: &mut Te
     );
     assert_eq!(task.chats[0].model.as_deref(), Some("opus"));
     assert_eq!(task.chats[0].effort.as_deref(), Some("low"));
-    assert!(task.repos.is_empty() && task.chats[0].plan);
+    assert_eq!(task.repos.len(), 1);
+    assert_eq!(task.repos[0].name, "web");
+    assert!(!task.chats[0].plan);
     assert_eq!(ids(&task), ["uuid-7"]);
     for doc in ["AGENTS.md", "CLAUDE.md"] {
         assert!(
@@ -1989,13 +1991,13 @@ async fn starting_from_an_issue_keeps_the_agent_chosen_before_lookup(cx: &mut Te
             fs::canonicalize(&skill).unwrap()
         );
     }
-    assert!(wire(&claude, 0).contains("ENG-7"));
-    cx.read(|cx| {
-        assert_eq!(
-            shark.read(cx).home.prompt.read(cx).value(),
-            "A newer standalone draft"
-        )
-    });
+    let sent = wire(&claude, 0);
+    assert!(sent.contains("ENG-7"));
+    assert!(
+        sent.ends_with("Keep this draft"),
+        "typed notes are the request: {sent}"
+    );
+    cx.read(|cx| assert_eq!(shark.read(cx).home.agent_prompt.read(cx).value(), ""));
 }
 
 /// A refused delete leaves the snapshots; a finished one takes them. And in the end: Linear only
@@ -2198,7 +2200,7 @@ fn pixel_answers(req: &Req) -> Result<Resp, linear::Error> {
 
 const PIXEL_DESCRIPTION: &str = "Adopt the new material across the app.\n\n## Scope\n- Navigation bars and **bottom drawers**\n- The form screens, see `FormView`\n\n```swift\nlet glass = Glass.regular\n```\n\nSee [the guidelines](https://developer.apple.com/design).";
 
-/// The picker in each of its states, details, the preview, the header with and without Linear,
+/// The picker in each of its states, details, the draft tray, the header with and without Linear,
 /// the Attach menu and Show attachments, in the real renderer. Saved to `SHARK_RENDER_DIR` for
 /// looking at.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
@@ -2428,12 +2430,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         shot(cx, "missing");
         keys(cx, &["escape"]);
         cx.update_window(window, |_, w, cx| {
-            shark.update(cx, |s, cx| s.start_from_issue(w, cx));
+            shark.update(cx, |s, cx| {
+                s.enter_home(w, cx);
+                s.start_from_issue(w, cx);
+            });
         })
         .unwrap();
         cx.run_until_parked();
         keys(cx, &["enter"]);
-        shot(cx, "preview");
+        shot(cx, "draft-issue");
         keys(cx, &["escape"]);
         // Last: nothing but a new credential clears it.
         cx.update_window(window, |_, w, cx| {

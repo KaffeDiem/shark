@@ -30,6 +30,7 @@ pub(super) struct NewTaskForm {
     pub(super) branch: Entity<InputState>,
     /// Home's prompt, sent once the task is created.
     first: Option<String>,
+    selection: Option<super::task_draft::PickRepos>,
     agent: Option<AgentLink>,
     picker: Entity<CommandState>,
     repos: Vec<Repo>,
@@ -140,6 +141,7 @@ impl NewTaskForm {
             defaults: vec![None; n],
             branch,
             first,
+            selection: None,
             agent,
             picker: cx.new(|cx| CommandState::new(window, cx)),
             repos,
@@ -429,7 +431,7 @@ impl NewTaskForm {
         self.picked[ix] = true;
         self.back(window, cx);
         // Stacking needs a new branch; the name field is where it goes.
-        if self.branch.read(cx).value().trim().is_empty() {
+        if self.selection.is_none() && self.branch.read(cx).value().trim().is_empty() {
             self.branch.update(cx, |i, cx| i.focus(window, cx));
         }
     }
@@ -727,6 +729,40 @@ impl NewTaskForm {
         if self.attach.is_some() {
             return self.submit_attach(self.source_repo(cx), window, cx);
         }
+        if let Some(done) = self.selection.clone() {
+            use super::task_draft::{BranchSpec, DraftRepo};
+            let repos: Vec<_> = self
+                .repos
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.picked[*i])
+                .map(|(i, repo)| {
+                    let branch = match (&self.chosen_pr[i], &self.own[i]) {
+                        (Some(pr), _) => BranchSpec::Pr(git::PullRequest {
+                            number: pr.number,
+                            url: pr.url.clone(),
+                            base: pr.base_ref_name.clone(),
+                        }),
+                        (_, Some(branch)) => BranchSpec::Existing(branch.clone()),
+                        _ => BranchSpec::New {
+                            base: self.from[i].clone().unwrap_or_default(),
+                        },
+                    };
+                    DraftRepo {
+                        repo: repo.clone(),
+                        branch,
+                    }
+                })
+                .collect();
+            if repos.is_empty() {
+                notify_err(window, cx, "Pick at least one repository");
+                return false;
+            }
+            self.shark
+                .update(cx, |s, cx| done(s, repos, window, cx))
+                .ok();
+            return true;
+        }
         let primary = self.primary(cx);
         let typed = self.branch.read(cx).value().trim().to_string();
         let picked: Vec<(Repo, Option<String>)> = (self.repos.iter())
@@ -1010,6 +1046,14 @@ impl Render for NewTaskForm {
                 if this.attach.is_some() {
                     return this.attach_tab(window, cx);
                 }
+                if this.selection.is_some() {
+                    if this.mode != Mode::Repos {
+                        this.back(window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                    return;
+                }
                 // branch <-> repos; out of a branch list, back to the repos
                 if this.mode != Mode::Repos {
                     this.back(window, cx)
@@ -1073,16 +1117,20 @@ impl Render for NewTaskForm {
                 .into_any_element();
         }
         form.gap_3()
-            .child(Input::new(&self.branch))
-            .child({
-                // As `create_workspace` names it.
-                let name = self.primary(cx).unwrap_or_default().replace('/', "-");
-                let dir = tasks_dir().join(if name.is_empty() { "<name>" } else { &name });
-                div()
-                    .text_xs()
-                    .text_color(faint)
-                    .truncate()
-                    .child(format!("Worktrees go in {}", super::menus::tilde(&dir)))
+            .when(self.selection.is_none(), |form| {
+                form.child(Input::new(&self.branch))
+            })
+            .when(self.selection.is_none(), |form| {
+                form.child({
+                    // As `create_workspace` names it.
+                    let name = self.primary(cx).unwrap_or_default().replace('/', "-");
+                    let dir = tasks_dir().join(if name.is_empty() { "<name>" } else { &name });
+                    div()
+                        .text_xs()
+                        .text_color(faint)
+                        .truncate()
+                        .child(format!("Worktrees go in {}", super::menus::tilde(&dir)))
+                })
             })
             .children(self.insert.as_ref().map(|child| {
                 let shark = self.shark.upgrade();
@@ -1156,11 +1204,20 @@ impl Render for NewTaskForm {
                             .child(hint(vec![kbd("enter")], "review"))
                             .child(hint(vec![kbd("alt-enter")], "branch from it"))
                             .child(hint(vec![kbd("tab")], "back")),
-                        (Mode::Repos, true) => d
-                            .child(hint(vec![kbd("tab")], "switch field"))
-                            .child(hint(vec![kbd("enter")], "create")),
+                        (Mode::Repos, true) => {
+                            d.child(hint(vec![kbd("tab")], "switch field")).child(hint(
+                                vec![kbd("enter")],
+                                if self.selection.is_some() {
+                                    "add to task"
+                                } else {
+                                    "create"
+                                },
+                            ))
+                        }
                         (Mode::Repos, false) => d
-                            .child(hint(vec![kbd("tab")], "switch field"))
+                            .when(self.selection.is_none(), |d| {
+                                d.child(hint(vec![kbd("tab")], "switch field"))
+                            })
                             .child(hint(vec![kbd("space")], "tick repo"))
                             .child(hint(vec![kbd("cmd-b")], "branch"))
                             .child(hint(vec![kbd("cmd-p")], "PR")),
@@ -1169,7 +1226,11 @@ impl Render for NewTaskForm {
                     .child(
                         Button::new("create")
                             .primary()
-                            .label("Create")
+                            .label(if self.selection.is_some() {
+                                "Add to task"
+                            } else {
+                                "Create"
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.submit(window, cx) {
                                     window.close_dialog(cx);
@@ -1371,7 +1432,7 @@ impl NewTaskForm {
     }
 
     /// What's happening to the listed branches or pull requests, if it's worth saying.
-    fn source_status(&self, cx: &App) -> Option<impl IntoElement + use<>> {
+    fn source_status(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
         let (ix, kind) = self.mode.slot()?;
         let text = if self.loading[ix][kind] {
             "Refreshing…".to_string()
@@ -1389,6 +1450,15 @@ impl NewTaskForm {
                 .text_color(cx.theme().muted_foreground)
                 .aria_label(text.clone())
                 .child(text)
+                .when(self.errors[ix][kind].is_some(), |d| {
+                    d.child(
+                        Button::new("retry-sources")
+                            .ghost()
+                            .xsmall()
+                            .label("Retry")
+                            .on_click(cx.listener(|f, _, window, cx| f.refresh(true, window, cx))),
+                    )
+                })
                 .test_support(),
         )
     }
@@ -1623,5 +1693,112 @@ impl NewTaskForm {
             .children(self.source_status(cx).map(|s| div().px_3().child(s)))
             .child(footer)
             .into_any_element()
+    }
+}
+
+impl Shark {
+    pub(super) fn pick_draft_repos(
+        &mut self,
+        current: Vec<super::task_draft::DraftRepo>,
+        only: Option<(String, bool)>,
+        done: super::task_draft::PickRepos,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::task_draft::BranchSpec;
+        if self.state.repos.is_empty() {
+            crate::settings::open_repos(&self.state, window, cx);
+            return;
+        }
+        let previous = current.clone();
+        let single = only.is_some();
+        let done: super::task_draft::PickRepos = Rc::new(move |s, mut selected, w, cx| {
+            let mut repos = Vec::new();
+            for repo in &previous {
+                if let Some(i) = selected.iter().position(|r| r.repo.name == repo.repo.name) {
+                    repos.push(selected.remove(i));
+                } else if single {
+                    repos.push(repo.clone());
+                }
+            }
+            repos.extend(selected);
+            done(s, repos, w, cx);
+        });
+        let repos: Vec<_> = self
+            .state
+            .repos
+            .iter()
+            .filter(|r| only.as_ref().is_none_or(|(name, _)| name == &r.name))
+            .cloned()
+            .collect();
+        if repos.is_empty() {
+            return notify_err(
+                window,
+                cx,
+                "This repository is no longer registered. Add it in Settings first.",
+            );
+        }
+        let picked: Vec<_> = current.iter().map(|r| r.repo.name.clone()).collect();
+        let shark = cx.entity().downgrade();
+        let form = cx.new(|cx| {
+            let mut f = NewTaskForm::new(
+                repos,
+                &picked,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                shark,
+                window,
+                cx,
+            );
+            f.selection = Some(done);
+            for (i, repo) in f.repos.iter().enumerate() {
+                if let Some(current) = current.iter().find(|r| r.repo.name == repo.name) {
+                    match &current.branch {
+                        BranchSpec::New { base } => {
+                            f.from[i] = (!base.is_empty()).then(|| base.clone())
+                        }
+                        BranchSpec::Existing(branch) => f.own[i] = Some(branch.clone()),
+                        BranchSpec::Pr(pr) => {
+                            f.chosen_pr[i] = Some(complete::Pr {
+                                repo: repo.name.clone(),
+                                number: pr.number,
+                                url: pr.url.clone(),
+                                base_ref_name: pr.base.clone(),
+                                title: String::new(),
+                                author: None,
+                                head_ref_name: String::new(),
+                                state: "OPEN".into(),
+                                is_draft: false,
+                                updated_at: String::new(),
+                                is_cross_repository: false,
+                            })
+                        }
+                    }
+                }
+            }
+            f
+        });
+        let input = form.read(cx).picker.clone();
+        if let Some((_, pr)) = only {
+            form.update(cx, |f, cx| {
+                if pr {
+                    f.pick_pr(0, window, cx)
+                } else {
+                    f.pick_branch(0, window, cx)
+                }
+            });
+        }
+        window.open_dialog(cx, move |d, _, _| {
+            let f = form.clone();
+            crate::ui::dialog(d)
+                .title("Add branch or pull request")
+                .w(px(640.))
+                .child(form.clone())
+                .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
+        });
+        input.update(cx, |i, cx| i.focus(window, cx));
     }
 }

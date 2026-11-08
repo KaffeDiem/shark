@@ -34,11 +34,11 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         assert!(w.try_find("agent-settings").is_some());
         w.click("agent-instructions", cx);
         w.input("Always use Mobbin to ground your research", cx);
-        // Attach › Repository › api makes it a default repository.
-        w.click("agent-attach", cx);
+        // Defaults › Repos › api makes it a default repository.
+        w.click("agent-repos", cx);
     })
     .unwrap();
-    press_in(window)(cx, &["r", "right", "enter"]);
+    press_in(window)(cx, &["a", "enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         let a = &s.state.agents[0];
@@ -77,8 +77,18 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
             "settings are edited on the agent's page"
         );
         assert!(w.try_find("agent-skills").is_some());
+        assert!(w.try_find("agent-attach").is_none());
+        assert_eq!(
+            w.find("agent-model").label().as_deref(),
+            Some("Model Inherit")
+        );
+        assert_eq!(
+            w.find("agent-effort").label().as_deref(),
+            Some("Thinking Inherit")
+        );
+        assert_eq!(w.find("agent-next").label().as_deref(), Some("Then None"));
         assert!(
-            w.try_find("agent-repo-api").is_some(),
+            w.try_find("agent-repos").is_some(),
             "the default shows as a chip"
         );
         assert!(w.try_find("agent-empty-tasks").is_some());
@@ -446,4 +456,107 @@ async fn inline_instruction_edits_reach_open_tasks_after_a_pause(cx: &mut TestAp
     assert_eq!(synced(cx), "Use tokens");
     let md = cx.read(|cx| shark.read(cx).state.tasks[0].dir().join("CLAUDE.md"));
     assert!(fs::read_to_string(md).unwrap().contains("Use tokens"));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn task_composers_keep_shift_enter_as_a_newline(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        s.home.prompt.update(cx, |p, cx| p.focus(w, cx));
+    });
+    cx.update_window(window, |_, w, cx| w.input("First line", cx))
+        .unwrap();
+    press_in(window)(cx, &["shift-enter"]);
+    cx.update_window(window, |_, w, cx| w.input("Second line", cx))
+        .unwrap();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.prompt.read(cx).value(), "First line\nSecond line");
+        assert!(s.state.tasks.is_empty());
+        assert!(s.creating.is_empty());
+    });
+    on(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.prefill_agent_task("designer", w, cx);
+    });
+    cx.update_window(window, |_, w, cx| w.input("Agent first", cx))
+        .unwrap();
+    press_in(window)(cx, &["shift-enter"]);
+    cx.update_window(window, |_, w, cx| w.input("Agent second", cx))
+        .unwrap();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.home.agent_prompt.read(cx).value(),
+            "Agent first\nAgent second"
+        );
+        assert!(s.state.tasks.is_empty());
+        assert!(s.creating.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_drafts_keep_context_and_only_unedited_repos_follow_defaults(
+    cx: &mut TestAppContext,
+) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api", "web"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.create_named_agent("Reviewer", cx).unwrap();
+        s.update_agent("designer", |a| a.repos = vec!["api".into()], cx);
+        s.prefill_agent_task("designer", w, cx);
+        assert_eq!(s.home.agent_draft.repos.len(), 1);
+        s.update_agent("designer", |a| a.repos.push("web".into()), cx);
+        assert_eq!(
+            s.home.agent_draft.repos.len(),
+            2,
+            "untouched pills follow defaults"
+        );
+        s.home.agent_draft.repos.clear();
+        s.home.agent_draft.repos_edited = true;
+        s.home.agent_draft.issues.push(crate::linear::Snapshot {
+            identifier: "ENG-412".into(),
+            title: "Keep this issue".into(),
+            ..Default::default()
+        });
+        s.home.agent_draft.model = Some("sonnet".into());
+        s.home.agent_draft.effort = Some("medium".into());
+        s.home.agent_draft.plan = true;
+        s.home
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("Keep these notes", w, cx));
+        s.update_agent("designer", |a| a.repos = vec!["api".into()], cx);
+        assert!(
+            s.home.agent_draft.repos.is_empty(),
+            "edited tray remains independent"
+        );
+        assert_eq!(s.state.agents[0].repos, ["api"]);
+        s.prefill_agent_task("reviewer", w, cx);
+        assert!(s.home.agent_draft.issues.is_empty());
+        assert!(s.home.agent_draft.model.is_none());
+        s.prefill_agent_task("designer", w, cx);
+        let draft = &s.home.agent_draft;
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "Keep these notes");
+        assert!(draft.repos.is_empty());
+        assert!(draft.repos_edited);
+        assert_eq!(draft.issues[0].identifier, "ENG-412");
+        assert_eq!(draft.model.as_deref(), Some("sonnet"));
+        assert_eq!(draft.effort.as_deref(), Some("medium"));
+        assert!(draft.plan);
+    });
 }

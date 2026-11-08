@@ -275,6 +275,10 @@ pub(crate) fn render_pixels() {
         super::agent_pixels::render_pixels(&mut cx);
         return;
     }
+    if std::env::var_os("SHARK_RENDER_INFO_ONLY").is_some() {
+        crate::chat::ui_tests::render_info_pixels(&mut cx);
+        return;
+    }
     if std::env::var_os("SHARK_RENDER_LINEAR_ONLY").is_some() {
         super::super::linear_connection::tests::render_pixels(&mut cx);
         return;

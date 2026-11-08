@@ -104,7 +104,13 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Link,
         None,
         "add ticket context",
-        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.attach_linear_issue(ws.name, w, cx))),
+        Some(|s, w, cx| {
+            if s.home_shown() {
+                s.start_from_issue(w, cx)
+            } else {
+                s.with_target(w, cx, |s, ws, w, cx| s.attach_linear_issue(ws.name, w, cx))
+            }
+        }),
     ),
     Row(
         "Show Linear issue…",
@@ -948,7 +954,9 @@ impl Shark {
                 groups.push((Some(heading), vec![]));
             }
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
-                || (no_target && NEED_TASK.contains(label))
+                || (no_target
+                    && NEED_TASK.contains(label)
+                    && !(*label == "Attach Linear issue…" && self.home_shown()))
                 || (no_linear && NEED_LINEAR.contains(label))
                 || (*label == "Show or hide diff files"
                     && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))

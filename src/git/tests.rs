@@ -1991,3 +1991,63 @@ fn agent_skills_reach_each_harness_and_survive_disabled_repo_skills() {
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(source.parent().unwrap()).unwrap();
 }
+
+#[test]
+fn draft_sources_mix_new_base_and_existing_branch() {
+    let root = std::env::temp_dir().join(format!("shark-draft-sources-{}", std::process::id()));
+    let api = init_repo(&root, "api");
+    let web = init_repo(&root, "web");
+    git(&api.path, &["checkout", "-b", "feature-base"]).unwrap();
+    fs::write(api.path.join("base.txt"), "base").unwrap();
+    git(&api.path, &["add", "base.txt"]).unwrap();
+    commit(&api.path, &["-qm", "Custom base"]);
+    let base = git(&api.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&api.path, &["checkout", "main"]).unwrap();
+    git(&web.path, &["checkout", "-b", "existing"]).unwrap();
+    fs::write(web.path.join("existing.txt"), "existing").unwrap();
+    git(&web.path, &["add", "existing.txt"]).unwrap();
+    commit(&web.path, &["-qm", "Existing work"]);
+    let existing = git(&web.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&web.path, &["checkout", "main"]).unwrap();
+    let picked = vec![
+        (api.clone(), "draft/new".into()),
+        (web.clone(), "existing".into()),
+    ];
+    let dir = root.join("task");
+    let task = create_task_with_sources(
+        &dir,
+        "task",
+        "draft/new",
+        &picked,
+        &[],
+        &[("api".into(), "feature-base".into())],
+        "",
+        None,
+        &["api".into()],
+    )
+    .unwrap();
+    assert_eq!(git(&dir.join("api"), &["rev-parse", "HEAD"]).unwrap(), base);
+    assert_eq!(
+        git(&dir.join("web"), &["rev-parse", "HEAD"]).unwrap(),
+        existing
+    );
+    assert_eq!(task.repos[0].base, "feature-base");
+    assert_eq!(task.repos[1].branch.as_deref(), Some("existing"));
+    remove_task(&task, &dir, false).unwrap();
+    let retry = create_task_with_sources(
+        &dir,
+        "task",
+        "draft/new",
+        &picked,
+        &[],
+        &[],
+        "",
+        None,
+        &["api".into()],
+    )
+    .err()
+    .unwrap();
+    assert!(retry.contains("already exists"), "{retry}");
+    assert!(!dir.exists());
+    fs::remove_dir_all(root).unwrap();
+}

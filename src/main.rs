@@ -34,6 +34,7 @@ mod skills;
 mod stack;
 mod state;
 mod sync;
+mod task_composer;
 mod theme;
 mod transcript;
 mod ui;
@@ -267,13 +268,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-0", ToggleHome, None),
         // Home: esc goes back to the task (or stops an Ask Shark answer); tab switches
         // the prompt between new task and Ask Shark; i/a jump from the list to it.
-        KeyBinding::new("escape", CancelEdit, Some("HomeView")),
-        KeyBinding::new("tab", SwitchField, Some("HomePrompt")),
-        // Up and down move through the `@agent` completions under Home's prompt.
-        KeyBinding::new("down", SelectNext, Some("HomePrompt > Input")),
-        KeyBinding::new("up", SelectPrev, Some("HomePrompt > Input")),
-        KeyBinding::new("ctrl-n", SelectNext, Some("HomePrompt > Input")),
-        KeyBinding::new("ctrl-p", SelectPrev, Some("HomePrompt > Input")),
+        KeyBinding::new("escape", CancelEdit, Some("HomeView && !Input")),
         KeyBinding::new(
             "i",
             FocusComposer,

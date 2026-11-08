@@ -327,9 +327,18 @@ async fn home_offers_linear_only_while_it_is_in_use(cx: &mut TestAppContext) {
     let offered = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
-            w.try_find("home-linear-issue").is_some()
+            w.click("draft-add", cx);
         })
-        .unwrap()
+        .unwrap();
+        cx.run_until_parked();
+        let offered = cx
+            .update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.within("menu-parent").find(0usize).label().as_deref() == Some("Linear issue…")
+            })
+            .unwrap();
+        press_in(window)(cx, &["escape"]);
+        offered
     };
     on(cx, &|s, _, cx| {
         s.home.on = true;
@@ -463,7 +472,9 @@ async fn sidebar_vim_keys_clamp(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppContext) {
+async fn agent_prompt_survives_failed_creation_and_agent_switching(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _claude = ClaudeGuard::set(&quiet);
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (home, window, shark) = one_task(cx).await;
     let on = on_app(window, shark.clone());
@@ -480,15 +491,15 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
     .await;
     on(cx, &|s, w, cx| {
         s.editor.as_ref().unwrap().update(cx, |e, _| e.dirty = true);
+        s.state.read_only = true;
         s.prefill_agent_task("designer", w, cx);
         s.home
             .agent_prompt
             .update(cx, |p, cx| p.set_value("preserve this prompt", w, cx));
     });
     press(cx, &["enter"]);
-    cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
         .unwrap();
-    press(cx, &["escape"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.tasks.len(), 1);
@@ -528,6 +539,10 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
         );
     });
     press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks.len() == 2
+    })
+    .await;
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.tasks.len(), 2);
@@ -700,4 +715,215 @@ async fn all_tasks_groups_keep_ungrouped_separate_and_agent_instructions(cx: &mu
         )
     });
     fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_composer_keeps_agent_completion_plan_and_ask_keys(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                repos: vec!["api".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        s.home.prompt.update(cx, |p, cx| p.focus(w, cx));
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.input("@des", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["tab"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.prompt.read(cx).value(), "@designer ");
+        assert!(!s.home.asking);
+        assert_eq!(s.home.draft.repos.len(), 1);
+    });
+    press_in(window)(cx, &["shift-tab"]);
+    cx.read(|cx| assert!(shark.read(cx).home.draft.plan));
+    press_in(window)(cx, &["tab"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(shark.read(cx).home.asking);
+        assert!(w.try_find("draft-add").is_none());
+        assert!(w.try_find("draft-model").is_none());
+    })
+    .unwrap();
+    press_in(window)(cx, &["tab"]);
+    cx.read(|cx| assert!(!shark.read(cx).home.asking));
+    cx.update_window(window, |_, w, cx| w.input("fix it", cx))
+        .unwrap();
+    press_in(window)(cx, &["shift-enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.prompt.read(cx).value(), "@designer fix it\n");
+        assert!(s.state.tasks.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn staged_files_stay_with_their_draft_and_block_early_start(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let source = home.join("notes.txt");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&source, "local-only notes").unwrap();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        s.draft_composer_event(
+            false,
+            &crate::task_composer::Event::Attach {
+                paths: vec![source.clone()],
+                image: None,
+            },
+            w,
+            cx,
+        );
+        assert_eq!(s.home.draft.staging, 1);
+        s.submit_task_draft(w, cx);
+        assert!(
+            s.creating.is_empty(),
+            "Start waits until files have been copied"
+        );
+        s.create_named_agent("Designer", cx).unwrap();
+        s.open_agent("designer", w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).home.draft.staging == 0
+    })
+    .await;
+    let staged = cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.home.agent_draft.files.is_empty(),
+            "copy never lands in a different agent's draft"
+        );
+        assert_eq!(s.home.draft.files.len(), 1);
+        s.home.draft.files[0].clone()
+    });
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "local-only notes");
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.enter_home(w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click(("remove-draft-file", 0usize), cx);
+    })
+    .unwrap();
+    assert!(!staged.exists());
+    assert!(
+        source.exists(),
+        "removing context never deletes the user's original file"
+    );
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn draft_tray_keyboard_opens_branch_choices_and_removes_repo(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                repos: vec!["api".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
+    press_in(window)(cx, &["up"]);
+    press_in(window)(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).menu.is_some()
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            w.within("menu-parent").find(0usize).label().as_deref(),
+            Some("New branch")
+        );
+    })
+    .unwrap();
+    press_in(window)(cx, &["escape"]);
+    press_in(window)(cx, &["backspace"]);
+    cx.read(|cx| {
+        let draft = &shark.read(cx).home.agent_draft;
+        assert!(draft.repos.is_empty());
+        assert!(draft.repos_edited);
+        assert!(shark.read(cx).state.tasks.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn branch_picker_stays_in_draft_flow_after_home_ask_mode(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                repos: vec!["api".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        s.toggle_ask_mode(w, cx);
+        s.prefill_agent_task("designer", w, cx);
+        s.new_task_default(w, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("create", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            !w.has_active_dialog(cx),
+            "Add closes without requiring a task branch name"
+        );
+        let s = shark.read(cx);
+        assert!(s.state.tasks.is_empty());
+        assert_eq!(s.home.agent_draft.repos.len(), 1);
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        assert!(s.home.asking);
+        s.new_task_default(w, cx);
+        assert!(
+            !s.home.asking,
+            "a task-context command returns Home to its task draft"
+        );
+        assert!(s.state.tasks.is_empty());
+    });
 }

@@ -2,7 +2,6 @@
 use super::*;
 use crate::complete::Kind;
 use gpui_kit::component::Theme;
-use gpui_kit::component::input::InlineToken;
 
 /// The open `@`/`/`/`#` completion menu.
 pub(super) struct Menu {
@@ -225,14 +224,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let token = InlineToken::new(text.clone(), text.clone()).with_label(label);
-        self.composer.update(cx, |c, cx| {
-            if c.replace_with_token(token, window, cx).is_err() {
-                // ponytail: tokens reject control characters; such a path goes in as plain text
-                c.replace(text, window, cx);
-            }
-            c.insert(" ", window, cx);
-        });
+        crate::task_composer::insert_token(&self.composer, text, label, window, cx);
         cx.notify();
     }
 
