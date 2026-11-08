@@ -29,6 +29,15 @@ pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
     if bytes.len() > MAX_BYTES {
         return Err("Choose an image smaller than 10 MB".into());
     }
+    // Read dimensions before AppKit can allocate decompressed pixels.
+    let size = imagesize::blob_size(bytes)
+        .map_err(|_| "Cannot open this image. Choose PNG, JPEG, WebP, GIF or HEIC")?;
+    if size.width == 0
+        || size.height == 0
+        || (size.width as u64).saturating_mul(size.height as u64) > MAX_PIXELS
+    {
+        return Err("Choose an image with at most 40 million pixels".into());
+    }
     // AppKit also supports HEIC and chooses the first frame of animated images.
     use objc2::AllocAnyThread as _;
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
@@ -221,6 +230,13 @@ mod tests {
         let input = RgbaImage::from_pixel(3, 2, image::Rgba([20, 30, 40, 128]));
         let mut png = std::io::Cursor::new(Vec::new());
         input.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert_eq!(
+            imagesize::blob_size(png.get_ref()).unwrap(),
+            imagesize::ImageSize {
+                width: 3,
+                height: 2
+            }
+        );
         let decoded = decode(png.get_ref()).unwrap();
         assert_eq!(decoded.dimensions(), (3, 2));
         assert_eq!(decoded.get_pixel(1, 1).0, [20, 30, 40, 128]);
@@ -234,6 +250,13 @@ mod tests {
             include_bytes!("../tests/fixtures/agent-icons/animated.gif").as_slice(),
             include_bytes!("../tests/fixtures/agent-icons/portrait.heic").as_slice(),
         ] {
+            assert_eq!(
+                imagesize::blob_size(bytes).unwrap(),
+                imagesize::ImageSize {
+                    width: 8,
+                    height: 6
+                }
+            );
             let decoded = decode(bytes).unwrap();
             assert_eq!(decoded.dimensions(), (8, 6));
             let pixel = decoded.get_pixel(4, 3).0;
@@ -241,6 +264,45 @@ mod tests {
                 pixel[0] > 200 && pixel[2] < 60,
                 "first frame should be red: {pixel:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions_before_decoding_pixels() {
+        // A truncated IHDR has dimensions but no compressed pixel data to allocate.
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&6_401u32.to_be_bytes());
+        png.extend_from_slice(&6_400u32.to_be_bytes());
+        assert_eq!(
+            imagesize::blob_size(&png).unwrap(),
+            imagesize::ImageSize {
+                width: 6_401,
+                height: 6_400
+            }
+        );
+        assert_eq!(
+            decode(&png).unwrap_err(),
+            "Choose an image with at most 40 million pixels"
+        );
+    }
+
+    #[test]
+    fn pixel_limit_accepts_exact_boundary_and_rejects_empty_dimensions() {
+        for (width, height, within_limit) in [
+            (8_000u32, 5_000u32, true),
+            (8_001, 5_000, false),
+            (0, 1, false),
+            (1, 0, false),
+        ] {
+            let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            png.extend_from_slice(&width.to_be_bytes());
+            png.extend_from_slice(&height.to_be_bytes());
+            let error = decode(&png).unwrap_err();
+            if within_limit {
+                assert!(error.starts_with("Cannot open this image"), "{error}");
+            } else {
+                assert!(error.contains("40 million pixels"), "{error}");
+            }
         }
     }
 

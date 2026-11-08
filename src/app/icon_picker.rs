@@ -248,6 +248,9 @@ impl IconPicker {
     }
 
     fn change_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
         self.generation += 1;
         self.busy = false;
         self.message = None;
@@ -316,6 +319,7 @@ impl IconPicker {
         let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         if key.modifiers.platform && matches!(key.key.as_str(), "v" | "d") {
             let item = cx.read_from_clipboard();
+            // Browser “Copy Image” may include a URL; image data keeps priority over text.
             if key.key == "v"
                 && search_focused
                 && !item.as_ref().is_some_and(|item| {
@@ -364,7 +368,8 @@ impl IconPicker {
             }
             "left" | "right" | "up" | "down"
                 if self.tab != Tab::Image
-                    && (grid_focused || search_focused)
+                    && (grid_focused
+                        || (search_focused && matches!(key.key.as_str(), "up" | "down")))
                     && !self.choices.is_empty() =>
             {
                 let step = match key.key.as_str() {
@@ -418,6 +423,8 @@ impl IconPicker {
     ) {
         self.cancel(cx);
         self.change_tab(Tab::Image, window, cx);
+        self.focus(window, cx);
+        self.message = None;
         if let Some(item) = item {
             if let Some(image) = item.entries().iter().find_map(|e| match e {
                 ClipboardEntry::Image(image) => Some(image),
@@ -1021,13 +1028,18 @@ mod regression_tests {
         cx: &mut TestAppContext,
         icon: AgentIcon,
     ) -> (AnyWindowHandle, Entity<IconPicker>) {
-        cx.update(|cx| {
+        let (window, picker) = cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
                 cx.new(|cx| IconPicker::new(icon, "picker-regression".into(), w, cx))
             })
             .unwrap()
+        });
+        cx.update_window(window, |_, w, cx| {
+            picker.update(cx, |this, cx| this.focus(w, cx));
         })
+        .unwrap();
+        (window, picker)
     }
 
     #[gpui_kit::test]
@@ -1130,6 +1142,15 @@ mod regression_tests {
                 std::fs::read(&path).unwrap(),
             )),
             ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())).into(),
+            ClipboardItem {
+                entries: vec![
+                    ClipboardEntry::from("https://example.com/portrait.png".to_string()),
+                    ClipboardEntry::Image(Image::from_bytes(
+                        ImageFormat::Png,
+                        std::fs::read(&path).unwrap(),
+                    )),
+                ],
+            },
         ] {
             cx.update_window(window, |_, w, cx| {
                 cx.write_to_clipboard(item);
@@ -1211,6 +1232,98 @@ mod regression_tests {
             });
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn active_image_tab_does_not_cancel_pending_work(cx: &mut TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let (window, picker) = picker(cx);
+        let applies = Rc::new(std::cell::Cell::new(0));
+        let observed = applies.clone();
+        let _events = cx.update(|cx| {
+            cx.subscribe(&picker, move |_, event, _| {
+                if matches!(event, Event::Apply(_)) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        cx.update_window(window, |_, w, cx| {
+            picker.update(cx, |this, cx| {
+                this.change_tab(Tab::Image, w, cx);
+                this.image = Some(Arc::new(image::RgbaImage::new(10, 20)));
+                this.done(w, cx);
+                this.change_tab(Tab::Image, w, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            applies.get(),
+            1,
+            "Clicking the active Image tab must not discard a pending save"
+        );
+        cx.update_window(window, |_, w, cx| {
+            picker.update(cx, |this, cx| {
+                this.load(|| Ok(image::RgbaImage::new(24, 36)), false, w, cx);
+                this.change_tab(Tab::Image, w, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                picker.read(cx).image.as_ref().unwrap().dimensions(),
+                (24, 36)
+            )
+        });
+    }
+
+    #[gpui_kit::test]
+    fn horizontal_search_keys_edit_text_without_moving_grid(cx: &mut TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let (window, picker) = picker(cx);
+        let cases: &[(&[&str], Option<&str>, &str)] = &[
+            (&["left"], None, "str"),
+            (&["shift-left", "shift-left"], Some("X"), "stX"),
+            (&["cmd-left"], Some("X"), "Xstar"),
+            (&["left", "right"], Some("X"), "starX"),
+        ];
+        for &(keys, insert, expected) in cases {
+            cx.update_window(window, |_, w, cx| {
+                picker.update(cx, |this, cx| {
+                    this.search.update(cx, |input, cx| {
+                        input.set_value("star", w, cx);
+                        input.set_selected_range(4..4, cx);
+                    });
+                    this.filter(cx);
+                    this.focus(w, cx);
+                });
+                w.render_frame(cx);
+                let selected = picker.read(cx).selected;
+                for key in keys {
+                    w.press(key, cx);
+                }
+                assert_eq!(
+                    picker.read(cx).selected,
+                    selected,
+                    "Search caret keys must not move the icon selection"
+                );
+                if let Some(text) = insert {
+                    w.input(text, cx);
+                } else {
+                    w.press("backspace", cx);
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.read(|cx| assert_eq!(picker.read(cx).search.read(cx).value().as_ref(), expected));
+        }
     }
 
     #[gpui_kit::test]
