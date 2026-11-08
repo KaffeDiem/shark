@@ -1,4 +1,4 @@
-//! Linear issues on an task: attaching one, its details, and starting an task from one. An
+//! Linear issues on a task: attaching one, its details, and starting a task from one. An
 //! attachment is reference material: it starts no turn and waits for nothing, and chats hear of
 //! it through `Task::context`. Nothing here writes to Linear.
 use super::attach::ChipCard;
@@ -928,7 +928,7 @@ impl Render for IssuePicker {
     }
 }
 
-/// The first request of an task started from an issue: to plan, which is all it can do so far.
+/// The first request of a task started from an issue: to plan, which is all it can do so far.
 fn planning_request(s: &Snapshot) -> String {
     format!(
         "Read the attached Linear issue {} and draft a plan for it. List anything unclear before going further.",
