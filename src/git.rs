@@ -688,12 +688,15 @@ fn plan_fresh(branch: &str, r: &Repo, base: &str) -> Result<Plan, String> {
         ));
     }
     let base = resolve_base(&r.path, base);
-    git(
+    let tip = git(
         &r.path,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
     )
     .map_err(|_| format!("{}: base `{base}` not found", r.name))?;
-    Ok(Plan::new(base.clone(), Some(base)))
+    Ok(Plan {
+        tip: (base != resolve_base(&r.path, "")).then_some(tip),
+        ..Plan::new(base.clone(), Some(base))
+    })
 }
 
 /// A new branch stacked on `p`: it starts on `origin/<p>`, which is also its base.

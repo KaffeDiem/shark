@@ -2,6 +2,52 @@ use super::*;
 use std::time::Duration;
 
 #[test]
+fn fresh_stacked_sources_record_the_original_parent_tip() {
+    let root = std::env::temp_dir().join(format!("shark-fresh-stack-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let repo = init_repo(&root, "api");
+    let remote = root.join("origin.git");
+    git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
+    git(
+        &repo.path,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    )
+    .unwrap();
+    git(&repo.path, &["push", "-q", "origin", "main"]).unwrap();
+    git(&repo.path, &["remote", "set-head", "origin", "main"]).unwrap();
+    git(&repo.path, &["checkout", "-q", "-b", "parent"]).unwrap();
+    commit(&repo.path, &["--allow-empty", "-qm", "parent"]);
+    let parent = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&repo.path, &["push", "-q", "origin", "parent"]).unwrap();
+    git(&repo.path, &["checkout", "-q", "main"]).unwrap();
+    let dir = root.join("child");
+    let task = create_task_with_sources(
+        &dir,
+        "child",
+        "child",
+        &[(repo.clone(), "child".into())],
+        &[],
+        &[("api".into(), "parent".into())],
+        "",
+        None,
+        &["api".into()],
+    )
+    .unwrap();
+    assert_eq!(task.repos[0].base, "origin/parent");
+    assert_eq!(
+        git(&repo.path, &["config", &parent_tip_key("child")]).ok(),
+        Some(parent)
+    );
+    remove_task(&task, &dir, false).unwrap();
+    let trunk = plan_fresh("trunk-child", &repo, "main").unwrap();
+    assert!(
+        trunk.tip.is_none(),
+        "the default branch is not a stack parent"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn automatic_tasks_refuse_retained_branches_but_explicit_tasks_can_reuse_them() {
     let root = std::env::temp_dir().join(format!("shark-fresh-task-{}", std::process::id()));
     let repo = init_repo(&root, "api");
