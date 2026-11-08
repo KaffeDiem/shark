@@ -296,6 +296,7 @@ impl Render for SkillImport {
             content = content.child(
                 v_flex()
                     .id("skill-choices")
+                    .flex_shrink_0()
                     .max_h(px(160.))
                     .overflow_y_scroll()
                     .children(import.skills.iter().enumerate().map(|(index, skill)| {

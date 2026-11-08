@@ -70,6 +70,19 @@ async fn skill_import_copies_selected_resources_and_refreshes_only_its_agent(
     let spacing = source.join("spacing");
     write_skill(&spacing, "spacing");
     write_skill(&source.join("unused"), "unused");
+    // A long preview must not squeeze the selection controls out of the dialog.
+    fs::write(
+        spacing.join("SKILL.md"),
+        format!(
+            "---\nname: spacing\ndescription: {}\n---\n{}",
+            "Review layout, spacing, typography and accessibility before making changes. "
+                .repeat(6),
+            "## Review\n\nRead references/spacing.md before reviewing.\n\n".repeat(40),
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    fs::write(source.join(".claude-plugin/plugin.json"), "{}").unwrap();
     fs::create_dir_all(spacing.join("references")).unwrap();
     fs::write(spacing.join("references/spacing.md"), "Use an 8 px grid.").unwrap();
     let agents: Vec<Agent> = ["designer", "writer"]
@@ -138,6 +151,10 @@ async fn skill_import_copies_selected_resources_and_refreshes_only_its_agent(
         let selected = p.selected.clone();
         w.render_frame(cx);
         assert!(w.try_find("skill-instructions").is_some());
+        assert!(
+            w.find(("skill-choice", 0usize)).visible(),
+            "skill selection remains visible with a long preview"
+        );
         if !selected[0] {
             w.click(("skill-choice", 0usize), cx);
         }
