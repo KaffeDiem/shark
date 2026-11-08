@@ -1,6 +1,6 @@
 cask "shark" do
-  version "0.1.30"
-  sha256 "8eea9730bd3d8cfbf68bfac3889533fccb917507c3d8a69a975c744446450ef5"
+  version "0.1.31"
+  sha256 "f6826a667d02ad7ebb0d4d0b99668e223bcd34850590cf86152dfeaf74ce11ce"
 
   url "https://github.com/KaffeDiem/shark/releases/download/v#{version}/Shark-#{version}.dmg"
   name "Shark"
