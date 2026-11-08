@@ -297,7 +297,15 @@ impl Shark {
                     return;
                 }
                 if let Some(agent) = &ws.agent {
-                    if let Err(e) = s.sync_agent(&agent.slug, false, cx) {
+                    let docs = s
+                        .state
+                        .agents
+                        .iter()
+                        .find(|a| a.slug == agent.slug)
+                        .is_some_and(|a| {
+                            a.name != agent.name || a.instructions != agent.instructions
+                        });
+                    if let Err(e) = s.sync_agent(&agent.slug, docs, cx) {
                         notify_err(window, cx, e);
                     }
                     s.refresh_agent_files(&agent.slug, cx);
@@ -414,6 +422,7 @@ fn create_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::prelude::v1::test;
     #[core::prelude::v1::test]
     fn typed_text_wins_over_issue_planning_request() {
         let mut draft = TaskDraft {
@@ -595,5 +604,63 @@ mod tests {
         assert!(empty.chats[0].plan, "No repositories always locks Plan on");
         assert!(prompt.is_none(), "Empty text starts an empty chat");
         git::remove_task(&empty, &empty.dir(), false).unwrap();
+    }
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn draft_creation_reconciles_agent_edits_before_completion(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestAppContextExt;
+        use std::time::Duration;
+        let _guard = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let agent = crate::state::Agent {
+            slug: "worker".into(),
+            name: "Old name".into(),
+            instructions: "Old instructions".into(),
+            ..Default::default()
+        };
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                agents: vec![agent.clone()],
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        cx.update_window(window, |_, window, cx| {
+            shark.update(cx, |s, cx| {
+                s.start_task_draft(
+                    TaskDraft::default(),
+                    Some(AgentLink::from(&agent)),
+                    Rc::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+                s.state.agents[0].name = "Current name".into();
+                s.state.agents[0].instructions = "Current instructions".into();
+            });
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            let s = shark.read(cx);
+            s.creating.is_empty() && !s.state.tasks.is_empty()
+        })
+        .await;
+        cx.read(|cx| {
+            let s = shark.read(cx);
+            let task = &s.state.tasks[0];
+            let link = task.agent.as_ref().unwrap();
+            assert_eq!(link.name, "Current name");
+            assert_eq!(link.instructions, "Current instructions");
+            let docs = std::fs::read_to_string(task.dir().join("CLAUDE.md")).unwrap();
+            assert!(docs.contains("Current name") && docs.contains("Current instructions"));
+            let saved = State::load();
+            assert_eq!(
+                saved.tasks[0].agent.as_ref().unwrap().instructions,
+                "Current instructions"
+            );
+        });
     }
 }
