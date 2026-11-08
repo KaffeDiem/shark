@@ -56,10 +56,29 @@ impl Shark {
         let from = source
             .as_ref()
             .and_then(|c| c.agent.as_deref())
-            .and_then(|s| self.agent(s))
-            .map(|a| a.name.clone())
-            .or_else(|| old.as_ref().map(|a| a.name.clone()))
+            .map(|slug| {
+                self.agent(slug)
+                    .map_or_else(|| slug.to_string(), |a| a.name.clone())
+            })
             .unwrap_or_else(|| "Previous chat".into());
+        if let Some(chat) = source.as_ref().and_then(|meta| self.chats.get(&meta.id)) {
+            chat.update(cx, |c, cx| c.retry_history(cx));
+            let plan = chat.read(cx).plan.clone();
+            let error = plan.update(cx, |p, cx| {
+                p.retry_save(cx);
+                p.storage_error().map(str::to_owned)
+            });
+            if let Some(error) = error {
+                return notify_err(window, cx, error);
+            }
+            if chat.read(cx).history_save_error.is_some() {
+                return notify_err(
+                    window,
+                    cx,
+                    "Answer sent, but could not save it to history. Retry save before handing off this chat.",
+                );
+            }
+        }
         let (task, to) = (task.to_string(), to.to_string());
         let payload = cx.background_executor().spawn(async move {
             source.and_then(|meta| {

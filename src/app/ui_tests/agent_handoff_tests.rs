@@ -345,3 +345,140 @@ async fn closing_unsent_handoff_preserves_quote_for_reopen_and_restart(cx: &mut 
     assert!(task.closed.is_empty());
     assert_eq!(task.chats[task.active_chat].handoff.as_ref(), Some(&quote));
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn handoff_origin_uses_source_identity_when_agent_is_deleted_or_unassigned(
+    cx: &mut TestAppContext,
+) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let agents = agents();
+    let mut tasks = Vec::new();
+    for (name, source_agent) in [
+        ("historical", Some("deleted-designer")),
+        ("unassigned", None),
+    ] {
+        let mut task = git::create_empty_task(
+            &tasks_dir().join(name),
+            name,
+            "Earlier design",
+            Some(AgentLink::from(&agents[1])),
+        )
+        .unwrap();
+        task.chats[0].agent = source_agent.map(str::to_owned);
+        let path = crate::plan::store_path(&task.chats[0].id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            r#"{"versions":[{"id":"plan","text":"Original design"}],"approved":0}"#,
+        )
+        .unwrap();
+        tasks.push(task);
+    }
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents,
+            tasks,
+            chat_agents_migrated: true,
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    for (name, expected) in [
+        ("historical", "deleted-designer"),
+        ("unassigned", "Previous chat"),
+    ] {
+        on_app(window, shark.clone())(cx, &|s, w, cx| {
+            let source = s.task(name).unwrap().chats[0].id.clone();
+            s.hand_off(name, "designer", Some(source), w, cx);
+        });
+        until(cx, window, |_, cx| {
+            shark.read(cx).task(name).unwrap().chats.len() == 2
+        })
+        .await;
+        cx.read(|cx| {
+            let s = shark.read(cx);
+            let handoff = s.task(name).unwrap().chats[1].handoff.as_ref().unwrap();
+            assert_eq!(handoff.from, expected);
+            assert_eq!(handoff.text, "Original design");
+        });
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn handoff_retries_unsaved_source_plan_and_refuses_until_it_can_save(
+    cx: &mut TestAppContext,
+) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let agents = agents();
+    let task = git::create_empty_task(
+        &tasks_dir().join("handoff"),
+        "handoff",
+        "Design",
+        Some(AgentLink::from(&agents[0])),
+    )
+    .unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents,
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.open_task_now(0, w, cx));
+    let (id, plan) = cx.read(|cx| {
+        let c = shark.read(cx).active_chat().unwrap().read(cx);
+        (c.meta.id.clone(), c.plan.clone())
+    });
+    let path = crate::plan::store_path(&id);
+    fs::create_dir_all(&path).unwrap();
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.add("approved".into(), "Approved design in memory".into(), cx);
+            p.approve(cx);
+            assert!(p.storage_error().is_some());
+        })
+    });
+    on(cx, &|s, w, cx| {
+        s.hand_off("handoff", "planner", Some(id.clone()), w, cx)
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let task = &shark.read(cx).state.tasks[0];
+        assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
+        assert_eq!(task.chats.len(), 1);
+        assert!(plan.read(cx).storage_error().is_some());
+        assert!(
+            fs::read_to_string(task.dir().join("CLAUDE.md"))
+                .unwrap()
+                .contains("## Agent: Designer")
+        );
+    });
+    fs::remove_dir(&path).unwrap();
+    on(cx, &|s, w, cx| {
+        s.hand_off("handoff", "planner", Some(id.clone()), w, cx)
+    });
+    until(cx, window, |_, cx| {
+        shark.read(cx).state.tasks[0].chats.len() == 2
+    })
+    .await;
+    cx.read(|cx| {
+        let task = &shark.read(cx).state.tasks[0];
+        assert_eq!(
+            task.chats[1].handoff.as_ref().unwrap().text,
+            "Approved design in memory"
+        );
+        assert!(plan.read(cx).storage_error().is_none());
+    });
+    assert_eq!(
+        crate::plan::handoff_text(&id).as_deref(),
+        Some("Approved design in memory")
+    );
+}
