@@ -12,6 +12,45 @@ const BUILD: &str = "Describe the work; enter starts a task";
 const ASK: &str = "Ask how to do something in Shark";
 const RELEASES: &str = "https://github.com/KaffeDiem/shark/releases/tag/v";
 
+/// Chat IDs keep creation order even after tabs are moved or closed.
+fn agent_chain(task: &Task) -> Vec<&str> {
+    let mut chats: Vec<_> = task.chats.iter().chain(&task.closed).collect();
+    chats.sort_by_key(|c| {
+        c.id.rsplit_once('~')
+            .and_then(|(_, n)| n.parse::<u64>().ok())
+            .unwrap_or(1)
+    });
+    let mut chain: Vec<_> = chats
+        .into_iter()
+        .filter_map(|c| c.agent.as_deref())
+        .collect();
+    chain.dedup();
+    chain
+}
+
+#[cfg(test)]
+mod handoff_chain_tests {
+    use super::*;
+    #[core::prelude::v1::test]
+    fn closed_and_reordered_chats_keep_agent_chronology() {
+        let chat = |id: &str, agent: &str| ChatMeta {
+            id: id.into(),
+            agent: Some(agent.into()),
+            ..Default::default()
+        };
+        let task = Task {
+            chats: vec![
+                chat("task~10", "coder"),
+                chat("task~3", "planner"),
+                chat("task~2", "planner"),
+            ],
+            closed: vec![chat("task", "designer")],
+            ..Default::default()
+        };
+        assert_eq!(agent_chain(&task), vec!["designer", "planner", "coder"]);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Destination {
     Home,
@@ -237,12 +276,7 @@ impl Shark {
             _ => return None,
         };
         let agent = self.state.agents.iter().find(|a| a.slug == slug)?;
-        Some(AgentLink {
-            slug: agent.slug.clone(),
-            name: agent.name.clone(),
-            instructions: agent.instructions.clone(),
-            siblings: vec![],
-        })
+        Some(AgentLink::from(agent))
     }
 
     /// Home is on screen: asked for, or nothing else to show.
@@ -646,12 +680,7 @@ impl Shark {
         let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
             return;
         };
-        let link = crate::state::AgentLink {
-            slug: agent.slug.clone(),
-            name: agent.name,
-            instructions: agent.instructions,
-            siblings: Vec::new(),
-        };
+        let link = crate::state::AgentLink::from(&agent);
         let repos: Vec<_> = self
             .state
             .repos
@@ -1431,7 +1460,18 @@ impl Shark {
         let name = w.name.clone();
         let title = w.display_title().to_string();
         let detail = format!("{} · {chats} · {names}", w.branch);
-        let tip: SharedString = detail.clone().into();
+        let chain = agent_chain(w);
+        let chain = chain
+            .into_iter()
+            .map(|slug| self.agent(slug).map_or(slug, |a| a.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(" → ");
+        let tip: SharedString = if chain.is_empty() {
+            detail.clone()
+        } else {
+            format!("{detail}\n{chain}")
+        }
+        .into();
         let ws = w.clone();
         h_flex()
             .id(("home-ws", ix))

@@ -162,6 +162,17 @@ pub(super) const COMMANDS: &[Row] = &[
     Row::key("Copy branch name", IconName::GitBranch, &CopyBranch, ""),
     Row::key("Show chat", IconName::MessageSquare, &ShowChat, "tab"),
     Row::key("New chat", IconName::Plus, &NewChat, "tab"),
+    Row(
+        "Hand off to…",
+        IconName::ArrowRightLeft,
+        None,
+        "agent pipeline",
+        Some(|s, w, cx| {
+            if let Some(task) = s.active.clone() {
+                s.hand_off_picker(&task, None, w, cx);
+            }
+        }),
+    ),
     Row::key("Close chat", IconName::X, &CloseChat, "tab"),
     Row(
         "Reopen closed chat…",

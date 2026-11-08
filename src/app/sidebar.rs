@@ -572,11 +572,7 @@ impl Shark {
         self.pick_named_icon(
             a.icon.clone(),
             move |s, icon, cx| {
-                if let Some(a) = s.state.agents.iter_mut().find(|a| a.slug == slug) {
-                    a.icon = icon.clone();
-                    let _ = s.state.save();
-                    cx.notify();
-                }
+                s.update_agent(&slug, |a| a.icon = icon, cx);
             },
             window,
             cx,

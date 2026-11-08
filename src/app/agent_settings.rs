@@ -220,6 +220,12 @@ impl Shark {
         let mut slug = base.to_string();
         let mut suffix = 2;
         while self.state.agents.iter().any(|a| a.slug == slug)
+            || self
+                .state
+                .tasks
+                .iter()
+                .flat_map(|task| task.chats.iter().chain(&task.closed))
+                .any(|chat| chat.agent.as_deref() == Some(slug.as_str()))
             || crate::state::agent_skills_dir(&slug)
                 .parent()
                 .is_some_and(|p| p.exists())
@@ -329,10 +335,20 @@ impl Shark {
     }
 
     /// Changes an agent and saves. A thinking level its model can't do falls back to the default.
-    fn update_agent(&mut self, slug: &str, f: impl FnOnce(&mut Agent), cx: &mut Context<Self>) {
+    pub(super) fn update_agent(
+        &mut self,
+        slug: &str,
+        f: impl FnOnce(&mut Agent),
+        cx: &mut Context<Self>,
+    ) {
         let Some(i) = self.state.agents.iter().position(|a| a.slug == slug) else {
             return;
         };
+        let old_next = self.state.agents[i].next.clone();
+        let old_identity = (
+            self.state.agents[i].name.clone(),
+            self.state.agents[i].icon.clone(),
+        );
         f(&mut self.state.agents[i]);
         let a = &self.state.agents[i];
         let model = a
@@ -346,7 +362,29 @@ impl Shark {
         {
             a.effort = None;
         }
+        let next_changed = old_next != a.next;
+        let identity_changed = old_identity != (a.name.clone(), a.icon.clone());
         let _ = self.state.save();
+        if next_changed {
+            let _ = self.sync_agent(slug, false, cx);
+        }
+        if identity_changed {
+            let incoming: Vec<_> = self
+                .state
+                .tasks
+                .iter()
+                .filter(|task| {
+                    task.agent
+                        .as_ref()
+                        .and_then(|a| self.agent(&a.slug))
+                        .is_some_and(|a| a.next.as_deref() == Some(slug))
+                })
+                .map(|task| task.name.clone())
+                .collect();
+            for task in incoming {
+                self.publish_task(&task, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -426,6 +464,44 @@ impl Shark {
             menu::item(IconName::Trash, "Delete agent…", act(Shark::delete_agent)),
         ]);
         entries
+    }
+
+    pub(super) fn agent_next_menu(
+        &mut self,
+        slug: &str,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
+        let current = agent.next.as_deref().filter(|s| self.agent(s).is_some());
+        let pick = |next: Option<String>| {
+            let slug = slug.to_string();
+            on_shark(cx, move |s, _, cx| {
+                s.update_agent(&slug, |a| a.next = next.clone(), cx)
+            })
+        };
+        let mut entries = vec![
+            menu::item(None, "None", pick(None)).checked(current.is_none()),
+            Entry::Sep,
+        ];
+        entries.extend(
+            self.state
+                .agents
+                .iter()
+                .filter(|a| a.slug != slug)
+                .map(|a| {
+                    menu::item(
+                        super::sidebar::section_icon(&a.icon),
+                        a.name.clone(),
+                        pick(Some(a.slug.clone())),
+                    )
+                    .checked(current == Some(a.slug.as_str()))
+                }),
+        );
+        self.show_menu(pos, entries, window, cx);
     }
 
     fn agent_model_menu(
@@ -789,6 +865,18 @@ impl Shark {
             "This agent's skills",
             Shark::agent_skills_menu,
         ));
+        chips.push(chip(
+            "agent-next",
+            IconName::ArrowRight,
+            agent
+                .next
+                .as_deref()
+                .and_then(|s| self.agent(s))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "Hand off…".into()),
+            "Agent this one hands its tasks to",
+            Shark::agent_next_menu,
+        ));
         let s = slug.clone();
         chips.push(anchored_button(
             "agent-attach".into(),
@@ -1033,7 +1121,24 @@ impl Shark {
                 let cursor_at = s.side_rows(false).iter().position(|row| *row == s.sel);
                 let agents = s.state.agents.clone();
                 let sections = s.state.sections.clone();
+                let affected: Vec<_> = s
+                    .state
+                    .tasks
+                    .iter()
+                    .filter(|task| {
+                        task.agent
+                            .as_ref()
+                            .and_then(|a| s.agent(&a.slug))
+                            .is_some_and(|a| a.next.as_deref() == Some(&slug))
+                    })
+                    .map(|task| task.name.clone())
+                    .collect();
                 s.state.agents.retain(|a| a.slug != slug);
+                for agent in &mut s.state.agents {
+                    if agent.next.as_deref() == Some(&slug) {
+                        agent.next = None;
+                    }
+                }
                 for section in &mut s.state.sections {
                     if section.agent.as_deref() == Some(&slug) {
                         section.agent = None;
@@ -1043,6 +1148,9 @@ impl Shark {
                     s.state.agents = agents;
                     s.state.sections = sections;
                     return notify_err(window, cx, e.to_string());
+                }
+                for task in affected {
+                    s.publish_task(&task, cx);
                 }
                 if let Some(cursor_slug) = cursor_slug {
                     s.sel = s

@@ -50,6 +50,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let agents = vec![
         Agent {
             slug: "designer".into(),
+            next: Some("planner".into()),
             name: "Designer".into(),
             icon: "palette".into(),
             instructions:
@@ -75,8 +76,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             ..Default::default()
         },
         Agent {
-            slug: "test".into(),
-            name: "test".into(),
+            slug: "planner".into(),
+            name: "Planner".into(),
             icon: "bot".into(),
             ..Default::default()
         },
@@ -86,14 +87,33 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         fs::create_dir_all(task.dir()).unwrap();
     }
     let cases: &[(&str, Setup)] = &[
+        ("agent-next-menu", |s, w, cx| {
+            s.open_agent("designer", w, cx);
+            s.agent_next_menu("designer", point(px(650.), px(120.)), w, cx);
+        }),
+        ("handoff-bar", |s, w, cx| {
+            s.open_task_now(0, w, cx);
+            s.active_chat().unwrap().clone().update(cx, |c, cx| {
+                c.play(crate::harness::Ev::User("Design onboarding".into()), cx);
+                c.play(
+                    crate::harness::Ev::Text(
+                        "Use three steps, with a skip link on step two.".into(),
+                    ),
+                    cx,
+                );
+                c.busy = false;
+                cx.notify();
+            });
+        }),
+        ("handoff-quote", |s, w, cx| s.open_task_now(0, w, cx)),
         ("agent-tasks", |s, w, cx| s.open_agent("designer", w, cx)),
-        ("agent-empty", |s, w, cx| s.open_agent("test", w, cx)),
+        ("agent-empty", |s, w, cx| s.open_agent("planner", w, cx)),
         ("rail", |s, w, cx| {
             s.rail = true;
             s.open_agent("designer", w, cx);
         }),
         ("agent-collapsed", |s, w, cx| {
-            s.open_agent("test", w, cx);
+            s.open_agent("planner", w, cx);
             s.set_agent_collapsed(0, true, cx);
         }),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
@@ -153,6 +173,20 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 agents: agents.clone(),
                 ..Default::default()
             };
+            if case == "handoff-quote" {
+                state.tasks[0].migrate();
+                state.tasks[0].chats[0].title = "Onboarding ideas".into();
+                state.tasks[0].agent = Some(AgentLink::from(&state.agents[1]));
+                let id = state.tasks[0].next_chat_id();
+                let mut meta = state.new_chat(&state.tasks[0], id);
+                meta.handoff = Some(crate::state::Handoff {
+                    from: "Designer".into(),
+                    title: "Onboarding ideas".into(),
+                    text: "Three-step flow, skip on step 2.\nUse Card and Stepper components.\nKeep keyboard navigation available throughout.".into(),
+                });
+                let at = state.tasks[0].push_chat(meta);
+                state.tasks[0].active_chat = at;
+            }
             state.appearance.mode = mode;
             state.save().unwrap();
             let (window, shark) = cx

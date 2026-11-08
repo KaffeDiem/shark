@@ -164,6 +164,7 @@ actions!(
         TogglePlan,
         ApprovePlan,
         BuildPlanInNewChat,
+        HandOff,
         PlanOlder,
         PlanNewer,
         TogglePlanChanges
@@ -332,6 +333,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("cmd-shift-enter", AskSide, Some("Composer")),
+        KeyBinding::new("cmd-alt-enter", HandOff, Some("Composer")),
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),
         KeyBinding::new("c", CopySide, Some("SideAnswer")),
         KeyBinding::new("enter", InsertSide, Some("SideAnswer")),
