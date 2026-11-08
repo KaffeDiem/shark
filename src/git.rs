@@ -806,6 +806,20 @@ pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Res
     Ok(())
 }
 
+/// Completion lookups must not move an open review's comparison or update baseline.
+pub(crate) fn fetch_composer_pr_head(src: &Path, pr: &PullRequest) -> Result<String, String> {
+    let remote = pr_remote(src, pr)?;
+    let reference = format!("refs/shark/composer/pull/{}/head", pr.number);
+    let spec = format!("+refs/pull/{}/head:{reference}", pr.number);
+    cmd_bounded(
+        src,
+        "git",
+        &["fetch", "--quiet", "--no-tags", &remote, &spec],
+        30,
+    )?;
+    Ok(reference)
+}
+
 /// Refresh only the review comparison ref; the head stays put so "Fetch updates" stays offered.
 pub(crate) fn refresh_review_base(src: &Path, pr: &PullRequest) -> Result<(), String> {
     fetch_review_refs(src, pr, false)
