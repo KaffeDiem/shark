@@ -110,6 +110,8 @@ fn install(artifact: &Artifact, cache: &Path) -> Result<PathBuf> {
                 "--location",
                 "--silent",
                 "--show-error",
+                "--header",
+                "Accept: application/octet-stream",
                 "--proto",
                 "=https",
                 "--proto-redir",
@@ -266,7 +268,14 @@ mod tests {
     fn manifest_has_exact_https_artifacts_and_safe_paths() {
         let artifacts = manifest().unwrap();
         for a in artifacts {
-            assert!(a.url.starts_with("https://") && a.url.contains(&a.version));
+            assert!(a.url.starts_with("https://"));
+            assert!(
+                a.url.contains(&a.version)
+                    || (a.url.starts_with("https://api.github.com/repos/")
+                        && a.url
+                            .rsplit_once("/releases/assets/")
+                            .is_some_and(|(_, id)| id.parse::<u64>().is_ok()))
+            );
             assert_eq!(a.sha256.len(), 64);
             assert!(a.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
             assert!(safe_member(&a.executable));

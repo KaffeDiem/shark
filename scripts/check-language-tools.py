@@ -92,7 +92,8 @@ def install_once(artifact):
         deadline = time.monotonic() + 180
         if not artifact["url"].startswith("https://"):
             raise ValueError("artifact URL must use HTTPS")
-        with urllib.request.urlopen(artifact["url"], timeout=30) as response, archive.open("xb") as output:
+        request = urllib.request.Request(artifact["url"], headers={"Accept": "application/octet-stream"})
+        with urllib.request.urlopen(request, timeout=30) as response, archive.open("xb") as output:
             if not response.url.startswith("https://"):
                 raise ValueError("artifact redirected outside HTTPS")
             while True:
