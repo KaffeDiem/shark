@@ -18,6 +18,26 @@ fn draft_issue() -> crate::linear::Snapshot {
     }
 }
 
+fn avatar_identities(s: &mut Shark) {
+    use crate::state::AgentIcon;
+    s.state.agents[0].icon = AgentIcon::Symbol {
+        name: "palette".into(),
+        tint: Some("blue".into()),
+    };
+    let photo = image::RgbaImage::from_fn(96, 96, |x, y| {
+        image::Rgba([80 + x as u8, 110 + y as u8, 160, 255])
+    });
+    s.state.agents[1].icon = crate::agent_icon::save_image("planner", &photo).unwrap();
+    s.state.agents.push(Agent {
+        slug: "reviewer".into(),
+        name: "Reviewer".into(),
+        icon: AgentIcon::Emoji {
+            value: "🐧".into()
+        },
+        ..Default::default()
+    });
+}
+
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
@@ -113,6 +133,41 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         fs::create_dir_all(task.dir()).unwrap();
     }
     let cases: &[(&str, Setup)] = &[
+        ("agent-icon-picker-symbols", |s, w, cx| {
+            s.pick_agent_icon("designer", w, cx);
+        }),
+        ("agent-icon-picker-emoji", |s, w, cx| {
+            s.state.agents[0].icon = crate::state::AgentIcon::Emoji {
+                value: "🐧".into()
+            };
+            s.pick_agent_icon("designer", w, cx);
+        }),
+        ("agent-icon-picker-image", |s, w, cx| {
+            let image = image::RgbaImage::from_fn(120, 180, |x, y| {
+                image::Rgba([x as u8, y as u8, 140, 255])
+            });
+            let path = crate::state::support_dir().join("crop-preview.png");
+            image.save(&path).unwrap();
+            s.pick_agent_icon("designer", w, cx);
+            s.icon_picker
+                .as_ref()
+                .unwrap()
+                .picker
+                .clone()
+                .update(cx, |p, cx| p.load_path(&path, false, w, cx));
+        }),
+        ("agent-identities-symbol", |s, w, cx| {
+            avatar_identities(s);
+            s.open_agent("designer", w, cx);
+        }),
+        ("agent-identities-photo", |s, w, cx| {
+            avatar_identities(s);
+            s.open_agent("planner", w, cx);
+        }),
+        ("agent-identities-emoji", |s, w, cx| {
+            avatar_identities(s);
+            s.open_agent("reviewer", w, cx);
+        }),
         ("task-agent-chip", |s, w, cx| s.open_task_now(0, w, cx)),
         ("task-agent-chip-narrow", |s, w, cx| {
             s.state.agents[0].name = "An agent with a very long descriptive name".into();
@@ -360,6 +415,26 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 });
             }
             let screenshot = cx.capture_screenshot(window).expect("real agent renderer");
+            if case == "agent-icon-picker-image" {
+                let (bounds, viewport) = cx
+                    .update_window(window, |_, w, _| {
+                        (w.find("agent-icon-crop").bounds(), w.viewport_size().width)
+                    })
+                    .unwrap();
+                let scale = screenshot.width() as f32 / f32::from(viewport);
+                let pixel = |x: Pixels, y: Pixels| {
+                    screenshot
+                        .get_pixel((f32::from(x) * scale) as u32, (f32::from(y) * scale) as u32)
+                        .0
+                };
+                let corner = pixel(bounds.left() + px(2.), bounds.top() + px(2.));
+                let outside = pixel(bounds.left() - px(2.), bounds.top() + px(2.));
+                assert!(
+                    corner.iter().zip(outside).all(|(a, b)| a.abs_diff(b) <= 3),
+                    "crop preview must have circular transparent corners: {corner:?} vs {outside:?}"
+                );
+                assert_ne!(pixel(bounds.center().x, bounds.center().y), outside);
+            }
             if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
                 let dir = PathBuf::from(dir);
                 fs::create_dir_all(&dir).unwrap();

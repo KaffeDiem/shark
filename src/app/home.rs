@@ -587,11 +587,11 @@ impl Shark {
             .and_then(|slug| agents.iter().position(|a| a.slug == slug))
             .map_or(0, |i| i + 1);
         let mut rows = vec![CommandItem::new().label("No agent").icon(IconName::AtSign)];
-        rows.extend(agents.iter().map(|agent| {
-            CommandItem::new()
-                .label(agent.name.clone())
-                .icon(super::sidebar::section_icon(&agent.icon))
-        }));
+        rows.extend(
+            agents
+                .iter()
+                .map(|agent| super::agent_icon_view::command(agent)),
+        );
         open_menu(
             cx.entity().downgrade(),
             "Start the task with an agent…",
@@ -1400,7 +1400,7 @@ impl Shark {
                     .gap_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(Icon::new(super::sidebar::section_icon(&a.icon)).with_size(px(12.)))
+                    .child(super::agent_icon_view::agent_icon(&a.icon))
                     .child(a.name.clone())
             }))
             .child(

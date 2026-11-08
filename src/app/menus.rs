@@ -746,12 +746,13 @@ pub(super) fn handoff_submenu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> O
         .map(|a| {
             let to = a.slug.clone();
             let entry = menu::item(
-                sidebar::section_icon(&a.icon),
+                None,
                 a.name.clone(),
                 on_task(cx, &ws.name, move |s, n, w, cx| {
                     s.hand_off(&n, &to, None, w, cx)
                 }),
             );
+            let entry = entry.agent_icon(a.icon.clone());
             if Some(a.slug.as_str()) == next {
                 entry.hint("next")
             } else {

@@ -20,6 +20,7 @@ pub(crate) enum Entry {
         icon: Option<IconName>,
         /// Drawn instead of `icon`: an app's own icon.
         image: Option<Arc<Image>>,
+        agent_icon: Option<crate::state::AgentIcon>,
         label: SharedString,
         /// Right-aligned and muted: the branch a copy will copy, the path an open will open.
         hint: Option<SharedString>,
@@ -30,6 +31,7 @@ pub(crate) enum Entry {
     Sub {
         icon: IconName,
         image: Option<Arc<Image>>,
+        agent_icon: Option<crate::state::AgentIcon>,
         label: SharedString,
         hint: Option<SharedString>,
         entries: Vec<Entry>,
@@ -45,6 +47,7 @@ pub(crate) fn item(
     Entry::Item {
         icon: icon.into(),
         image: None,
+        agent_icon: None,
         label: label.into(),
         hint: None,
         checked: false,
@@ -56,6 +59,7 @@ pub(crate) fn sub(icon: IconName, label: impl Into<SharedString>, entries: Vec<E
     Entry::Sub {
         icon,
         image: None,
+        agent_icon: None,
         label: label.into(),
         hint: None,
         entries,
@@ -76,6 +80,13 @@ impl Entry {
     pub(crate) fn image(mut self, img: Option<Arc<Image>>) -> Self {
         if let Entry::Item { image, .. } | Entry::Sub { image, .. } = &mut self {
             *image = img;
+        }
+        self
+    }
+
+    pub(crate) fn agent_icon(mut self, icon: crate::state::AgentIcon) -> Self {
+        if let Entry::Item { agent_icon, .. } | Entry::Sub { agent_icon, .. } = &mut self {
+            *agent_icon = Some(icon);
         }
         self
     }
@@ -402,7 +413,7 @@ impl Menu {
         let theme = cx.theme();
         let (icons, controls) = columns(entries);
         let rows = entries.iter().enumerate().map(|(ix, e)| {
-            let (icon, image, label, hint, checked, submenu) = match e {
+            let (icon, image, agent_icon, label, hint, checked, submenu) = match e {
                 Entry::Sep => {
                     return div()
                         .h(px(1.))
@@ -414,18 +425,36 @@ impl Menu {
                 Entry::Item {
                     icon,
                     image,
+                    agent_icon,
                     label,
                     hint,
                     checked,
                     ..
-                } => (*icon, image.clone(), label, hint, *checked, false),
+                } => (
+                    *icon,
+                    image.clone(),
+                    agent_icon,
+                    label,
+                    hint,
+                    *checked,
+                    false,
+                ),
                 Entry::Sub {
                     icon,
                     image,
+                    agent_icon,
                     label,
                     hint,
                     ..
-                } => (Some(*icon), image.clone(), label, hint, false, true),
+                } => (
+                    Some(*icon),
+                    image.clone(),
+                    agent_icon,
+                    label,
+                    hint,
+                    false,
+                    true,
+                ),
             };
             let label_width = text_width(label, window, theme);
             let hint_width = hint
@@ -470,22 +499,26 @@ impl Menu {
                             .test_support()
                             .size(px(16.))
                             .flex_none()
-                            .child(match (image, icon) {
-                                // App icons have a margin built in; 18px matches a 16px glyph.
-                                (Some(app), _) => img(app)
-                                    .size(px(18.))
-                                    .mx(px(-1.))
-                                    .flex_none()
-                                    .into_any_element(),
-                                (None, Some(i)) => Icon::new(i)
-                                    .with_size(px(16.))
-                                    .text_color(if theme.is_dark() {
-                                        theme.popover.blend(theme.foreground.alpha(0.61))
-                                    } else {
-                                        theme.muted_foreground
-                                    })
-                                    .into_any_element(),
-                                (None, None) => div().size(px(16.)).into_any_element(),
+                            .child(if let Some(icon) = agent_icon {
+                                crate::app::agent_icon_view::agent_icon(icon).into_any_element()
+                            } else {
+                                match (image, icon) {
+                                    // App icons have a margin built in; 18px matches a 16px glyph.
+                                    (Some(app), _) => img(app)
+                                        .size(px(18.))
+                                        .mx(px(-1.))
+                                        .flex_none()
+                                        .into_any_element(),
+                                    (None, Some(i)) => Icon::new(i)
+                                        .with_size(px(16.))
+                                        .text_color(if theme.is_dark() {
+                                            theme.popover.blend(theme.foreground.alpha(0.61))
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .into_any_element(),
+                                    (None, None) => div().size(px(16.)).into_any_element(),
+                                }
                             }),
                     )
                 })
@@ -630,6 +663,10 @@ fn columns(entries: &[Entry]) -> (bool, bool) {
             e,
             Entry::Item { icon: Some(_), .. }
                 | Entry::Item { image: Some(_), .. }
+                | Entry::Item {
+                    agent_icon: Some(_),
+                    ..
+                }
                 | Entry::Sub { .. }
         )
     });

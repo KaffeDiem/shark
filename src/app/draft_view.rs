@@ -930,7 +930,13 @@ impl Shark {
                     Button::new(("home-mention", i))
                         .ghost()
                         .small()
-                        .label(format!("{} @{}", a.name, a.slug))
+                        .accessibility_label(format!("{} @{}", a.name, a.slug))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(super::agent_icon_view::agent_icon(&a.icon))
+                                .child(format!("{} @{}", a.name, a.slug)),
+                        )
                         .when(row == at, |b| b.bg(theme.list_hover))
                         .on_click(
                             cx.listener(move |s, _, w, cx| s.complete_mention(Some(i), w, cx)),

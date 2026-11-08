@@ -13,7 +13,7 @@ impl Shark {
         (next.slug != current.slug).then(|| HandoffTarget {
             slug: next.slug.clone(),
             name: next.name.clone(),
-            icon: sidebar::section_icon(&next.icon),
+            icon: next.icon.clone(),
         })
     }
 
@@ -214,11 +214,7 @@ impl Shark {
         }
         let items = agents
             .iter()
-            .map(|a| {
-                CommandItem::new()
-                    .label(a.name.clone())
-                    .icon(sidebar::section_icon(&a.icon))
-            })
+            .map(|a| super::agent_icon_view::command(a))
             .collect();
         let task = task.to_string();
         open_menu(

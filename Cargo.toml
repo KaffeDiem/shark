@@ -14,6 +14,7 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 unicode-width = "0.2"
 smallvec = "1"
 unicode-segmentation = "1"
+emojis = "0.8"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSEvent", "NSImage", "NSResponder", "NSWorkspace", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSDictionary", "NSValue", "NSURL", "NSArray", "NSGeometry", "NSFileManager", "NSError", "NSDate", "NSDateFormatter", "NSISO8601DateFormatter", "NSFormatter", "NSTimeZone"] }
