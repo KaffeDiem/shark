@@ -12,7 +12,7 @@ fn write_skill(dir: &std::path::Path, name: &str) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn skill_import_attach_entry_and_cancelled_picker_leave_agent_unchanged(
+async fn skill_import_skills_entry_and_cancelled_picker_leave_agent_unchanged(
     cx: &mut TestAppContext,
 ) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -32,10 +32,10 @@ async fn skill_import_attach_entry_and_cancelled_picker_leave_agent_unchanged(
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("agent-attach", cx);
+        w.click("agent-skills", cx);
     })
     .unwrap();
-    press_in(window)(cx, &["s", "enter"]);
+    press_in(window)(cx, &["a", "enter"]);
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.try_find("skill-import").is_some());

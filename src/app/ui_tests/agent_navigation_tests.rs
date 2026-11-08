@@ -132,43 +132,46 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
     );
     cx.run_until_parked();
     let on = on_app(window, shark.clone());
-    for (destination, branch) in [(home::Destination::Agent("designer".into()), "from-agent")] {
-        on(cx, &|s, w, cx| {
-            s.enter_home(w, cx);
-            s.home
-                .prompt
-                .update(cx, |p, cx| p.set_value("Keep this draft", w, cx));
-            if let home::Destination::Agent(slug) = &destination {
-                s.open_agent(slug, w, cx)
-            }
-            s.new_task_default(w, cx);
-        });
-        cx.update_window(window, |_, w, cx| w.input(branch, cx))
-            .unwrap();
-        press_in(window)(cx, &["enter"]);
-        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-            shark.read(cx).active.as_deref() == Some(branch)
-        })
-        .await;
-        cx.run_until_parked();
-        cx.read(|cx| {
-            let s = shark.read(cx);
-            assert_eq!(s.home.prompt.read(cx).value().as_ref(), "Keep this draft");
-            assert!(s.active_chat().unwrap().read(cx).sent_texts().is_empty());
-            let expected = match &destination {
-                home::Destination::Agent(slug) => Some(slug.as_str()),
-                _ => None,
-            };
-            assert_eq!(
-                s.task(branch)
-                    .unwrap()
-                    .agent
-                    .as_ref()
-                    .map(|a| a.slug.as_str()),
-                expected
-            );
-        });
-    }
+    on(cx, &|s, w, cx| {
+        git::git(&s.state.repos[0].path, &["branch", "from-agent"]).unwrap();
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("Keep this draft", w, cx));
+        s.open_agent("designer", w, cx);
+        s.new_task_default(w, cx);
+    });
+    press_in(window)(cx, &["cmd-b"]);
+    cx.update_window(window, |_, w, cx| w.input("from-agent", cx))
+        .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| w.click("create", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.state.tasks.is_empty(), "branch selection only adds context");
+        assert!(matches!(&s.home.agent_draft.repos[0].branch, task_draft::BranchSpec::Existing(b) if b == "from-agent"));
+    });
+    cx.update_window(window, |_, w, cx| w.click("draft-start", cx))
+        .unwrap();
+    until(cx, window, |_, cx| {
+        let s = shark.read(cx);
+        s.state.tasks.len() == 1 && !s.home.agent_draft.starting
+    })
+    .await;
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        let task = &s.state.tasks[0];
+        assert_eq!(s.home.prompt.read(cx).value().as_ref(), "Keep this draft");
+        assert!(s.chats[&task.chats[0].id].read(cx).sent_texts().is_empty());
+        assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
+        assert_eq!(task.repos[0].branch.as_deref(), Some("from-agent"));
+        assert_eq!(
+            s.home.destination,
+            home::Destination::Agent("designer".into())
+        );
+        assert!(s.active.is_none(), "starting keeps the agent page visible");
+    });
 }
 
 #[gpui_kit::test]
@@ -202,26 +205,52 @@ async fn branch_task_captures_selected_agent_and_repository_defaults(cx: &mut Te
     cx.run_until_parked();
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("@designer Initial notes", w, cx));
+        s.draft_composer_event(false, &crate::task_composer::Event::Change, w, cx);
+    });
+    cx.run_until_parked();
+    on(cx, &|s, w, cx| {
+        s.new_task_default(w, cx);
+        // Selecting context must use the text still visible when Start is finally pressed.
         s.home.prompt.update(cx, |p, cx| {
             p.set_value("@designer Fix onboarding spacing", w, cx)
         });
-        s.new_task_default(w, cx);
-        // The dialog owns the choice; later Home changes must not retarget this task.
-        s.home
-            .prompt
-            .update(cx, |p, cx| p.set_value("Keep a newer draft", w, cx));
     });
-    cx.update_window(window, |_, w, cx| w.input("spacing", cx))
+    cx.update_window(window, |_, w, cx| w.click("create", cx))
         .unwrap();
-    press_in(window)(cx, &["enter"]);
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).active.as_deref() == Some("spacing")
-    })
-    .await;
     cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);
-        let task = s.task("spacing").unwrap();
+        assert!(
+            s.state.tasks.is_empty(),
+            "picker does not create a task or send hidden notes"
+        );
+        assert_eq!(
+            s.home
+                .draft
+                .repos
+                .iter()
+                .map(|r| r.repo.name.as_str())
+                .collect::<Vec<_>>(),
+            ["web"]
+        );
+        assert_eq!(
+            s.home.prompt.read(cx).value(),
+            "@designer Fix onboarding spacing"
+        );
+    });
+    cx.update_window(window, |_, w, cx| w.click("draft-start", cx))
+        .unwrap();
+    until(cx, window, |_, cx| {
+        let s = shark.read(cx);
+        s.state.tasks.len() == 1 && !s.home.draft.starting
+    })
+    .await;
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        let task = &s.state.tasks[0];
         assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
         assert_eq!(
             task.agent.as_ref().unwrap().instructions,
@@ -244,9 +273,10 @@ async fn branch_task_captures_selected_agent_and_repository_defaults(cx: &mut Te
             );
         }
         assert_eq!(
-            s.active_chat().unwrap().read(cx).sent_texts(),
+            s.chats[&task.chats[0].id].read(cx).sent_texts(),
             ["Fix onboarding spacing"]
         );
-        assert_eq!(s.home.prompt.read(cx).value(), "Keep a newer draft");
+        assert_eq!(s.home.prompt.read(cx).value(), "");
+        assert!(s.home_shown() && s.active.is_none());
     });
 }

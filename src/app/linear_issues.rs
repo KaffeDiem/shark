@@ -4,12 +4,11 @@
 use super::attach::ChipCard;
 use super::*;
 use crate::linear::{self, Credential, Error, Hit, Http, IssueRef, Lists, Page, Target};
-use crate::state::AgentLink;
 use crate::sync::ago;
 use crate::ui::menu_dialog;
 use crate::usage::now;
 use gpui_kit::component::Disableable as _;
-use gpui_kit::component::input::{Enter, Textarea, TextareaState};
+use gpui_kit::component::input::Enter;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::text::TextViewState;
 use std::collections::VecDeque;
@@ -311,7 +310,7 @@ pub(super) struct IssuePicker {
     state: Entity<CommandState>,
     /// The task to attach to; None starts a new one.
     task: Option<String>,
-    agent: Option<AgentLink>,
+    picked: Option<super::task_draft::PickIssues>,
     /// Why nothing can be asked of Linear; the row to Settings replaces the others.
     blocked: Option<Blocked>,
     /// Lists, cached results and marks belong to this connection.
@@ -749,9 +748,6 @@ impl IssuePicker {
             Some(Row::Lookup(t)) => t,
             _ => return,
         };
-        if self.task.is_none() {
-            return;
-        }
         let before = self.marks.len();
         self.marks.retain(|t| t.id != target.id);
         if self.marks.len() == before {
@@ -797,12 +793,11 @@ impl IssuePicker {
     fn finish(&mut self, snapshots: Vec<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.close_dialog(cx);
         let task = self.task.clone();
-        let agent = self.agent.clone();
-        (self.shark.update(cx, |s, cx| match task {
-            Some(name) => s.attach_issues(name, snapshots, window, cx),
-            // Nothing can be marked here, so it's the one.
-            None => (snapshots.into_iter())
-                .for_each(|one| s.preview_issue(one, agent.clone(), window, cx)),
+        let picked = self.picked.clone();
+        (self.shark.update(cx, |s, cx| match (task, picked) {
+            (Some(name), _) => s.attach_issues(name, snapshots, window, cx),
+            (_, Some(picked)) => picked(s, snapshots, window, cx),
+            _ => s.add_draft_issues(snapshots, window, cx),
         }))
         .ok();
     }
@@ -823,7 +818,6 @@ impl Render for IssuePicker {
         let (nav, close) = (("up down", "Navigate"), ("escape", "Close"));
         let hints = match (&self.blocked, &self.task, marked) {
             (Some(b), ..) => vec![("enter", b.action()), close],
-            (_, None, _) => vec![nav, ("enter", "Start"), close],
             (_, _, 0) => vec![nav, ("enter", "Attach"), ("cmd-enter", "Mark"), close],
             _ => vec![
                 nav,
@@ -929,7 +923,7 @@ impl Render for IssuePicker {
 }
 
 /// The first request of a task started from an issue: to plan, which is all it can do so far.
-fn planning_request(s: &Snapshot) -> String {
+pub(super) fn planning_request(s: &Snapshot) -> String {
     format!(
         "Read the attached Linear issue {} and draft a plan for it. List anything unclear before going further.",
         s.identifier
@@ -1200,17 +1194,32 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.issue_picker(task, None, window, cx)
+    }
+
+    pub(super) fn pick_draft_issues(
+        &mut self,
+        picked: super::task_draft::PickIssues,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.issue_picker(None, Some(picked), window, cx)
+    }
+
+    fn issue_picker(
+        &mut self,
+        task: Option<String>,
+        picked: Option<super::task_draft::PickIssues>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let blocked = self.linear_blocked();
         let connection = (self.state.linear.clone(), self.linear_connection_epoch());
         let shark = cx.entity();
-        let agent = task
-            .is_none()
-            .then(|| self.selected_task_agent(cx))
-            .flatten();
         let picker = cx.new(|cx| IssuePicker {
             state: cx.new(|cx| CommandState::new(window, cx)),
             task,
-            agent,
+            picked,
             blocked,
             connection,
             query: String::new(),
@@ -1256,7 +1265,17 @@ impl Shark {
     }
 
     pub(super) fn start_from_issue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_issue_picker(None, window, cx)
+        if !self.home_shown() {
+            self.enter_home(window, cx);
+        }
+        let destination = self.home.destination.clone();
+        self.pick_draft_issues(
+            Rc::new(move |s, issues, window, cx| {
+                s.add_draft_issues_to(&destination, issues, window, cx)
+            }),
+            window,
+            cx,
+        )
     }
 
     /// Adds `snapshots` to `name`, but not what's already there: only Refresh replaces a snapshot.
@@ -1484,87 +1503,6 @@ impl Shark {
             window,
             cx,
         );
-    }
-
-    /// Start from Linear issue's confirmation: nothing exists until it's accepted.
-    fn preview_issue(
-        &mut self,
-        snapshot: Snapshot,
-        agent: Option<AgentLink>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let title = crate::chat::title_of(&snapshot.title);
-        let title = cx.new(|cx| InputState::new(window, cx).default_value(title));
-        let description = cx.new(|cx| TextViewState::markdown(&snapshot.description, cx));
-        let request = planning_request(&snapshot);
-        let request = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(3, 10)
-                .default_value(request)
-        });
-        let (field, shark) = (title.clone(), cx.entity().downgrade());
-        let issue = snapshot.clone();
-        let (edited, asked) = (title.clone(), request.clone());
-        let start = Rc::new(move |window: &mut Window, cx: &mut App| {
-            let title = edited.read(cx).value().trim().to_string();
-            let title = match title.is_empty() {
-                true => issue.title.clone(),
-                false => title,
-            };
-            let first = asked.read(cx).value().trim().to_string();
-            let first = (!first.is_empty()).then_some(first);
-            window.close_dialog(cx);
-            let issue = Some((title, issue.clone()));
-            shark
-                .update(cx, |s, cx| {
-                    s.new_task(first, issue, agent.clone(), window, cx)
-                })
-                .ok();
-        });
-        window.open_dialog(cx, move |d, _, cx| {
-            let (by_key, by_click) = (start.clone(), start.clone());
-            let label = |text: &'static str| {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(text)
-            };
-            crate::ui::dialog(d)
-                .title("Start from Linear issue")
-                .w(px(640.))
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(issue_summary(&snapshot, &description, true, cx))
-                        .child(
-                            div()
-                                .id("issue-plan-note")
-                                .test_support()
-                                .px_3()
-                                .text_sm()
-                                .child("The task starts in Plan mode, with no repository yet."),
-                        )
-                        .child(label("Title"))
-                        .child(Input::new(&title))
-                        .child(label("Planning request"))
-                        .child(Textarea::new(&request)),
-                )
-                .footer(
-                    Button::new("issue-start")
-                        .primary()
-                        .label("Start task")
-                        .on_click(move |_, window, cx| by_click(window, cx)),
-                )
-                .on_ok(move |_, window, cx| {
-                    by_key(window, cx);
-                    false
-                })
-        });
-        field.update(cx, |i, cx| {
-            i.focus(window, cx);
-            i.select_all(window, cx);
-        });
     }
 
     /// `s` belongs to no connection here, so it can't refresh.

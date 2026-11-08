@@ -156,7 +156,7 @@ pub fn create_task(
     create_task_with_prs(dir, name, branch, repos, &[], &[], "", None, false)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
@@ -178,6 +178,37 @@ pub fn create_task_with_prs(
     agent: Option<AgentLink>,
     fresh: bool,
 ) -> Result<Task, String> {
+    let fresh_repos: Vec<_> = repos
+        .iter()
+        .filter(|_| fresh)
+        .map(|(r, _)| r.name.clone())
+        .collect();
+    create_task_with_sources(
+        dir,
+        name,
+        branch,
+        repos,
+        prs,
+        parents,
+        title,
+        agent,
+        &fresh_repos,
+    )
+}
+
+/// Drafts may mix new branches, existing branches and PR checkouts.
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_with_sources(
+    dir: &Path,
+    name: &str,
+    branch: &str,
+    repos: &[(Repo, String)],
+    prs: &[(String, PullRequest)],
+    parents: &[(String, String)],
+    title: &str,
+    agent: Option<AgentLink>,
+    fresh_repos: &[String],
+) -> Result<Task, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
     }
@@ -192,7 +223,10 @@ pub fn create_task_with_prs(
     let plans = crate::proc::par_map(repos, |(r, b)| {
         match prs.iter().find(|(name, _)| name == &r.name) {
             Some((_, pr)) => plan_pr_worktree(b, r, pr),
-            None if fresh => plan_fresh(b, r, ""),
+            None if fresh_repos.contains(&r.name) => {
+                let base = parents.iter().find(|(n, _)| n == &r.name);
+                plan_fresh(b, r, base.map_or("", |(_, b)| b.as_str()))
+            }
             None => {
                 let parent = parents.iter().find(|(n, _)| n == &r.name);
                 plan_worktree(b, r, parent.map(|(_, p)| p.as_str()))
@@ -654,12 +688,15 @@ fn plan_fresh(branch: &str, r: &Repo, base: &str) -> Result<Plan, String> {
         ));
     }
     let base = resolve_base(&r.path, base);
-    git(
+    let tip = git(
         &r.path,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
     )
     .map_err(|_| format!("{}: base `{base}` not found", r.name))?;
-    Ok(Plan::new(base.clone(), Some(base)))
+    Ok(Plan {
+        tip: (base != resolve_base(&r.path, "")).then_some(tip),
+        ..Plan::new(base.clone(), Some(base))
+    })
 }
 
 /// A new branch stacked on `p`: it starts on `origin/<p>`, which is also its base.
@@ -770,6 +807,20 @@ pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Res
     args.extend(specs.iter().map(String::as_str));
     cmd_bounded(src, "git", &args, 30)?;
     Ok(())
+}
+
+/// Completion lookups must not move an open review's comparison or update baseline.
+pub(crate) fn fetch_composer_pr_head(src: &Path, pr: &PullRequest) -> Result<String, String> {
+    let remote = pr_remote(src, pr)?;
+    let reference = format!("refs/shark/composer/pull/{}/head", pr.number);
+    let spec = format!("+refs/pull/{}/head:{reference}", pr.number);
+    cmd_bounded(
+        src,
+        "git",
+        &["fetch", "--quiet", "--no-tags", &remote, &spec],
+        30,
+    )?;
+    Ok(reference)
 }
 
 /// Refresh only the review comparison ref; the head stays put so "Fetch updates" stays offered.
@@ -1116,7 +1167,7 @@ fn reconcile_skills(ws: &Task, dir: &Path, on: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn skill_entries(dir: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
+pub(crate) fn skill_entries(dir: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
     let read = || {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -1141,6 +1192,22 @@ fn skill_entries(dir: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
         Ok(found)
     };
     read().map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))
+}
+
+/// The name used by the task's Codex skill links when skill names collide.
+pub(crate) fn skill_link_name(skill: &str, prefix: &str, used: &mut HashSet<String>) -> String {
+    let mut name = skill.to_string();
+    if used.contains(&name) {
+        name = format!("{prefix}-{skill}");
+    }
+    let base = name.clone();
+    let mut suffix = 2;
+    while used.contains(&name) {
+        name = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    used.insert(name.clone());
+    name
 }
 
 fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) -> std::io::Result<()> {
@@ -1179,17 +1246,7 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) -> std:
         if user_targets.contains(&target) {
             return;
         }
-        let mut name = skill.clone();
-        if used.contains(&name) {
-            name = format!("{prefix}-{skill}");
-        }
-        let base = name.clone();
-        let mut suffix = 2;
-        while used.contains(&name) {
-            name = format!("{base}-{suffix}");
-            suffix += 1;
-        }
-        used.insert(name.clone());
+        let name = skill_link_name(&skill, prefix, &mut used);
         want.insert(name, target);
     };
     // Agent skills claim plain names before repo skills, even when repo skills are disabled.

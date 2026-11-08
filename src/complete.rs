@@ -46,8 +46,140 @@ pub fn files(repos: &[(String, PathBuf)]) -> Vec<Item> {
             .unwrap_or_default();
         (name.clone(), out)
     });
+    file_items(&lists)
+}
+
+/// Committed paths only: a new worktree never contains the checkout's local-only files.
+#[cfg(test)]
+pub fn committed_files(repos: &[(String, PathBuf, String, bool)]) -> Result<Vec<Item>, String> {
+    committed_paths(repos).map(|repos| file_items(&repos.files))
+}
+
+pub(crate) struct CommittedPaths {
+    pub files: Vec<(String, Vec<String>)>,
+    pub skills: Vec<(String, Vec<String>)>,
+}
+
+/// Resolve each source once, keeping its committed paths available to both completion menus.
+pub(crate) fn committed_paths(
+    repos: &[(String, PathBuf, String, bool)],
+) -> Result<CommittedPaths, String> {
+    let lists = crate::proc::par_map(repos, |(name, dir, start, fresh)| {
+        let reference = if *fresh || start.is_empty() {
+            crate::git::resolve_base(dir, start)
+        } else {
+            let local = format!("refs/heads/{start}");
+            let remote = format!("refs/remotes/origin/{start}");
+            let has = |reference: &str| {
+                crate::git::git(
+                    dir,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{reference}^{{commit}}"),
+                    ],
+                )
+                .is_ok()
+            };
+            match (has(&local), has(&remote)) {
+                (true, true)
+                    if crate::git::git(dir, &["merge-base", "--is-ancestor", &local, &remote])
+                        .is_ok() =>
+                {
+                    remote
+                }
+                (true, _) => local,
+                (false, true) => remote,
+                _ => start.clone(),
+            }
+        };
+        let commit = crate::git::git(
+            dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{reference}^{{commit}}"),
+            ],
+        )?;
+        let out = crate::git::git_bytes(dir, &["ls-tree", "-r", "-z", &commit, "--"])?;
+        let mut paths = vec![];
+        let mut links = vec![];
+        let mut skills = vec![];
+        let mut non_files = BTreeSet::new();
+        for record in out.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let Some(tab) = record.iter().position(|b| *b == b'\t') else {
+                continue;
+            };
+            let path = String::from_utf8_lossy(&record[tab + 1..]).into_owned();
+            if record.starts_with(b"120000 ") {
+                let header = String::from_utf8_lossy(&record[..tab]);
+                if let Some(oid) = header.split_whitespace().nth(2) {
+                    links.push((path.clone(), oid.to_string()));
+                }
+            }
+            if record.starts_with(b"100644 ") || record.starts_with(b"100755 ") {
+                if path.ends_with("/SKILL.md") {
+                    skills.push(path.clone());
+                }
+            } else {
+                non_files.insert(path.clone());
+            }
+            paths.push(path);
+        }
+        let definitions: BTreeSet<_> = skills.iter().cloned().collect();
+        for (path, oid) in links {
+            let Some((folder, skill)) = path.rsplit_once('/') else {
+                continue;
+            };
+            let marker = skill == "SKILL.md";
+            let skill_folder = if marker {
+                folder.rsplit_once('/').map(|(folder, _)| folder)
+            } else {
+                Some(folder)
+            };
+            if !matches!(skill_folder, Some(".agents/skills" | ".claude/skills")) {
+                continue;
+            }
+            let target = crate::git::git_bytes(dir, &["cat-file", "blob", &oid])?;
+            let target = String::from_utf8_lossy(&target);
+            let mut parts: Vec<_> = folder.split('/').collect();
+            let within_repo = !target.starts_with('/')
+                && target.split('/').all(|part| match part {
+                    "" | "." => true,
+                    ".." => parts.pop().is_some(),
+                    part => {
+                        parts.push(part);
+                        true
+                    }
+                });
+            // shortcut: resolve direct in-tree skill links; extend if chained or external links are needed.
+            let target = parts.join("/");
+            if within_repo && marker && paths.contains(&target) && !non_files.contains(&target) {
+                skills.push(path);
+            } else if within_repo && !marker && definitions.contains(&format!("{target}/SKILL.md"))
+            {
+                skills.push(format!("{path}/SKILL.md"));
+            }
+        }
+        Ok::<_, String>((name.clone(), paths, skills))
+    });
+    let mut result = CommittedPaths {
+        files: vec![],
+        skills: vec![],
+    };
+    for list in lists {
+        let (name, files, skills) = list?;
+        result.files.push((name.clone(), files));
+        result.skills.push((name, skills));
+    }
+    Ok(result)
+}
+
+pub(crate) fn file_items(lists: &[(String, Vec<String>)]) -> Vec<Item> {
     let mut items = vec![];
-    for (repo, out) in &lists {
+    for (repo, out) in lists {
         let mut dirs = BTreeSet::new();
         for path in out {
             let mut p = path.as_str();
@@ -291,6 +423,65 @@ fn commands(cmds: Vec<Cmd>) -> Vec<Item> {
         .collect()
 }
 
+/// Match the skill names the selected harness receives, keeping repository collisions visible.
+pub(crate) fn draft_skill_names(
+    agent: &[String],
+    repos: &[(String, Vec<String>)],
+    codex: bool,
+) -> Vec<String> {
+    let mut names = agent.to_vec();
+    let mut used: std::collections::HashSet<_> = agent.iter().cloned().collect();
+    let folders: &[&str] = if codex {
+        &[".agents/skills", ".claude/skills"]
+    } else {
+        &[".claude/skills"]
+    };
+    for (repo, paths) in repos {
+        let mut own = BTreeSet::new();
+        for folder in folders {
+            let prefix = format!("{folder}/");
+            let skills: BTreeSet<_> = paths
+                .iter()
+                .filter_map(|path| path.strip_prefix(&prefix)?.strip_suffix("/SKILL.md"))
+                .filter(|skill| !skill.is_empty() && !skill.contains('/'))
+                .collect();
+            for skill in skills {
+                let skill = skill.to_string();
+                if !own.insert(skill.clone()) {
+                    continue;
+                }
+                let name = if codex {
+                    crate::git::skill_link_name(&skill, repo, &mut used)
+                } else if used.contains(&skill) {
+                    let name = format!("{repo}:{skill}");
+                    used.insert(name.clone());
+                    name
+                } else {
+                    used.insert(skill.clone());
+                    skill
+                };
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Skills explicitly attached to the agent or discovered in its selected repositories.
+pub fn skill_items(names: Vec<String>) -> Vec<Item> {
+    let names: BTreeSet<_> = names.into_iter().collect();
+    commands(
+        names
+            .into_iter()
+            .map(|name| Cmd {
+                name,
+                description: String::new(),
+                argument_hint: String::new(),
+            })
+            .collect(),
+    )
+}
+
 /// Menu rows, most recently updated first across repos. The key is `repo/number title author
 /// branch`, so `api/` scopes to a repo as it does for files.
 pub fn pr_items(prs: &[Pr]) -> Vec<Item> {
@@ -514,6 +705,200 @@ mod tests {
         let odd = [item(Kind::File, "r", "\u{212A}\u{212A}\u{212A}/é.rs")];
         assert_eq!(rank(&odd, "é", 1), [0]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn draft_files_use_selected_commit_and_exclude_local_files() {
+        let root =
+            std::env::temp_dir().join(format!("shark-committed-complete-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| crate::git::git(&root, args).unwrap();
+        git(&["init", "-q"]);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/a b.md"), "base").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+        let base = git(&["rev-parse", "HEAD"]);
+        fs::write(root.join("head-only.md"), "head").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "head",
+        ]);
+        fs::write(root.join("local-only.md"), "local").unwrap();
+        let at_base = committed_files(&[("api".into(), root.clone(), base.clone(), true)]).unwrap();
+        assert!(
+            at_base
+                .iter()
+                .any(|item| item.insert == "@\"api/docs/a b.md\"")
+        );
+        assert!(at_base.iter().any(|item| item.insert == "@api/docs/"));
+        assert!(!at_base.iter().any(|item| item.insert.contains("only")));
+        let at_head =
+            committed_files(&[("api".into(), root.clone(), "HEAD".into(), false)]).unwrap();
+        assert!(
+            at_head
+                .iter()
+                .any(|item| item.insert == "@api/head-only.md")
+        );
+        assert!(
+            !at_head
+                .iter()
+                .any(|item| item.insert.contains("local-only"))
+        );
+        assert!(
+            committed_files(&[("api".into(), root.clone(), "missing-ref".into(), false)]).is_err()
+        );
+        let default =
+            committed_files(&[("api".into(), root.clone(), String::new(), true)]).unwrap();
+        assert!(
+            default
+                .iter()
+                .any(|item| item.insert == "@api/head-only.md")
+        );
+        git(&["update-ref", "refs/remotes/origin/remote-only", "HEAD"]);
+        let remote =
+            committed_files(&[("api".into(), root.clone(), "remote-only".into(), false)]).unwrap();
+        assert!(remote.iter().any(|item| item.insert == "@api/head-only.md"));
+        git(&["update-ref", "refs/heads/behind", &base]);
+        git(&["update-ref", "refs/remotes/origin/behind", "HEAD"]);
+        let caught_up =
+            committed_files(&[("api".into(), root.clone(), "behind".into(), false)]).unwrap();
+        assert!(
+            caught_up
+                .iter()
+                .any(|item| item.insert == "@api/head-only.md")
+        );
+        let new = committed_files(&[("api".into(), root.clone(), "behind".into(), true)]).unwrap();
+        assert!(new.iter().any(|item| item.insert == "@api/head-only.md"));
+        assert_eq!(
+            git(&["rev-parse", "refs/heads/behind"]),
+            base,
+            "listing must not move a branch"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn draft_skills_follow_selected_commit_instead_of_source_checkout() {
+        let root =
+            std::env::temp_dir().join(format!("shark-selected-skills-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".claude/skills/old")).unwrap();
+        let git = |args: &[&str]| crate::git::git(&root, args).unwrap();
+        git(&["init", "-q"]);
+        fs::write(root.join(".claude/skills/old/SKILL.md"), "old").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "old",
+        ]);
+        let old = git(&["rev-parse", "HEAD"]);
+        fs::remove_dir_all(root.join(".claude/skills/old")).unwrap();
+        fs::create_dir_all(root.join(".claude/skills/new")).unwrap();
+        fs::write(root.join(".claude/skills/new/SKILL.md"), "new").unwrap();
+        std::os::unix::fs::symlink("new", root.join(".claude/skills/linked")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/review.md"), "linked definition").unwrap();
+        fs::create_dir_all(root.join(".claude/skills/file-link")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../docs/review.md",
+            root.join(".claude/skills/file-link/SKILL.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&root, root.join(".claude/skills/external")).unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "new",
+        ]);
+        let selected = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--detach", &old]);
+        fs::create_dir_all(root.join(".claude/skills/local-only")).unwrap();
+        fs::write(root.join(".claude/skills/local-only/SKILL.md"), "local").unwrap();
+        let sources = vec![("api".into(), root.clone(), selected, false)];
+        assert!(
+            committed_files(&sources)
+                .unwrap()
+                .iter()
+                .any(|i| i.insert.ends_with("new/SKILL.md"))
+        );
+        let repos = committed_paths(&sources).unwrap();
+        assert_eq!(
+            draft_skill_names(&["attached".into()], &repos.skills, false),
+            ["attached", "file-link", "linked", "new"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn draft_skill_collisions_match_each_harness() {
+        let repos = vec![
+            (
+                "api".into(),
+                vec![
+                    ".agents/skills/review/SKILL.md".into(),
+                    ".claude/skills/review/SKILL.md".into(),
+                    ".claude/skills/deploy/SKILL.md".into(),
+                    ".claude/skills/nested/invalid/SKILL.md".into(),
+                ],
+            ),
+            ("web".into(), vec![".claude/skills/review/SKILL.md".into()]),
+        ];
+        let agent = vec!["review".into(), "api-review".into()];
+        assert_eq!(
+            draft_skill_names(&agent, &repos, true),
+            [
+                "review",
+                "api-review",
+                "api-review-2",
+                "deploy",
+                "web-review"
+            ]
+        );
+        assert_eq!(
+            draft_skill_names(&agent, &repos, false),
+            ["review", "api-review", "deploy", "api:review", "web:review"]
+        );
+        assert_eq!(
+            draft_skill_names(&[], &repos, false),
+            ["deploy", "review", "web:review"]
+        );
+        assert_eq!(
+            draft_skill_names(&agent, &[], true),
+            agent,
+            "disabled repository skills retain agent skills"
+        );
+    }
+
+    #[test]
+    fn agent_and_repository_skills_are_deduplicated() {
+        let skills = skill_items(vec!["review".into(), "test".into(), "review".into()]);
+        assert_eq!(skills.len(), 2);
+        assert_eq!(inserts(&skills, "rev"), ["/review"]);
     }
 
     #[test]

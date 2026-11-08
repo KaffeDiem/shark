@@ -2,6 +2,52 @@ use super::*;
 use std::time::Duration;
 
 #[test]
+fn fresh_stacked_sources_record_the_original_parent_tip() {
+    let root = std::env::temp_dir().join(format!("shark-fresh-stack-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let repo = init_repo(&root, "api");
+    let remote = root.join("origin.git");
+    git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
+    git(
+        &repo.path,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    )
+    .unwrap();
+    git(&repo.path, &["push", "-q", "origin", "main"]).unwrap();
+    git(&repo.path, &["remote", "set-head", "origin", "main"]).unwrap();
+    git(&repo.path, &["checkout", "-q", "-b", "parent"]).unwrap();
+    commit(&repo.path, &["--allow-empty", "-qm", "parent"]);
+    let parent = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&repo.path, &["push", "-q", "origin", "parent"]).unwrap();
+    git(&repo.path, &["checkout", "-q", "main"]).unwrap();
+    let dir = root.join("child");
+    let task = create_task_with_sources(
+        &dir,
+        "child",
+        "child",
+        &[(repo.clone(), "child".into())],
+        &[],
+        &[("api".into(), "parent".into())],
+        "",
+        None,
+        &["api".into()],
+    )
+    .unwrap();
+    assert_eq!(task.repos[0].base, "origin/parent");
+    assert_eq!(
+        git(&repo.path, &["config", &parent_tip_key("child")]).ok(),
+        Some(parent)
+    );
+    remove_task(&task, &dir, false).unwrap();
+    let trunk = plan_fresh("trunk-child", &repo, "main").unwrap();
+    assert!(
+        trunk.tip.is_none(),
+        "the default branch is not a stack parent"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn automatic_tasks_refuse_retained_branches_but_explicit_tasks_can_reuse_them() {
     let root = std::env::temp_dir().join(format!("shark-fresh-task-{}", std::process::id()));
     let repo = init_repo(&root, "api");
@@ -1990,4 +2036,64 @@ fn agent_skills_reach_each_harness_and_survive_disabled_repo_skills() {
     );
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(source.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn draft_sources_mix_new_base_and_existing_branch() {
+    let root = std::env::temp_dir().join(format!("shark-draft-sources-{}", std::process::id()));
+    let api = init_repo(&root, "api");
+    let web = init_repo(&root, "web");
+    git(&api.path, &["checkout", "-b", "feature-base"]).unwrap();
+    fs::write(api.path.join("base.txt"), "base").unwrap();
+    git(&api.path, &["add", "base.txt"]).unwrap();
+    commit(&api.path, &["-qm", "Custom base"]);
+    let base = git(&api.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&api.path, &["checkout", "main"]).unwrap();
+    git(&web.path, &["checkout", "-b", "existing"]).unwrap();
+    fs::write(web.path.join("existing.txt"), "existing").unwrap();
+    git(&web.path, &["add", "existing.txt"]).unwrap();
+    commit(&web.path, &["-qm", "Existing work"]);
+    let existing = git(&web.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&web.path, &["checkout", "main"]).unwrap();
+    let picked = vec![
+        (api.clone(), "draft/new".into()),
+        (web.clone(), "existing".into()),
+    ];
+    let dir = root.join("task");
+    let task = create_task_with_sources(
+        &dir,
+        "task",
+        "draft/new",
+        &picked,
+        &[],
+        &[("api".into(), "feature-base".into())],
+        "",
+        None,
+        &["api".into()],
+    )
+    .unwrap();
+    assert_eq!(git(&dir.join("api"), &["rev-parse", "HEAD"]).unwrap(), base);
+    assert_eq!(
+        git(&dir.join("web"), &["rev-parse", "HEAD"]).unwrap(),
+        existing
+    );
+    assert_eq!(task.repos[0].base, "feature-base");
+    assert_eq!(task.repos[1].branch.as_deref(), Some("existing"));
+    remove_task(&task, &dir, false).unwrap();
+    let retry = create_task_with_sources(
+        &dir,
+        "task",
+        "draft/new",
+        &picked,
+        &[],
+        &[],
+        "",
+        None,
+        &["api".into()],
+    )
+    .err()
+    .unwrap();
+    assert!(retry.contains("already exists"), "{retry}");
+    assert!(!dir.exists());
+    fs::remove_dir_all(root).unwrap();
 }

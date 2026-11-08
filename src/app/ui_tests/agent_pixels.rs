@@ -7,10 +7,36 @@ use crate::state::{Agent, AgentLink, TaskRecord, TaskRepo};
 
 type Setup = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
+fn draft_issue() -> crate::linear::Snapshot {
+    crate::linear::Snapshot {
+        org: "acme".into(),
+        id: "issue-412".into(),
+        identifier: "ENG-412".into(),
+        title: "Skills can't be added".into(),
+        description: "Keep the selected skill when changing repositories.".into(),
+        ..Default::default()
+    }
+}
+
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api", "web"]);
+    fs::create_dir_all(repos[1].path.join("src")).unwrap();
+    fs::write(
+        repos[1].path.join("src/button.ts"),
+        "export const Button = {};\n",
+    )
+    .unwrap();
+    fs::write(
+        repos[1].path.join("src/card.ts"),
+        "export const Card = {};\n",
+    )
+    .unwrap();
+    commit_all(&repos[1].path, "Composer screenshot files");
+    let key = crate::files::fingerprint(repos[1].path.as_os_str().as_encoded_bytes());
+    crate::state::write(&crate::state::support_dir().join("prs").join(format!("{key:016x}-recent.json")),
+        br#"[{"number":89,"title":"Preserve selected skills","author":{"login":"ada"},"headRefName":"fix-skills","baseRefName":"main","url":"https://github.com/acme/web/pull/89","state":"OPEN","isDraft":false}]"#).unwrap();
     let link = |slug: &str, name: &str| AgentLink {
         slug: slug.into(),
         name: name.into(),
@@ -87,6 +113,85 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         fs::create_dir_all(task.dir()).unwrap();
     }
     let cases: &[(&str, Setup)] = &[
+        ("task-agent-chip", |s, w, cx| s.open_task_now(0, w, cx)),
+        ("task-agent-chip-narrow", |s, w, cx| {
+            s.state.agents[0].name = "An agent with a very long descriptive name".into();
+            s.open_task_now(0, w, cx);
+        }),
+        ("draft-file-completion", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.insert("Review @", w, cx);
+                p.set_selected_range(8..8, cx);
+            });
+        }),
+        ("draft-pr-completion", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.insert("Review #89", w, cx);
+                p.set_selected_range(10..10, cx);
+            });
+        }),
+        ("draft-issue-pr", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_draft.issues.push(draft_issue());
+            s.home.agent_draft.repos[0].branch =
+                super::super::task_draft::BranchSpec::Pr(git::PullRequest {
+                    number: 89,
+                    url: "https://github.com/acme/web/pull/89".into(),
+                    base: "main".into(),
+                });
+            s.home.agent_prompt.update(cx, |p, cx| p.set_value("Keep the selected skill when changing repositories.\nCheck the keyboard flow too.", w, cx));
+        }),
+        ("draft-issue-plan", |s, w, cx| {
+            s.prefill_agent_task("planner", w, cx);
+            s.home.agent_draft.issues.push(draft_issue());
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.set_placeholder("Add notes, or press Enter to plan ENG-412", w, cx)
+            });
+        }),
+        ("draft-model-override", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_draft.model = Some("sonnet".into());
+            s.home.agent_draft.effort = Some("medium".into());
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.set_value("Tighten the onboarding spacing", w, cx)
+            });
+        }),
+        ("draft-starting", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.set_value("Tighten the onboarding spacing", w, cx)
+            });
+            s.home.agent_draft.starting = true;
+            s.home
+                .agent_composer
+                .update(cx, |c, cx| c.set_read_only(true, cx));
+        }),
+        ("draft-no-repositories", |s, w, cx| {
+            s.state.repos.clear();
+            s.prefill_agent_task("planner", w, cx);
+        }),
+        ("draft-repository-settings", |s, w, cx| {
+            s.state.repos.clear();
+            s.prefill_agent_task("planner", w, cx);
+            crate::settings::open_repos(&s.state, w, cx);
+        }),
+        ("draft-branch-fetch-failure", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.set_value("Keep these notes if refreshing fails", w, cx)
+            });
+            s.pick_draft_branch(Some(("web".into(), false)), w, cx);
+        }),
+        ("home-ask", |s, w, cx| {
+            s.enter_home(w, cx);
+            s.toggle_ask_mode(w, cx);
+            s.home.prompt.update(cx, |p, cx| {
+                p.set_value("How do I attach a repository?", w, cx);
+                p.focus(w, cx);
+            });
+        }),
         ("agent-next-menu", |s, w, cx| {
             s.open_agent("designer", w, cx);
             s.agent_next_menu("designer", point(px(650.), px(120.)), w, cx);
@@ -155,12 +260,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             s.enter_home(w, cx);
             s.home
                 .prompt
-                .update(cx, |p, cx| p.set_value("@designer Tighten spacing", w, cx));
+                .update(cx, |p, cx| p.insert("@designer Tighten spacing", w, cx));
         }),
         ("home-mention", |s, w, cx| {
             s.enter_home(w, cx);
             s.home.prompt.update(cx, |p, cx| {
-                p.set_value("@d", w, cx);
+                p.insert("@d", w, cx);
                 p.focus(w, cx)
             });
         }),
@@ -202,7 +307,14 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                                 point(px(0.), px(0.)),
-                                size(px(1280.), px(800.)),
+                                size(
+                                    px(if case == "task-agent-chip-narrow" {
+                                        800.
+                                    } else {
+                                        1280.
+                                    }),
+                                    px(800.),
+                                ),
                             ))),
                             focus: false,
                             show: false,
@@ -226,6 +338,26 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 cx.update_window(window, |_, w, cx| w.render_frame(cx))
                     .unwrap();
                 cx.run_until_parked();
+            }
+            if case.starts_with("task-agent-chip") {
+                cx.update_window(window, |_, w, _| {
+                    let agent = w.find("task-agent").bounds();
+                    let attach = w.find("header-attach").bounds();
+                    assert_eq!(agent.center().y, attach.center().y);
+                    assert!(agent.size.width <= px(160.));
+                    assert!(agent.right() <= attach.left());
+                    assert!(attach.right() <= w.viewport_size().width);
+                    assert!(w.try_find("task-identity").is_none());
+                })
+                .unwrap();
+            }
+            if matches!(case, "draft-file-completion" | "draft-pr-completion") {
+                cx.update(|cx| {
+                    assert!(
+                        shark.read(cx).home.agent_composer.read(cx).has_menu(),
+                        "{case} must show its completion menu"
+                    )
+                });
             }
             let screenshot = cx.capture_screenshot(window).expect("real agent renderer");
             if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {

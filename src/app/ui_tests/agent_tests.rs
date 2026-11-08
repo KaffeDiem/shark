@@ -75,7 +75,19 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
         assert!(!w.has_active_dialog(cx), "no dialog");
     })
     .unwrap();
-    let ws = active_task(cx, &shark);
+    until(cx, window, |_, cx| {
+        let s = shark.read(cx);
+        s.state.tasks.len() == 1 && !s.home.draft.starting
+    })
+    .await;
+    let ws = cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.home_shown() && s.active.is_none(),
+            "starting keeps Home visible"
+        );
+        s.state.tasks[0].clone()
+    });
     assert!(SEA_NAMES.contains(&ws.name.as_str()), "{}", ws.name);
     assert_eq!(ws.title, "sketch a login page");
     assert_eq!(ws.branch, ws.name);
@@ -90,7 +102,7 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
     let saved = State::load();
     assert_eq!(saved.tasks[0].name, ws.name);
     assert_eq!(saved.tasks[0].title, ws.title);
-    let chat = active_chat(cx, &shark);
+    let chat = cx.read(|cx| shark.read(cx).chats[&ws.chats[0].id].clone());
     cx.update(|cx| {
         assert_eq!(chat.read(cx).sent_texts(), ["sketch a login page"]);
         assert!(chat.read(cx).meta.plan);
@@ -197,11 +209,16 @@ async fn failed_first_send_keeps_agent_and_prompt(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| w.input("sketch a login page", cx))
         .unwrap();
     press_in(window)(cx, &["enter"]);
-    let ws = active_task(cx, &shark);
+    until(cx, window, |_, cx| {
+        let s = shark.read(cx);
+        s.state.tasks.len() == 1 && !s.home.draft.starting
+    })
+    .await;
+    let ws = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
     assert_eq!(ws.title, "sketch a login page");
     assert_eq!(State::load().tasks.len(), 1);
     assert!(ws.dir().exists());
-    let chat = active_chat(cx, &shark);
+    let chat = cx.read(|cx| shark.read(cx).chats[&ws.chats[0].id].clone());
     cx.update(|cx| {
         let c = chat.read(cx);
         assert_eq!(c.composer.read(cx).value(), "sketch a login page");
@@ -230,6 +247,7 @@ async fn failed_save_leaves_no_orphan(cx: &mut TestAppContext) {
         .unwrap();
     let before = toasts(cx, window);
     press_in(window)(cx, &["enter"]);
+    until(cx, window, |_, cx| !shark.read(cx).home.draft.starting).await;
     let entries = |dir: PathBuf| fs::read_dir(dir).map_or(0, |d| d.count());
     cx.update(|cx| {
         let s = shark.read(cx);
@@ -622,10 +640,26 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
         cx.update_window(window, |_, w, cx| w.has_active_dialog(cx))
             .unwrap()
     };
-    assert!(!run(cx), "nothing to check out");
+    assert!(
+        run(cx),
+        "without registered repositories the picker opens Settings"
+    );
+    cx.update_window(window, |_, w, cx| w.close_all_dialogs(cx))
+        .unwrap();
     let repos = repos(&home, &["api"]);
     on_app(window, shark.clone())(cx, &|s, _, _| s.state.repos = repos.clone());
     assert!(run(cx));
+    cx.update_window(window, |_, w, cx| w.click("create", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.state.tasks.is_empty(),
+            "selecting a repository never starts a task"
+        );
+        assert_eq!(s.home.draft.repos[0].repo.name, "api");
+    });
 }
 
 #[gpui_kit::test]
@@ -832,6 +866,19 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        let agent = w.find("task-agent");
+        assert_eq!(agent.label().as_deref(), Some("Designer"));
+        let agent_bounds = agent.bounds();
+        let attach_bounds = w.find("header-attach").bounds();
+        assert_eq!(
+            agent_bounds.center().y,
+            attach_bounds.center().y,
+            "the task agent belongs in the Attach toolbar row"
+        );
+        assert!(
+            w.try_find("task-identity").is_none(),
+            "agent tasks must not add a separate title row"
+        );
         w.click("task-agent", cx);
         w.render_frame(cx);
         assert!(w.try_find("agent-page").is_some());

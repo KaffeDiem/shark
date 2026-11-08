@@ -273,17 +273,14 @@ impl Chat {
         // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
         meta.plan |= ws.repos.is_empty();
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 10)
-                .placeholder(if meta.handoff.is_some() {
-                    format!(
-                        "Tell {} what to do with it…",
-                        ws.agent.as_ref().map_or("the agent", |a| a.name.as_str())
-                    )
-                } else {
-                    "Message the agent (@ to add files, / for skills)".into()
-                })
-                .submit_on_enter(true)
+            crate::task_composer::textarea(window, cx, 1).placeholder(if meta.handoff.is_some() {
+                format!(
+                    "Tell {} what to do with it…",
+                    ws.agent.as_ref().map_or("the agent", |a| a.name.as_str())
+                )
+            } else {
+                "Message the agent (@ to add files, / for skills)".into()
+            })
         });
         let _sub =
             cx.subscribe_in(
@@ -1624,7 +1621,7 @@ impl Chat {
                     .gap_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(t.clone())
+                    .child(div().min_w_0().child(t.clone()))
                     .when_some(reply, |d, r| {
                         d.child(copy_button(("copy", ix), r, "row").when(latest, |d| d.visible()))
                     })
@@ -3342,6 +3339,142 @@ exec cat >>"$0.stdin"
                     w.remove_window();
                 })
                 .unwrap();
+            }
+        }
+    }
+
+    struct InfoPreview(Entity<Chat>);
+
+    impl Render for InfoPreview {
+        fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(cx.theme().background)
+                .child(self.0.update(cx, |c, cx| c.render_row(1, w, cx)))
+        }
+    }
+
+    fn info_preview(w: &mut Window, cx: &mut App) -> Entity<InfoPreview> {
+        let chat = cx.new(|cx| Chat::new(Task::default(), ChatMeta::default(), false, w, cx));
+        chat.update(cx, |c, cx| {
+            c.apply(Ev::Text("**reply**".into()), cx);
+            c.push(Block::Info("done · 1s".into()), cx);
+        });
+        cx.new(|_| InfoPreview(chat))
+    }
+
+    fn check_info_layout(host: &Entity<InfoPreview>, w: &mut Window, cx: &mut App, width: f32) {
+        let chat = host.read(cx).0.clone();
+        let mut short_copy_top = px(0.);
+        for (i, text) in [
+            "done · 1s".to_string(),
+            "[shark] Repository instructions could not be loaded from the requested working directory. ".repeat(8),
+            format!("[shark] instructions: /Users/{}AGENTS.md", "very_long_directory_name/".repeat(16)),
+        ].into_iter().enumerate() {
+            chat.update(cx, |c, cx| {
+                c.blocks[1] = Block::Info(text);
+                cx.notify();
+            });
+            w.render_frame(cx);
+            let copy = w.find(("copy", 1usize));
+            assert!(copy.visible());
+            assert!(copy.bounds().left() >= w.rem_size());
+            assert!(copy.bounds().right() <= w.viewport_size().width - w.rem_size(), "case {i}, width {width}, copy {:?}", copy.bounds());
+            if i == 0 {
+                short_copy_top = copy.bounds().top();
+                assert!(copy.bounds().left() < px(width / 2.), "short status keeps copy adjacent");
+            } else {
+                assert!(copy.bounds().top() > short_copy_top + px(12.), "long Info wraps: case {i}, width {width}, copy {:?}", copy.bounds());
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn info_rows_wrap_and_keep_copy_reachable(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for width in [320., 420., 800.] {
+            let (window, host) = cx
+                .update(|cx| {
+                    gpui_kit::open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(0.), px(0.)),
+                                size(px(width), px(700.)),
+                            ))),
+                            ..Default::default()
+                        },
+                        cx,
+                        info_preview,
+                    )
+                })
+                .unwrap();
+            cx.update_window(window, |_, w, cx| check_info_layout(&host, w, cx, width))
+                .unwrap();
+        }
+    }
+
+    pub(crate) fn render_info_pixels(cx: &mut HeadlessAppContext) {
+        for (mode, label) in [
+            (crate::state::Mode::Dark, "dark"),
+            (crate::state::Mode::Light, "light"),
+        ] {
+            cx.update(|cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            for width in [320., 420., 800.] {
+                let (window, host) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(700.)),
+                                ))),
+                                focus: false,
+                                show: false,
+                                ..Default::default()
+                            },
+                            cx,
+                            info_preview,
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| check_info_layout(&host, w, cx, width))
+                    .unwrap();
+                for copy in [true, false] {
+                    if !copy {
+                        cx.update_window(window, |_, w, cx| {
+                            host.read(cx).0.clone().update(cx, |c, cx| {
+                                c.blocks[0] = Block::Info("[shark] instructions".into());
+                                cx.notify();
+                            });
+                            w.render_frame(cx);
+                            assert!(w.find_all(("copy", 1usize)).is_empty());
+                        })
+                        .unwrap();
+                    }
+                    if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                        let dir = PathBuf::from(dir);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        cx.capture_screenshot(window)
+                            .expect("real Info renderer")
+                            .save(
+                                dir.join(format!(
+                                    "info-{label}-{}-copy-{copy}.png",
+                                    width as usize
+                                )),
+                            )
+                            .unwrap();
+                    }
+                }
+                cx.update_window(window, |_, w, _| w.remove_window())
+                    .unwrap();
             }
         }
     }

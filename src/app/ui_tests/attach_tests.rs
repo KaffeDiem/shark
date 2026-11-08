@@ -2233,7 +2233,9 @@ async fn new_task_from_branch_keeps_its_keys(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     let press = press_in(window);
-    branch_dialog(cx, window);
+    // The explicit branch creation dialog remains available inside an open task.
+    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window, &shark);
     assert!(shows(cx, window, ("repo-prs", 0usize)));
     assert!(!shows(cx, window, "attach-summary"));
     cx.update_window(window, |_, w, cx| w.input("kept", cx))

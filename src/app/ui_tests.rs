@@ -109,10 +109,13 @@ pub(super) fn boot(
     open(cx, options)
 }
 
-/// Opens the branch and PR dialog, which has no key of its own.
-fn branch_dialog(cx: &mut TestAppContext, window: AnyWindowHandle) {
+/// Opens the explicit creation dialog for tests of its branch/PR behavior. Home's action
+/// now selects draft context; composer tests exercise that separate entry point.
+fn branch_dialog(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
     cx.update_window(window, |_, w, cx| {
-        w.dispatch_action(Box::new(NewTaskFromBranch), cx)
+        shark.update(cx, |s, cx| {
+            s.new_task_from_repos(s.state.last_repos.clone(), None, w, cx)
+        });
     })
     .unwrap();
     cx.run_until_parked();
@@ -433,7 +436,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
         })
         .unwrap()
     };
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     press(cx, &["tab", "cmd-p"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {
         w.try_find("source-status").is_none() && w.try_find(("source-pr", 0usize)).is_some()
@@ -500,7 +503,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
         )
     });
     // An explicit name creates another review branch without resetting the first one.
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     input(cx, "second-review");
     press(cx, &["tab", "cmd-p"]);
     input(cx, "7");
@@ -584,7 +587,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.tasks.len());
 
     // The row label says new or existing as the name is typed.
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     assert_eq!(gets(cx, 0).as_deref(), Some("new"));
     input(cx, "shared");
     assert_eq!(
@@ -613,7 +616,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     );
 
     // Picking, then the first row puts the new branch back. Clicking the label lists too.
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     input(cx, "y1");
     press(cx, &["tab"]);
     branches_of(cx, "web", "shared");
@@ -651,7 +654,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     assert_eq!(on("y1", "web"), "y1");
 
     // Without a name, every ticked repo needs a branch: one is not enough.
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     press(cx, &["tab"]);
     branches_of(cx, "api", "kd/a");
     press(cx, &["enter"]);
@@ -712,7 +715,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         cx.update_window(window, |_, w, cx| w.dispatch_action(a.boxed_clone(), cx))
             .unwrap()
     };
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     cx.update_window(window, |_, w, cx| w.input("ui x", cx))
         .unwrap();
     press(cx, &["enter"]);
@@ -1075,7 +1078,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
 
     // Repo picker: tab to the filter, enter ticks the match, space unticks the
     // highlighted (top) row, cmd-enter creates from the picker.
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("kb", cx))
         .unwrap();
@@ -1167,7 +1170,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     )
     .unwrap();
     git::git(&api, &["push", "-q", "origin", "main:remote-only"]).unwrap();
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("new-x", cx))
         .unwrap();
@@ -3877,10 +3880,10 @@ async fn home_navigation(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(shark.read(cx).home.asking));
     press(cx, &["tab"]);
     cx.update(|cx| assert!(!shark.read(cx).home.asking));
-    // The branch dialog opens over a typed prompt, which becomes the first message.
+    // Cancelling an explicit branch dialog leaves the Home prompt intact.
     cx.update_window(window, |_, w, cx| w.input("add a login page", cx))
         .unwrap();
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     cx.update_window(window, |_, w, cx| {
         assert!(w.has_active_dialog(cx), "the dialog opens");
         w.close_dialog(cx);
@@ -4133,7 +4136,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
     };
     cx.update_window(window, |_, w, cx| w.input("add a login page", cx))
         .unwrap();
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     cx.update_window(window, |_, w, cx| w.close_dialog(cx))
         .unwrap();
     assert_eq!(text(cx), "add a login page", "cancelled: kept");
@@ -8356,7 +8359,7 @@ async fn stacked_tasks(cx: &mut TestAppContext) {
 
     // alt-enter on a branch: api's new branch starts on `logic` and targets it; web, unticked,
     // isn't in the task.
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     input(cx, "ui");
     press(cx, &["tab", "cmd-b"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {
@@ -8587,7 +8590,7 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
         })
         .unwrap()
     };
-    branch_dialog(cx, window);
+    branch_dialog(cx, window, &shark);
     input(cx, "mixed");
     press(cx, &["tab", "cmd-b"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {

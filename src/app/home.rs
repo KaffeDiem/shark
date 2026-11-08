@@ -1,11 +1,14 @@
 //! Home starts tasks and lists every task; agent pages do both for one agent. Neither leaves
 //! the open task.
 use super::ask::Ask;
+use super::task_draft::TaskDraft;
 use super::*;
 use crate::state::AgentLink;
 use crate::state::Appearance;
 use crate::sync::PrState;
+use crate::task_composer::{Event as ComposerEvent, TaskComposer};
 use crate::ui::{card, close_button, mode_pills};
+use gpui_kit::component::input::TextareaState;
 use std::time::SystemTime;
 
 const BUILD: &str = "Describe the work; enter starts a task";
@@ -137,12 +140,19 @@ pub(crate) struct Home {
     pub(super) focus: FocusHandle,
     /// The task under the list cursor.
     pub(super) sel: Option<String>,
-    pub(super) prompt: Entity<InputState>,
+    pub(super) prompt: Entity<TextareaState>,
+    pub(super) composer: Entity<TaskComposer>,
+    pub(super) draft: TaskDraft,
+    pub(super) draft_agent: Option<String>,
+    pub(super) tray_focus: FocusHandle,
+    pub(super) tray_index: usize,
     /// The agent page's task composer, holding `agent_prompt_for`'s draft; other agents'
     /// drafts wait in `agent_drafts`.
-    pub(super) agent_prompt: Entity<InputState>,
+    pub(super) agent_prompt: Entity<TextareaState>,
+    pub(super) agent_composer: Entity<TaskComposer>,
+    pub(super) agent_draft: TaskDraft,
     pub(super) agent_prompt_for: Option<String>,
-    pub(super) agent_drafts: HashMap<String, String>,
+    pub(super) agent_drafts: HashMap<String, TaskDraft>,
     /// The agent page's header fields.
     pub(super) agent_header: Option<Entity<super::agent_settings::AgentHeader>>,
     /// The highlighted `@agent` completion under Home's prompt.
@@ -166,28 +176,21 @@ pub(crate) struct Home {
 
 impl Home {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Shark>) -> Self {
-        let prompt = cx.new(|cx| InputState::new(window, cx).placeholder(BUILD));
-        let agent_prompt = cx.new(|cx| InputState::new(window, cx));
+        let composer = cx.new(|cx| TaskComposer::new(window, cx));
+        composer.update(cx, |c, cx| c.set_sources(vec![], vec![], true, false, cx));
+        let agent_composer = cx.new(|cx| TaskComposer::new(window, cx));
+        let prompt = composer.read(cx).input.clone();
+        let agent_prompt = agent_composer.read(cx).input.clone();
+        prompt.update(cx, |p, cx| p.set_placeholder(BUILD, window, cx));
         let _subs = vec![
-            cx.subscribe_in(&prompt, window, |s, _, ev: &InputEvent, w, cx| match ev {
-                InputEvent::PressEnter { .. } => match s.mentions(cx).is_empty() {
-                    true => s.submit_prompt(w, cx),
-                    false => s.complete_mention(None, w, cx),
-                },
-                InputEvent::Change => {
-                    s.home.mention = 0;
-                    cx.notify()
-                }
-                _ => {}
+            cx.subscribe_in(&composer, window, |s, _, ev: &ComposerEvent, w, cx| {
+                s.draft_composer_event(false, ev, w, cx)
             }),
-            cx.subscribe_in(&agent_prompt, window, |s, field, ev: &InputEvent, w, cx| {
-                if let InputEvent::PressEnter { .. } = ev
-                    && let Destination::Agent(slug) = s.home.destination.clone()
-                {
-                    let text = field.read(cx).value().trim().to_string();
-                    s.start_agent_task(&slug, text, w, cx);
-                }
-            }),
+            cx.subscribe_in(
+                &agent_composer,
+                window,
+                |s, _, ev: &ComposerEvent, w, cx| s.draft_composer_event(true, ev, w, cx),
+            ),
         ];
         Home {
             on: false,
@@ -196,7 +199,14 @@ impl Home {
             focus: cx.focus_handle(),
             sel: None,
             prompt,
+            composer,
+            draft: TaskDraft::default(),
+            draft_agent: None,
+            tray_focus: cx.focus_handle(),
+            tray_index: 0,
             agent_prompt,
+            agent_composer,
+            agent_draft: TaskDraft::default(),
             agent_prompt_for: None,
             agent_drafts: HashMap::new(),
             agent_header: None,
@@ -216,6 +226,7 @@ impl Home {
 
     pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
         self.focus.is_focused(window)
+            || self.tray_focus.is_focused(window)
             || self.prompt.read(cx).focus_handle(cx).is_focused(window)
             || (self.agent_prompt.read(cx))
                 .focus_handle(cx)
@@ -243,23 +254,16 @@ impl Shark {
         }
     }
 
-    /// The branch and PR dialog on the repos of the last one, with Home's typed prompt as the
-    /// first message.
+    /// Overview commands add draft context; an open task keeps the standalone branch dialog.
     pub(super) fn new_task_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self.home.prompt.read(cx).value().trim().to_string();
-        let agent = self.selected_task_agent(cx);
-        let picked = agent
-            .as_ref()
-            .and_then(|link| self.state.agents.iter().find(|a| a.slug == link.slug))
-            .map_or_else(|| self.state.last_repos.clone(), |a| a.repos.clone());
-        let (_, body) = agent_prompt(&typed, &self.state.agents);
-        let body = match &self.home.destination {
-            Destination::Home if !self.home.asking => body.to_string(),
-            Destination::Agent(_) => self.home.agent_prompt.read(cx).value().trim().to_string(),
-            _ => String::new(),
-        };
-        let first = (self.home_shown() && !body.is_empty()).then_some(body);
-        self.new_task_from(picked, first, vec![], None, agent, window, cx)
+        if self.home_shown() {
+            if self.home.destination == Destination::Home && self.home.asking {
+                self.toggle_ask_mode(window, cx);
+            }
+            self.pick_draft_branch(None, window, cx);
+        } else {
+            self.new_task_from_repos(self.state.last_repos.clone(), None, window, cx);
+        }
     }
 
     /// Capture the visible choice before a task dialog or asynchronous lookup opens.
@@ -536,6 +540,9 @@ impl Shark {
             return self.complete_mention(None, window, cx);
         }
         self.home.asking = !self.home.asking;
+        self.home
+            .composer
+            .update(cx, |c, cx| c.set_asking(self.home.asking, cx));
         let placeholder = if self.home.asking { ASK } else { BUILD };
         self.home
             .prompt
@@ -543,7 +550,7 @@ impl Shark {
         cx.notify();
     }
 
-    fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.home.prompt.read(cx).value().trim().to_string();
         if self.home.asking {
             if !text.is_empty() {
@@ -554,14 +561,7 @@ impl Shark {
             }
             return;
         }
-        let (agent, prompt) = agent_prompt(&text, &self.state.agents);
-        if let Some(slug) = agent {
-            let slug = slug.to_string();
-            let prompt = prompt.to_string();
-            self.start_agent_task(&slug, prompt, window, cx);
-        } else {
-            self.new_task((!text.is_empty()).then_some(text), None, None, window, cx);
-        }
+        self.submit_task_draft(window, cx);
     }
 
     /// The agent's page, typing into its task composer.
@@ -605,10 +605,28 @@ impl Shark {
                 } else {
                     format!("@{} {body}", agents[i - 1].slug)
                 };
+                let old_start = text.trim_end().len() - body.len();
+                let new_start = value.len() - body.len();
+                let mut content = gpui_kit::component::input::InputContent::new(value);
+                for span in s.home.prompt.read(cx).tokens() {
+                    let range = span.range();
+                    if range.start >= old_start && range.end <= old_start + body.len() {
+                        content = content
+                            .with_token(
+                                range.start - old_start + new_start
+                                    ..range.end - old_start + new_start,
+                                span.token().clone(),
+                            )
+                            .expect("unchanged token text in the task body");
+                    }
+                }
                 s.home.prompt.update(cx, |p, cx| {
-                    p.set_value(value, w, cx);
+                    p.set_value(content, w, cx);
+                    let end = p.value().len();
+                    p.set_selected_range(end..end, cx);
                     p.focus(w, cx);
                 });
+                s.draft_composer_event(false, &ComposerEvent::Change, w, cx);
                 cx.notify();
             },
             window,
@@ -657,80 +675,20 @@ impl Shark {
         self.home.mention = 0;
         self.home.prompt.update(cx, |p, cx| {
             p.set_value(value, window, cx);
+            let end = p.value().len();
+            p.set_selected_range(end..end, cx);
             p.focus(window, cx);
         });
+        self.draft_composer_event(false, &ComposerEvent::Change, window, cx);
         cx.notify();
     }
 
-    fn move_mention(&mut self, by: isize, cx: &mut Context<Self>) {
+    pub(super) fn move_mention(&mut self, by: isize, cx: &mut Context<Self>) {
         let n = self.mentions(cx).len();
         if n > 0 {
             self.home.mention = (self.home.mention as isize + by).rem_euclid(n as isize) as usize;
             cx.notify();
         }
-    }
-
-    fn start_agent_task(
-        &mut self,
-        slug: &str,
-        prompt: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
-            return;
-        };
-        let link = crate::state::AgentLink::from(&agent);
-        let repos: Vec<_> = self
-            .state
-            .repos
-            .iter()
-            .filter(|r| agent.repos.contains(&r.name))
-            .cloned()
-            .collect();
-        let first = (!prompt.is_empty()).then_some(prompt);
-        if repos.is_empty() {
-            self.new_task(first, None, Some(link), window, cx);
-            return;
-        }
-        let title = first
-            .as_deref()
-            .map(crate::chat::title_of)
-            .unwrap_or_default();
-        let title_slug = crate::state::slug(&title);
-        let prefix = format!(
-            "{slug}/{}",
-            if title_slug.is_empty() {
-                "task"
-            } else {
-                &title_slug
-            }
-        );
-        let sea = crate::state::task_name(interaction::now_ms(), |sea| {
-            let name = format!("{prefix}-{sea}").replace('/', "-");
-            self.creating.contains_key(&name)
-                || self.task(&name).is_some()
-                || tasks_dir().join(&name).exists()
-                || crate::transcript::transcript_path(&name).exists()
-        });
-        let branch = format!("{prefix}-{sea}");
-        let repos = repos
-            .into_iter()
-            .map(|repo| (repo, branch.clone()))
-            .collect();
-        self.create_task_on(
-            branch,
-            repos,
-            vec![],
-            vec![],
-            None,
-            first,
-            title,
-            Some(link),
-            true,
-            window,
-            cx,
-        );
     }
 
     /// A task was created with `first` as its first message: clear the prompt if it
@@ -762,7 +720,7 @@ impl Shark {
             if composer.read(cx).value().trim() == first {
                 composer.update(cx, |p, cx| p.set_value("", window, cx));
             }
-        } else if self.home.agent_drafts.get(slug).map(|d| d.trim()) == Some(first) {
+        } else if self.home.agent_drafts.get(slug).map(|d| d.text.trim()) == Some(first) {
             self.home.agent_drafts.remove(slug);
         }
     }
@@ -980,124 +938,14 @@ impl Shark {
     }
 
     fn render_prompt(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let focused = self
-            .home
-            .prompt
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
-        let (title, enter, other) = match self.home.asking {
-            true => ("Ask Shark", "ask", "new task"),
-            false => ("What do you want to build?", "start task", "ask Shark"),
-        };
-        // The agent picker and Linear sit in the composer's footer, as Codex puts its repo picker.
-        let footer = (!self.home.asking).then(|| {
-            let text = self.home.prompt.read(cx).value();
-            let (slug, _) = agent_prompt(text.trim(), &self.state.agents);
-            let selected = slug.and_then(|slug| self.state.agents.iter().find(|a| a.slug == slug));
-            h_flex()
-                .gap_1()
-                .ml(px(-6.))
-                .child(
-                    Button::new("home-agent-picker")
-                        .xsmall()
-                        .ghost()
-                        .icon(
-                            selected.map_or(IconName::AtSign, |a| {
-                                super::sidebar::section_icon(&a.icon)
-                            }),
-                        )
-                        .label(selected.map_or_else(|| "No agent".to_string(), |a| a.name.clone()))
-                        .tooltip("Pick an agent, or type @")
-                        .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
-                )
-                .when(self.linear_in_use(), |d| {
-                    d.child(
-                        Button::new("home-linear-issue")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::TagPlus)
-                            .label("Linear issue…")
-                            .tooltip("Start a task from a Linear issue, for the picked agent")
-                            .on_click(cx.listener(|s, _, w, cx| s.start_from_issue(w, cx))),
-                    )
-                })
-        });
-        let hits = self.mentions(cx);
-        let at = self.home.mention.min(hits.len().saturating_sub(1));
-        let suggestions = (!hits.is_empty()).then(|| {
-            v_flex()
-                .id("home-mentions")
-                .test_support()
-                .mx(px(-6.))
-                .py_1()
-                .border_t_1()
-                .border_color(theme.border)
-                .children(hits.iter().enumerate().map(|(row, &i)| {
-                    let a = &self.state.agents[i];
-                    h_flex()
-                        .id(("home-mention", i))
-                        .role(gpui_kit::accesskit::Role::Button)
-                        .aria_label(format!("Start with {}", a.name))
-                        .test_support()
-                        .h(px(32.))
-                        .px_2()
-                        .gap_2()
-                        .rounded(theme.radius)
-                        .text_sm()
-                        .when(row == at, |d| d.bg(theme.list_hover))
-                        .hover(|d| d.bg(theme.list_hover))
-                        .child(Icon::new(super::sidebar::section_icon(&a.icon)).with_size(px(16.)))
-                        .child(div().child(a.name.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("@{}", a.slug)),
-                        )
-                        .on_click(
-                            cx.listener(move |s, _, w, cx| s.complete_mention(Some(i), w, cx)),
-                        )
-                }))
-        });
         v_flex()
             .gap_2()
-            .child(div().text_base().text_color(theme.foreground).child(title))
-            .child(
-                v_flex()
-                    .key_context("HomePrompt")
-                    .on_action(
-                        cx.listener(|this, _: &SwitchField, w, cx| this.toggle_ask_mode(w, cx)),
-                    )
-                    .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_mention(1, cx)))
-                    .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_mention(-1, cx)))
-                    .px_3()
-                    .py_2()
-                    .gap_1()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(if focused { theme.primary } else { theme.border })
-                    .bg(theme.secondary)
-                    .text_size(px(14.))
-                    .child(Input::new(&self.home.prompt).appearance(false))
-                    .children(suggestions)
-                    .children(footer),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(crate::ui::hint("enter", enter))
-                    .child(crate::ui::hint(
-                        "tab",
-                        if hits.is_empty() { other } else { "complete" },
-                    ))
-                    .when(!self.home.asking && hits.is_empty(), |d| {
-                        d.child(crate::ui::hint("@", "agent"))
-                    }),
-            )
+            .child(div().text_base().child(if self.home.asking {
+                "Ask Shark"
+            } else {
+                "What do you want to build?"
+            }))
+            .child(self.render_task_composer(false, window, cx))
             .into_any_element()
     }
 
@@ -1674,7 +1522,10 @@ mod tests {
 }
 
 /// Only a registered leading mention starts an agent task; unknown mentions remain text.
-fn agent_prompt<'a>(text: &'a str, agents: &[crate::state::Agent]) -> (Option<&'a str>, &'a str) {
+pub(super) fn agent_prompt<'a>(
+    text: &'a str,
+    agents: &[crate::state::Agent],
+) -> (Option<&'a str>, &'a str) {
     let Some(mention) = text.strip_prefix('@') else {
         return (None, text);
     };
