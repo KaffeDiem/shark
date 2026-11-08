@@ -107,6 +107,7 @@ pub(crate) fn committed_paths(
         let mut paths = vec![];
         let mut links = vec![];
         let mut skills = vec![];
+        let mut non_files = BTreeSet::new();
         for record in out.split(|b| *b == 0).filter(|p| !p.is_empty()) {
             let Some(tab) = record.iter().position(|b| *b == b'\t') else {
                 continue;
@@ -118,10 +119,12 @@ pub(crate) fn committed_paths(
                     links.push((path.clone(), oid.to_string()));
                 }
             }
-            if (record.starts_with(b"100644 ") || record.starts_with(b"100755 "))
-                && path.ends_with("/SKILL.md")
-            {
-                skills.push(path.clone());
+            if record.starts_with(b"100644 ") || record.starts_with(b"100755 ") {
+                if path.ends_with("/SKILL.md") {
+                    skills.push(path.clone());
+                }
+            } else {
+                non_files.insert(path.clone());
             }
             paths.push(path);
         }
@@ -130,7 +133,13 @@ pub(crate) fn committed_paths(
             let Some((folder, skill)) = path.rsplit_once('/') else {
                 continue;
             };
-            if !matches!(folder, ".agents/skills" | ".claude/skills") || skill.is_empty() {
+            let marker = skill == "SKILL.md";
+            let skill_folder = if marker {
+                folder.rsplit_once('/').map(|(folder, _)| folder)
+            } else {
+                Some(folder)
+            };
+            if !matches!(skill_folder, Some(".agents/skills" | ".claude/skills")) {
                 continue;
             }
             let target = crate::git::git_bytes(dir, &["cat-file", "blob", &oid])?;
@@ -146,7 +155,11 @@ pub(crate) fn committed_paths(
                     }
                 });
             // shortcut: resolve direct in-tree skill links; extend if chained or external links are needed.
-            if within_repo && definitions.contains(&format!("{}/SKILL.md", parts.join("/"))) {
+            let target = parts.join("/");
+            if within_repo && marker && paths.contains(&target) && !non_files.contains(&target) {
+                skills.push(path);
+            } else if within_repo && !marker && definitions.contains(&format!("{target}/SKILL.md"))
+            {
                 skills.push(format!("{path}/SKILL.md"));
             }
         }
@@ -803,6 +816,14 @@ mod tests {
         fs::create_dir_all(root.join(".claude/skills/new")).unwrap();
         fs::write(root.join(".claude/skills/new/SKILL.md"), "new").unwrap();
         std::os::unix::fs::symlink("new", root.join(".claude/skills/linked")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/review.md"), "linked definition").unwrap();
+        fs::create_dir_all(root.join(".claude/skills/file-link")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../docs/review.md",
+            root.join(".claude/skills/file-link/SKILL.md"),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&root, root.join(".claude/skills/external")).unwrap();
         git(&["add", "-A"]);
         git(&[
@@ -828,7 +849,7 @@ mod tests {
         let repos = committed_paths(&sources).unwrap();
         assert_eq!(
             draft_skill_names(&["attached".into()], &repos.skills, false),
-            ["attached", "linked", "new"]
+            ["attached", "file-link", "linked", "new"]
         );
         fs::remove_dir_all(root).unwrap();
     }
