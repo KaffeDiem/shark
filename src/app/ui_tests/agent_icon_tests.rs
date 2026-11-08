@@ -217,3 +217,48 @@ async fn paste_image_bytes_and_finder_file_reach_crop_then_persist(cx: &mut Test
         ));
     }
 }
+
+#[gpui_kit::test]
+async fn rejected_crop_cleanup_preserves_referenced_images(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, agents(), WindowOptions::default());
+    let old = crate::agent_icon::save_image("designer", &image::RgbaImage::new(96, 96)).unwrap();
+    let rejected = crate::agent_icon::save_image(
+        "designer",
+        &image::RgbaImage::from_pixel(96, 96, image::Rgba([255, 0, 0, 255])),
+    )
+    .unwrap();
+    let path = |icon: &AgentIcon| {
+        let AgentIcon::Image { file } = icon else {
+            panic!("image")
+        };
+        crate::agent_icon::path(file).unwrap()
+    };
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        assert!(s.apply_agent_icon("designer", old.clone(), w, cx));
+        s.state.read_only = true;
+        assert!(!s.apply_agent_icon("designer", rejected.clone(), w, cx));
+        assert_eq!(s.agent("designer").unwrap().icon, old);
+        assert!(path(&old).exists());
+        assert!(
+            !path(&rejected).exists(),
+            "A rejected crop must not leave a private photo behind"
+        );
+        let shared =
+            crate::agent_icon::save_image("other", &image::RgbaImage::new(96, 96)).unwrap();
+        s.state.agents.push(Agent {
+            slug: "other".into(),
+            name: "Other".into(),
+            icon: shared.clone(),
+            ..Default::default()
+        });
+        assert!(!s.apply_agent_icon("designer", shared.clone(), w, cx));
+        assert!(path(&shared).exists(), "Another agent still owns the image");
+        assert!(!s.apply_agent_icon("designer", old.clone(), w, cx));
+        assert!(
+            path(&old).exists(),
+            "Rejecting the same crop must preserve the current image"
+        );
+    });
+}

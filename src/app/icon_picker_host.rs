@@ -79,7 +79,13 @@ impl Shark {
         let old = std::mem::replace(&mut self.state.agents[index].icon, icon.clone());
         if let Err(error) = self.state.save() {
             self.state.agents[index].icon = old;
-            notify_err(window, cx, format!("Couldn't save agent icon: {error}"));
+            let mut message = format!("Couldn't save agent icon: {error}");
+            if !self.state.agents.iter().any(|a| a.icon == icon)
+                && let Err(cleanup) = crate::agent_icon::remove(&icon)
+            {
+                message.push_str(&format!("; couldn't remove the unused image: {cleanup}"));
+            }
+            notify_err(window, cx, message);
             return false;
         }
         if old != icon && !self.state.agents.iter().any(|a| a.icon == old) {

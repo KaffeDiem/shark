@@ -10,6 +10,7 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 mod agent_handoff_tests;
+mod agent_icon_review_tests;
 mod agent_icon_tests;
 mod agent_navigation_tests;
 mod agent_pixels;

@@ -157,6 +157,12 @@ impl IconPicker {
             AgentIcon::Symbol { tint, .. } => tint.clone(),
             _ => None,
         };
+        let mut preferences = Preferences::load();
+        if let AgentIcon::Emoji { value } = &current
+            && let Some(tone) = emojis::get(value).and_then(emojis::Emoji::skin_tone)
+        {
+            preferences.tone = tone as usize;
+        }
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let zoom = cx.new(|_| {
             SliderState::new()
@@ -200,7 +206,7 @@ impl IconPicker {
             choices: vec![],
             selected: 0,
             tint,
-            preferences: Preferences::load(),
+            preferences,
             scroll: UniformListScrollHandle::new(),
             image: None,
             preview: None,
@@ -276,8 +282,27 @@ impl IconPicker {
                 .collect(),
             Tab::Image => vec![],
         };
-        self.selected = 0;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.selected = if query.is_empty() {
+            self.choices
+                .iter()
+                .position(|choice| match (&self.current, choice) {
+                    (AgentIcon::Symbol { name, .. }, Choice::Symbol(candidate, _)) => {
+                        name == candidate
+                    }
+                    (AgentIcon::Emoji { value }, Choice::Emoji(emoji)) => {
+                        value == emoji.as_str()
+                            || emoji
+                                .skin_tones()
+                                .is_some_and(|mut tones| tones.any(|tone| tone.as_str() == value))
+                    }
+                    _ => false,
+                })
+        } else {
+            None
+        }
+        .unwrap_or(0);
+        self.scroll
+            .scroll_to_item(self.selected / COLUMNS, ScrollStrategy::Nearest);
     }
 
     fn toned(&self, emoji: &'static emojis::Emoji) -> &'static emojis::Emoji {
@@ -288,11 +313,24 @@ impl IconPicker {
     }
 
     fn key(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         if key.modifiers.platform && matches!(key.key.as_str(), "v" | "d") {
-            self.paste(window, cx);
+            let item = cx.read_from_clipboard();
+            if key.key == "v"
+                && search_focused
+                && !item.as_ref().is_some_and(|item| {
+                    item.entries().iter().any(|entry| match entry {
+                        ClipboardEntry::Image(_) => true,
+                        ClipboardEntry::ExternalPaths(paths) => !paths.paths().is_empty(),
+                        _ => false,
+                    })
+                })
+            {
+                return false;
+            }
+            self.paste_item(item, window, cx);
             return true;
         }
-        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         let grid_focused = self.focus.is_focused(window);
         match key.key.as_str() {
             "escape" => {
@@ -369,9 +407,18 @@ impl IconPicker {
     }
 
     pub(super) fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.paste_item(cx.read_from_clipboard(), window, cx);
+    }
+
+    fn paste_item(
+        &mut self,
+        item: Option<ClipboardItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel(cx);
         self.change_tab(Tab::Image, window, cx);
-        if let Some(item) = cx.read_from_clipboard() {
+        if let Some(item) = item {
             if let Some(image) = item.entries().iter().find_map(|e| match e {
                 ClipboardEntry::Image(image) => Some(image),
                 _ => None,
@@ -964,17 +1011,140 @@ mod tests {
 mod regression_tests {
     use super::*;
     use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt as _;
 
     fn picker(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<IconPicker>) {
+        picker_with_icon(cx, AgentIcon::default())
+    }
+
+    fn picker_with_icon(
+        cx: &mut TestAppContext,
+        icon: AgentIcon,
+    ) -> (AnyWindowHandle, Entity<IconPicker>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                cx.new(|cx| {
-                    IconPicker::new(AgentIcon::default(), "picker-regression".into(), w, cx)
-                })
+                cx.new(|cx| IconPicker::new(icon, "picker-regression".into(), w, cx))
             })
             .unwrap()
         })
+    }
+
+    #[gpui_kit::test]
+    fn opening_picker_then_enter_preserves_current_icon(cx: &mut TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        for current in [
+            AgentIcon::Symbol {
+                name: "star".into(),
+                tint: Some("green".into()),
+            },
+            AgentIcon::from("folder"),
+            AgentIcon::Emoji {
+                value: "🐧".into()
+            },
+            AgentIcon::Emoji {
+                value: "👍🏽".into()
+            },
+        ] {
+            let (window, picker) = picker_with_icon(cx, current.clone());
+            let applied = Rc::new(RefCell::new(None));
+            let observed = applied.clone();
+            let _events = cx.update(|cx| {
+                cx.subscribe(&picker, move |_, event, _| {
+                    if let Event::Apply(icon) = event {
+                        *observed.borrow_mut() = Some(icon.clone());
+                    }
+                })
+            });
+            cx.update_window(window, |_, w, cx| {
+                picker.update(cx, |this, cx| this.focus(w, cx));
+                w.render_frame(cx);
+                w.press("enter", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                *applied.borrow(),
+                Some(current),
+                "Opening and confirming must preserve the current choice"
+            );
+            cx.update_window(window, |_, w, _| w.remove_window())
+                .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn text_paste_searches_without_switching_to_image(cx: &mut TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let (window, picker) = picker(cx);
+        for tab in [Tab::Icons, Tab::Emoji] {
+            cx.update_window(window, |_, w, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string("star".into()));
+                picker.update(cx, |this, cx| this.change_tab(tab, w, cx));
+                w.render_frame(cx);
+                w.press("cmd-v", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let picker = picker.read(cx);
+                assert!(
+                    picker.tab == tab,
+                    "Text paste belongs in the focused search field"
+                );
+                assert_eq!(picker.search.read(cx).value().as_ref(), "star");
+            });
+        }
+        cx.update_window(window, |_, w, cx| w.press("cmd-d", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let picker = picker.read(cx);
+            assert!(picker.tab == Tab::Image);
+            assert_eq!(
+                picker.message.as_deref(),
+                Some("No image on the pasteboard")
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn image_and_finder_paste_still_open_crop_from_search(cx: &mut TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("paste-image.png");
+        image::RgbaImage::new(12, 18).save(&path).unwrap();
+        let (window, picker) = picker(cx);
+        for item in [
+            ClipboardItem::new_image(&Image::from_bytes(
+                ImageFormat::Png,
+                std::fs::read(&path).unwrap(),
+            )),
+            ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())).into(),
+        ] {
+            cx.update_window(window, |_, w, cx| {
+                cx.write_to_clipboard(item);
+                picker.update(cx, |this, cx| this.change_tab(Tab::Icons, w, cx));
+                w.render_frame(cx);
+                w.press("cmd-v", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let picker = picker.read(cx);
+                assert!(picker.tab == Tab::Image);
+                assert_eq!(picker.image.as_ref().unwrap().dimensions(), (12, 18));
+            });
+        }
     }
 
     #[gpui_kit::test]
