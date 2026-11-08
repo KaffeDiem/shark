@@ -1,4 +1,4 @@
-//! Workspace feature launchers. Each feature opens its content in an artifact tab.
+//! Task feature launchers. Each feature opens its content in an artifact tab.
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -209,7 +209,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let at = self.active_tab_index(cx);
-        let Some(ws) = self.active_ws_mut() else {
+        let Some(ws) = self.active_task_mut() else {
             return;
         };
         *feature.closed_mut(ws) = true;
@@ -230,12 +230,12 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<git_feature::GitFeature>> {
-        let ws = self.effective_workspace(self.active_ws()?.clone(), cx);
+        let ws = self.effective_task(self.active_task()?.clone(), cx);
         let archiving = self.archiving.contains(&ws.name);
         if let Some(git) = self.git_features.get(&ws.name).cloned() {
             git.update(cx, |g, cx| {
                 g.set_archiving(archiving, cx);
-                g.set_workspace(ws, window, cx);
+                g.set_task(ws, window, cx);
             });
             return Some(git);
         }
@@ -245,10 +245,10 @@ impl Shark {
             git.set_archiving(archiving, cx);
             git
         });
-        let workspace = name.clone();
+        let task = name.clone();
         self._subs
             .push(cx.subscribe_in(&git, window, move |s, _, event, w, cx| {
-                if s.active.as_ref() != Some(&workspace) {
+                if s.active.as_ref() != Some(&task) {
                     return;
                 }
                 let git_feature::GitFeatureEvent::OpenFile { repo, path } = event;
@@ -367,7 +367,7 @@ impl Shark {
 
     /// The open agent has no repository, so Diff and Git have nothing to show.
     pub(super) fn no_repos(&self) -> bool {
-        self.active_ws().is_some_and(|w| w.repos.is_empty())
+        self.active_task().is_some_and(|w| w.repos.is_empty())
     }
 
     /// Diff and Git of an agent with no repository: the offer instead of Git actions.

@@ -1,4 +1,4 @@
-use super::super::workspace_picker::WorkspacePicker;
+use super::super::task_picker::TaskPicker;
 use super::*;
 use gpui_kit::test::TestEventExt;
 
@@ -7,14 +7,14 @@ fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
     boot(
         cx,
         State {
-            workspaces: ["current", "recent", "older", "unknown"]
+            tasks: ["current", "recent", "older", "unknown"]
                 .into_iter()
                 .enumerate()
-                .map(|(i, name)| Workspace {
+                .map(|(i, name)| Task {
                     name: name.into(),
                     branch: name.into(),
                     last_interacted_at: [Some(30), Some(20), Some(10), None][i],
-                    repos: vec![crate::state::WsRepo {
+                    repos: vec![crate::state::TaskRepo {
                         name: if i == 1 { "payments" } else { "api" }.into(),
                         src: PathBuf::new(),
                         base: "main".into(),
@@ -24,10 +24,11 @@ fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
                 })
                 .collect(),
             sections: vec![Section {
+                agent: None,
                 name: "Folded".into(),
                 icon: "folder".into(),
                 collapsed: true,
-                workspaces: vec!["recent".into()],
+                tasks: vec!["recent".into()],
             }],
             ..Default::default()
         },
@@ -37,12 +38,27 @@ fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
+async fn task_picker_navigation_and_focus(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     let press = press_in(window);
     let on = on_app(window, shark.clone());
-    // Home chooses the newest workspace, including all folded entries.
+    on(cx, &|s, _, cx| {
+        s.state.agents.push(crate::state::Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            ..Default::default()
+        });
+        s.state.tasks[1].agent = Some(crate::state::AgentLink {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            instructions: String::new(),
+            siblings: vec![],
+        });
+        s.collapsed_agents.insert("designer".into());
+        cx.notify();
+    });
+    // Home chooses the newest task, including all folded entries.
     press(cx, &["cmd-shift-o"]);
     cx.update_window(window, |_, w, cx| {
         w.change_modifiers(Modifiers::default(), cx);
@@ -56,8 +72,12 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.active.as_deref(), Some("recent"));
-        assert!(!s.state.sections[0].collapsed);
-        assert!(s.state.workspaces[1].last_interacted_at.unwrap() > 20);
+        assert!(!s.collapsed_agents.contains("designer"));
+        assert!(
+            s.state.sections[0].collapsed,
+            "opening a task leaves manual groups unchanged"
+        );
+        assert!(s.state.tasks[1].last_interacted_at.unwrap() > 20);
     });
     let focus = cx
         .update_window(window, |_, w, cx| w.focused(cx).unwrap())
@@ -93,14 +113,14 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_picker_keeps_identity_during_updates(cx: &mut TestAppContext) {
+async fn task_picker_keeps_identity_during_updates(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     let picker = cx
         .update_window(window, |_, w, cx| {
             let picker = cx.new(|cx| {
-                WorkspacePicker::new(
-                    WorkspacePicker::snapshot(shark.read(cx), cx),
+                TaskPicker::new(
+                    TaskPicker::snapshot(shark.read(cx), cx),
                     Some("current".into()),
                     shark.downgrade(),
                     w,
@@ -120,9 +140,9 @@ async fn workspace_picker_keeps_identity_during_updates(cx: &mut TestAppContext)
         .unwrap();
     press_in(window)(cx, &["down"]);
     on_app(window, shark.clone())(cx, &|s, _, cx| {
-        s.state.workspaces[3].last_interacted_at = Some(100);
-        s.state.workspaces.remove(0);
-        let ws = &s.state.workspaces[0];
+        s.state.tasks[3].last_interacted_at = Some(100);
+        s.state.tasks.remove(0);
+        let ws = &s.state.tasks[0];
         let mut repo = crate::sync::Repo::fresh(&ws.repos[0], ws);
         repo.pr = Some(Err("offline".into()));
         s.attn.set_checked("recent", vec![repo]);
@@ -144,21 +164,21 @@ async fn workspace_picker_keeps_identity_during_updates(cx: &mut TestAppContext)
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_picker_live_activity_preserves_query(cx: &mut TestAppContext) {
+async fn task_picker_live_activity_preserves_query(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     cx.update(|cx| cx.set_reduce_motion(true));
     let chats = cx
         .update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| {
-                s.state.workspaces[1].chats = ["first", "second"]
+                s.state.tasks[1].chats = ["first", "second"]
                     .map(|id| ChatMeta {
                         id: id.into(),
                         ..Default::default()
                     })
                     .to_vec();
-                s.state.workspaces[1].normalize_tabs();
-                let ws = s.state.workspaces[1].clone();
+                s.state.tasks[1].normalize_tabs();
+                let ws = s.state.tasks[1].clone();
                 ws.chats
                     .iter()
                     .map(|meta| s.ensure_chat(&ws, meta, w, cx))
@@ -228,15 +248,15 @@ async fn workspace_picker_live_activity_preserves_query(cx: &mut TestAppContext)
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContext) {
+async fn task_picker_discard_revalidates_destination(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| s.open_workspace(0, w, cx));
+    on(cx, &|s, w, cx| s.open_task(0, w, cx));
     let path = cx.update(|cx| {
         shark
             .read(cx)
-            .active_ws()
+            .active_task()
             .unwrap()
             .dir()
             .join("api/edit.txt")
@@ -255,9 +275,9 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
         .unwrap();
     cx.run_until_parked();
     for scenario in ["cancel", "archiving", "removed"] {
-        // Cmd-Shift-O belongs to the outline while editing; the File menu still opens workspaces.
+        // Cmd-Shift-O belongs to the outline while editing; the File menu still opens tasks.
         cx.update_window(window, |_, w, cx| {
-            w.dispatch_action(Box::new(OpenWorkspacePicker), cx)
+            w.dispatch_action(Box::new(OpenTaskPicker), cx)
         })
         .unwrap();
         press_in(window)(cx, &["enter"]);
@@ -268,7 +288,7 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
                 s.archiving.insert("recent".into());
             }
             "removed" => {
-                s.state.workspaces.remove(1);
+                s.state.tasks.remove(1);
             }
             _ => {}
         });
@@ -285,7 +305,7 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
             assert_eq!(s.active.as_deref(), Some("current"));
             assert_eq!(s.editor.as_ref(), Some(&editor));
             assert!(editor.read(cx).dirty, "{scenario} keeps dirty state");
-            if let Some(ws) = s.ws("recent") {
+            if let Some(ws) = s.task("recent") {
                 assert_eq!(ws.last_interacted_at, Some(20));
             }
         });
@@ -296,42 +316,42 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_interaction_excludes_background_and_flushes(cx: &mut TestAppContext) {
+async fn task_interaction_excludes_background_and_flushes(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
         s.state.last_open = Some(("current".into(), "chat".into()));
         s.restore_last_open(w, cx);
-        assert_eq!(s.state.workspaces[0].last_interacted_at, Some(30));
+        assert_eq!(s.state.tasks[0].last_interacted_at, Some(30));
     });
     press_in(window)(cx, &["cmd-shift-o", "down", "escape"]);
     on(cx, &|s, _, cx| {
-        let chat = s.active_ws().unwrap().chats[0].id.clone();
+        let chat = s.active_task().unwrap().chats[0].id.clone();
         s.turn_done("current", &chat, cx);
-        assert_eq!(s.state.workspaces[0].last_interacted_at, Some(30));
+        assert_eq!(s.state.tasks[0].last_interacted_at, Some(30));
     });
     press_in(window)(cx, &["a"]);
     on(cx, &|s, w, cx| {
         assert!(
-            s.state.workspaces[0].last_interacted_at.unwrap() > 30,
+            s.state.tasks[0].last_interacted_at.unwrap() > 30,
             "keyboard interaction"
         );
         s.flush_interaction();
-        let recorded = s.state.workspaces[0].last_interacted_at;
-        assert_eq!(State::load().workspaces[0].last_interacted_at, recorded);
-        s.state.workspaces[0].last_interacted_at = Some(31);
+        let recorded = s.state.tasks[0].last_interacted_at;
+        assert_eq!(State::load().tasks[0].last_interacted_at, recorded);
+        s.state.tasks[0].last_interacted_at = Some(31);
         s.enter_home(w, cx);
     });
     press_in(window)(cx, &["b"]);
     on(cx, &|s, w, cx| {
-        assert_eq!(s.state.workspaces[0].last_interacted_at, Some(31));
+        assert_eq!(s.state.tasks[0].last_interacted_at, Some(31));
         s.toggle_home(w, cx);
         s.record_interaction("current", cx);
         assert!(s.storage_guard(false, w, cx));
         assert_eq!(
-            State::load().workspaces[0].last_interacted_at,
-            s.state.workspaces[0].last_interacted_at
+            State::load().tasks[0].last_interacted_at,
+            s.state.tasks[0].last_interacted_at
         );
     });
 }
@@ -367,13 +387,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             let indicators = cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
                     s.rail = width < 400.;
-                    s.state.workspaces = ["checkout-redesign", "fix-auth-with-a-very-long-workspace-name", "many-repositories", "unknown"].into_iter().enumerate().map(|(i, name)| Workspace {
+                    s.state.tasks = ["checkout-redesign", "fix-auth-with-a-very-long-workspace-name", "many-repositories", "unknown"].into_iter().enumerate().map(|(i, name)| Task {
                         name: name.into(), branch: name.into(), last_interacted_at: (i < 3).then_some(super::super::interaction::now_ms().saturating_sub(i as u64 * 720_000)),
-                        repos: (0..[2, 1, 18, 3][i]).map(|r| crate::state::WsRepo {
+                        repos: (0..[2, 1, 18, 3][i]).map(|r| crate::state::TaskRepo {
                             name: if r == 0 { "web-with-a-long-repository-name".into() } else { format!("payments-{r}") }, src: PathBuf::new(), base: "main".into(), branch: None,
                         }).collect(), ..Default::default()
                     }).collect();
-                    for ws in &s.state.workspaces {
+                    for ws in &s.state.tasks {
                         let repos = ws.repos.iter().enumerate().map(|(i, r)| {
                             let mut repo = crate::sync::Repo::fresh(r, ws);
                             repo.pr = match i % 7 {
@@ -385,11 +405,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         s.attn.set_checked(&ws.name, repos);
                     }
                     for ix in 0..3 {
-                        s.state.workspaces[ix].chats = (0..if ix == 0 { 2 } else { 1 }).map(|n| ChatMeta {
+                        s.state.tasks[ix].chats = (0..if ix == 0 { 2 } else { 1 }).map(|n| ChatMeta {
                             id: format!("picker-{ix}-{n}"), ..Default::default()
                         }).collect();
-                        s.state.workspaces[ix].normalize_tabs();
-                        let ws = s.state.workspaces[ix].clone();
+                        s.state.tasks[ix].normalize_tabs();
+                        let ws = s.state.tasks[ix].clone();
                         for meta in &ws.chats {
                             let chat = s.ensure_chat(&ws, meta, w, cx);
                             chat.update(cx, |c, cx| {
@@ -406,7 +426,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     }
                     s.active = Some("fix-auth-with-a-very-long-workspace-name".into());
                     s.home.on = false;
-                    s.open_workspace_picker(w, cx);
+                    s.open_task_picker(w, cx);
                 });
                 w.render_frame(cx);
                 let first = w.find("workspace-result-checkout-redesign");
@@ -485,23 +505,23 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppContext) {
+async fn task_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.open_workspace(0, w, cx);
+        s.open_task(0, w, cx);
         s.flush_interaction();
-        s.state.workspaces[0].last_interacted_at = Some(1);
+        s.state.tasks[0].last_interacted_at = Some(1);
     });
     cx.update_window(window, |_, w, cx| w.click("content-island", cx))
         .unwrap();
     on(cx, &|s, _, _cx| {
         assert!(
-            s.state.workspaces[0].last_interacted_at.unwrap() > 1,
+            s.state.tasks[0].last_interacted_at.unwrap() > 1,
             "click inside content"
         );
-        s.state.workspaces[0].last_interacted_at = Some(1);
+        s.state.tasks[0].last_interacted_at = Some(1);
     });
     cx.update_window(window, |_, w, cx| {
         w.scroll(
@@ -513,10 +533,10 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
     .unwrap();
     on(cx, &|s, _, _cx| {
         assert!(
-            s.state.workspaces[0].last_interacted_at.unwrap() > 1,
+            s.state.tasks[0].last_interacted_at.unwrap() > 1,
             "scroll inside content"
         );
-        s.state.workspaces[0].last_interacted_at = Some(1);
+        s.state.tasks[0].last_interacted_at = Some(1);
     });
     press_in(window)(cx, &["cmd-shift-o"]);
     cx.update_window(window, |_, w, cx| {
@@ -530,7 +550,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
     press_in(window)(cx, &["escape"]);
     on(cx, &|s, w, cx| {
         assert_eq!(
-            s.state.workspaces[0].last_interacted_at,
+            s.state.tasks[0].last_interacted_at,
             Some(1),
             "picker scroll doesn't count"
         );
@@ -538,23 +558,23 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         s.refresh_attention(cx);
     });
     on(cx, &|s, _, _cx| {
-        assert_eq!(s.state.workspaces[0].last_interacted_at, Some(1))
+        assert_eq!(s.state.tasks[0].last_interacted_at, Some(1))
     });
     // A model menu selection succeeds through ChatEvent::Picked; mere menu browsing does not.
     on(cx, &|s, w, cx| s.pick_model(w, cx));
     press_in(window)(cx, &["escape"]);
     on(cx, &|s, w, cx| {
-        assert_eq!(s.state.workspaces[0].last_interacted_at, Some(1));
+        assert_eq!(s.state.tasks[0].last_interacted_at, Some(1));
         s.set_model(0, w, cx);
     });
     on(cx, &|s, _, _cx| {
-        assert!(s.state.workspaces[0].last_interacted_at.unwrap() > 1)
+        assert!(s.state.tasks[0].last_interacted_at.unwrap() > 1)
     });
 }
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_picker_empty_states_and_click(cx: &mut TestAppContext) {
+async fn task_picker_empty_states_and_click(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     press_in(window)(cx, &["cmd-shift-o"]);
@@ -573,7 +593,7 @@ async fn workspace_picker_empty_states_and_click(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("recent")));
     on_app(window, shark)(cx, &|s, w, cx| {
-        s.state.workspaces.clear();
+        s.state.tasks.clear();
         s.active = None;
         s.enter_home(w, cx);
     });
@@ -591,19 +611,19 @@ async fn workspace_picker_empty_states_and_click(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_interaction_coalesces_and_restores(cx: &mut TestAppContext) {
+async fn task_interaction_coalesces_and_restores(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
     let on = on_app(window, shark.clone());
     on(cx, &|s, _, cx| s.record_interaction("recent", cx));
     assert_eq!(
-        State::load().workspaces[1].last_interacted_at,
+        State::load().tasks[1].last_interacted_at,
         Some(20),
         "no immediate write"
     );
     cx.executor().advance_clock(Duration::from_millis(500));
     on(cx, &|s, _, cx| s.record_interaction("recent", cx));
-    assert_eq!(State::load().workspaces[1].last_interacted_at, Some(20));
+    assert_eq!(State::load().tasks[1].last_interacted_at, Some(20));
     cx.executor().advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
     on(cx, &|s, _, _cx| {
@@ -612,8 +632,8 @@ async fn workspace_interaction_coalesces_and_restores(cx: &mut TestAppContext) {
             "continuous input doesn't defer the first save"
         );
         assert_eq!(
-            State::load().workspaces[1].last_interacted_at,
-            s.state.workspaces[1].last_interacted_at
+            State::load().tasks[1].last_interacted_at,
+            s.state.tasks[1].last_interacted_at
         );
     });
     let (restored_window, restored) = open(cx, WindowOptions::default());

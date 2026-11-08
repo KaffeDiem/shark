@@ -43,7 +43,7 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "menu-scope".into(),
             git::on_branch(&repos, "menu-scope"),
             vec![],
@@ -55,7 +55,7 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     until(cx, window, |_, cx| shark.read(cx).active.is_some()).await;
     on(cx, &|s, _, cx| {
         let sync = s.syncs.remove("menu-scope").unwrap();
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         assert_eq!(
             menus::repo_branch(s, ws, &ws.repos[0], cx).as_deref(),
             Some("menu-scope"),
@@ -71,7 +71,7 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     })
     .await;
     on(cx, &|s, _, cx| {
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         // Only GitHub's answer that there is none offers one; the poll can't land mid-closure.
         for answer in [None, Some(Err("offline".to_string()))] {
             s.syncs["menu-scope"].update(cx, |g, _| g.set_no_pr("api", answer));
@@ -89,10 +89,10 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
             g.set_pr("api", 11, true);
             g.set_pr("web", 22, true);
         });
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         let entries = menus::branch_entries(s, ws, Some("api"), cx);
-        assert!(!has(&entries, "New agent on top…"));
-        assert!(!has(&entries, "Insert agent below…"));
+        assert!(!has(&entries, "New task on top…"));
+        assert!(!has(&entries, "Insert task below…"));
         assert!(!has(&entries, "Create pull request"));
         assert!(has(&entries, "Merge pull request…"));
         assert!(has(&entries, "Reveal in Finder"));
@@ -107,7 +107,7 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
         Some("https://github.com/o/api/pull/11")
     );
     on(cx, &|s, w, cx| {
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         invoke(
             menus::branch_entries(s, ws, Some("web"), cx),
             "Open pull request",
@@ -136,19 +136,19 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     git::git(&api, &["checkout", "-qb", "actual-api"]).unwrap();
     let refresh = |cx: &mut TestAppContext| {
         on(cx, &|s, _, cx| {
-            let ws = s.ws("menu-scope").unwrap().clone();
-            s.syncs["menu-scope"].update(cx, |g, cx| g.set_workspace(ws, cx));
+            let ws = s.task("menu-scope").unwrap().clone();
+            s.syncs["menu-scope"].update(cx, |g, cx| g.set_task(ws, cx));
         })
     };
     refresh(cx);
     until(cx, window, |_, cx| {
         let s = shark.read(cx);
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         menus::repo_branch(s, ws, &ws.repos[0], cx).as_deref() == Some("actual-api")
     })
     .await;
     on(cx, &|s, w, cx| {
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         let entries = menus::branch_entries(s, ws, Some("api"), cx);
         assert!(entries.iter().any(|e| matches!(e,
             Entry::Item { label, hint: Some(hint), .. }
@@ -175,7 +175,7 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     );
 
     on(cx, &|s, w, cx| {
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         invoke(
             menus::branch_entries(s, ws, Some("api"), cx),
             "Open attached branch “menu-scope” on GitHub",
@@ -192,12 +192,12 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     refresh(cx);
     until(cx, window, |_, cx| {
         let s = shark.read(cx);
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         menus::repo_branch(s, ws, &ws.repos[0], cx).is_none()
     })
     .await;
     on(cx, &|s, _, cx| {
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         assert!(!has(
             &menus::branch_entries(s, ws, Some("api"), cx),
             "Copy branch name"
@@ -205,7 +205,7 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
         assert!(menus::branch_entries(s, ws, Some("gone"), cx).is_empty());
         assert!(has(
             &menus::branch_entries(s, ws, None, cx),
-            "New agent on top…"
+            "New task on top…"
         ));
     });
 
@@ -213,12 +213,12 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     refresh(cx);
     until(cx, window, |_, cx| {
         let s = shark.read(cx);
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         menus::repo_branch(s, ws, &ws.repos[0], cx).as_deref() == Some("menu-scope")
     })
     .await;
     on(cx, &|s, _, cx| {
-        let ws = s.ws("menu-scope").unwrap();
+        let ws = s.task("menu-scope").unwrap();
         assert!(has(
             &menus::branch_entries(s, ws, Some("api"), cx),
             "Copy Git error"

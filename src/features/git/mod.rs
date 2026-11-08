@@ -6,7 +6,7 @@ pub(crate) use drafts::store_path as drafts_path;
 mod mermaid;
 use crate::media::{Lru, Playing};
 use crate::pr::git_feature as api;
-use crate::state::Workspace;
+use crate::state::Task;
 use crate::ui::{confirm, faint};
 use crate::{
     CancelEdit, CommentOnPr, Confirm, EditDescription, PageDown, PageUp, ReplyToThread, SaveFile,
@@ -71,7 +71,7 @@ pub(crate) enum GitFeatureEvent {
 impl EventEmitter<GitFeatureEvent> for GitFeature {}
 
 pub(crate) struct GitFeature {
-    workspace: Workspace,
+    task: Task,
     selected: usize,
     details: Option<api::Details>,
     loading: bool,
@@ -110,13 +110,13 @@ pub(crate) struct GitFeature {
 }
 
 impl GitFeature {
-    pub(crate) fn new(workspace: Workspace, _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let store = DraftStore::load(&workspace.name);
+    pub(crate) fn new(task: Task, _: &mut Window, cx: &mut Context<Self>) -> Self {
+        let store = DraftStore::load(&task.name);
         let media_cache = Lru::new(cx);
         let commits = cx.new(|cx| Commits::new(media_cache.clone(), cx));
-        commits.update(cx, |c, cx| c.set_repo(repo_context(&workspace, 0), cx));
+        commits.update(cx, |c, cx| c.set_repo(repo_context(&task, 0), cx));
         Self {
-            workspace,
+            task,
             selected: 0,
             details: None,
             loading: false,
@@ -149,24 +149,17 @@ impl GitFeature {
     }
 
     /// A base change (the host passes its effective bases) resets only the history.
-    pub(crate) fn set_workspace(
-        &mut self,
-        workspace: Workspace,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let identity = |ws: &Workspace| {
+    pub(crate) fn set_task(&mut self, task: Task, window: &mut Window, cx: &mut Context<Self>) {
+        let identity = |ws: &Task| {
             ws.repos
                 .iter()
                 .map(|r| (r.name.clone(), r.src.clone(), ws.branch_of(r).to_string()))
                 .collect::<Vec<_>>()
         };
-        let changed = identity(&self.workspace) != identity(&workspace);
-        self.workspace = workspace;
+        let changed = identity(&self.task) != identity(&task);
+        self.task = task;
         if changed {
-            self.selected = self
-                .selected
-                .min(self.workspace.repos.len().saturating_sub(1));
+            self.selected = self.selected.min(self.task.repos.len().saturating_sub(1));
             self.clear_selection(cx);
             self.refresh(window, cx);
         }
@@ -174,7 +167,7 @@ impl GitFeature {
     }
 
     fn sync_commits(&mut self, cx: &mut Context<Self>) {
-        let repo = repo_context(&self.workspace, self.selected);
+        let repo = repo_context(&self.task, self.selected);
         let visible = self.view == GitView::Commits;
         self.commits.update(cx, |c, cx| {
             c.set_repo(repo, cx);
@@ -303,7 +296,7 @@ impl GitFeature {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.posting || index >= self.workspace.repos.len() || self.selected == index {
+        if self.posting || index >= self.task.repos.len() || self.selected == index {
             return;
         }
         self.clear_selection(cx);
@@ -313,8 +306,8 @@ impl GitFeature {
     }
 
     fn wt(&self) -> Option<PathBuf> {
-        let repo = self.workspace.repos.get(self.selected)?;
-        Some(self.workspace.dir().join(&repo.name))
+        let repo = self.task.repos.get(self.selected)?;
+        Some(self.task.dir().join(&repo.name))
     }
 
     pub(crate) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -325,8 +318,8 @@ impl GitFeature {
             return;
         };
         let branch = self
-            .workspace
-            .branch_of(&self.workspace.repos[self.selected])
+            .task
+            .branch_of(&self.task.repos[self.selected])
             .to_string();
         self.generation += 1;
         let generation = self.generation;
@@ -1039,9 +1032,9 @@ impl GitFeature {
     /// Relative links in PR text resolve against the PR head the conversation was read at.
     fn doc_context(&self) -> Option<DocContext> {
         let d = self.details.as_ref()?;
-        let repo = self.workspace.repos.get(self.selected)?;
+        let repo = self.task.repos.get(self.selected)?;
         Some(DocContext {
-            repo: self.workspace.dir().join(&repo.name),
+            repo: self.task.dir().join(&repo.name),
             rev: d.head_sha.clone(),
             dir: String::new(),
             web: Some(format!(
@@ -1828,7 +1821,7 @@ impl GitFeature {
             t.can_resolve
         };
         let writing = self.posting || self.loading || self.archiving;
-        let repo = self.workspace.repos[self.selected].name.clone();
+        let repo = self.task.repos[self.selected].name.clone();
         let comments: Vec<AnyElement> = t
             .comments
             .iter()
@@ -2474,10 +2467,10 @@ fn hunk_tail(hunk: &str, n: usize) -> Vec<String> {
 }
 
 /// The selected repository's history source: its worktree and effective comparison base.
-fn repo_context(workspace: &Workspace, selected: usize) -> Option<RepoContext> {
-    let repo = workspace.repos.get(selected)?;
+fn repo_context(task: &Task, selected: usize) -> Option<RepoContext> {
+    let repo = task.repos.get(selected)?;
     Some(RepoContext {
-        wt: workspace.dir().join(&repo.name),
+        wt: task.dir().join(&repo.name),
         base: repo.base.clone(),
     })
 }
@@ -2500,7 +2493,7 @@ impl GitFeature {
     fn toolbar(&self, drafts: usize, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         let disabled = self.posting || self.archiving;
-        let repo = self.workspace.repos.get(self.selected);
+        let repo = self.task.repos.get(self.selected);
         let commits_view = self.view == GitView::Commits;
         h_flex()
             .flex_none()
@@ -2511,8 +2504,8 @@ impl GitFeature {
             .border_b_1()
             .border_color(border)
             // The repo picker only when there is a choice.
-            .when(self.workspace.repos.len() > 1, |d| {
-                d.children(self.workspace.repos.iter().enumerate().map(|(i, r)| {
+            .when(self.task.repos.len() > 1, |d| {
+                d.children(self.task.repos.iter().enumerate().map(|(i, r)| {
                     Button::new(SharedString::from(format!("git-repo-{i}")))
                         .label(r.name.clone())
                         .small()
@@ -2589,10 +2582,10 @@ impl GitFeature {
 
     /// Icon, title and detail shown while there is no pull request to list.
     fn placeholder_state(&self) -> (&'static str, &'static str, &'static str, IconName) {
-        if self.workspace.repos.get(self.selected).is_none() {
+        if self.task.repos.get(self.selected).is_none() {
             (
                 "git-empty-repositories",
-                "No repositories in this agent",
+                "No repositories in this task",
                 "Attach a repository to view its pull request.",
                 IconName::FolderGit2,
             )
@@ -2615,7 +2608,7 @@ impl GitFeature {
                 "git-unloaded",
                 "Pull request not loaded",
                 if self.archiving {
-                    "This agent is being deleted."
+                    "This task is being deleted."
                 } else {
                     "Load this branch’s pull request to read its description and review activity."
                 },
@@ -2635,7 +2628,7 @@ impl GitFeature {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let disabled = self.posting || self.archiving;
-        let repo = self.workspace.repos.get(self.selected);
+        let repo = self.task.repos.get(self.selected);
         let (state_id, state_title, state_detail, state_icon) = self.placeholder_state();
         v_flex()
             .id(state_id)

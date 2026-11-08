@@ -1,6 +1,6 @@
-//! Which workspaces need the user: a turn finished while it wasn't on screen ("unread"), or its
+//! Which tasks need the user: a turn finished while it wasn't on screen ("unread"), or its
 //! next git step is the user's to take ("needs you"). Drives the sidebar row icons, the Dock
-//! badge, OS notifications and the jump to the next such workspace.
+//! badge, OS notifications and the jump to the next such task.
 use crate::app::Shark;
 use crate::sync::{self, Repo};
 use gpui_kit::component::WindowExt as _;
@@ -8,17 +8,17 @@ use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// How often each workspace that isn't shown is checked.
+/// How often each task that isn't shown is checked.
 const BG_EVERY: Duration = Duration::from_secs(300);
-/// One workspace per tick, so the checks are spread out instead of all at once.
+/// One task per tick, so the checks are spread out instead of all at once.
 const TICK: Duration = Duration::from_secs(20);
-/// After gh failed for two workspaces in a row, gh isn't asked for this long.
+/// After gh failed for two tasks in a row, gh isn't asked for this long.
 const BG_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Attn {
     None,
-    /// A turn finished while the workspace wasn't shown.
+    /// A turn finished while the task wasn't shown.
     Unread,
     /// The label of the step that waits for the user.
     Needs(String),
@@ -38,12 +38,12 @@ pub struct Attention {
     /// (empty until the first check landed).
     checked: HashMap<String, Checked>,
     paused_until: Option<Instant>,
-    /// The workspace whose last check failed: one that isn't on GitHub shouldn't pause the rest.
+    /// The task whose last check failed: one that isn't on GitHub shouldn't pause the rest.
     failed: Option<String>,
-    /// The last "needs you" label seen per workspace, so each change notifies once.
+    /// The last "needs you" label seen per task, so each change notifies once.
     announced: HashMap<String, Option<String>>,
     pub window_active: bool,
-    _poll: Option<Task<()>>,
+    _poll: Option<gpui_kit::Task<()>>,
 }
 
 impl Attention {
@@ -63,19 +63,19 @@ impl Attention {
         }
     }
 
-    /// An archived workspace: a later one with its name starts with nothing known.
+    /// An archived task: a later one with its name starts with nothing known.
     pub fn forget(&mut self, name: &str) {
         self.opened(name);
         self.announced.remove(name);
     }
 
-    /// Opening a workspace reads it; its own GitSync polls from now on.
+    /// Opening a task reads it; its own GitSync polls from now on.
     pub fn opened(&mut self, name: &str) {
         self.unread.remove(name);
         self.checked.remove(name);
     }
 
-    /// The workspace to check next: not shown, oldest check first, never-checked before all.
+    /// The task to check next: not shown, oldest check first, never-checked before all.
     fn due(&self, names: &[String], active: Option<&str>, now: Instant) -> Option<String> {
         names
             .iter()
@@ -86,8 +86,8 @@ impl Attention {
             .map(|(_, n)| n.clone())
     }
 
-    /// Stores a background check's outcome. Two different workspaces failing gh in a row pause gh;
-    /// a failure keeps the last label; the open workspace isn't stored (its GitSync polls).
+    /// Stores a background check's outcome. Two different tasks failing gh in a row pause gh;
+    /// a failure keeps the last label; the open task isn't stored (its GitSync polls).
     fn record(
         &mut self,
         name: &str,
@@ -125,23 +125,21 @@ impl Attention {
     }
 }
 
-fn poll(cx: &mut Context<Shark>) -> Task<()> {
+fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
     cx.spawn(async move |this, cx| {
         loop {
             cx.background_executor().timer(TICK).await;
             let Ok(next) = this.update(cx, |s, cx| {
                 s.refresh_attention(cx);
                 // With no repos there's nothing to check.
-                let names: Vec<String> = (s.state.workspaces.iter())
+                let names: Vec<String> = (s.state.tasks.iter())
                     .filter(|w| !w.repos.is_empty())
                     .map(|w| w.name.clone())
                     .filter(|n| !s.busy(n, cx))
                     .collect();
                 let now = Instant::now();
                 let name = s.attn.due(&names, s.active.as_deref(), now)?;
-                let ws = (s.state.workspaces.iter())
-                    .find(|w| w.name == name)
-                    .cloned()?;
+                let ws = (s.state.tasks.iter()).find(|w| w.name == name).cloned()?;
                 let last = (s.attn.checked.get(&name)).map(|c| c.repos.clone());
                 // Backing off skips gh only: local git state keeps refreshing.
                 let gh = s.attn.paused_until.is_none_or(|t| now >= t);
@@ -184,12 +182,12 @@ impl Shark {
         }
     }
 
-    /// A turn finished off screen, in the workspace or any of its chat tabs.
+    /// A turn finished off screen, in the task or any of its chat tabs.
     fn unread_ws(&self, name: &str) -> bool {
         self.attn.unread.contains(name) || self.chat_unread(name)
     }
 
-    /// The agent is on it (mid-rebase looks like conflicts), or the workspace is going away.
+    /// The agent is on it (mid-rebase looks like conflicts), or the task is going away.
     fn busy(&self, name: &str, cx: &App) -> bool {
         self.archiving.contains(name) || self.running_chats(name, cx) > 0
     }
@@ -210,13 +208,13 @@ impl Shark {
         }
     }
 
-    /// The background check's result, for a workspace other than the open one.
+    /// The background check's result, for a task other than the open one.
     fn bg_checked(&self, name: &str) -> Option<&Checked> {
         let open = self.active.as_deref() == Some(name);
         self.attn.checked.get(name).filter(|_| !open)
     }
 
-    /// Each repo's local and PR state, for workspaces not opened this session too: the same
+    /// Each repo's local and PR state, for tasks not opened this session too: the same
     /// source as `needs_you`. `None` until a probe or background check landed.
     pub(crate) fn overview_repos<'a>(&'a self, name: &str, cx: &'a App) -> Option<&'a [Repo]> {
         match self.bg_checked(name) {
@@ -226,7 +224,7 @@ impl Shark {
     }
 
     pub(crate) fn turn_done(&mut self, name: &str, chat: &str, cx: &mut Context<Self>) {
-        // Home covers the open workspace: its turns end unseen.
+        // Home covers the open task: its turns end unseen.
         let shown = self.active.as_deref() == Some(name) && !self.home_shown();
         if !shown {
             self.attn.unread.insert(name.to_string());
@@ -238,17 +236,108 @@ impl Shark {
         if !shown || !self.attn.window_active {
             self.notify(name, Some(chat), "The agent finished its turn", cx);
         }
+        self.refresh_sibling_files(name, cx);
         self.refresh_attention(cx);
     }
 
-    /// Recounts the Dock badge and notifies when a workspace off screen starts needing you.
-    pub(crate) fn refresh_attention(&mut self, cx: &mut Context<Self>) {
-        let names: Vec<String> = self
+    pub(crate) fn refresh_agent_files(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let names: Vec<_> = self
             .state
-            .workspaces
+            .tasks
             .iter()
-            .map(|w| w.name.clone())
+            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == slug))
+            .map(|t| t.name.clone())
             .collect();
+        for name in names {
+            self.refresh_sibling_files(&name, cx);
+        }
+    }
+
+    pub(crate) fn refresh_sibling_files(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.archiving.contains(name) {
+            return;
+        }
+        let Some(task) = self.state.tasks.iter().find(|t| t.name == name).cloned() else {
+            return;
+        };
+        let Some(agent) = task.agent.as_ref() else {
+            return;
+        };
+        let slug = agent.slug.clone();
+        if !self
+            .state
+            .tasks
+            .iter()
+            .any(|t| t.name != name && t.agent.as_ref().is_some_and(|a| a.slug == slug))
+        {
+            return;
+        }
+        let name = name.to_string();
+        let key = name.clone();
+        let refresh = cx.spawn(async move |this, cx| {
+            let source = task.clone();
+            let files = cx
+                .background_executor()
+                .spawn(async move { sibling_files(&source, &source.dir()) })
+                .await;
+            let Ok(files) = files else { return };
+            this.update(cx, |s, cx| {
+                if s.archiving.contains(&name) {
+                    return;
+                }
+                let Some(current) = s.state.tasks.iter().find(|t| t.name == name) else {
+                    return;
+                };
+                if current.branch != task.branch
+                    || current.repos != task.repos
+                    || current.agent.as_ref().is_none_or(|a| a.slug != slug)
+                {
+                    return;
+                }
+                let sibling = crate::state::Sibling {
+                    title: current.display_title().into(),
+                    branch: current.branch.clone(),
+                    dirs: current
+                        .repos
+                        .iter()
+                        .map(|r| current.dir().join(&r.name).to_string_lossy().into_owned())
+                        .collect(),
+                    files,
+                };
+                let mut changed = false;
+                for other in s.state.tasks.iter_mut().filter(|t| t.name != name) {
+                    let Some(agent) = other.agent.as_mut().filter(|a| a.slug == slug) else {
+                        continue;
+                    };
+                    match agent
+                        .siblings
+                        .iter_mut()
+                        .find(|a| a.branch == sibling.branch && a.dirs == sibling.dirs)
+                    {
+                        Some(old) if *old != sibling => {
+                            *old = sibling.clone();
+                            changed = true;
+                        }
+                        None => {
+                            agent.siblings.push(sibling.clone());
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if changed {
+                    let _ = s.sync_agent(&slug, false, cx);
+                }
+            })
+            .ok();
+        });
+        // Replacing the handle cancels an older scan before it can publish stale files.
+        self.sibling_refreshes.insert(key, refresh);
+    }
+
+    /// Recounts the Dock badge and notifies when a task off screen starts needing you.
+    pub(crate) fn refresh_attention(&mut self, cx: &mut Context<Self>) {
+        let names: Vec<String> = self.state.tasks.iter().map(|w| w.name.clone()).collect();
         self.attn.checked.retain(|n, _| names.contains(n));
         self.attn.unread.retain(|n| names.contains(n));
         let mut count = 0;
@@ -272,26 +361,22 @@ impl Shark {
         cx.notify();
     }
 
-    /// Opens the next workspace after the open one (in sidebar order) that needs you.
+    /// Opens the next task after the open one (in sidebar order) that needs you.
     pub(crate) fn next_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.ws_order(true);
         let n = order.len();
         let from = self
             .active
             .as_ref()
-            .and_then(|a| {
-                order
-                    .iter()
-                    .position(|&ix| &self.state.workspaces[ix].name == a)
-            })
+            .and_then(|a| order.iter().position(|&ix| &self.state.tasks[ix].name == a))
             .map_or(0, |i| i + 1);
         let hit = (0..n).map(|i| order[(from + i) % n]).find(|&ix| {
-            let name = &self.state.workspaces[ix].name;
+            let name = &self.state.tasks[ix].name;
             self.active.as_ref() != Some(name) && self.attention_of(name, cx) != Attn::None
         });
         match hit {
-            Some(ix) => self.open_workspace(ix, window, cx),
-            None => window.push_notification("No other agent needs you", cx),
+            Some(ix) => self.open_task(ix, window, cx),
+            None => window.push_notification("No other task needs you", cx),
         }
     }
 }
@@ -342,7 +427,7 @@ pub(crate) fn init(window: &Window, cx: &mut Context<Shark>) {
 
 impl Shark {
     fn notify(&self, name: &str, chat: Option<&str>, body: &str, cx: &App) {
-        let Some(ws) = self.state.workspaces.iter().find(|ws| ws.name == name) else {
+        let Some(ws) = self.state.tasks.iter().find(|ws| ws.name == name) else {
             return;
         };
         cx.show_system_notification(SystemNotification {
@@ -387,12 +472,12 @@ mod tests {
     }
 
     #[test]
-    fn two_workspaces_failing_in_a_row_pause_gh() {
+    fn two_tasks_failing_in_a_row_pause_gh() {
         let (mut at, now) = (Attention::default(), Instant::now());
         let fail = || Err("no gh".to_string());
         at.record("a", None, fail(), vec![], true, now);
         at.record("a", None, fail(), vec![], true, now);
-        assert_eq!(at.paused_until, None, "the same workspace twice");
+        assert_eq!(at.paused_until, None, "the same task twice");
         at.record("b", None, fail(), vec![], true, now);
         assert_eq!(at.paused_until, Some(now + BG_BACKOFF));
         let mut at = Attention::default();
@@ -421,5 +506,112 @@ mod tests {
             !at.checked.contains_key("open"),
             "the open one isn't stored"
         );
+    }
+}
+
+fn sibling_files(task: &crate::state::Task, root: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut files = std::collections::BTreeSet::new();
+    for repo in &task.repos {
+        let dir = root.join(&repo.name);
+        let rev = crate::git::compare_rev(&dir, &repo.base, false);
+        if rev.is_empty() {
+            return Err(format!("{}: comparison base unavailable", repo.name));
+        }
+        let diff = crate::git::git_bytes(
+            &dir,
+            &["diff", "--name-only", "-z", "--no-renames", &rev, "--"],
+        )?;
+        let diff = std::str::from_utf8(&diff).map_err(|e| e.to_string())?;
+        for path in diff.split('\0').filter(|p| !p.is_empty()) {
+            files.insert(format!("{}/{path}", repo.name));
+        }
+        for (path, untracked) in crate::git::uncommitted_files(&dir)? {
+            if untracked {
+                files.insert(format!("{}/{path}", repo.name));
+            }
+        }
+    }
+    let more = files.len().saturating_sub(20);
+    let mut files: Vec<_> = files.into_iter().take(20).collect();
+    if more > 0 {
+        files.push(format!("+{more} more"));
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod sibling_file_tests {
+    use super::sibling_files;
+    use crate::{
+        git::git,
+        state::{Task, TaskRepo},
+    };
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn committed_working_and_untracked_files_are_sorted_capped_and_nul_safe() {
+        let root = std::env::temp_dir().join(format!(
+            "shark-siblings-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("api");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = || {
+            git(&repo, &["add", "."]).unwrap();
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "test",
+                ],
+            )
+            .unwrap();
+        };
+        fs::write(repo.join("tracked.txt"), "before").unwrap();
+        commit();
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(repo.join("committed.txt"), "committed").unwrap();
+        commit();
+        fs::write(repo.join("tracked.txt"), "after").unwrap();
+        fs::write(repo.join("odd\nname.txt"), "untracked").unwrap();
+        let mut task = Task {
+            repos: vec![TaskRepo {
+                name: "api".into(),
+                src: repo.clone(),
+                base,
+                branch: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            sibling_files(&task, &root).unwrap(),
+            ["api/committed.txt", "api/odd\nname.txt", "api/tracked.txt"]
+        );
+        for i in 0..23 {
+            fs::write(repo.join(format!("overflow-{i:02}.txt")), "x").unwrap();
+        }
+        let files = sibling_files(&task, &root).unwrap();
+        assert_eq!(files.len(), 21);
+        assert_eq!(files.last().unwrap(), "+6 more");
+        assert_eq!(files, sibling_files(&task, &root).unwrap());
+        task.repos[0].base = "missing-ref".into();
+        assert!(
+            sibling_files(&task, &root).is_err(),
+            "a failed probe must not clear the previous files"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

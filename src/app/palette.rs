@@ -38,26 +38,42 @@ impl Row {
 
 /// Grouped the way people reach for them; `GROUPS` names each group by its first row.
 pub(super) const COMMANDS: &[Row] = &[
-    Row::key(
-        "New agent",
-        IconName::Plus,
-        &NewWorkspace,
-        "create start chat",
+    Row::key("New task", IconName::Plus, &NewTask, "create start chat"),
+    Row(
+        "New task for agent…",
+        IconName::Bot,
+        None,
+        "instructions",
+        Some(|s, w, cx| s.pick_agent(true, w, cx)),
+    ),
+    Row(
+        "Open agent…",
+        IconName::Bot,
+        None,
+        "instructions tasks history",
+        Some(|s, w, cx| s.pick_agent(false, w, cx)),
+    ),
+    Row(
+        "New agent…",
+        IconName::Bot,
+        None,
+        "create instructions skills",
+        Some(|s, w, cx| s.new_agent_dialog(w, cx)),
     ),
     Row::key(
-        "New agent from branch or PR…",
+        "New task from branch or PR…",
         IconName::GitBranch,
-        &NewWorkspaceFromBranch,
+        &NewTaskFromBranch,
         "create branch checkout pull request worktree repo review",
     ),
     Row::key(
-        "Open agent…",
+        "Open task…",
         IconName::Search,
-        &OpenWorkspacePicker,
+        &OpenTaskPicker,
         "switch recent repository",
     ),
     Row::key(
-        "Open next agent needing attention",
+        "Open next task needing attention",
         IconName::CircleAlert,
         &NextAttention,
         "jump waiting",
@@ -66,7 +82,7 @@ pub(super) const COMMANDS: &[Row] = &[
     Row::key(
         "Attach repository…",
         IconName::FolderPlus,
-        &AddRepoToWorkspace,
+        &AddRepoToTask,
         "add repo folder git",
     ),
     Row(
@@ -80,7 +96,7 @@ pub(super) const COMMANDS: &[Row] = &[
         "Start from Linear issue…",
         IconName::Plus,
         None,
-        "new agent create ticket plan",
+        "new task create ticket plan",
         Some(|s, w, cx| s.start_from_issue(w, cx)),
     ),
     Row(
@@ -105,11 +121,11 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.attachment_list(ws.name, 0, w, cx))),
     ),
     Row(
-        "Rename agent…",
+        "Rename task…",
         IconName::Pencil,
         None,
         "title",
-        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.rename_agent(ws.name, w, cx))),
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.rename_task(ws.name, w, cx))),
     ),
     Row::key(
         "Run or stop run scripts",
@@ -125,24 +141,24 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.show_script_log(w, cx)),
     ),
     Row::key(
-        "Delete agent",
+        "Delete task",
         IconName::Archive,
-        &ArchiveWorkspace,
+        &ArchiveTask,
         "remove close archive",
     ),
     Row::key(
-        "Force delete agent…",
+        "Force delete task…",
         IconName::ArchiveX,
-        &ForceArchiveWorkspace,
+        &ForceArchiveTask,
         "discard changes remove archive",
     ),
     Row::key(
         "Reveal in Finder",
         IconName::FolderOpen,
         &RevealInFinder,
-        "agent folder",
+        "task folder",
     ),
-    Row::key("Copy agent path", IconName::Copy, &CopyPath, "folder"),
+    Row::key("Copy task path", IconName::Copy, &CopyPath, "folder"),
     Row::key("Copy branch name", IconName::GitBranch, &CopyBranch, ""),
     Row::key("Show chat", IconName::MessageSquare, &ShowChat, "tab"),
     Row::key("New chat", IconName::Plus, &NewChat, "tab"),
@@ -494,14 +510,14 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.change_base(ws.name, None, w, cx))),
     ),
     Row(
-        "New agent on top…",
+        "New task on top…",
         IconName::Layers,
         None,
         "stack stacked branch from child pr",
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.stack_from(ws.name, false, w, cx))),
     ),
     Row(
-        "Insert agent below…",
+        "Insert task below…",
         IconName::ListPlus,
         None,
         "stack stacked between parent in-between pr",
@@ -569,38 +585,41 @@ pub(super) const COMMANDS: &[Row] = &[
         "setting",
         Some(|s, _, cx| s.set_delete_remote(!s.state.delete_remote_branches, cx)),
     ),
-    Row::key("New section", IconName::FolderPlus, &NewSection, "group"),
     Row::key(
-        "Move agent to section…",
+        "New task group",
+        IconName::FolderPlus,
+        &NewSection,
+        "section",
+    ),
+    Row::key(
+        "Move task to group…",
         IconName::FolderInput,
         &MoveToSection,
         "group",
     ),
-    Row::key("Rename section", IconName::Pencil, &RenameSection, "group"),
     Row::key(
-        "Change section icon…",
+        "Rename task group",
+        IconName::Pencil,
+        &RenameSection,
+        "section",
+    ),
+    Row::key(
+        "Change task group icon…",
         IconName::Shapes,
         &SectionIcon,
         "group",
     ),
-    Row(
-        "Toggle section folded",
-        IconName::ChevronsUpDown,
-        None,
-        "fold group",
-        Some(|s, w, cx| s.with_section(w, cx, |s, i, _, cx| s.toggle_section(i, cx))),
-    ),
     Row::key(
-        "Delete section",
+        "Delete task group",
         IconName::Trash,
         &DeleteSection,
-        "group remove agents stay",
+        "group remove tasks stay",
     ),
     Row(
         "Go to Home",
         IconName::House,
         Some(&ToggleHome),
-        "start overview dashboard",
+        "start overview dashboard all tasks list",
         Some(|s, w, cx| s.enter_home(w, cx)),
     ),
     Row(
@@ -729,18 +748,18 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
 ];
 
-/// Rows that act on an agent; left out while there's none to act on.
-const NEED_WORKSPACE: &[&str] = &[
+/// Rows that act on a task; left out while there's none to act on.
+const NEED_TASK: &[&str] = &[
     "Show Git",
     "Attach repository…",
     "Attach Linear issue…",
     "Show Linear issue…",
     "Show attachments",
-    "Rename agent…",
+    "Rename task…",
     "Run or stop run scripts",
     "Show script output",
-    "Delete agent",
-    "Force delete agent…",
+    "Delete task",
+    "Force delete task…",
     "Reveal in Finder",
 ];
 
@@ -757,12 +776,12 @@ const CODEX_ONLY: &[&str] = &["Toggle fast mode", "Thinking: Ultra"];
 
 /// The palette's headings, each with the label of the row it starts at.
 const GROUPS: &[(&str, &str)] = &[
-    ("Agent", "New agent"),
+    ("Task", "New task"),
     ("Chat", "Show chat"),
     ("Plan", "Toggle plan mode"),
     ("Files and diff", "Open file…"),
     ("Git", "Run next git step"),
-    ("Sections", "New section"),
+    ("Task groups", "New task group"),
     ("View", "Go to Home"),
     ("Shark", "Settings"),
 ];
@@ -785,7 +804,7 @@ fn shortcut(action: &dyn Action, window: &Window) -> Option<Keystroke> {
 }
 
 /// Each command with a shortcut from where `window` is focused, as (label, keystroke) like
-/// ("New agent", "cmd-n"): the live keymap for Home and Ask Shark.
+/// ("New task", "cmd-n"): the live keymap for Home and Ask Shark.
 pub(crate) fn keymap_summary(window: &Window) -> Vec<(String, String)> {
     (COMMANDS.iter())
         .filter_map(|Row(label, _, action, ..)| {
@@ -818,7 +837,7 @@ fn row_item(label: impl Into<SharedString>, icon: IconName, key: Option<Keystrok
     }
 }
 
-/// A palette row: a command, or opening the workspace in an app.
+/// A palette row: a command, or opening the task in an app.
 enum Pick {
     Cmd(usize),
     App(&'static OpenApp),
@@ -834,7 +853,7 @@ fn app_item(app: &'static OpenApp) -> CommandItem {
 }
 
 /// The palette and app switcher offer the same eligible apps.
-pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp> {
+pub(super) fn available_apps(target: Option<&Task>) -> Vec<&'static OpenApp> {
     let Some(ws) = target else { return vec![] };
     apps::installed()
         .iter()
@@ -852,7 +871,7 @@ impl Shark {
         }
     }
 
-    /// Terminals and editors open the target workspace's folder; git clients a repo and
+    /// Terminals and editors open the target task's folder; git clients a repo and
     /// Xcode a project, asking which when there are several.
     pub(super) fn open_in(
         &mut self,
@@ -861,14 +880,14 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         self.with_target(window, cx, |s, ws, window, cx| {
-            s.open_in_workspace(app, &ws, window, cx)
+            s.open_in_task(app, &ws, window, cx)
         });
     }
 
-    pub(super) fn open_in_workspace(
+    pub(super) fn open_in_task(
         &mut self,
         app: &'static OpenApp,
-        ws: &Workspace,
+        ws: &Task,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -918,7 +937,7 @@ impl Shark {
                 groups.push((Some(heading), vec![]));
             }
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
-                || (no_target && NEED_WORKSPACE.contains(label))
+                || (no_target && NEED_TASK.contains(label))
                 || (no_linear && NEED_LINEAR.contains(label))
                 || (*label == "Show or hide diff files"
                     && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
@@ -933,34 +952,34 @@ impl Shark {
             if *label == "Reveal in Finder" {
                 for app in apps.drain(..) {
                     rows.push(Pick::App(app));
-                    group.push(app_item(app).keywords(["app", "open", "agent"]));
+                    group.push(app_item(app).keywords(["app", "open", "task"]));
                 }
             }
         }
-        let workspaces = order.iter().map(|&ix| {
+        let tasks = order.iter().map(|&ix| {
             let key = (shown.iter().position(|&s| s == ix))
                 .filter(|&n| n < 9)
-                .and_then(|n| shortcut(&OpenWorkspace(n), window));
-            let ws = &self.state.workspaces[ix];
+                .and_then(|n| shortcut(&OpenTask(n), window));
+            let ws = &self.state.tasks[ix];
             let open = format!("Open {}", ws.display_title());
             row_item(open, IconName::GitBranch, key).keywords([
                 "go".to_string(),
                 "switch".to_string(),
-                "agent".to_string(),
+                "task".to_string(),
                 ws.name.clone(),
             ])
         });
-        groups.push((Some("Open agent"), workspaces.collect()));
+        groups.push((Some("Open task"), tasks.collect()));
         open_grouped(
             cx.entity().downgrade(),
             "Type a command or search…",
             groups,
             0,
-            // Rows count the shown commands, then the workspaces.
+            // Rows count the shown commands, then the tasks.
             move |s, row, window, cx| match rows.get(row) {
                 Some(&Pick::Cmd(ix)) => COMMANDS[ix].run(s, window, cx),
                 Some(&Pick::App(app)) => s.open_in(app, window, cx),
-                None => s.open_workspace(order[row - rows.len()], window, cx),
+                None => s.open_task(order[row - rows.len()], window, cx),
             },
             window,
             cx,
@@ -982,7 +1001,7 @@ mod tests {
                 "{heading}: no row {first}"
             );
         }
-        let gated = [CLAUDE_ONLY, CODEX_ONLY, NEED_WORKSPACE, NEED_LINEAR];
+        let gated = [CLAUDE_ONLY, CODEX_ONLY, NEED_TASK, NEED_LINEAR];
         for label in gated.into_iter().flatten() {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }

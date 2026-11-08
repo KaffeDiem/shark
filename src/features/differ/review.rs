@@ -436,23 +436,23 @@ impl Differ {
     }
 
     pub(crate) fn ws_comments(&self) -> &[Comment] {
-        self.workspace_name()
+        self.task_name()
             .and_then(|ws| self.review.store.comments.get(ws))
             .map_or(&[], |c| &c[..])
     }
 
-    /// The open workspace's comment `id`.
+    /// The open task's comment `id`.
     pub(crate) fn comment(&self, id: u64) -> Option<&Comment> {
         self.ws_comments().iter().find(|c| c.id == id)
     }
 
-    /// Edits the open workspace's comments and saves them.
+    /// Edits the open task's comments and saves them.
     pub(crate) fn edit_comments(
         &mut self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Vec<Comment>),
     ) {
-        if let Some(ws) = self.workspace_name().map(str::to_string) {
+        if let Some(ws) = self.task_name().map(str::to_string) {
             self.review.store.edit(&ws, f);
             cx.notify();
         }
@@ -544,10 +544,10 @@ impl Differ {
             })
     }
 
-    /// Moves the open workspace's working-copy threads to where their lines are on disk now, so
+    /// Moves the open task's working-copy threads to where their lines are on disk now, so
     /// lines added above one don't leave it beside other code.
     pub(crate) fn reanchor_comments(&mut self) {
-        let Some((ws, dir)) = self.active_ws().map(|w| (w.name.clone(), w.dir())) else {
+        let Some((ws, dir)) = self.active_task().map(|w| (w.name.clone(), w.dir())) else {
             return;
         };
         // ponytail: reads each thread's file on every diff refresh; group by path if many.
@@ -655,7 +655,7 @@ impl Differ {
     /// The comment quoting its lines as they are now (`snapshot`), at the revision they are
     /// read at (`rev`).
     fn anchor_text(&self, c: &Comment) -> Comment {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return c.clone();
         };
         let rev = match c.end.0 {
@@ -682,8 +682,8 @@ impl Differ {
     /// `c`: the composer on the selected lines (the cursor line). A pending thread there is
     /// edited instead.
     pub(crate) fn comment_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.is_none() {
-            return notify_err(window, cx, "Open an agent first");
+        if self.task.is_none() {
+            return notify_err(window, cx, "Open a task first");
         }
         let Some(range) = self.picked_lines(cx) else {
             let keys = if self.preferences.vim {
@@ -845,7 +845,7 @@ impl Differ {
         let order: HashMap<String, usize> = (self.diff_files.iter().enumerate())
             .map(|(i, f)| (f.path().to_string(), i))
             .collect();
-        let ws = self.workspace_name()?.to_string();
+        let ws = self.task_name()?.to_string();
         let id = match comp.draft.id {
             0 => self.review.store.new_id(&ws),
             id => id,
@@ -1029,7 +1029,7 @@ impl Differ {
             return vec![];
         };
         let act = |f: fn(&mut Self, u64, &mut Window, &mut Context<Self>)| {
-            on_differ(self.workspace_name(), cx, move |s, w, cx| f(s, id, w, cx))
+            on_differ(self.task_name(), cx, move |s, w, cx| f(s, id, w, cx))
         };
         let addressed = matches!(c.status, Status::Addressed { .. } | Status::Outdated);
         let mut entries = vec![menu::item(IconName::Pencil, "Edit", act(Self::edit_thread))];
@@ -1179,9 +1179,9 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let chat = self.comment(id).and_then(|c| c.chat.clone());
-        if let Some(workspace) = self.workspace_name() {
+        if let Some(task) = self.task_name() {
             cx.emit(DifferEvent::OpenChat {
-                workspace: workspace.into(),
+                task: task.into(),
                 chat,
             });
         }
@@ -1899,6 +1899,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn expanded_context_keeps_local_comments_and_navigation(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1983,6 +1984,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn rows_follow_the_diff_layout(cx: &mut TestAppContext) {
         // Whole-file context narrows to git's default hunks; 7 lines apart stay separate.

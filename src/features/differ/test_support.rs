@@ -86,8 +86,8 @@ impl Differ {
     pub(crate) fn viewed_now(&self) -> &Rc<HashSet<SharedString>> {
         &self.viewed_now
     }
-    pub(crate) fn workspace(&self) -> &Option<Workspace> {
-        &self.workspace
+    pub(crate) fn task(&self) -> &Option<Task> {
+        &self.task
     }
     pub(crate) fn diff_error_mut(&mut self) -> &mut Option<String> {
         &mut self.diff_error

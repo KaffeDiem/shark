@@ -14,7 +14,7 @@ impl Shark {
         if self.archiving.contains(name) {
             return;
         }
-        let Some(ws) = self.state.workspaces.iter_mut().find(|ws| ws.name == name) else {
+        let Some(ws) = self.state.tasks.iter_mut().find(|ws| ws.name == name) else {
             return;
         };
         ws.last_interacted_at = Some(now_ms());
@@ -31,7 +31,7 @@ impl Shark {
         }
     }
 
-    /// Records an interaction with the open workspace, if any.
+    /// Records an interaction with the open task, if any.
     pub(super) fn record_active_interaction(&mut self, cx: &mut Context<Self>) {
         if let Some(name) = self.active.clone() {
             self.record_interaction(&name, cx);
@@ -65,7 +65,7 @@ impl Shark {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Opening/browsing navigation surfaces isn't an interaction with the old workspace.
+        // Opening/browsing navigation surfaces isn't an interaction with the old task.
         let navigation = key.modifiers.platform
             && matches!(
                 key.key.as_str(),

@@ -1,4 +1,4 @@
-//! The header's git button: keeps every repo of the open workspace in sync with git and GitHub,
+//! The header's git button: keeps every repo of the open task in sync with git and GitHub,
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 #[cfg(all(test, feature = "test-support"))]
@@ -14,7 +14,7 @@ use crate::chat::Chat;
 use crate::menu::each_or_all;
 use crate::menu::{self, Entry};
 use crate::pr;
-use crate::state::Workspace;
+use crate::state::Task;
 use crate::ui::notify_err;
 use crate::ui::open_menu;
 use gpui_kit::assets::IconName;
@@ -77,8 +77,8 @@ pub enum SyncEvent {
 }
 
 pub struct GitSync {
-    ws: Workspace,
-    /// Every open chat of the workspace; git writes wait for all of them.
+    ws: Task,
+    /// Every open chat of the task; git writes wait for all of them.
     chats: Vec<Entity<Chat>>,
     /// The shown chat; judgment steps prompt it.
     chat: Option<Entity<Chat>>,
@@ -104,10 +104,10 @@ pub struct GitSync {
     want_pr: bool,
     kick: Sender<()>,
     kicked: Receiver<()>,
-    /// Polling runs only while the workspace is shown; dropping the task stops it.
-    poll: Option<Task<()>>,
-    /// Open PRs per repo, for the stack around this workspace's branches; from the disk cache
-    /// the New workspace dialog shares, refreshed with each fetch.
+    /// Polling runs only while the task is shown; dropping the task stops it.
+    poll: Option<gpui_kit::Task<()>>,
+    /// Open PRs per repo, for the stack around this task's branches; from the disk cache
+    /// the New task dialog shares, refreshed with each fetch.
     pub stack_prs: std::collections::HashMap<String, Vec<crate::prs::Pr>>,
     /// The git menu, open under the chevron, whose bounds the last paint recorded.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
@@ -144,7 +144,7 @@ impl GitSync {
         self.delete_remote = state.delete_remote_branches;
     }
 
-    pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(ws: Task, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (kick, kicked) = unbounded();
         let repos = ws.repos.iter().map(|r| Repo::fresh(r, &ws)).collect();
         let _subs = vec![cx.observe_window_activation(window, |s, window, _| {
@@ -188,7 +188,7 @@ impl GitSync {
         }
     }
 
-    /// Only the shown workspace polls; switching back catches up right away.
+    /// Only the shown task polls; switching back catches up right away.
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         match (active, self.poll.is_some()) {
             (true, false) => {
@@ -201,9 +201,9 @@ impl GitSync {
         }
     }
 
-    /// A repo joined the workspace or a base changed: track it too (known repos keep their
+    /// A repo joined the task or a base changed: track it too (known repos keep their
     /// state) and re-probe.
-    pub fn set_workspace(&mut self, ws: Workspace, cx: &mut Context<Self>) {
+    pub fn set_task(&mut self, ws: Task, cx: &mut Context<Self>) {
         let mut old = std::mem::take(&mut self.repos);
         self.repos = ws
             .repos
@@ -306,7 +306,7 @@ impl GitSync {
     }
 
     fn apply(&mut self, p: Probed, cx: &mut Context<Self>) {
-        // A base or repo changed while the worker ran; its answer belongs to the old workspace.
+        // A base or repo changed while the worker ran; its answer belongs to the old task.
         if p.repos != worktrees(&self.ws) {
             self.kick(true, true);
             return;
@@ -366,7 +366,7 @@ impl GitSync {
         }
     }
 
-    // ponytail: a closed chat's two subscriptions live until the workspace closes; they hold no
+    // ponytail: a closed chat's two subscriptions live until the task closes; they hold no
     // strong ref, so this only costs a few bytes per closed tab
     pub fn add_chat(&mut self, chat: Entity<Chat>, cx: &mut Context<Self>) {
         let hold = self.running.is_some();
@@ -450,7 +450,7 @@ impl GitSync {
         }
     }
 
-    /// The open PR target for display, or None to keep the caller's current workspace base.
+    /// The open PR target for display, or None to keep the caller's current task base.
     pub fn diff_base(&self, repo: &str) -> Option<String> {
         self.repos
             .iter()
@@ -572,7 +572,7 @@ impl GitSync {
         urls.iter().for_each(|u| cx.open_url(u));
     }
 
-    /// The button: run whatever the workspace needs next.
+    /// The button: run whatever the task needs next.
     pub fn primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.action.clone() {
             Some(a) => self.run(a, true, window, cx),
@@ -626,7 +626,7 @@ impl GitSync {
                 return notify_err(window, cx, "Open a chat to queue this step");
             };
             if !chat.update(cx, |c, cx| c.enqueue(prompt, a.reviews, cx)) {
-                return notify_err(window, cx, "This agent is being deleted");
+                return notify_err(window, cx, "This task is being deleted");
             }
             return;
         }
@@ -872,7 +872,7 @@ impl GitSync {
         self.action.as_ref().map(|_| &self.repos[..])
     }
 
-    /// The shown workspace's own answer to `check_in_background`, from its faster polling.
+    /// The shown task's own answer to `check_in_background`, from its faster polling.
     pub fn needs_you(&self) -> Option<String> {
         self.action
             .as_ref()
@@ -1329,9 +1329,9 @@ impl Render for GitSync {
     }
 }
 
-/// Repo names in merge order: `saved` first (names no longer in the workspace dropped), then
+/// Repo names in merge order: `saved` first (names no longer in the task dropped), then
 /// the rest in the order they were added.
-pub fn merge_order(ws: &Workspace, saved: &[String]) -> Vec<String> {
+pub fn merge_order(ws: &Task, saved: &[String]) -> Vec<String> {
     let names: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
     let mut out: Vec<String> = saved
         .iter()
@@ -1378,7 +1378,7 @@ mod tests {
             });
             let (window, sync) = cx.update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| GitSync::new(Workspace::default(), w, cx))
+                    cx.new(|cx| GitSync::new(Task::default(), w, cx))
                 })
                 .unwrap()
             });
@@ -1426,10 +1426,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cx.update(gpui_kit::init);
-        let ws = crate::state::Workspace {
+        let ws = crate::state::Task {
             name: "git-queue-test".into(),
             branch: "feature".into(),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: "/nonexistent".into(),
                 base: "origin/main".into(),
@@ -1501,11 +1501,11 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cx.update(gpui_kit::init);
-        let ws = crate::state::Workspace {
+        let ws = crate::state::Task {
             name: "git-button-test".into(),
             branch: "feature".into(),
             repos: ["api", "web"]
-                .map(|n| crate::state::WsRepo {
+                .map(|n| crate::state::TaskRepo {
                     name: n.into(),
                     src: "/nonexistent".into(),
                     base: "origin/main".into(),
@@ -1674,10 +1674,10 @@ mod tests {
 
     #[test]
     fn merge_guard_sees_a_retargeted_pr_through_the_saved_base() {
-        let ws = crate::state::Workspace {
+        let ws = crate::state::Task {
             name: "retarget".into(),
             branch: "feat".into(),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: "/unused".into(),
                 base: "origin/main".into(),
@@ -1731,7 +1731,7 @@ mod tests {
             .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
         let name = format!("pr-retry-{}", std::process::id());
         let root = std::env::temp_dir().join(&name);
-        let mut ws = Workspace {
+        let mut ws = Task {
             name,
             branch: "feature".into(),
             ..Default::default()
@@ -1752,7 +1752,7 @@ mod tests {
             git(&wt, &["push", "-q", "origin", "main"]).unwrap();
             git(&wt, &["checkout", "-qb", "feature"]).unwrap();
             commit("work");
-            ws.repos.push(crate::state::WsRepo {
+            ws.repos.push(crate::state::TaskRepo {
                 name: name.into(),
                 src: wt,
                 base: "origin/main".into(),
@@ -1829,8 +1829,8 @@ esac
         assert!(!root.join("api.body").exists());
         fs::remove_file(root.join("fail")).unwrap();
         let mut repos = snapshot();
-        // A mixed workspace must not publish its local PR review checkout.
-        ws.repos.push(crate::state::WsRepo {
+        // A mixed task must not publish its local PR review checkout.
+        ws.repos.push(crate::state::TaskRepo {
             name: "review".into(),
             src: Default::default(),
             base: "origin/main".into(),
@@ -1884,11 +1884,11 @@ esac
             .unwrap_or_else(|e| e.into_inner());
         crate::state::TEST_HOME
             .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
-        let ws = Workspace {
+        let ws = Task {
             name: format!("scope-test-{}", std::process::id()),
             branch: "main".into(),
             repos: ["api", "web"]
-                .map(|n| crate::state::WsRepo {
+                .map(|n| crate::state::TaskRepo {
                     name: n.into(),
                     src: Default::default(),
                     base: "HEAD".into(),
@@ -2013,7 +2013,7 @@ esac
         cx.update(gpui_kit::init);
         let (mut ws, _) = stacked_probe();
         ws.repos[0].base = "origin/main".into();
-        ws.repos.push(crate::state::WsRepo {
+        ws.repos.push(crate::state::TaskRepo {
             name: "web".into(),
             ..ws.repos[0].clone()
         });
@@ -2096,11 +2096,11 @@ esac
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cx.update(gpui_kit::init);
-        let ws = Workspace {
+        let ws = Task {
             name: "merged-scope-test".into(),
             branch: "feature".into(),
             repos: ["api", "web"]
-                .map(|name| crate::state::WsRepo {
+                .map(|name| crate::state::TaskRepo {
                     name: name.into(),
                     src: "/nonexistent".into(),
                     base: format!("origin/{name}-parent"),
@@ -2286,7 +2286,7 @@ esac
     /// steps and prompts follow it.
     #[test]
     fn probes_each_repo_on_its_branch() {
-        use crate::git::{add_repo, create_workspace, git};
+        use crate::git::{add_repo, create_task, git};
         let root = std::env::temp_dir().join(format!("shark-sync-prb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let c = ["-c", "user.name=t", "-c", "user.email=t@t"];
@@ -2314,7 +2314,7 @@ esac
         }
         repos[0].1 = "kd/x".into();
         let dir = root.join("ws/feat");
-        let ws = create_workspace(&dir, "feat", "feat", &repos).unwrap();
+        let ws = create_task(&dir, "feat", "feat", &repos).unwrap();
         let job = Job {
             repos: (ws.repos.iter())
                 .map(|r| (dir.join(&r.name), r.base.clone(), ws.branch_of(r).into()))
@@ -2374,11 +2374,11 @@ esac
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    fn stacked_probe() -> (crate::state::Workspace, super::Probed) {
-        let ws = crate::state::Workspace {
+    fn stacked_probe() -> (crate::state::Task, super::Probed) {
+        let ws = crate::state::Task {
             name: "stack".into(),
             branch: "child".into(),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: "/unused".into(),
                 base: "origin/parent".into(),
@@ -2497,7 +2497,7 @@ esac
             sync.update(cx, |s, cx| {
                 let mut changed = ws.clone();
                 changed.repos[0].base = "origin/new-parent".into();
-                s.set_workspace(changed, cx);
+                s.set_task(changed, cx);
                 s.apply(p, cx);
                 assert_eq!(s.repos[0].parent, None);
                 assert!(s.repos[0].local.as_ref().unwrap().head.is_empty());
@@ -2509,9 +2509,9 @@ esac
 
     #[test]
     fn failed_gh_keeps_the_local_state() {
-        let ws = crate::state::Workspace {
+        let ws = crate::state::Task {
             name: "ws".into(),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: "/x".into(),
                 base: "origin/main".into(),
@@ -2538,11 +2538,11 @@ esac
 
     #[test]
     fn merge_order_follows_saved_then_added() {
-        let ws = crate::state::Workspace {
+        let ws = crate::state::Task {
             name: "w".into(),
             branch: "b".into(),
             repos: ["api", "web", "ios"]
-                .map(|n| crate::state::WsRepo {
+                .map(|n| crate::state::TaskRepo {
                     name: n.into(),
                     src: n.into(),
                     base: "origin/main".into(),

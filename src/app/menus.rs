@@ -13,56 +13,64 @@ pub(super) fn tilde(path: &Path) -> String {
     }
 }
 
-/// "Open in <app>" for each installed app with something to open in `folder` (the
-/// workspace's, if any) and `repos`: one target opens directly, several make a submenu.
-pub(super) fn open_in_entries(
+/// One "Open in…" that folds out into every app. Menus nest one level, so an app with several
+/// targets (the task folder and each repo) opens a picker of them.
+pub(super) fn open_in(
     folder: Option<&(String, PathBuf)>,
     repos: &[(String, PathBuf)],
     cx: &Context<Shark>,
-) -> Vec<Entry> {
+) -> Option<Entry> {
     let mut entries = vec![];
     for app in apps::installed() {
         let mut targets = app.targets(folder, repos);
-        if targets.is_empty() {
-            continue;
-        }
-        let label = format!("Open in {}", app.name);
         let image = app.icon.clone();
-        if targets.len() == 1 {
-            let (hint, path) = targets.remove(0);
-            let item = menu::item(
-                app_icon(app),
-                label,
-                on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
-            );
-            entries.push(item.hint(hint).image(image));
-            continue;
-        }
-        let rows = targets.into_iter().map(|(name, path)| {
-            let is_folder = folder.is_some_and(|f| f.1 == path);
-            let icon = match app.kind {
-                _ if is_folder => IconName::Folder,
-                Kind::Xcode => IconName::FileCode,
-                _ => IconName::FolderGit2,
-            };
-            let hint = if is_folder {
-                tilde(&path)
-            } else {
-                String::new()
-            };
-            menu::item(
-                icon,
-                name,
-                on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
-            )
-            .hint(hint)
-        });
-        entries.push(menu::sub(app_icon(app), label, rows.collect()).image(image));
+        let entry = match targets.len() {
+            0 => continue,
+            1 => {
+                let (hint, path) = targets.remove(0);
+                menu::item(
+                    app_icon(app),
+                    app.name.clone(),
+                    on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
+                )
+                .hint(hint)
+            }
+            _ => {
+                let folder = folder.map(|f| f.1.clone());
+                menu::item(
+                    app_icon(app),
+                    format!("{}…", app.name),
+                    on_shark(cx, move |_, w, cx| {
+                        let items = (targets.iter())
+                            .map(|(name, path)| {
+                                let icon = match app.kind {
+                                    _ if folder.as_ref() == Some(path) => IconName::Folder,
+                                    Kind::Xcode => IconName::FileCode,
+                                    _ => IconName::FolderGit2,
+                                };
+                                CommandItem::new().label(name.clone()).icon(icon)
+                            })
+                            .collect();
+                        let paths: Vec<PathBuf> = targets.iter().map(|t| t.1.clone()).collect();
+                        open_menu(
+                            cx.entity().downgrade(),
+                            "Open in…",
+                            items,
+                            0,
+                            move |s, i, _, _| s.launch_app(app, &paths[i]),
+                            w,
+                            cx,
+                        );
+                    }),
+                )
+            }
+        };
+        entries.push(entry.image(image));
     }
-    entries
+    (!entries.is_empty()).then(|| menu::sub(IconName::AppWindow, "Open in…", entries))
 }
 
-/// "Workspace folder", its path muted on the right, plus one row per repo.
+/// "Task folder", its path muted on the right, plus one row per repo.
 pub(super) fn path_submenu(
     icon: IconName,
     label: &'static str,
@@ -91,10 +99,10 @@ pub(super) fn path_submenu(
     menu::sub(icon, label, entries)
 }
 
-/// Right-click menu of a sidebar workspace. Shows where everything lives on disk,
+/// Right-click menu of a sidebar task. Shows where everything lives on disk,
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
-pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
-    let paths: Vec<(String, PathBuf)> = std::iter::once(("Agent folder".into(), ws.dir()))
+pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry> {
+    let paths: Vec<(String, PathBuf)> = std::iter::once(("Task folder".into(), ws.dir()))
         .chain(ws.repo_paths())
         .collect();
     let mut entries = vec![];
@@ -102,16 +110,14 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         // By name: the list can change under an open menu (a background auto-archive).
         entries.push(menu::item(
             IconName::MessageSquare,
-            "Open agent",
-            on_ws(cx, &ws.name, |s, n, w, cx| {
-                s.open_workspace_named(&n, w, cx)
-            }),
+            "Open task",
+            on_task(cx, &ws.name, |s, n, w, cx| s.open_task_named(&n, w, cx)),
         ));
     }
     entries.push(menu::item(
         IconName::Pencil,
-        "Rename agent…",
-        on_ws(cx, &ws.name, |s, n, w, cx| s.rename_agent(n, w, cx)),
+        "Rename task…",
+        on_task(cx, &ws.name, |s, n, w, cx| s.rename_task(n, w, cx)),
     ));
     entries.push(move_submenu(this, &ws.name, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
@@ -144,7 +150,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             |p, _, cx| cx.reveal_path(p),
         ),
     ]);
-    entries.extend(open_in_entries(Some(&paths[0]), &paths[1..], cx));
+    entries.extend(open_in(Some(&paths[0]), &paths[1..], cx));
     entries.extend([path_submenu(
         IconName::Copy,
         "Copy path",
@@ -156,29 +162,29 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         Entry::Sep,
         menu::item(
             IconName::Archive,
-            "Delete agent…",
-            on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, false, w, cx)),
+            "Delete task…",
+            on_task(cx, &ws.name, |s, n, w, cx| s.archive_task(n, false, w, cx)),
         ),
         menu::item(
             IconName::ArchiveX,
-            "Force delete agent…",
-            on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, true, w, cx)),
+            "Force delete task…",
+            on_task(cx, &ws.name, |s, n, w, cx| s.archive_task(n, true, w, cx)),
         ),
     ]);
     entries
 }
 
-/// One repo's PR stack around the workspace's branch, trunk side first.
+/// One repo's PR stack around the task's branch, trunk side first.
 pub(super) struct RepoStack {
     pub repo: String,
     pub nodes: Vec<crate::stack::Node>,
-    /// The workspace's own branch.
+    /// The task's own branch.
     pub me: usize,
 }
 
 /// Each repo of `ws` that is part of a stack (a chain of two or more branches), from the
-/// local workspaces and the open PRs the git button keeps. Empty until the repo was probed.
-pub(super) fn stacks(this: &Shark, ws: &Workspace, cx: &App) -> Vec<RepoStack> {
+/// local tasks and the open PRs the git button keeps. Empty until the repo was probed.
+pub(super) fn stacks(this: &Shark, ws: &Task, cx: &App) -> Vec<RepoStack> {
     let Some(sync) = this.syncs.get(&ws.name).map(|s| s.read(cx)) else {
         return vec![];
     };
@@ -195,7 +201,7 @@ pub(super) fn stacks(this: &Shark, ws: &Workspace, cx: &App) -> Vec<RepoStack> {
             if trunk.is_empty() {
                 return None;
             }
-            let local: Vec<(String, String, String)> = (this.state.workspaces.iter())
+            let local: Vec<(String, String, String)> = (this.state.tasks.iter())
                 .filter_map(|w| {
                     let wr = w.repos.iter().find(|x| x.src == r.src)?;
                     Some((w.name.clone(), w.branch_of(wr).to_string(), wr.base.clone()))
@@ -212,11 +218,11 @@ pub(super) fn stacks(this: &Shark, ws: &Workspace, cx: &App) -> Vec<RepoStack> {
         .collect()
 }
 
-/// A stack's rows, newest on top, the workspace's own checked. A row opens its workspace,
+/// A stack's rows, newest on top, the task's own checked. A row opens its task,
 /// else its PR; a merged parent (gone from the open PRs) shows the PR the git button found.
 fn stack_rows(
     this: &Shark,
-    ws: &Workspace,
+    ws: &Task,
     s: &RepoStack,
     prefix: bool,
     cx: &Context<Shark>,
@@ -246,7 +252,7 @@ fn stack_rows(
                     let label = format!("#{} · {:?}", p.number, p.state).to_lowercase();
                     (IconName::GitMerge, label, Some(p.url.clone()))
                 }
-                (None, None) if n.ws.is_some() => (IconName::GitBranch, "agent".into(), None),
+                (None, None) if n.ws.is_some() => (IconName::GitBranch, "task".into(), None),
                 (None, None) => (IconName::GitBranch, String::new(), None),
             };
             let hint = match prefix {
@@ -263,7 +269,7 @@ fn stack_rows(
                 icon,
                 n.branch.clone(),
                 on_shark(cx, move |s, w, cx| match (&target, &url) {
-                    (Some(name), _) => s.open_workspace_named(name, w, cx),
+                    (Some(name), _) => s.open_task_named(name, w, cx),
                     (None, Some(u)) => cx.open_url(u),
                     _ => {}
                 }),
@@ -277,8 +283,8 @@ fn stack_rows(
 /// The checked-out branch, with saved state before a successful probe; None means detached.
 pub(super) fn repo_branch(
     this: &Shark,
-    ws: &Workspace,
-    repo: &crate::state::WsRepo,
+    ws: &Task,
+    repo: &crate::state::TaskRepo,
     cx: &App,
 ) -> Option<String> {
     let local = this
@@ -293,10 +299,10 @@ pub(super) fn repo_branch(
     }
 }
 
-/// Branch actions for one attached repository, or the whole workspace in its sidebar menu.
+/// Branch actions for one attached repository, or the whole task in its sidebar menu.
 pub(super) fn branch_entries(
     this: &Shark,
-    ws: &Workspace,
+    ws: &Task,
     repo: Option<&str>,
     cx: &Context<Shark>,
 ) -> Vec<Entry> {
@@ -307,7 +313,7 @@ pub(super) fn branch_entries(
         return vec![menu::item(
             IconName::FolderPlus,
             "Attach repository…",
-            on_ws(cx, &ws.name, |s, n, w, cx| s.attach_repository(n, w, cx)),
+            on_task(cx, &ws.name, |s, n, w, cx| s.attach_repository(n, w, cx)),
         )];
     }
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
@@ -353,7 +359,7 @@ pub(super) fn branch_entries(
     let base = menu::item(
         IconName::Target,
         "Change base…",
-        on_ws(cx, &ws.name, move |s, n, w, cx| {
+        on_task(cx, &ws.name, move |s, n, w, cx| {
             s.change_base(n, target.clone(), w, cx)
         }),
     )
@@ -447,7 +453,7 @@ pub(super) fn branch_entries(
     // A repository's menu leads with its pull request, the next thing to do with a branch.
     let pr_step = |icon, label: &'static str, kind: crate::sync::Kind| {
         let name = name.to_string();
-        let step = on_ws(cx, &ws.name, move |s, n, w, cx| {
+        let step = on_task(cx, &ws.name, move |s, n, w, cx| {
             if let Some(g) = s.syncs.get(&n).cloned() {
                 let (kind, repos) = (kind.clone(), vec![name.clone()]);
                 let label = label.trim_end_matches('…');
@@ -505,7 +511,7 @@ pub(super) fn branch_entries(
         "Reveal in Finder",
         move |_, cx| cx.reveal_path(&reveal),
     ));
-    menu.extend(open_in_entries(None, &[(name.to_string(), path)], cx));
+    menu.extend(open_in(None, &[(name.to_string(), path)], cx));
     menu.extend(worktree);
     let repo = name.to_string();
     menu.push(menu::item(
@@ -520,10 +526,10 @@ pub(super) fn branch_entries(
     menu
 }
 
-/// Restack onto the parent (the merged parent's base once it merged), new workspace on top,
+/// Restack onto the parent (the merged parent's base once it merged), new task on top,
 /// insert one below. Review checkouts get none of them.
 fn stack_actions(
-    ws: &Workspace,
+    ws: &Task,
     sync: Option<&crate::sync::GitSync>,
     repo: Option<&str>,
     attached_branch: Option<&str>,
@@ -554,7 +560,7 @@ fn stack_actions(
             menu::item(
                 IconName::Layers,
                 label.clone(),
-                on_ws(cx, &name, move |s, n, w, cx| {
+                on_task(cx, &name, move |s, n, w, cx| {
                     if let Some(g) = s.syncs.get(&n).cloned() {
                         let (label, rs) = (label.clone(), merged.clone());
                         g.update(cx, |g, cx| {
@@ -564,7 +570,7 @@ fn stack_actions(
                 }),
             )
             .hint(
-                attached_branch.map_or_else(|| "Agent".into(), |b| format!("Attached branch: {b}")),
+                attached_branch.map_or_else(|| "Task".into(), |b| format!("Attached branch: {b}")),
             ),
         );
     } else if let Some(r) = stacked.first() {
@@ -579,7 +585,7 @@ fn stack_actions(
             menu::item(
                 IconName::GitCompareArrows,
                 label,
-                on_ws(cx, &name, move |s, n, w, cx| {
+                on_task(cx, &name, move |s, n, w, cx| {
                     if let Some(g) = s.syncs.get(&n).cloned() {
                         g.update(cx, |g, cx| g.restack_onto_parent(repo.as_deref(), w, cx));
                     }
@@ -588,7 +594,7 @@ fn stack_actions(
             .hint(match (attached_branch, behind) {
                 (Some(b), 0) => format!("Attached branch: {b}"),
                 (Some(b), n) => format!("Attached branch: {b} · {n} behind"),
-                (None, 0) => "Agent".to_string(),
+                (None, 0) => "Task".to_string(),
                 (None, n) => format!("{n} behind"),
             }),
         );
@@ -599,8 +605,8 @@ fn stack_actions(
     out.push(
         menu::item(
             IconName::Layers,
-            "New agent on top…",
-            on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, false, w, cx)),
+            "New task on top…",
+            on_task(cx, &name, |s, n, w, cx| s.stack_from(n, false, w, cx)),
         )
         .hint(ws.branch.clone()),
     );
@@ -611,8 +617,8 @@ fn stack_actions(
     out.push(
         menu::item(
             IconName::ListPlus,
-            "Insert agent below…",
-            on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, true, w, cx)),
+            "Insert task below…",
+            on_task(cx, &name, |s, n, w, cx| s.stack_from(n, true, w, cx)),
         )
         .hint(below),
     );
@@ -624,7 +630,7 @@ fn open_urls(urls: &[String], _: &mut Window, cx: &mut App) {
 }
 
 /// The base every repo targets, e.g. `origin/main`, or "per repo" when they differ.
-pub(super) fn base_hint(ws: &Workspace) -> String {
+pub(super) fn base_hint(ws: &Task) -> String {
     let mut bases: Vec<&str> = ws.repos.iter().map(|r| r.base.as_str()).collect();
     bases.sort();
     bases.dedup();
@@ -649,10 +655,10 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
         ),
         menu::item(
             IconName::Plus,
-            "New agent from this repo…",
+            "New task from this repo…",
             on_shark(cx, move |s, w, cx| {
                 w.close_all_dialogs(cx);
-                s.new_workspace(picked.clone(), None, w, cx)
+                s.new_task_from_repos(picked.clone(), None, w, cx)
             }),
         ),
         Entry::Sep,
@@ -661,8 +667,8 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
         })
         .hint(tilde(&path)),
     ];
-    // Active workspace first: the likeliest target.
-    let mut targets: Vec<&Workspace> = (this.state.workspaces.iter())
+    // Active task first: the likeliest target.
+    let mut targets: Vec<&Task> = (this.state.tasks.iter())
         .filter(|w| !w.repos.iter().any(|r| r.name == name))
         .collect();
     targets.sort_by_key(|w| this.active.as_ref() != Some(&w.name));
@@ -680,9 +686,9 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
         })
         .collect();
     if !rows.is_empty() {
-        entries.insert(2, menu::sub(IconName::FolderPlus, "Attach to agent", rows));
+        entries.insert(2, menu::sub(IconName::FolderPlus, "Attach to task", rows));
     }
-    entries.extend(open_in_entries(None, &[(name, path.clone())], cx));
+    entries.extend(open_in(None, &[(name, path.clone())], cx));
     entries.push(
         menu::item(IconName::Copy, "Copy path", move |w, cx| {
             copy(p3.display().to_string(), w, cx)
@@ -703,8 +709,8 @@ pub(super) fn on_shark(
     }
 }
 
-/// `on_shark` that hands `f` its own copy of the workspace `name`.
-pub(super) fn on_ws(
+/// `on_shark` that hands `f` its own copy of the task `name`.
+pub(super) fn on_task(
     cx: &Context<Shark>,
     name: &str,
     f: impl Fn(&mut Shark, String, &mut Window, &mut Context<Shark>) + 'static,

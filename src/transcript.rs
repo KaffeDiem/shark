@@ -1,8 +1,8 @@
 //! A chat's stored transcript and stderr log: what is clipped on the way in, appended,
 //! read back, and what the stored events say about the chat's state.
-use crate::agent::{Ev, parse_record, text_of};
 use crate::codex;
-use crate::state::{Workspace, support_dir};
+use crate::harness::{Ev, parse_record, text_of};
+use crate::state::{Task, support_dir};
 use serde_json::Value;
 use std::{
     borrow::Cow,
@@ -120,8 +120,8 @@ pub fn forget(chat: &str) {
     let _ = fs::remove_file(log_path(chat));
 }
 
-/// When any of the workspace's chats last wrote to its transcript. Reads file metadata.
-pub(crate) fn last_activity(ws: &Workspace) -> Option<SystemTime> {
+/// When any of the task's chats last wrote to its transcript. Reads file metadata.
+pub(crate) fn last_activity(ws: &Task) -> Option<SystemTime> {
     (ws.chats.iter())
         .filter_map(|c| fs::metadata(transcript_path(&c.id)).ok()?.modified().ok())
         .max()
@@ -130,10 +130,10 @@ pub(crate) fn last_activity(ws: &Workspace) -> Option<SystemTime> {
 pub const PLAN_TO_APPROVE: &str = "Plan to approve";
 pub const QUESTION: &str = "Question to answer";
 
-/// What one of the workspace's chats waits on the user for, by how its last turn ended: a plan
+/// What one of the task's chats waits on the user for, by how its last turn ended: a plan
 /// to approve before a question. `None` while a turn runs. Reads each chat's transcript tail
 /// and plans: call it off the UI thread.
-pub(crate) fn waiting_on_user(ws: &Workspace) -> Option<&'static str> {
+pub(crate) fn waiting_on_user(ws: &Task) -> Option<&'static str> {
     (ws.chats.iter())
         .filter_map(|c| {
             let plan = c.plan && crate::plan::unapproved(&c.id);
@@ -222,10 +222,10 @@ pub(crate) fn append(path: &Option<PathBuf>, line: &str) {
 
 /// `"Which DB?"="Postgres", …`: the answers as claude's tool result words them.
 pub(crate) fn answer_pairs(
-    qs: &[crate::agent::Question],
-    answers: &[crate::agent::Answer],
+    qs: &[crate::harness::Question],
+    answers: &[crate::harness::Answer],
 ) -> String {
-    let pairs: Vec<String> = crate::agent::given(qs, answers)
+    let pairs: Vec<String> = crate::harness::given(qs, answers)
         // Only the agent gets a secret; the row shows that one was given.
         .map(|(q, _, all)| {
             format!(
@@ -273,19 +273,19 @@ pub(crate) fn answered(result: &str) -> Option<&str> {
             );
         }
     }
-    (result == crate::agent::ANSWER_IN_CHAT).then_some("Answered in the chat")
+    (result == crate::harness::ANSWER_IN_CHAT).then_some("Answered in the chat")
 }
 
 /// The questions as the row's summary until they're answered.
 pub(crate) fn asked_summary(input: &Value) -> String {
-    let qs = crate::agent::questions(input);
+    let qs = crate::harness::questions(input);
     let texts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
     texts.join(" · ")
 }
 
 /// Completed answers keep their existing Claude-shaped history records for replay.
 pub(crate) fn completed_answer(
-    request: crate::agent::Questions,
+    request: crate::harness::Questions,
     result: String,
 ) -> ([String; 2], Vec<Ev>) {
     let (id, input) = (request.tool_use_id, request.input);
@@ -295,7 +295,7 @@ pub(crate) fn completed_answer(
     ].map(|v| compact(&v.to_string()).into_owned());
     let events = records
         .iter()
-        .flat_map(|record| crate::agent::parse(record))
+        .flat_map(|record| crate::harness::parse(record))
         .collect();
     (records, events)
 }
@@ -374,7 +374,7 @@ mod tests {
         let r = r#"The user answered: "Name?"="bob". Read the answers carefully — they may request clarification"#;
         assert_eq!(answered(r), Some(r#""Name?"="bob""#));
         assert_eq!(
-            answered(crate::agent::ANSWER_IN_CHAT),
+            answered(crate::harness::ANSWER_IN_CHAT),
             Some("Answered in the chat")
         );
         assert_eq!(answered("(interrupted)"), None);
@@ -402,7 +402,7 @@ mod tests {
             );
             let result = format!("{prefix}{summary}{ending}");
             let record = json!({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"q", "content":result}]}}).to_string();
-            let events = crate::agent::parse(&crate::transcript::compact(&record));
+            let events = crate::harness::parse(&crate::transcript::compact(&record));
             let [Ev::ToolResult { text, .. }] = events.as_slice() else {
                 panic!()
             };
@@ -583,11 +583,11 @@ mod tests {
         ]}})
         .to_string();
         let note = format!("\n… truncated, {} chars total", MAX_OUTPUT + 5);
-        let [Ev::ToolResult { text: live, .. }] = &crate::agent::parse(&line)[..] else {
+        let [Ev::ToolResult { text: live, .. }] = &crate::harness::parse(&line)[..] else {
             panic!("{line}");
         };
         let stored = compact(&line);
-        let [Ev::ToolResult { text, .. }] = &crate::agent::parse(&stored)[..] else {
+        let [Ev::ToolResult { text, .. }] = &crate::harness::parse(&stored)[..] else {
             panic!("{stored}");
         };
         assert_eq!(text, live, "replay shows what the live turn did");
@@ -605,7 +605,7 @@ mod tests {
         ]}})
         .to_string();
         let stored = compact(&write);
-        let [Ev::ToolUse { input, .. }] = &crate::agent::parse(&stored)[..] else {
+        let [Ev::ToolUse { input, .. }] = &crate::harness::parse(&stored)[..] else {
             panic!("{stored}");
         };
         assert_eq!(input["content"].as_str().unwrap().len(), MAX_INPUT);

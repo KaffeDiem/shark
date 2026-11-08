@@ -1,8 +1,8 @@
 //! Attaching repositories to an agent: one operation at a time, repo by repo. It waits until
-//! nothing runs in the agent, and holds new work until it is over (`Workspace::attaching`, which
+//! nothing runs in the agent, and holds new work until it is over (`Task::attaching`, which
 //! is saved before Git changes anything, so a restart can tell what happened).
 use super::interaction::now_ms;
-use super::new_workspace::{AttachTo, NewWorkspaceForm};
+use super::new_task::{AttachTo, NewTaskForm};
 use super::*;
 use crate::scripts::{self, Phase};
 use crate::state::{AttachStage, Attachment};
@@ -488,7 +488,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let failed = (self.attach_results.get(&name)).is_some_and(|r| !r.failed.is_empty());
         match (ws.attaching.as_slice(), failed) {
             ([], false) => {}
@@ -513,11 +513,11 @@ impl Shark {
         if self.state.repos.is_empty() {
             return self.attach_local_repo(name, None, window, cx);
         }
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let attached: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
         // A repo's last use is the last interaction with an agent that has it.
         let last = |r: &Repo| {
-            (self.state.workspaces.iter())
+            (self.state.tasks.iter())
                 .filter(|w| w.repos.iter().any(|x| x.name == r.name))
                 .filter_map(|w| w.last_interacted_at)
                 .max()
@@ -541,7 +541,18 @@ impl Shark {
         });
         let shark = cx.entity().downgrade();
         let form = cx.new(|cx| {
-            NewWorkspaceForm::new(repos, &picked, None, &[], None, attach, shark, window, cx)
+            NewTaskForm::new(
+                repos,
+                &picked,
+                None,
+                None,
+                &[],
+                None,
+                attach,
+                shark,
+                window,
+                cx,
+            )
         });
         let opened = form.clone();
         window.open_dialog(cx, move |d, _, cx| {
@@ -558,7 +569,7 @@ impl Shark {
     pub(super) fn attach_local_repo(
         &mut self,
         name: String,
-        form: Option<WeakEntity<NewWorkspaceForm>>,
+        form: Option<WeakEntity<NewTaskForm>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -610,27 +621,29 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = self.ws_title(&name);
+        let title = self.task_title(&name);
         if self.archiving.contains(&name) {
             return notify_err(window, cx, format!("{title} is being deleted"));
         }
-        let Some(ws) = self.ws_mut(&name) else { return };
+        let Some(ws) = self.task_mut(&name) else {
+            return;
+        };
         if !ws.attaching.is_empty() {
             let msg = format!("{title}: a repository is already being attached");
             return notify_err(window, cx, msg);
         }
         ws.attaching = picks;
         if let Err(e) = self.state.save() {
-            if let Some(ws) = self.ws_mut(&name) {
+            if let Some(ws) = self.task_mut(&name) {
                 ws.attaching.clear();
             }
-            let msg = format!("Nothing was attached: couldn't save the agent: {e}");
+            let msg = format!("Nothing was attached: couldn't save the task: {e}");
             return notify_err(window, cx, msg);
         }
         self.attach_results.remove(&name);
-        self.publish_workspace(&name, cx);
+        self.publish_task(&name, cx);
         self.advance_attachment(&name, window, cx);
-        let queued: Vec<&str> = (self.ws(&name).into_iter())
+        let queued: Vec<&str> = (self.task(&name).into_iter())
             .flat_map(|w| &w.attaching)
             .filter(|a| a.stage == AttachStage::Queued)
             .map(|a| a.repo.as_str())
@@ -647,12 +660,12 @@ impl Shark {
 
     /// Hands the saved agent to its loaded chats and Git button. Chats that aren't loaded need
     /// nothing: they read it when they open.
-    pub(super) fn publish_workspace(&mut self, name: &str, cx: &mut Context<Self>) {
-        let Some(ws) = self.ws(name).cloned() else {
+    pub(super) fn publish_task(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(ws) = self.task(name).cloned() else {
             return;
         };
         for chat in self.started_chats(name) {
-            chat.update(cx, |c, cx| c.workspace_changed(&ws, cx));
+            chat.update(cx, |c, cx| c.task_changed(&ws, cx));
         }
         if let Some(sync) = self.syncs.get(name) {
             sync.update(cx, |g, _| g.set_attaching(ws.attaching));
@@ -678,7 +691,7 @@ impl Shark {
             let n = chats.iter().filter(|c| test(c.read(cx))).count();
             (n > 0).then(|| format!("{n} chat{} {what}", if n == 1 { "" } else { "s" }))
         };
-        let moving = (self.ws(name).into_iter())
+        let moving = (self.task(name).into_iter())
             .flat_map(|w| &w.attaching)
             .find(|a| matches!(a.stage, AttachStage::Creating | AttachStage::Setup));
         let setup = self.setting_up.iter().any(|n| n == name);
@@ -710,13 +723,15 @@ impl Shark {
     ) {
         let queued = |a: &Attachment| a.stage == AttachStage::Queued;
         if !self
-            .ws(name)
+            .task(name)
             .is_some_and(|w| w.attaching.iter().any(queued))
             || !self.attach_idle(name, cx)
         {
             return;
         }
-        let Some(ws) = self.ws_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         let Some(a) = ws.attaching.iter_mut().find(|a| queued(a)) else {
             return;
         };
@@ -724,23 +739,23 @@ impl Shark {
         let a = a.clone();
         let ws = ws.clone();
         if let Err(e) = self.state.save() {
-            if let Some(ws) = self.ws_mut(name) {
+            if let Some(ws) = self.task_mut(name) {
                 ws.attaching
                     .retain(|x| x.stuck() || x.stage == AttachStage::Setup);
             }
-            let msg = format!("Nothing more was attached: couldn't save the agent: {e}");
+            let msg = format!("Nothing more was attached: couldn't save the task: {e}");
             notify_err(window, cx, msg);
             return self.attach_settled(name, window, cx);
         }
-        self.add_repo_to_workspace(ws, a, window, cx);
-        self.publish_workspace(name, cx);
+        self.add_repo_to_task(ws, a, window, cx);
+        self.publish_task(name, cx);
     }
 
     /// Creates `a`'s worktree off the UI thread. Only `advance_attachment` calls this: its intent
     /// is saved by now.
-    fn add_repo_to_workspace(
+    fn add_repo_to_task(
         &mut self,
-        ws: Workspace,
+        ws: Task,
         a: Attachment,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -759,12 +774,10 @@ impl Shark {
                 a.fresh.then_some(a.base.clone()),
             );
             let branch = a.branch.clone();
-            let result =
-                cx.background_executor()
-                    .spawn(async move {
-                        git::add_to_workspace(&ws, &dir, &repo, &branch, fresh.as_deref())
-                    })
-                    .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { git::add_to_task(&ws, &dir, &repo, &branch, fresh.as_deref()) })
+                .await;
             this.update_in(cx, |s, window, cx| {
                 s.adding_repos.remove(&name);
                 match result {
@@ -787,7 +800,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ws) = self.ws_mut(name) {
+        if let Some(ws) = self.task_mut(name) {
             if e.preserved {
                 if let Some(a) = ws.attaching.iter_mut().find(|a| a.repo == repo) {
                     a.stage = AttachStage::Uncertain;
@@ -808,14 +821,8 @@ impl Shark {
 
     /// Saves the new repo and its branch together, then runs its setup scripts. Readiness waits
     /// for them.
-    fn repo_added(
-        &mut self,
-        ws: Workspace,
-        repo: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(slot) = self.ws_mut(&ws.name) else {
+    fn repo_added(&mut self, ws: Task, repo: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slot) = self.task_mut(&ws.name) else {
             return;
         };
         // Only the repos change; session, model and viewed may have moved on meanwhile.
@@ -831,7 +838,7 @@ impl Shark {
         self.record_interaction(&ws.name, cx);
         // The intent is still on disk, as Creating: a restart would adopt this worktree.
         if let Err(e) = self.state.save() {
-            notify_err(window, cx, format!("Couldn't save the agent: {e}"));
+            notify_err(window, cx, format!("Couldn't save the task: {e}"));
         }
         self.repos_published(&ws, window, cx);
         if !self.run_setup(&ws, Some(repo), None, window, cx) {
@@ -840,14 +847,20 @@ impl Shark {
     }
 
     /// Everything reading the repo list picks up a new one.
-    fn repos_published(&mut self, ws: &Workspace, window: &mut Window, cx: &mut Context<Self>) {
-        self.publish_workspace(&ws.name, cx);
+    fn repos_published(&mut self, ws: &Task, window: &mut Window, cx: &mut Context<Self>) {
+        self.publish_task(&ws.name, cx);
+        if let Some(agent) = &ws.agent {
+            if let Err(e) = self.sync_agent(&agent.slug, false, cx) {
+                notify_err(window, cx, e);
+            }
+            self.refresh_sibling_files(&ws.name, cx);
+        }
         if let Some(sync) = self.syncs.get(&ws.name) {
-            sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
+            sync.update(cx, |g, cx| g.set_task(ws.clone(), cx));
         }
         if let Some(git) = self.git_features.get(&ws.name).cloned() {
-            let git_ws = self.effective_workspace(ws.clone(), cx);
-            git.update(cx, |g, cx| g.set_workspace(git_ws, window, cx));
+            let git_ws = self.effective_task(ws.clone(), cx);
+            git.update(cx, |g, cx| g.set_task(git_ws, window, cx));
         }
         self.refresh_diff_if_active(&ws.name, cx);
         // An empty agent's Diff or Git tab may be up, the offer in its place and no Git view made.
@@ -874,7 +887,7 @@ impl Shark {
             return self.attach_done(name, repo, window, cx);
         };
         let slot =
-            (self.ws_mut(name)).and_then(|w| w.attaching.iter_mut().find(|a| a.repo == repo));
+            (self.task_mut(name)).and_then(|w| w.attaching.iter_mut().find(|a| a.repo == repo));
         if let Some(a) = slot {
             a.stage = AttachStage::SetupFailed;
             a.error = Some(e);
@@ -885,7 +898,7 @@ impl Shark {
 
     /// `repo` is ready: its attachment is over.
     fn attach_done(&mut self, name: &str, repo: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ws) = self.ws_mut(name) {
+        if let Some(ws) = self.task_mut(name) {
             ws.attaching.retain(|a| a.repo != repo);
         }
         let _ = self.state.save();
@@ -897,10 +910,10 @@ impl Shark {
     /// One repo is through: on to the next, and once none is left running, the report. A chat
     /// goes free when nothing is left at all.
     fn attach_settled(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.publish_workspace(name, cx);
+        self.publish_task(name, cx);
         self.advance_attachment(name, window, cx);
         let Some(ws) = self
-            .ws(name)
+            .task(name)
             .filter(|w| w.attaching.iter().all(Attachment::stuck))
         else {
             return;
@@ -937,7 +950,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.ws_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         let had = ws.attaching.len();
         (ws.attaching)
             .retain(|a| a.stage != AttachStage::Queued || repo.is_some_and(|r| r != a.repo));
@@ -956,18 +971,18 @@ impl Shark {
     /// Runs a failed setup again.
     fn retry_setup(&mut self, name: &str, repo: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.attach_idle(name, cx) {
-            return notify_err(window, cx, "Wait for what is running in this agent");
+            return notify_err(window, cx, "Wait for what is running in this task");
         }
         let slot =
-            (self.ws_mut(name)).and_then(|w| w.attaching.iter_mut().find(|a| a.repo == repo));
+            (self.task_mut(name)).and_then(|w| w.attaching.iter_mut().find(|a| a.repo == repo));
         let Some(a) = slot.filter(|a| a.stage == AttachStage::SetupFailed) else {
             return;
         };
         a.stage = AttachStage::Setup;
         a.error = None;
         let _ = self.state.save();
-        self.publish_workspace(name, cx);
-        let Some(ws) = self.ws(name).cloned() else {
+        self.publish_task(name, cx);
+        let Some(ws) = self.task(name).cloned() else {
             return;
         };
         if !self.run_setup(&ws, Some(repo), None, window, cx) {
@@ -983,7 +998,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.ws_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         let Some(a) = ws
             .attaching
             .iter()
@@ -999,7 +1016,7 @@ impl Shark {
         let dropped = ws.repos.len() != had;
         let ws = ws.clone();
         if dropped {
-            git::write_claude_md(&ws);
+            let _ = git::write_claude_md(&ws);
         }
         let _ = self.state.save();
         window.push_notification(format!("{repo}: nothing was deleted. {what}"), cx);
@@ -1009,20 +1026,20 @@ impl Shark {
         self.attach_settled(name, window, cx);
     }
 
-    /// Launch: settles what an earlier run left in `Workspace::attaching`. Before any chat opens,
+    /// Launch: settles what an earlier run left in `Task::attaching`. Before any chat opens,
     /// so they all start on the outcome.
     // ponytail: a few git reads on the UI thread, only for agents interrupted mid-attachment.
     pub(super) fn reconcile_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let names: Vec<String> = (self.state.workspaces.iter())
+        let names: Vec<String> = (self.state.tasks.iter())
             .filter(|w| !w.attaching.is_empty())
             .map(|w| w.name.clone())
             .collect();
         for name in &names {
-            self.reconcile_agent(name);
+            self.reconcile_task(name);
         }
         if !names.is_empty() {
             if let Err(e) = self.state.save() {
-                notify_err(window, cx, format!("Couldn't save the agents: {e}"));
+                notify_err(window, cx, format!("Couldn't save the tasks: {e}"));
             }
             self.refresh_attention(cx);
         }
@@ -1030,8 +1047,8 @@ impl Shark {
 
     /// Decides each of `name`'s recorded attachments from what is on disk. Finished work is
     /// adopted, untouched intent cleared, the rest kept for the user. Setup never reruns here.
-    fn reconcile_agent(&mut self, name: &str) {
-        let Some(mut ws) = self.ws(name).cloned() else {
+    fn reconcile_task(&mut self, name: &str) {
+        let Some(mut ws) = self.task(name).cloned() else {
             return;
         };
         for mut a in std::mem::take(&mut ws.attaching) {
@@ -1059,7 +1076,7 @@ impl Shark {
                     }
                     wr.branch = (a.branch != ws.branch).then(|| a.branch.clone());
                     ws.repos.push(wr);
-                    git::write_claude_md(&ws);
+                    let _ = git::write_claude_md(&ws);
                 }
                 Found::Worktree(_) => {}
             }
@@ -1071,7 +1088,7 @@ impl Shark {
                 ws.attaching.push(a);
             }
         }
-        if let Some(slot) = self.ws_mut(name) {
+        if let Some(slot) = self.task_mut(name) {
             (slot.repos, slot.branch, slot.attaching) = (ws.repos, ws.branch, ws.attaching);
         }
     }
@@ -1079,13 +1096,13 @@ impl Shark {
     /// Check again: the user may have sorted out what recovery found.
     fn recheck_attachment(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.attach_idle(name, cx) {
-            return notify_err(window, cx, "Wait for what is running in this agent");
+            return notify_err(window, cx, "Wait for what is running in this task");
         }
-        let before = self.ws(name).map(|w| w.repos.len());
-        self.reconcile_agent(name);
+        let before = self.task(name).map(|w| w.repos.len());
+        self.reconcile_task(name);
         let _ = self.state.save();
         if let Some(ws) = self
-            .ws(name)
+            .task(name)
             .cloned()
             .filter(|w| Some(w.repos.len()) != before)
         {
@@ -1096,7 +1113,7 @@ impl Shark {
 
     /// The label the attention system shows while `name` waits on a decision about a repo.
     pub(crate) fn attach_needs(&self, name: &str) -> Option<String> {
-        let stuck = (self.ws(name)?.attaching.iter()).find(|a| a.stuck());
+        let stuck = (self.task(name)?.attaching.iter()).find(|a| a.stuck());
         match stuck {
             Some(a) if a.stage == AttachStage::Uncertain => Some(format!("Recover {}", a.repo)),
             Some(a) => Some(format!("Setup failed: {}", a.repo)),
@@ -1107,7 +1124,7 @@ impl Shark {
 
     /// The branch and base `repo` gets or got, for its panel.
     fn attach_summary(&self, name: &str, repo: &str) -> Option<String> {
-        let ws = self.ws(name)?;
+        let ws = self.task(name)?;
         if let Some(a) = ws.attaching.iter().find(|a| a.repo == repo) {
             return Some(match (a.fresh, a.base.as_str()) {
                 (false, _) => a.branch.clone(),
@@ -1128,7 +1145,7 @@ impl Shark {
         cx: &App,
     ) -> [(&'static str, Step, Option<String>); 3] {
         use Step::*;
-        let a = (self.ws(name).into_iter())
+        let a = (self.task(name).into_iter())
             .flat_map(|w| &w.attaching)
             .find(|a| a.repo == repo);
         let refused = (self.attach_results.get(name).into_iter())
@@ -1165,7 +1182,7 @@ impl Shark {
     ) -> Vec<(IconName, &'static str, Act)> {
         let log: Act = |s, n, _, w, cx| s.show_log_of(n, w, cx);
         let close: Act = |_, _, _, _, _| {};
-        let ws = self.ws(name);
+        let ws = self.task(name);
         let stage = (ws.into_iter())
             .flat_map(|w| &w.attaching)
             .find(|a| a.repo == repo)
@@ -1254,7 +1271,7 @@ impl Shark {
     }
 
     /// Every repo the header shows, what needs the user first.
-    fn repo_rows(&self, ws: &Workspace) -> Vec<RepoRow> {
+    fn repo_rows(&self, ws: &Task) -> Vec<RepoRow> {
         let pending = (ws.attaching.iter()).map(|a| {
             let (standing, state) = match a.stage {
                 AttachStage::Queued => (Standing::Queued, "queued"),
@@ -1320,8 +1337,8 @@ impl Shark {
 
     /// Branch actions remain reachable when the toolbar is hidden or its chips overflow.
     pub(super) fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
         let name = ws.name.clone();
         let repos = self.repo_rows(ws);
@@ -1374,7 +1391,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let Some(row) = self.repo_rows(ws).into_iter().find(|r| r.repo == repo) else {
             return;
         };
@@ -1390,8 +1407,8 @@ impl Shark {
     /// A ready repository's card, and its accessible details.
     fn repository_details(
         &self,
-        ws: &Workspace,
-        repo: &crate::state::WsRepo,
+        ws: &Task,
+        repo: &crate::state::TaskRepo,
         branch: &str,
         cx: &App,
     ) -> Vec<(&'static str, String)> {
@@ -1426,7 +1443,7 @@ impl Shark {
     /// What the header shows from chip `from` on, grouped with the available Attach offers.
     pub(super) fn attachment_rows(
         &self,
-        ws: &Workspace,
+        ws: &Task,
         from: usize,
         cx: &App,
     ) -> Vec<(Option<&'static str>, Vec<ListRow>)> {
@@ -1474,7 +1491,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let mut picks = vec![];
         let groups = (self.attachment_rows(ws, from, cx).into_iter())
             .map(|(heading, rows)| {
@@ -1528,7 +1545,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return div().into_any_element();
         };
         let name = ws.name.clone();

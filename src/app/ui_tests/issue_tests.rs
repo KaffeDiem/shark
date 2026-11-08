@@ -1,8 +1,8 @@
 //! Linear issues on an agent, against a fake Linear behind the `http` seam.
-use super::attach_tests::{agent, chat_of, recording_claude, result, wire, ws_of};
+use super::attach_tests::{agent, chat_of, recording_claude, result, task_of, wire};
 use super::*;
-use crate::agent::Ev;
 use crate::chat::Chat;
+use crate::harness::Ev;
 use crate::linear::{self, IssueRef, Req, Resp, fake};
 use crate::linear::{Connection, Method};
 use gpui_kit::test::TestQueryExt as _;
@@ -181,7 +181,7 @@ fn shows(cx: &mut TestAppContext, window: AnyWindowHandle, id: impl Into<Element
 
 /// Attach Linear issue on `shark`'s open agent, its lists loaded.
 fn open_picker(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
-    let name = ws_of(cx, shark).name;
+    let name = task_of(cx, shark).name;
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| s.attach_linear_issue(name.clone(), w, cx));
 }
@@ -247,7 +247,7 @@ fn issue_ref(n: u32) -> IssueRef {
     }
 }
 
-fn ids(ws: &Workspace) -> Vec<&str> {
+fn ids(ws: &Task) -> Vec<&str> {
     (ws.linear.ordered()).map(|r| r.issue.as_str()).collect()
 }
 
@@ -291,7 +291,7 @@ async fn urls_and_identifiers_attach_and_duplicates_change_nothing(cx: &mut Test
     let _claude = ClaudeGuard::set(&quiet);
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
-    let before = ws_of(cx, &shark);
+    let before = task_of(cx, &shark);
 
     attach(
         cx,
@@ -300,7 +300,7 @@ async fn urls_and_identifiers_attach_and_duplicates_change_nothing(cx: &mut Test
         "https://linear.app/acme/issue/ENG-1/fix-the-login",
     );
     assert!(!dialog_open(cx, window));
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ids(&ws), ["uuid-1"]);
     assert_eq!(ws.primary_issue().unwrap().identifier, "ENG-1");
     assert_eq!(ws.title, before.title, "reference material only");
@@ -313,7 +313,7 @@ async fn urls_and_identifiers_attach_and_duplicates_change_nothing(cx: &mut Test
     });
 
     attach(cx, window, &shark, "eng-2");
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ids(&ws), ["uuid-1", "uuid-2"], "the first stays primary");
 
     // A duplicate isn't fetched, and keeps what the agent has: only Refresh replaces a snapshot.
@@ -323,25 +323,25 @@ async fn urls_and_identifiers_attach_and_duplicates_change_nothing(cx: &mut Test
     assert_eq!(fetches().len(), asked);
     assert!(dialog_open(cx, window));
     press_in(window)(cx, &["escape", "escape"]);
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ids(&ws), ["uuid-1", "uuid-2"]);
     assert_eq!(ws.issues[0].description, "Fix the login");
     let file = linear::read_snapshots(&ws.name).unwrap();
     assert_eq!(file[0].description, "Fix the login");
 
-    // A URL into another workspace is refused rather than resolved against this one, and the
+    // A URL into another task is refused rather than resolved against this one, and the
     // pasted reference stays.
     let url = "https://linear.app/other/issue/ENG-9/x";
     attach(cx, window, &shark, url);
     assert!(dialog_open(cx, window));
     assert_eq!(field(cx, window), url);
     assert!(shows(cx, window, "issue-notice"));
-    assert_eq!(ids(&ws_of(cx, &shark)).len(), 2);
+    assert_eq!(ids(&task_of(cx, &shark)).len(), 2);
 
     let saved = State::load();
-    assert_eq!(saved.workspaces[0].linear, ws.linear);
+    assert_eq!(saved.tasks[0].linear, ws.linear);
     assert_eq!(
-        saved.workspaces[0].issues, ws.issues,
+        saved.tasks[0].issues, ws.issues,
         "read back from their file"
     );
 }
@@ -373,7 +373,7 @@ async fn the_picker_opens_on_assigned_and_recent_issues(cx: &mut TestAppContext)
     );
     press_in(window)(cx, &["enter"]);
     assert_eq!(
-        ids(&ws_of(cx, &shark)),
+        ids(&task_of(cx, &shark)),
         ["uuid-1"],
         "the first row is ready"
     );
@@ -494,7 +494,7 @@ async fn a_search_in_flight_never_blocks_the_picker(cx: &mut TestAppContext) {
     settle(cx);
     assert_eq!(searches().len(), 3);
     assert!(!dialog_open(cx, window), "Enter works during a search");
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-1"]);
 }
 
 /// A 429 stops everything until Linear's time is up, with a live countdown, then the latest query
@@ -658,7 +658,7 @@ async fn an_identifier_shaped_term_searches_as_well(cx: &mut TestAppContext) {
     type_in(cx, window, "ENG-77");
     settle(cx);
     press_in(window)(cx, &["enter"]);
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-77"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-77"]);
 }
 
 /// ⌘↵ marks rows and keeps the picker open, through a new query too; Attach takes them all.
@@ -692,7 +692,7 @@ async fn marked_rows_attach_together(cx: &mut TestAppContext) {
     assert!(!dialog_open(cx, window));
     assert_eq!(fetches(), ["ENG-1", "ENG-4"]);
     assert_eq!(
-        ids(&ws_of(cx, &shark)),
+        ids(&task_of(cx, &shark)),
         ["uuid-1", "uuid-4"],
         "in marking order"
     );
@@ -721,7 +721,7 @@ async fn attached_rows_show_a_check_and_skip_the_fetch(cx: &mut TestAppContext) 
 
     press(cx, &["down", "cmd-enter", "down", "enter"]);
     assert!(!dialog_open(cx, window));
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1", "uuid-2"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-1", "uuid-2"]);
 }
 
 /// A failed search keeps the query and the rows and offers Retry, which is the highlighted row
@@ -763,7 +763,7 @@ async fn a_failure_keeps_the_query_and_the_rows(cx: &mut TestAppContext) {
     assert!(!shows(cx, window, "issue-notice"));
     press(cx, &["enter"]);
     assert_eq!(
-        ids(&ws_of(cx, &shark)),
+        ids(&task_of(cx, &shark)),
         ["uuid-21"],
         "appended, and highlighted"
     );
@@ -811,14 +811,14 @@ async fn the_highlight_follows_its_issue_through_a_refresh(cx: &mut TestAppConte
     settle(cx);
     assert_eq!(searches(), ["issue"]);
     press(cx, &["enter"]);
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-3"], "now near the end");
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-3"], "now near the end");
 
     open_picker(cx, window, &shark);
     type_in(cx, window, "issue");
     settle(cx);
     press(cx, &["enter"]);
     assert_eq!(
-        ids(&ws_of(cx, &shark)),
+        ids(&task_of(cx, &shark)),
         ["uuid-3", "uuid-20"],
         "the first row"
     );
@@ -846,7 +846,7 @@ async fn a_rejected_credential_asks_for_a_reconnect(cx: &mut TestAppContext) {
         shows(cx, window, "linear-sign-in"),
         "Settings on its Linear page"
     );
-    assert!(ids(&ws_of(cx, &shark)).is_empty());
+    assert!(ids(&task_of(cx, &shark)).is_empty());
 }
 
 /// Settings › Linear finished connecting, as `linear_adopt` ends.
@@ -915,7 +915,7 @@ async fn the_picker_comes_back_from_settings_with_its_query(cx: &mut TestAppCont
     assert_eq!(searches(), ["login"]);
     assert!(shows(cx, window, "issue-row-ENG-1"));
     press(cx, &["enter"]);
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-1"]);
 }
 
 /// Settings closed before the browser finished: only the picker is left, and it stays.
@@ -1010,7 +1010,7 @@ fn attach_directly(s: &mut Shark, name: &str, n: u32) {
         status: "Todo".into(),
         ..Snapshot::default()
     };
-    let ws = s.ws_mut(name).unwrap();
+    let ws = s.task_mut(name).unwrap();
     ws.linear.attach((&snapshot).into());
     ws.issues.push(snapshot);
 }
@@ -1025,7 +1025,7 @@ async fn linear_is_in_use_once_connected_or_while_issues_are_attached(cx: &mut T
     let home = test_home();
     reset();
     let (_, shark, _) = agent(cx, &home, &[], &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let in_use = |cx: &mut TestAppContext| cx.read(|cx| shark.read(cx).linear_in_use());
     assert!(!in_use(cx), "never connected");
     connect(cx, &shark);
@@ -1130,14 +1130,14 @@ async fn attach_and_the_palette_follow_linear_in_use(cx: &mut TestAppContext) {
     press(cx, &["escape"]);
 
     assert_eq!(palette_rows(cx, window), 3);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     shark.update(cx, |s, _| s.state.linear = None);
     assert_eq!(palette_rows(cx, window), 0);
     shark.update(cx, |s, _| attach_directly(s, &name, 1));
     assert_eq!(palette_rows(cx, window), 3, "a way back");
 }
 
-/// Delete agent names Linear only for an agent with issues, whatever is connected.
+/// Delete task names Linear only for an agent with issues, whatever is connected.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn delete_copy_mentions_linear_only_with_issues(cx: &mut TestAppContext) {
@@ -1146,7 +1146,7 @@ async fn delete_copy_mentions_linear_only_with_issues(cx: &mut TestAppContext) {
     let _claude = ClaudeGuard::set(&quiet);
     let home = test_home();
     let (_, shark, _) = connected(cx, &home, &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let copy =
         |cx: &mut TestAppContext, force| cx.read(|cx| shark.read(cx).delete_copy(&name, force));
     for force in [false, true] {
@@ -1170,7 +1170,7 @@ async fn disconnected_issues_share_one_mark(cx: &mut TestAppContext) {
     let _claude = ClaudeGuard::set(&quiet);
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     shark.update(cx, |s, cx| {
         (1..=3).for_each(|n| attach_directly(s, &name, n));
         cx.notify();
@@ -1234,7 +1234,7 @@ async fn disconnected_overflow_controls_remain_reachable(cx: &mut TestAppContext
     let _claude = ClaudeGuard::set(&quiet);
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     shark.update(cx, |s, cx| {
         (1..=20).for_each(|n| attach_directly(s, &name, n));
         s.rail = true;
@@ -1313,16 +1313,19 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     let _claude = ClaudeGuard::set(&quiet);
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     shark.update(cx, |s, cx| {
         attach_directly(s, &name, 1);
         attach_directly(s, &name, 2);
-        s.ws_mut(&name).unwrap().repos.push(crate::state::WsRepo {
-            name: "api".into(),
-            src: "/src/api".into(),
-            base: "main".into(),
-            branch: None,
-        });
+        s.task_mut(&name)
+            .unwrap()
+            .repos
+            .push(crate::state::TaskRepo {
+                name: "api".into(),
+                src: "/src/api".into(),
+                base: "main".into(),
+                branch: None,
+            });
         cx.notify();
     });
     let on = on_app(window, shark.clone());
@@ -1334,13 +1337,13 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     let rows = |cx: &mut TestAppContext, from: usize| -> Rows {
         cx.read(|cx| {
             let s = shark.read(cx);
-            let rows = s.attachment_rows(s.ws(&name).unwrap(), from, cx);
+            let rows = s.attachment_rows(s.task(&name).unwrap(), from, cx);
             (rows.into_iter())
                 .map(|(heading, rows)| (heading, rows.into_iter().map(|r| r.0).collect()))
                 .collect()
         })
     };
-    let repository = format!("api · {}", ws_of(cx, &shark).branch);
+    let repository = format!("api · {}", task_of(cx, &shark).branch);
     let group = |heading, rows: &[&str]| (heading, rows.iter().map(|r| r.to_string()).collect());
     assert_eq!(
         rows(cx, 0),
@@ -1381,7 +1384,7 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     // Disconnected, the row says so; with its snapshot gone, that.
     shark.update(cx, |s, _| {
         s.state.linear = None;
-        s.ws_mut(&name).unwrap().issues.remove(0);
+        s.task_mut(&name).unwrap().issues.remove(0);
     });
     assert_eq!(
         rows(cx, 1),
@@ -1396,7 +1399,7 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
 
     // Linear gone, nothing of it is left to offer; a repository keeps its row.
     shark.update(cx, |s, _| {
-        let ws = s.ws_mut(&name).unwrap();
+        let ws = s.task_mut(&name).unwrap();
         for r in [issue_ref(1), issue_ref(2)] {
             ws.linear.remove(&r);
         }
@@ -1421,7 +1424,7 @@ async fn details_act_in_place_and_refresh_repairs_a_missing_snapshot(cx: &mut Te
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
     let (on, press) = (on_app(window, shark.clone()), press_in(window));
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     attach(cx, window, &shark, "ENG-1");
     attach(cx, window, &shark, "ENG-2");
 
@@ -1433,7 +1436,7 @@ async fn details_act_in_place_and_refresh_repairs_a_missing_snapshot(cx: &mut Te
     assert!(shows(cx, window, "issue-primary"), "not the primary yet");
     press(cx, &["down", "down", "enter"]);
     assert!(dialog_open(cx, window));
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-2", "uuid-1"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-2", "uuid-1"]);
     assert!(!shows(cx, window, "issue-primary"));
 
     describe("Rewritten in Linear");
@@ -1447,7 +1450,7 @@ async fn details_act_in_place_and_refresh_repairs_a_missing_snapshot(cx: &mut Te
     assert!(!shows(cx, window, "issue-refreshing"));
     assert!(dialog_open(cx, window), "Refresh shows its result in place");
     assert_eq!(
-        ws_of(cx, &shark).issues[1].description,
+        task_of(cx, &shark).issues[1].description,
         "Rewritten in Linear"
     );
 
@@ -1459,17 +1462,20 @@ async fn details_act_in_place_and_refresh_repairs_a_missing_snapshot(cx: &mut Te
     in_flight(cx, asked + 1);
     press(cx, &["escape"]);
     assert!(!dialog_open(cx, window));
-    assert_eq!(ws_of(cx, &shark).issues[1].description, "Closed meanwhile");
+    assert_eq!(
+        task_of(cx, &shark).issues[1].description,
+        "Closed meanwhile"
+    );
 
     on(cx, &|s, w, cx| {
         s.issue_details(name.clone(), issue_ref(2), w, cx)
     });
     press(cx, &["down", "down", "enter"]);
     assert!(!dialog_open(cx, window), "Remove is last, and closes");
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-1"]);
 
     // The snapshot goes missing: the chip stays, and Refresh brings it back.
-    on(cx, &|s, _, _| s.active_ws_mut().unwrap().issues.clear());
+    on(cx, &|s, _, _| s.active_task_mut().unwrap().issues.clear());
     assert!(shows(cx, window, "issue-chip-uuid-1"));
     on(cx, &|s, w, cx| {
         s.issue_details(name.clone(), issue_ref(1), w, cx)
@@ -1477,7 +1483,7 @@ async fn details_act_in_place_and_refresh_repairs_a_missing_snapshot(cx: &mut Te
     assert!(shows(cx, window, "issue-missing"));
     assert!(!shows(cx, window, "issue-open"), "no URL to open");
     press(cx, &["enter"]);
-    assert_eq!(ws_of(cx, &shark).issues[0].identifier, "ENG-1");
+    assert_eq!(task_of(cx, &shark).issues[0].identifier, "ENG-1");
     assert!(shows(cx, window, "issue-summary"));
 }
 
@@ -1492,15 +1498,18 @@ async fn primary_changes_leave_branches_and_titles_alone(cx: &mut TestAppContext
     let home = test_home();
     let (window, shark, repos) = connected(cx, &home, &["api"]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on(cx, &|s, _, cx| s.set_title(&name, "My title".into(), cx));
     for id in ["ENG-1", "ENG-2", "ENG-3"] {
         attach(cx, window, &shark, id);
     }
-    assert_eq!(ws_of(cx, &shark).default_branch(), format!("eng-1-{name}"));
+    assert_eq!(
+        task_of(cx, &shark).default_branch(),
+        format!("eng-1-{name}")
+    );
 
     on(cx, &|s, _, cx| s.make_primary(&name, &issue_ref(3), cx));
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ids(&ws), ["uuid-3", "uuid-1", "uuid-2"]);
     assert_eq!(ws.default_branch(), format!("eng-3-{name}"));
     assert_eq!(ws.title, "My title");
@@ -1512,18 +1521,18 @@ async fn primary_changes_leave_branches_and_titles_alone(cx: &mut TestAppContext
     });
     let waiting = shark.clone();
     until(cx, window, move |_, cx| {
-        waiting.read(cx).active_ws().unwrap().ready()
+        waiting.read(cx).active_task().unwrap().ready()
     })
     .await;
 
     on(cx, &|s, _, cx| s.make_primary(&name, &issue_ref(2), cx));
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.branch, branch, "the branch isn't renamed");
     assert_eq!(ws.default_branch(), branch);
 
     // Removing the primary promotes the earliest left.
     on(cx, &|s, _, cx| s.remove_issue(&name, &issue_ref(2), cx));
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ids(&ws), ["uuid-1", "uuid-3"]);
     assert_eq!(
         (ws.branch.as_str(), ws.title.as_str()),
@@ -1547,10 +1556,10 @@ async fn snapshots_survive_disconnecting_and_changing_organization(cx: &mut Test
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     attach(cx, window, &shark, "ENG-1");
     let requests = sent().len();
-    let before = ws_of(cx, &shark).issues;
+    let before = task_of(cx, &shark).issues;
     let refresh = |cx: &mut TestAppContext| {
         let on = on_app(window, shark.clone());
         on(cx, &|s, w, cx| {
@@ -1574,8 +1583,8 @@ async fn snapshots_survive_disconnecting_and_changing_organization(cx: &mut Test
     let why = cx.read(|cx| shark.read(cx).refresh_refused(&before[0]).unwrap());
     assert!(why.contains("another Linear organization"), "{why}");
     assert!(why.contains("snapshot stays"), "{why}");
-    assert_eq!(ws_of(cx, &shark).issues, before);
-    assert!(!ws_of(cx, &shark).context().is_empty());
+    assert_eq!(task_of(cx, &shark).issues, before);
+    assert!(!task_of(cx, &shark).context().is_empty());
     on(cx, &|s, w, cx| s.pick_issue(name.clone(), w, cx));
     assert!(shows(cx, window, "issue-summary"), "details stay readable");
     press_in(window)(cx, &["escape"]);
@@ -1591,8 +1600,8 @@ async fn snapshots_survive_disconnecting_and_changing_organization(cx: &mut Test
     assert!(why.contains("Connect Linear in Settings"), "{why}");
     let (window2, shark2) = open(cx, WindowOptions::default());
     cx.run_until_parked();
-    on_app(window2, shark2.clone())(cx, &|s, w, cx| s.open_workspace_named(&name, w, cx));
-    assert_eq!(ws_of(cx, &shark2).issues, before);
+    on_app(window2, shark2.clone())(cx, &|s, w, cx| s.open_task_named(&name, w, cx));
+    assert_eq!(task_of(cx, &shark2).issues, before);
     assert!(shows(cx, window2, "issue-chip-uuid-1"));
     cx.update_window(window2, |_, w, _| w.remove_window())
         .unwrap();
@@ -1610,7 +1619,7 @@ async fn refreshes_reach_each_chat_once_and_removal_stops_them(cx: &mut TestAppC
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     attach(cx, window, &shark, "ENG-1");
     attach(cx, window, &shark, "ENG-2");
     let first = chat_of(cx, &shark);
@@ -1632,15 +1641,15 @@ async fn refreshes_reach_each_chat_once_and_removal_stops_them(cx: &mut TestAppC
     assert_eq!(pending(cx, &first), 0);
 
     // A refresh that finds nothing new and a primary change tell nobody anything.
-    let read = ws_of(cx, &shark).issues[0].retrieved_at;
+    let read = task_of(cx, &shark).issues[0].retrieved_at;
     on(cx, &|s, _, _| {
-        s.active_ws_mut().unwrap().issues[0].retrieved_at = read - 60;
+        s.active_task_mut().unwrap().issues[0].retrieved_at = read - 60;
     });
     on(cx, &|s, w, cx| {
         s.refresh_attached(&name, &issue_ref(1), w, cx).detach()
     });
     assert!(
-        ws_of(cx, &shark).issues[0].retrieved_at >= read,
+        task_of(cx, &shark).issues[0].retrieved_at >= read,
         "it did run"
     );
     assert_eq!(pending(cx, &first), 0);
@@ -1649,13 +1658,13 @@ async fn refreshes_reach_each_chat_once_and_removal_stops_them(cx: &mut TestAppC
     on(cx, &|s, _, cx| s.make_primary(&name, &issue_ref(1), cx));
 
     // A failed refresh leaves the snapshot, and so nothing to tell.
-    let before = ws_of(cx, &shark).issues;
+    let before = task_of(cx, &shark).issues;
     describe("Rewritten in Linear");
     outage(500, "{}");
     on(cx, &|s, w, cx| {
         s.refresh_attached(&name, &issue_ref(1), w, cx).detach()
     });
-    assert_eq!(ws_of(cx, &shark).issues, before);
+    assert_eq!(task_of(cx, &shark).issues, before);
     assert_eq!(linear::read_snapshots(&name).unwrap(), before);
     assert_eq!(pending(cx, &first), 0);
     *OUTAGE.lock().unwrap() = None;
@@ -1674,7 +1683,7 @@ async fn refreshes_reach_each_chat_once_and_removal_stops_them(cx: &mut TestAppC
         s.refresh_attached(&name, &issue_ref(1), w, cx).detach()
     });
     assert_eq!(
-        ws_of(cx, &shark).issues[0].description,
+        task_of(cx, &shark).issues[0].description,
         "Rewritten in Linear"
     );
     cx.update(|cx| assert!(!first.read(cx).busy && !second.read(cx).busy));
@@ -1751,7 +1760,7 @@ async fn updates_wait_for_the_next_turn_and_nothing_blocks_them(cx: &mut TestApp
     let home = test_home();
     let (window, shark, repos) = connected(cx, &home, &["api"]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     attach(cx, window, &shark, "ENG-1");
     let chat = chat_of(cx, &shark);
     assert!(ask(cx, window, &chat, "plan it"));
@@ -1767,13 +1776,13 @@ async fn updates_wait_for_the_next_turn_and_nothing_blocks_them(cx: &mut TestApp
     });
     cx.update(|cx| assert!(chat.read(cx).attach_hold));
     attach(cx, window, &shark, "ENG-2");
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1", "uuid-2"]);
+    assert_eq!(ids(&task_of(cx, &shark)), ["uuid-1", "uuid-2"]);
     describe("Rewritten in Linear");
     on(cx, &|s, w, cx| {
         s.refresh_attached(&name, &issue_ref(1), w, cx).detach()
     });
     assert_eq!(
-        ws_of(cx, &shark).issues[0].description,
+        task_of(cx, &shark).issues[0].description,
         "Rewritten in Linear"
     );
     cx.update(|cx| assert_eq!(chat.read(cx).pending_context().len(), 2));
@@ -1846,7 +1855,7 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
     connect(cx, &shark);
     let on = on_app(window, shark.clone());
     let press = press_in(window);
-    let agents = |cx: &mut TestAppContext| cx.read(|cx| shark.read(cx).state.workspaces.len());
+    let agents = |cx: &mut TestAppContext| cx.read(|cx| shark.read(cx).state.tasks.len());
 
     on(cx, &|s, w, cx| s.start_from_issue(w, cx));
     type_in(cx, window, "ENG-7");
@@ -1872,8 +1881,8 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
     );
     type_in(cx, window, "Edited request: ");
     press(cx, &["tab", "enter"]);
-    assert_eq!(agents(cx), 1, "the keyboard reaches Start agent");
-    let ws = ws_of(cx, &shark);
+    assert_eq!(agents(cx), 1, "the keyboard reaches Start task");
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.title, "Login work");
     assert!(ws.repos.is_empty() && ws.chats[0].plan);
     assert_eq!(ids(&ws), ["uuid-7"]);
@@ -1900,16 +1909,93 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
     play(cx, &chat, init());
     play(cx, &chat, Ev::User(sent));
     play(cx, &chat, result());
-    assert_eq!(ws_of(cx, &shark).title, "Login work");
+    assert_eq!(task_of(cx, &shark).title, "Login work");
     let name = ws.name.clone();
     on(cx, &|s, _, cx| s.set_title(&name, "Renamed".into(), cx));
-    let after = ws_of(cx, &shark);
+    let after = task_of(cx, &shark);
     assert_eq!(
         (after.title.as_str(), &after.branch),
         ("Renamed", &ws.branch)
     );
     assert_eq!(ids(&after), ["uuid-7"]);
     assert_eq!(after.default_branch(), format!("eng-7-{name}"));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn starting_from_an_issue_keeps_the_agent_chosen_before_lookup(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let claude = recording_claude(&quiet);
+    let _claude = ClaudeGuard::set(&claude);
+    let home = test_home();
+    let skill = crate::state::agent_skills_dir("designer").join("spacing");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(skill.join("SKILL.md"), "# Spacing").unwrap();
+    reset();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["web"]),
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                instructions: "Keep spacing consistent".into(),
+                repos: vec!["web".into()],
+                model: Some("opus".into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    connect(cx, &shark);
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("@designer Keep this draft", w, cx));
+        s.start_from_issue(w, cx);
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("A newer standalone draft", w, cx));
+    });
+    type_in(cx, window, "ENG-7");
+    press_in(window)(cx, &["enter"]);
+    assert!(shows(cx, window, "issue-summary"));
+    press_in(window)(cx, &["tab", "tab", "enter"]);
+    let task = task_of(cx, &shark);
+    assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
+    assert_eq!(
+        task.agent.as_ref().unwrap().instructions,
+        "Keep spacing consistent"
+    );
+    assert_eq!(task.chats[0].model.as_deref(), Some("opus"));
+    assert_eq!(task.chats[0].effort.as_deref(), Some("low"));
+    assert!(task.repos.is_empty() && task.chats[0].plan);
+    assert_eq!(ids(&task), ["uuid-7"]);
+    for doc in ["AGENTS.md", "CLAUDE.md"] {
+        assert!(
+            fs::read_to_string(task.dir().join(doc))
+                .unwrap()
+                .contains("Keep spacing consistent")
+        );
+    }
+    for folder in [".agents/skills", ".claude/skills"] {
+        assert_eq!(
+            fs::canonicalize(task.dir().join(folder).join("spacing")).unwrap(),
+            fs::canonicalize(&skill).unwrap()
+        );
+    }
+    assert!(wire(&claude, 0).contains("ENG-7"));
+    cx.read(|cx| {
+        assert_eq!(
+            shark.read(cx).home.prompt.read(cx).value(),
+            "A newer standalone draft"
+        )
+    });
 }
 
 /// A refused delete leaves the snapshots; a finished one takes them. And in the end: Linear only
@@ -1923,13 +2009,13 @@ async fn deleting_an_agent_removes_its_snapshots_once_it_is_gone(cx: &mut TestAp
     let home = test_home();
     let (window, shark, _) = connected(cx, &home, &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     attach(cx, window, &shark, "ENG-1");
     attach(cx, window, &shark, "ENG-2");
     on(cx, &|s, w, cx| {
         s.refresh_attached(&name, &issue_ref(1), w, cx).detach()
     });
-    let dir = ws_of(cx, &shark).dir();
+    let dir = task_of(cx, &shark).dir();
 
     let support = crate::state::support_dir();
     for file in [
@@ -1954,18 +2040,24 @@ async fn deleting_an_agent_removes_its_snapshots_once_it_is_gone(cx: &mut TestAp
 
     // A stray file in the agent's root stops a plain delete.
     fs::write(dir.join("notes.txt"), "mine").unwrap();
-    on(cx, &|s, w, cx| s.remove_workspace(&name, false, w, cx));
+    on(cx, &|s, w, cx| s.remove_task(&name, false, w, cx));
     let gone = shark.clone();
     until(cx, window, move |_, cx| gone.read(cx).archiving.is_empty()).await;
     cx.run_until_parked();
-    assert!(cx.read(|cx| shark.read(cx).ws(&name).is_some()), "refused");
+    assert!(
+        cx.read(|cx| shark.read(cx).task(&name).is_some()),
+        "refused"
+    );
     assert_eq!(linear::read_snapshots(&name).unwrap().len(), 2);
 
     fs::remove_file(dir.join("notes.txt")).unwrap();
-    on(cx, &|s, w, cx| s.remove_workspace(&name, false, w, cx));
+    on(cx, &|s, w, cx| s.remove_task(&name, false, w, cx));
     let gone = shark.clone();
     let agent = name.clone();
-    until(cx, window, move |_, cx| gone.read(cx).ws(&agent).is_none()).await;
+    until(cx, window, move |_, cx| {
+        gone.read(cx).task(&agent).is_none()
+    })
+    .await;
     assert!(linear::read_snapshots(&name).unwrap().is_empty());
     let saved = fs::read_dir(crate::state::support_dir().join("linear")).unwrap();
     assert_eq!(saved.count(), 0, "nothing left");
@@ -2159,7 +2251,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| {
                 s.linear_connected(KEY, acme(), &pixel_answers, cx);
-                let mut ws = Workspace {
+                let mut ws = Task {
                     name: name.clone(),
                     branch: name.clone(),
                     ..Default::default()
@@ -2173,7 +2265,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     ws.linear.attach(s.into());
                 }
                 ws.linear.attach(lost.clone());
-                s.state.workspaces = vec![ws];
+                s.state.tasks = vec![ws];
                 s.active = Some(name.clone());
                 s.home.on = false;
                 s.attach_linear_issue(name.clone(), w, cx);
@@ -2261,8 +2353,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         cx.update_window(window, |_, _, cx| {
             shark.update(cx, |s, cx| {
                 s.linear_connected(KEY, acme(), &pixel_answers, cx);
-                let ws = s.ws_mut(&name).unwrap();
-                ws.repos.push(crate::state::WsRepo {
+                let ws = s.task_mut(&name).unwrap();
+                ws.repos.push(crate::state::TaskRepo {
                     name: "api".into(),
                     src: "/src/api".into(),
                     base: "main".into(),
@@ -2295,7 +2387,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         keys(cx, &["escape"]);
         let attached = cx.update_window(window, |_, _, cx| {
             shark.update(cx, |s, cx| {
-                let ws = s.ws_mut(&name).unwrap();
+                let ws = s.task_mut(&name).unwrap();
                 let kept = (
                     std::mem::take(&mut ws.linear),
                     std::mem::take(&mut ws.issues),
@@ -2308,7 +2400,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         shot(cx, "header-plain");
         cx.update_window(window, |_, _, cx| {
             shark.update(cx, |s, cx| {
-                let ws = s.ws_mut(&name).unwrap();
+                let ws = s.task_mut(&name).unwrap();
                 (ws.linear, ws.issues) = attached.unwrap();
                 cx.notify();
             })

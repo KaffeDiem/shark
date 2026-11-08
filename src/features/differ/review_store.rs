@@ -1,4 +1,4 @@
-//! The comments on disk, per workspace: ids, loading and saving.
+//! The comments on disk, per task: ids, loading and saving.
 use super::review_comment::{Comment, Status};
 use super::*;
 use crate::state::support_dir;
@@ -55,9 +55,9 @@ pub(crate) fn comments_path(ws: &str) -> PathBuf {
 
 #[derive(Default)]
 pub(crate) struct CommentStore {
-    /// Comments per workspace, loaded from disk on first use.
+    /// Comments per task, loaded from disk on first use.
     pub(crate) comments: HashMap<String, Vec<Comment>>,
-    /// The last comment id given out per workspace.
+    /// The last comment id given out per task.
     last_id: HashMap<String, u64>,
     /// Workspaces whose comments file couldn't be read or moved aside: never saved over.
     unsaved: Vec<String>,
@@ -142,7 +142,7 @@ impl CommentStore {
         }
     }
 
-    /// A new comment id in workspace `ws`, never one given out before.
+    /// A new comment id in task `ws`, never one given out before.
     pub(crate) fn new_id(&mut self, ws: &str) -> u64 {
         self.load(ws);
         let last = self.last_id.entry(ws.to_string()).or_default();
@@ -150,7 +150,7 @@ impl CommentStore {
         *last
     }
 
-    /// A removed workspace's comments, so a later one of the same name starts with none.
+    /// A removed task's comments, so a later one of the same name starts with none.
     pub(crate) fn forget(&mut self, ws: &str) {
         self.comments.remove(ws);
         self.last_id.remove(ws);
@@ -159,7 +159,7 @@ impl CommentStore {
         let _ = std::fs::remove_file(comments_path(ws));
     }
 
-    /// Edits workspace `ws`'s comments and saves them if that changed them.
+    /// Edits task `ws`'s comments and saves them if that changed them.
     pub(crate) fn edit(&mut self, ws: &str, f: impl FnOnce(&mut Vec<Comment>)) {
         self.load(ws);
         let l = self.comments.get_mut(ws).unwrap();

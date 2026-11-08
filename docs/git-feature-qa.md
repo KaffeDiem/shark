@@ -1,4 +1,7 @@
-# Git feature and feature-refactor QA
+# Historical Git feature QA — October 2026
+
+Results, code names and local logs below describe the reviewed revisions;
+see [Git artifact](git-feature.md) for current behavior and validation commands.
 
 QA date: 2026-10-28. Reviewed `905b752..1fe6751` on `git-feature`.
 Four tracks: GitHub API boundary, Git interaction/drafts, feature-refactor
@@ -7,10 +10,10 @@ agents worked alongside the coordinating agent. The original QA changed only
 tests and this report. The follow-up fixes below also change production code.
 No live PR was mutated.
 
-## Latest test verification
+## Recorded final verification
 
-The documented `cargo test --features test-support` command now passes with its
-normal parallel runner: **405 passed, 0 failed, 15 opt-in tests ignored** (263.32
+At the recorded final verification, `cargo test --features test-support` passed
+with its normal parallel runner: **405 passed, 0 failed, 15 opt-in tests ignored** (263.32
 seconds). Native Metal rendering, `cargo build`, `cargo fmt --check`, and
 `git diff --check` also pass. The initial serial rerun passed 404 tests before
 the new isolation regression was added.
@@ -41,7 +44,7 @@ services or other explicit setup.
 
 ## Follow-up fixes
 
-All four confirmed findings are fixed in the working tree:
+The follow-up fixed all four confirmed findings:
 
 | Finding | Fix | Focused verification |
 | --- | --- | --- |
@@ -267,3 +270,24 @@ coverage. Representative screenshots were visually inspected. Temporary evidence
 
 Formal review decisions and other product-scope gaps remain unchanged; they were
 not part of the confirmed defects addressed by these fixes.
+
+## Recorded performance measurements
+
+The original feature guide recorded these development-build measurements on the
+review machine. They are retained as evidence, not current latency guarantees.
+
+| Scenario | Observed result |
+| --- | --- |
+| Headless frame, 10 review threads | 1.52 ms mean across 10 frames |
+| Headless frame, 100 review threads | 1.49 ms mean across 10 frames |
+| Headless frame, 1,000 review threads | 1.49 ms mean across 10 frames |
+| 2,000-thread mock CLI payload | 133 ms; one subprocess, no per-thread requests |
+| Actual compiled read-only GitHub load + discovery, PR #60 | 1.23 seconds |
+| 65 KB inline-heavy Markdown preview | 3–4 ms settled redraw; 11–18 ms parsed and rendered |
+| Complete 65 KB source in read-only editor | 13–19 ms open; 1.4–1.6 ms redraw; exact clipboard copy verified |
+| Native Metal rendering | 800/1440 px, dark/light: overview, description editing, activity, inline reply, comment composer, local drafts, reader, states |
+
+The same feature guide recorded a strict Clippy run finding existing
+`type_complexity`, `needless_borrow`, `non_octal_unix_permissions` and
+`unnecessary_unwrap` lint categories, plus a future-Rust warning from `block`.
+These observations were not rerun as part of the documentation update.

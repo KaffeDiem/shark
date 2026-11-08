@@ -25,7 +25,7 @@ pub const MAX_BYTES: u64 = 4 << 20;
 pub enum EditorEvent {
     /// The file on disk now matches the buffer; the diff should refresh.
     Saved,
-    /// Escape with nothing left to cancel: focus the file tree or workspace sidebar.
+    /// Escape with nothing left to cancel: focus the file tree or task sidebar.
     Leave,
     /// A completed :wq closes this editor even if another tab is now selected.
     Close,

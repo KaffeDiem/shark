@@ -57,7 +57,7 @@ pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
 
 impl Shark {
     /// The persisted strip's visible tabs, then external files (unlisted); unavailable files have none.
-    pub(super) fn visible_tab_ids(&self, ws: &Workspace, cx: &App) -> Vec<TabId> {
+    pub(super) fn visible_tab_ids(&self, ws: &Task, cx: &App) -> Vec<TabId> {
         let external = self.file_tabs.iter().filter_map(|tab| {
             let editor = tab.editor.read(cx);
             editor.external.then(|| TabId::File(editor.path.clone()))
@@ -75,7 +75,7 @@ impl Shark {
     }
 
     /// The shown tab's identity, if it is in the strip.
-    fn current_tab_id(&self, ws: &Workspace, cx: &App) -> Option<TabId> {
+    fn current_tab_id(&self, ws: &Task, cx: &App) -> Option<TabId> {
         Some(match self.tab {
             Tab::Chat => TabId::Chat(ws.chats.get(ws.active_chat)?.id.clone()),
             Tab::Feature(feature) => feature.tab_id(),
@@ -84,7 +84,7 @@ impl Shark {
     }
 
     pub(super) fn active_tab_index(&self, cx: &App) -> Option<usize> {
-        let ws = self.active_ws()?;
+        let ws = self.active_task()?;
         let current = self.current_tab_id(ws, cx)?;
         (self.visible_tab_ids(ws, cx).iter()).position(|id| *id == current)
     }
@@ -92,7 +92,7 @@ impl Shark {
     /// The chat entity for `meta`, started (transcript replayed) on first use.
     pub(super) fn ensure_chat(
         &mut self,
-        ws: &Workspace,
+        ws: &Task,
         meta: &ChatMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -104,7 +104,7 @@ impl Shark {
         let archiving = self.archiving.contains(&ws.name);
         let vim = self.state.vim;
         // Current, whatever the caller cloned: a chat opened mid-attachment inherits its hold.
-        let ws = self.ws(&ws.name).unwrap_or(ws).clone();
+        let ws = self.task(&ws.name).unwrap_or(ws).clone();
         let ws = &ws;
         let chat = cx.new(|cx| {
             let mut c = Chat::new(ws.clone(), meta.clone(), vim, window, cx);
@@ -113,7 +113,7 @@ impl Shark {
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
         // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
-        let workspace = name.clone();
+        let task = name.clone();
         self._subs
             .push(cx.observe_in(&chat, window, move |this, chat, window, cx| {
                 this.update_awake(cx);
@@ -121,7 +121,7 @@ impl Shark {
                 if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
                     this.state.mark(|s| &mut s.approved_plan);
                 }
-                this.advance_attachment(&workspace, window, cx);
+                this.advance_attachment(&task, window, cx);
                 cx.notify()
             }));
         self._subs.push(cx.subscribe_in(
@@ -155,7 +155,7 @@ impl Shark {
                         }
                         this.refresh_home(Some(&name), cx);
                         this.turn_done(&name, &id, cx);
-                        if let Some(ws) = this.ws(&name) {
+                        if let Some(ws) = this.task(&name) {
                             let dir = ws.dir();
                             let c = chat.read(cx);
                             let (turn, reply, held) =
@@ -166,7 +166,7 @@ impl Shark {
                         }
                         cx.notify();
                     }
-                    // A question off screen marks its tab; the workspace needs you until it's answered.
+                    // A question off screen marks its tab; the task needs you until it's answered.
                     ChatEvent::Asking => {
                         if this.active_chat() != Some(chat) && chat.read(cx).asking() {
                             this.unread.insert(id.clone());
@@ -203,16 +203,20 @@ impl Shark {
     /// The first message of a still untitled agent titles it too.
     fn save_meta(&mut self, chat: &Entity<Chat>, cx: &mut Context<Self>) {
         let meta = chat.read(cx).meta.clone();
-        let ws =
-            (self.state.workspaces.iter_mut()).find(|w| w.chats.iter().any(|c| c.id == meta.id));
+        let ws = (self.state.tasks.iter_mut()).find(|w| w.chats.iter().any(|c| c.id == meta.id));
         let Some(ws) = ws else { return };
-        let untitled = ws.title == crate::state::NEW_AGENT && !meta.title.is_empty();
+        let untitled = ws.title == crate::state::NEW_TASK && !meta.title.is_empty();
         if untitled {
             ws.title = meta.title.clone();
         }
         let slot = ws.chats.iter_mut().find(|c| c.id == meta.id);
         let changed = slot.filter(|s| **s != meta).map(|s| *s = meta).is_some();
-        if untitled || changed {
+        let agent = untitled
+            .then(|| ws.agent.as_ref().map(|a| a.slug.clone()))
+            .flatten();
+        if let Some(slug) = agent {
+            let _ = self.sync_agent(&slug, false, cx);
+        } else if changed || untitled {
             let _ = self.state.save();
         }
     }
@@ -226,18 +230,18 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if instance.is_empty() || self.ws(name).is_none_or(|ws| ws.instance_id != instance) {
-            return notify_err(window, cx, "The selected agent is no longer available");
+        if instance.is_empty() || self.task(name).is_none_or(|ws| ws.instance_id != instance) {
+            return notify_err(window, cx, "The selected task is no longer available");
         }
-        self.open_workspace_then(name, chat, window, cx, |s, window, cx| {
-            let Some(ws) = s.active_ws() else { return };
+        self.open_task_then(name, chat, window, cx, |s, window, cx| {
+            let Some(ws) = s.active_task() else { return };
             s.select_chat(ws.active_chat, window, cx);
         });
     }
 
-    /// Shows the workspace's `ix`th chat tab.
+    /// Shows the task's `ix`th chat tab.
     pub(super) fn select_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws_mut() else {
+        let Some(ws) = self.active_task_mut() else {
             return;
         };
         let Some(meta) = ws.chats.get(ix).cloned() else {
@@ -247,7 +251,7 @@ impl Shark {
             ws.active_chat = ix;
             let _ = self.state.save();
         }
-        let ws = self.active_ws().cloned().unwrap();
+        let ws = self.active_task().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
@@ -260,19 +264,19 @@ impl Shark {
     /// Reorder identities, keeping entities, selected content and focus intact.
     pub(super) fn move_tab(
         &mut self,
-        workspace: &str,
+        task: &str,
         from: &TabId,
         to: &TabId,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws().filter(|ws| ws.name == workspace) else {
+        let Some(ws) = self.active_task().filter(|ws| ws.name == task) else {
             return;
         };
         let tabs = self.visible_tab_ids(ws, cx);
         if !tabs.contains(from) || !tabs.contains(to) {
             return;
         }
-        if !self.active_ws_mut().unwrap().move_tab(from, to) {
+        if !self.active_task_mut().unwrap().move_tab(from, to) {
             return;
         }
         self.sort_file_tabs(cx);
@@ -301,7 +305,7 @@ impl Shark {
     }
 
     pub(super) fn cycle_chat(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ws) = self.active_ws() {
+        if let Some(ws) = self.active_task() {
             let n = ws.chats.len() as isize;
             let ix = (ws.active_chat as isize + d).rem_euclid(n) as usize;
             self.select_chat(ix, window, cx);
@@ -313,7 +317,7 @@ impl Shark {
         if self.home_shown() {
             return self.cycle_chat(d, window, cx);
         }
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let Some(active) = self.active_tab_index(cx) else {
             return;
         };
@@ -323,7 +327,7 @@ impl Shark {
     }
 
     pub(super) fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let Some(id) = self.visible_tab_ids(ws, cx).get(ix).cloned() else {
             return;
         };
@@ -349,7 +353,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let n = self.visible_tab_ids(ws, cx).len();
         if n > 0 {
             self.select_tab(at.min(n - 1), window, cx);
@@ -359,15 +363,18 @@ impl Shark {
     /// cmd-t: a new tab at the end of the strip, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.chat_actions_available() {
+            return notify_err(window, cx, "Open a task first");
+        }
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
-        let Some(id) = self.active_ws_mut().map(Workspace::next_chat_id) else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(id) = self.active_task_mut().map(Task::next_chat_id) else {
+            return notify_err(window, cx, "Open a task first");
         };
         let meta = ChatMeta {
             fast,
-            ..self.state.new_chat(self.active_ws().unwrap(), id)
+            ..self.state.new_chat(self.active_task().unwrap(), id)
         };
-        let at = self.active_ws_mut().unwrap().push_chat(meta);
+        let at = self.active_task_mut().unwrap().push_chat(meta);
         let _ = self.state.save();
         self.select_chat(at, window, cx);
     }
@@ -384,13 +391,13 @@ impl Shark {
     }
 
     /// Closes the shown chat, asking first if it's running. The last tab gives way to a
-    /// fresh one, so a workspace always has a chat.
+    /// fresh one, so a task always has a chat.
     pub(super) fn close_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The chat isn't on screen.
         if self.home_shown() {
             return;
         }
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let (name, id) = (ws.name.clone(), ws.chats[ws.active_chat].id.clone());
         self.close_chat_by_id(&name, &id, window, cx);
     }
@@ -406,8 +413,8 @@ impl Shark {
             }
             match &id {
                 TabId::Chat(id) => {
-                    if let Some(workspace) = this.active.clone() {
-                        this.close_chat_by_id(&workspace, id, w, cx);
+                    if let Some(task) = this.active.clone() {
+                        this.close_chat_by_id(&task, id, w, cx);
                     }
                 }
                 TabId::Diff => this.close_feature(Feature::Diff, w, cx),
@@ -424,22 +431,22 @@ impl Shark {
 
     fn close_chat_by_id(
         &mut self,
-        workspace: &str,
+        task: &str,
         id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let chat = self.chats.get(id).filter(|chat| chat.read(cx).working());
         let Some(chat) = chat else {
-            return self.close_chat_now(workspace, id, window, cx);
+            return self.close_chat_now(task, id, window, cx);
         };
         let title = chat.read(cx).title();
-        let (workspace, id) = (workspace.to_string(), id.to_string());
+        let (task, id) = (task.to_string(), id.to_string());
         confirm(
             format!("Stop and close “{title}”?"),
             "The agent is still running in this chat. Closing stops it; cmd-shift-t reopens the chat.",
             "Stop and close",
-            move |s, w, cx| s.close_chat_now(&workspace, &id, w, cx),
+            move |s, w, cx| s.close_chat_now(&task, &id, w, cx),
             window,
             cx,
         );
@@ -447,7 +454,7 @@ impl Shark {
 
     fn close_chat_now(
         &mut self,
-        workspace: &str,
+        task: &str,
         id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -476,11 +483,11 @@ impl Shark {
         }
         // The closed chat's strip slot, used when it is the one shown.
         let at = self.active_tab_index(cx);
-        let Some(ws) = self.ws(workspace) else {
+        let Some(ws) = self.task(task) else {
             return;
         };
         let fresh = self.state.new_chat(ws, String::new());
-        let Some(ws) = self.ws_mut(workspace) else {
+        let Some(ws) = self.task_mut(task) else {
             return;
         };
         let Some(shown) = ws.chats.get(ws.active_chat).map(|c| c.id == id) else {
@@ -517,17 +524,17 @@ impl Shark {
             sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
         }
         self.refresh_attention(cx); // an unread or asking tab no longer counts
-        self.advance_attachment(workspace, window, cx); // a closed chat can't report going idle
-        if self.active.as_deref() == Some(workspace) && shown {
+        self.advance_attachment(task, window, cx); // a closed chat can't report going idle
+        if self.active.as_deref() == Some(task) && shown {
             if self.tab == Tab::Chat && !self.home_shown() {
                 match at {
                     Some(at) if !last => self.select_neighbor(at, window, cx),
                     _ => self.select_chat(next, window, cx),
                 }
             } else {
-                let ws = self.active_ws().cloned().unwrap();
+                let ws = self.active_task().cloned().unwrap();
                 let chat = self.ensure_chat(&ws, &ws.chats[next], window, cx);
-                if let Some(sync) = self.syncs.get(workspace) {
+                if let Some(sync) = self.syncs.get(task) {
                     sync.update(cx, |g, cx| g.set_chat(chat, cx));
                 }
             }
@@ -542,11 +549,14 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws_mut() else {
-            return notify_err(window, cx, "Open an agent first");
+        if !self.chat_actions_available() {
+            return notify_err(window, cx, "Open a task first");
+        }
+        let Some(ws) = self.active_task_mut() else {
+            return notify_err(window, cx, "Open a task first");
         };
         let Some(ix) = pick.or(ws.closed.len().checked_sub(1)) else {
-            return notify_err(window, cx, "No closed chats in this agent");
+            return notify_err(window, cx, "No closed chats in this task");
         };
         let meta = ws.closed.remove(ix);
         let at = ws.push_chat(meta);
@@ -556,11 +566,14 @@ impl Shark {
     }
 
     pub(super) fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open an agent first");
+        if !self.chat_actions_available() {
+            return notify_err(window, cx, "Open a task first");
+        }
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
         if ws.closed.is_empty() {
-            return notify_err(window, cx, "No closed chats in this agent");
+            return notify_err(window, cx, "No closed chats in this task");
         }
         // Newest first.
         let n = ws.closed.len();
@@ -587,11 +600,19 @@ impl Shark {
         );
     }
 
-    /// The shown agent's chat, or a toast saying to open one.
+    // The legacy Home can resume its open chat. Agent and All tasks pages have no shown chat.
+    fn chat_actions_available(&self) -> bool {
+        !self.home_shown() || self.home.destination == home::Destination::Home
+    }
+
+    /// The shown task's chat, or a toast saying to open one.
     pub(super) fn chat_or_err(&self, window: &mut Window, cx: &mut App) -> Option<Entity<Chat>> {
-        let chat = self.active_chat().cloned();
+        let chat = self
+            .chat_actions_available()
+            .then(|| self.active_chat().cloned())
+            .flatten();
         if chat.is_none() {
-            notify_err(window, cx, "Open an agent first");
+            notify_err(window, cx, "Open a task first");
         }
         chat
     }
@@ -606,13 +627,13 @@ impl Shark {
     }
 
     pub(super) fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(chat) = self.active_chat().cloned() {
+        if let Some(chat) = self.chat_or_err(window, cx) {
             self.show(Tab::Chat, window, cx);
             chat.update(cx, |c, cx| c.focus_queue(window, cx));
         }
     }
 
-    /// How many of a workspace's chats have something going on.
+    /// How many of a task's chats have something going on.
     /// Chats whose agent is at work. One waiting on answers to its questions isn't: it
     /// needs you (`asking_chat`).
     pub(crate) fn running_chats(&self, ws: &str, cx: &App) -> usize {
@@ -625,9 +646,9 @@ impl Shark {
         (self.started_chats(ws).iter()).any(|c| c.read(cx).asking())
     }
 
-    /// A workspace's open chat tabs that have been shown (and so have an entity).
+    /// A task's open chat tabs that have been shown (and so have an entity).
     pub(super) fn started_chats(&self, ws: &str) -> Vec<Entity<Chat>> {
-        let Some(ws) = self.ws(ws) else {
+        let Some(ws) = self.task(ws) else {
             return vec![];
         };
         (ws.chats.iter())
@@ -635,9 +656,9 @@ impl Shark {
             .collect()
     }
 
-    /// A chat tab of the workspace finished a turn that hasn't been looked at.
+    /// A chat tab of the task finished a turn that hasn't been looked at.
     pub(crate) fn chat_unread(&self, ws: &str) -> bool {
-        self.ws(ws)
+        self.task(ws)
             .is_some_and(|w| w.chats.iter().any(|c| self.unread.contains(&c.id)))
     }
 
@@ -718,8 +739,9 @@ impl Shark {
 
     /// The no-menu fast path, so confirm the switch in a toast.
     pub(super) fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(m) = MODELS.get(ix) else { return };
+        let Some(chat) = self.chat_or_err(window, cx) else {
+            return;
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
         let m = crate::models::model_label(m);
@@ -815,7 +837,7 @@ impl Shark {
 
     /// Chats, Diff and files share equal-width tabs that shrink to fit the header.
     pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let theme = cx.theme();
@@ -893,10 +915,10 @@ impl Shark {
                         .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
                         .child(tab_close(
                             crate::ui::close_button("close-chat", "Close chat (cmd-w)").on_click({
-                                let (workspace, id) = (ws.name.clone(), meta.id.clone());
+                                let (task, id) = (ws.name.clone(), meta.id.clone());
                                 cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.close_chat_by_id(&workspace, &id, window, cx)
+                                    this.close_chat_by_id(&task, &id, window, cx)
                                 })
                             }),
                             theme,
@@ -996,7 +1018,7 @@ impl Shark {
             })
             .id("chat-tabs")
             .role(Role::TabList)
-            .aria_label("Agent tabs")
+            .aria_label("Task tabs")
             .test_support()
             .min_w_0()
             .gap_1()
@@ -1032,7 +1054,7 @@ impl Shark {
 
     /// Right-click on the `ix`th chat tab; closing it is offered where its close button is.
     pub(super) fn chat_tab_menu(&self, ix: usize, cx: &Context<Self>) -> Vec<Entry> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let Some(meta) = ws.chats.get(ix) else {
@@ -1078,7 +1100,7 @@ impl Shark {
         entries
     }
 
-    /// Chats whose agent is at work, in any workspace.
+    /// Chats whose agent is at work, in any task.
     pub(crate) fn working_chats(&self, cx: &App) -> usize {
         self.chats.values().filter(|c| c.read(cx).working()).count()
     }

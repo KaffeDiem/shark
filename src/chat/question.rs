@@ -2,7 +2,7 @@
 //! answered in a card above the composer while the turn waits. The card is gpui-component's
 //! questionnaire: number keys pick, ↑/↓ move, enter goes on, the last question submits.
 use super::*;
-use crate::agent::{ANSWER_IN_CHAT, Answer, Questions};
+use crate::harness::{ANSWER_IN_CHAT, Answer, Questions};
 use crate::transcript::{answer_pairs, answer_result};
 use gpui_kit::component::Size;
 use gpui_kit::component::input::InputState;
@@ -181,7 +181,7 @@ impl Chat {
             })
             .collect();
         let summary = answer_pairs(&asked.request.questions, &answers);
-        let res = (self.agent.as_mut()).map_or(Ok(()), |a| {
+        let res = (self.harness.as_mut()).map_or(Ok(()), |a| {
             a.answer_questions(&asked.request, Some(&answers))
         });
         let result = answer_result(&summary);
@@ -196,7 +196,7 @@ impl Chat {
             return;
         };
         let res = self
-            .agent
+            .harness
             .as_mut()
             .map_or(Ok(()), |a| a.answer_questions(&asked.request, None));
         self.answered(asked, ANSWER_IN_CHAT.into(), res, cx);
@@ -462,13 +462,7 @@ mod tests {
                             cx,
                             |w, cx| {
                                 cx.new(|cx| {
-                                    Chat::new(
-                                        Workspace::default(),
-                                        ChatMeta::default(),
-                                        false,
-                                        w,
-                                        cx,
-                                    )
+                                    Chat::new(Task::default(), ChatMeta::default(), false, w, cx)
                                 })
                             },
                         )
@@ -502,8 +496,8 @@ mod tests {
     #[gpui_kit::test]
     fn review_wrapped_choices_keep_submit_inside_viewport(cx: &mut TestAppContext) {
         // With no repository the chat would share its width with the plan pane.
-        let ws = Workspace {
-            repos: vec![crate::state::WsRepo {
+        let ws = Task {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: Default::default(),
                 base: "main".into(),
@@ -700,7 +694,7 @@ mod tests {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
                     cx.new(|cx| {
                         Chat::new(
-                            Workspace::default(),
+                            Task::default(),
                             ChatMeta {
                                 id: id.clone(),
                                 ..Default::default()
@@ -715,7 +709,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         let input = json!({"questions":[{"id":"secret","question":"Token?","isSecret":true}]});
-        let qs = agent::questions(&input);
+        let qs = harness::questions(&input);
         let summary = answer_pairs(&qs, &[(vec![], Some("NEVER_STORE_THIS_SECRET".into()))]);
         chat.update(cx, |c, cx| {
             let asked = Asked { request: Questions::new("rpc".into(), "question-1".into(), input, true), form:None, scroll:ScrollHandle::new(), revealed:Cell::new(None), _subs:vec![] };
@@ -798,7 +792,7 @@ mod tests {
             std::env::temp_dir().join(format!("shark-live-answer-{}", std::process::id()))
         });
         cx.update(gpui_kit::init);
-        let ws = Workspace {
+        let ws = Task {
             name: format!("live-answer-{}", std::process::id()),
             ..Default::default()
         };
@@ -825,11 +819,11 @@ mod tests {
             id: format!("{}-wire", meta.id),
             ..meta.clone()
         };
-        let (mut process, rx) = agent::spawn(&ws, &wire).unwrap();
+        let (mut process, rx) = harness::spawn(&ws, &wire).unwrap();
         process.send("Use request_user_input exactly once to ask for a public synthetic test marker, offering options Red and Blue. The user will give their own text instead. Once answered, reply only with the final four digits of that marker. Never repeat the full marker or write it anywhere.").unwrap();
         chat.update(cx, |c, _| {
-            c.agent = Some(process);
-            c.agent_model = meta.model.clone();
+            c.harness = Some(process);
+            c.harness_model = meta.model.clone();
         });
         const SENTINEL: &str = "SHARK_SYNTHETIC_7391";
         let end = Instant::now() + Duration::from_secs(180);
@@ -892,7 +886,7 @@ mod tests {
                 break;
             }
         }
-        chat.update(cx, |c, _| c.agent = None);
+        chat.update(cx, |c, _| c.harness = None);
         let stop_by = Instant::now() + Duration::from_secs(10);
         while Instant::now() < stop_by && !rx.is_closed() {
             let _ = rx.try_recv();
@@ -971,8 +965,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_questions() {
-        use crate::agent::{self, Ev};
-        use crate::state::{ChatMeta, Workspace};
+        use crate::harness::{self, Ev};
+        use crate::state::{ChatMeta, Task};
         // Unset: earlier tests in this process may have swapped in fakes.
         unsafe {
             std::env::remove_var("SHARK_CLAUDE");
@@ -991,7 +985,7 @@ mod tests {
             let root =
                 std::env::temp_dir().join(format!("shark-live-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
-            let ws = Workspace {
+            let ws = Task {
                 name: format!("live-{tag}-{}", std::process::id()),
                 ..Default::default()
             };
@@ -1002,10 +996,10 @@ mod tests {
                 plan,
                 ..Default::default()
             };
-            std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+            std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
             let _ = std::fs::remove_file(ws.dir());
             std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-            let (mut a, rx) = agent::spawn(&ws, &meta).unwrap();
+            let (mut a, rx) = harness::spawn(&ws, &meta).unwrap();
             if plan && !model.starts_with("codex:") {
                 a.set_plan_mode(true).unwrap();
             }

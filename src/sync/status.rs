@@ -29,7 +29,7 @@ pub struct Local {
     /// patch-equivalent local one and the local tip is newer, so a lease-guarded force push
     /// loses nothing.
     pub rewritten: bool,
-    /// `(ahead, behind)` vs the workspace base, e.g. `origin/main`.
+    /// `(ahead, behind)` vs the task base, e.g. `origin/main`.
     pub base: (u32, u32),
     /// The repo's default branch, e.g. `origin/main`; a base other than it may be a stack.
     pub trunk: String,
@@ -447,7 +447,7 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
                 wt,
                 &["check-ref-format", &format!("refs/heads/{}", pr.base)],
             )?;
-            // Only remove the identity we read; another workspace may have changed it meanwhile.
+            // Only remove the identity we read; another task may have changed it meanwhile.
             git(
                 wt,
                 &[
@@ -512,7 +512,7 @@ fn mark_contains_head(wt: &Path, p: &mut Pr, head: &str) {
     }
 }
 
-/// Everything known about one repo of a workspace.
+/// Everything known about one repo of a task.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Repo {
     pub name: String,
@@ -529,7 +529,7 @@ pub struct Repo {
 
 impl Repo {
     /// Known by name only: nothing probed yet.
-    pub fn fresh(r: &crate::state::WsRepo, ws: &crate::state::Workspace) -> Repo {
+    pub fn fresh(r: &crate::state::TaskRepo, ws: &crate::state::Task) -> Repo {
         Repo {
             name: r.name.clone(),
             base: r.base.clone(),
@@ -746,7 +746,7 @@ fn act(label: impl Into<String>, kind: Kind, repos: Vec<String>, attention: bool
     }
 }
 
-/// The repos named in `rs`, in workspace order.
+/// The repos named in `rs`, in task order.
 pub fn among<'a>(repos: &'a [Repo], rs: &'a [String]) -> impl Iterator<Item = &'a Repo> {
     repos.iter().filter(|r| rs.contains(&r.name))
 }
@@ -756,7 +756,7 @@ pub fn in_scope(rs: &[String], r: &Repo) -> bool {
     rs.is_empty() || rs.contains(&r.name)
 }
 
-/// The single most useful next step for the whole workspace. Local problems come before
+/// The single most useful next step for the whole task. Local problems come before
 /// remote ones, and within the PR phase actionable steps beat passive waits, so a
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
@@ -1040,7 +1040,7 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         .iter()
         .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged))
     {
-        return act("Merged · delete agent", Kind::Archive, vec![], false);
+        return act("Merged · delete task", Kind::Archive, vec![], false);
     }
     act("No changes", Kind::None, vec![], false)
 }
@@ -1120,13 +1120,13 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             }
             if p.base != short(&r.base) {
                 return Err(format!(
-                    "PR targets `{}`, but this agent targets `{}`; retarget the PR before merging",
+                    "PR targets `{}`, but this task targets `{}`; retarget the PR before merging",
                     p.base,
                     short(&r.base)
                 ));
             }
             let l = local()?;
-            // Merge exactly what this workspace has: clean, pushed, and GitHub's head matching.
+            // Merge exactly what this task has: clean, pushed, and GitHub's head matching.
             if l.changed > 0 || l.remote != Some((0, 0)) || p.head != l.head {
                 return Err(
                     "local branch, origin and the PR don't match; push or pull first".into(),
@@ -1463,7 +1463,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     #[test]
-    fn fetch_updates_outranks_normal_repo_in_mixed_workspace() {
+    fn fetch_updates_outranks_normal_repo_in_mixed_task() {
         let work = repo("work", clean(2), None);
         assert_eq!(next(std::slice::from_ref(&work)).kind, Kind::CreatePr);
         let a = next(&[reviewed("review", "old", "new", |_| {}), work]);
@@ -2118,7 +2118,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     /// A child merges after its parent, from the button and from the menu alike; the other repo
-    /// of the workspace merges meanwhile.
+    /// of the task merges meanwhile.
     #[test]
     fn child_waits_for_its_parent_to_merge() {
         let own = Some(pr("CLEAN", Checks::Passing));
@@ -2294,7 +2294,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     /// the prompt gives leaves exactly the child's own commit.
     #[test]
     fn parent_tip_tracks_and_restacks_after_a_squash() {
-        use crate::git::{create_workspace_with_prs, git};
+        use crate::git::{create_task_with_prs, git};
         use std::fs;
         let root = std::env::temp_dir().join(format!("shark-stack-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2342,8 +2342,18 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let repo = crate::git::add_repo(&src, &[]).unwrap();
         let on = crate::git::on_branch(&[repo], "ui");
         let parents = [("ios".to_string(), "logic".to_string())];
-        let ws =
-            create_workspace_with_prs(&root.join("ws/ui"), "ui", "ui", &on, &[], &parents).unwrap();
+        let ws = create_task_with_prs(
+            &root.join("ws/ui"),
+            "ui",
+            "ui",
+            &on,
+            &[],
+            &parents,
+            "",
+            None,
+            false,
+        )
+        .unwrap();
         let wt = root.join("ws/ui/ios");
         assert_eq!(ws.repos[0].base, "origin/logic");
         let own = edit(&wt, "c.txt", "c");
@@ -2423,7 +2433,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
 
     #[test]
     fn probes_a_linked_worktree() {
-        use crate::git::{create_workspace, git};
+        use crate::git::{create_task, git};
         use std::fs;
         let root = std::env::temp_dir().join(format!("shark-sync-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2461,7 +2471,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         git(&src, &["remote", "set-head", "origin", "main"]).unwrap();
         let repo = crate::git::add_repo(&src, &[]).unwrap();
         let on = crate::git::on_branch(&[repo], "feat");
-        let ws = create_workspace(&root.join("ws/feat"), "feat", "feat", &on).unwrap();
+        let ws = create_task(&root.join("ws/feat"), "feat", "feat", &on).unwrap();
         let wt = root.join("ws/feat/api");
         let base = ws.repos[0].base.clone();
         let p = || probe(&wt, "feat", &base, None, true).unwrap();

@@ -6,15 +6,15 @@ fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.state.workspaces = ["remaining", "target"]
-            .map(|name| Workspace {
+        s.state.tasks = ["remaining", "target"]
+            .map(|name| Task {
                 name: name.into(),
                 branch: name.into(),
                 ..Default::default()
             })
             .to_vec();
         s.active = Some("remaining".into());
-        s.sel = SideRow::Ws(1);
+        s.sel = SideRow::Task(1);
         s.sidebar_focus.focus(w, cx);
     });
     (window, shark)
@@ -42,40 +42,36 @@ async fn app_switcher_recents(cx: &mut TestAppContext) {
     press(cx, &["cmd-o", "right", "escape"]);
     assert_eq!(history(cx), [apps[1].path.clone()]);
 
-    // Both direct repo entries and workspace submenus use the same launch path.
+    // A single target launches from "Open in…"; several open a picker of them first.
     for folder in [false, true] {
         let action = shark.update(cx, |_, cx| {
-            let dir = ("Workspace folder".into(), PathBuf::from("/workspace"));
-            let entries = crate::app::menus::open_in_entries(
+            let dir = ("Task folder".into(), PathBuf::from("/workspace"));
+            let Some(Entry::Sub { entries, .. }) = crate::app::menus::open_in(
                 folder.then_some(&dir),
                 &[("repo".into(), PathBuf::from("/repo"))],
                 cx,
-            );
+            ) else {
+                panic!("expected Open in…")
+            };
             let entry = entries
                 .into_iter()
-                .find(|entry| match entry {
-                    Entry::Item { label, .. } | Entry::Sub { label, .. } => {
-                        label == "Open in Terminal"
-                    }
-                    _ => false,
-                })
+                .find(|entry| matches!(entry, Entry::Item { label, .. } if label.starts_with("Terminal")))
                 .unwrap();
-            let entry = match entry {
-                Entry::Sub { mut entries, .. } => entries.remove(0),
-                entry => entry,
-            };
             let Entry::Item { on_click, .. } = entry else {
                 panic!("expected launch action")
             };
             on_click
         });
         cx.update_window(window, |_, w, cx| action(w, cx)).unwrap();
+        if folder {
+            press(cx, &["enter"]);
+        }
     }
     assert_eq!(history(cx), [apps[0].path.clone(), apps[1].path.clone()]);
 
-    // Another workspace sees the same order; moving an app to the front deduplicates it.
+    // Another task sees the same order; moving an app to the front deduplicates it.
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.sel = SideRow::Ws(0);
+        s.sel = SideRow::Task(0);
         s.sidebar_focus.focus(w, cx);
     });
     press(cx, &["cmd-o", "right", "enter"]);
@@ -91,7 +87,7 @@ async fn app_switcher_recents(cx: &mut TestAppContext) {
     saved.recent_apps.insert(0, apps[3].path.clone());
     let (reopened, restored) = boot(cx, saved, WindowOptions::default());
     on_app(reopened, restored.clone())(cx, &|s, w, cx| {
-        s.sel = SideRow::Ws(0);
+        s.sel = SideRow::Task(0);
         s.sidebar_focus.focus(w, cx);
     });
     press_in(reopened)(cx, &["cmd-o"]);
@@ -267,14 +263,14 @@ async fn app_switcher_archived_target_does_not_retarget(cx: &mut TestAppContext)
     // Archiving finishes asynchronously, after the switcher has captured the selected row.
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.remove_workspace("target", true, w, cx);
+            s.remove_task("target", true, w, cx);
         });
         w.press("cmd-o", cx);
     })
     .unwrap();
     cx.run_until_parked();
     cx.wait_for(window, Duration::from_secs(5), |_, cx| {
-        shark.read(cx).ws("target").is_none()
+        shark.read(cx).task("target").is_none()
     })
     .await;
     cx.update(|cx| {

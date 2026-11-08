@@ -1,10 +1,11 @@
 //! Ask Shark: a question to claude about Shark, answered below Home's prompt.
 use super::*;
-use crate::agent::{self, Agent, Ev};
+use crate::harness::{self, Ev, Harness};
 use gpui_kit::component::text::TextViewState;
 
-const ASK_PROMPT: &str = "You answer questions about Shark, a macOS app for running Claude Code \
-    on features that span several repos. Answer briefly, from the README and the shortcut list \
+const ASK_PROMPT: &str = "You answer questions about Shark, a macOS workbench for directing \
+    reusable agents, running isolated tasks with Claude or Codex across repositories, and \
+    reviewing changes through to merge. Answer briefly, from the README and the shortcut list \
     below only; name the key or the cmd-k command to use. If they don't cover it, say so.";
 
 /// claude's error, or what to do when it's the login one (it says "/login", a chat command).
@@ -24,8 +25,8 @@ pub(super) struct Ask {
     pub(super) done: bool,
     pub(super) error: Option<String>,
     /// Before `agent`: dropped first, so the kill's exit isn't read.
-    _reader: Option<Task<()>>,
-    pub(super) agent: Option<Agent>,
+    _reader: Option<gpui_kit::Task<()>>,
+    pub(super) harness: Option<Harness>,
 }
 
 impl Ask {
@@ -33,7 +34,7 @@ impl Ask {
     fn stop(&mut self) {
         self.done = true;
         self._reader = None;
-        self.agent = None;
+        self.harness = None;
     }
 }
 
@@ -46,14 +47,14 @@ impl Shark {
         let system = format!(
             "{ASK_PROMPT}\n\n# Shortcuts\n{}\n\n# README\n{}",
             keys.join("\n"),
-            agent::README
+            harness::README
         );
         let mut ask = Ask {
             question: question.clone(),
             answer: cx.new(|cx| TextViewState::markdown("", cx)),
             done: false,
             error: None,
-            agent: None,
+            harness: None,
             _reader: None,
         };
         // The setup rows for a missing claude show right below.
@@ -63,11 +64,11 @@ impl Shark {
                 crate::proc::spawn_err(Path::new("/"), "claude", e)
             )
         };
-        let started = agent::spawn_ask("haiku", &system)
+        let started = harness::spawn_ask("haiku", &system)
             .and_then(|(mut a, rx)| a.send(&question).map(|()| (a, rx)));
         match started {
             Ok((a, rx)) => {
-                ask.agent = Some(a);
+                ask.harness = Some(a);
                 ask._reader = Some(crate::chat::read_events(rx, Self::apply_ask, cx));
             }
             Err(e) => (ask.done, ask.error) = (true, Some(failed(e))),

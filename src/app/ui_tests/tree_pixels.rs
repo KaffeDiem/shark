@@ -52,10 +52,10 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     .unwrap();
                 cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
-                    let mut ws = Workspace {
+                    let mut ws = Task {
                         name: "Features and artifacts".into(),
                         branch: "feature/a-very-long-branch-name-that-must-truncate-before-the-diff-controls".into(),
-                        repos: vec![crate::state::WsRepo {
+                        repos: vec![crate::state::TaskRepo {
                             name: "shark".into(),
                             src: home.join("shark"),
                             base: "main".into(),
@@ -80,10 +80,10 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.syncs.insert(ws.name.clone(), sync);
                     s.rail = rail;
                     s.active = Some(ws.name.clone());
-                    s.state.workspaces = vec![ws];
+                    s.state.tasks = vec![ws];
                     s.home.on = false;
                     s.tab = Tab::Feature(Feature::Diff);
-                    s.sel = SideRow::Ws(0);
+                    s.sel = SideRow::Task(0);
                     s.configure_differ(cx);
                     s.differ.update(cx, |d, cx| {
                     *d.show_tree_mut() = true;
@@ -361,7 +361,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             let shark = cx.update(|cx| preview.read(cx).0.clone());
             cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
-                    s.state.workspaces = vec![Workspace { name: "tree".into(), ..Default::default() }];
+                    s.state.tasks = vec![Task { name: "tree".into(), ..Default::default() }];
                     s.active = Some("tree".into());
                     let mut paths: Vec<String> = [
                         "api/src/app/sidebar.rs", "api/src/deep/a.rs", "api/src/deep/b.rs",
@@ -377,7 +377,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     d.uncommitted_mut().insert(paths[0].clone());
                     });
                     if matches!(case, "viewed" | "changed") {
-                        s.state.workspaces[0].viewed.insert(paths[0].clone(), if case == "viewed" { 1 } else { 2 });
+                        s.state.tasks[0].viewed.insert(paths[0].clone(), if case == "viewed" { 1 } else { 2 });
                     }
                     if case == "open" {
                         let abs = home.join("sidebar.rs");

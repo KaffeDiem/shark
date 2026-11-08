@@ -285,7 +285,7 @@ fn codex(value: &Value) -> Result<Vec<Allowance>, Failure> {
 
 /// The text of an error's message fields (and code), not the ids and durations around them.
 fn message(v: &Value) -> String {
-    let text = |k: &str| crate::agent::text_of(&v[k]);
+    let text = |k: &str| crate::harness::text_of(&v[k]);
     format!(
         "{}\n{}\n{}\n{}\n{}",
         text("result"),

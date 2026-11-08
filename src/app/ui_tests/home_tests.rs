@@ -1,9 +1,9 @@
 use super::*;
 use crate::attention::Attn;
-use crate::state::WsRepo;
+use crate::state::TaskRepo;
 
-/// A workspace `one` made from a repo `api`; the app has it open.
-async fn one_workspace(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, Entity<Shark>) {
+/// A task `one` made from a repo `api`; the app has it open.
+async fn one_task(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, Entity<Shark>) {
     let home = test_home();
     let (window, shark) = boot(
         cx,
@@ -16,7 +16,7 @@ async fn one_workspace(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, En
     cx.run_until_parked();
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "one".into(),
             git::on_branch(&repos, "one"),
             vec![],
@@ -32,15 +32,15 @@ async fn one_workspace(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, En
     (home, window, shark)
 }
 
-fn fake(name: &str) -> Workspace {
-    Workspace {
+fn fake(name: &str) -> Task {
+    Task {
         name: name.into(),
         branch: name.into(),
         ..Default::default()
     }
 }
 
-/// A workspace made from Home with a dirty file tab in the one left asks before it opens; the
+/// A task made from Home with a dirty file tab in the one left asks before it opens; the
 /// first message goes out once the answer is Discard, and the prompt stays until then.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -48,7 +48,7 @@ async fn home_prompt_waits_for_discard_dialog(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _claude = ClaudeGuard::set(&quiet);
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     fs::write(home.join("shark/workspaces/one/api/a.txt"), "a\n").unwrap();
@@ -69,7 +69,7 @@ async fn home_prompt_waits_for_discard_dialog(cx: &mut TestAppContext) {
         s.home
             .prompt
             .update(cx, |p, cx| p.set_value("build it", w, cx));
-        s.create_workspace(
+        s.create_task_for_test(
             "two".into(),
             git::on_branch(&repos, "two"),
             vec![],
@@ -79,7 +79,7 @@ async fn home_prompt_waits_for_discard_dialog(cx: &mut TestAppContext) {
         )
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.len() == 2
+        shark.read(cx).state.tasks.len() == 2
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -105,7 +105,7 @@ async fn home_prompt_waits_for_discard_dialog(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// Archiving moves both cursors: the sidebar's stays on its own workspace, and either one
+/// Archiving moves both cursors: the sidebar's stays on its own task, and either one
 /// that sat on the archived row goes to the row that took its place.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -118,17 +118,19 @@ async fn archive_keeps_cursors_on_their_rows(cx: &mut TestAppContext) {
     let names = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            let SideRow::Ws(ix) = s.sel else { return None };
-            Some(s.state.workspaces[ix].name.clone())
+            let SideRow::Task(ix) = s.sel else {
+                return None;
+            };
+            Some(s.state.tasks[ix].name.clone())
         })
     };
     on(cx, &|s, w, cx| {
-        s.state.workspaces = ["a", "b", "c", "d"].map(fake).to_vec();
-        s.sel = SideRow::Ws(2);
+        s.state.tasks = ["a", "b", "c", "d"].map(fake).to_vec();
+        s.sel = SideRow::Task(2);
         s.enter_home(w, cx);
         s.home.sel = Some("c".into());
         s.home.focus.focus(w, cx);
-        // Another workspace goes: the cursor stays on `c`, not on whatever has index 2.
+        // Another task goes: the cursor stays on `c`, not on whatever has index 2.
         s.archived("a", Ok(vec![]), w, cx);
     });
     assert_eq!(names(cx).as_deref(), Some("c"));
@@ -146,7 +148,7 @@ async fn archive_keeps_cursors_on_their_rows(cx: &mut TestAppContext) {
 #[allow(clippy::await_holding_lock)]
 async fn chat_commands_leave_home(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     let shown = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).home_shown());
@@ -165,12 +167,12 @@ async fn chat_commands_leave_home(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// A turn that ends while Home covers the workspace is unread; going back reads it.
+/// A turn that ends while Home covers the task is unread; going back reads it.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn turn_done_under_home_is_unread(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let press = press_in(window);
     let state = |cx: &mut TestAppContext| {
         cx.update(|cx| {
@@ -195,7 +197,7 @@ async fn turn_done_under_home_is_unread(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// cmd-r and the target of palette commands are the highlighted Home row, not the workspace
+/// cmd-r and the target of palette commands are the highlighted Home row, not the task
 /// behind Home, wherever the focus is.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -216,9 +218,9 @@ async fn home_row_is_the_target(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.state.workspaces = ["one", "two"]
-            .map(|n| Workspace {
-                repos: vec![WsRepo {
+        s.state.tasks = ["one", "two"]
+            .map(|n| Task {
+                repos: vec![TaskRepo {
                     name: "api".into(),
                     src: home.join("api"),
                     base: "main".into(),
@@ -227,7 +229,7 @@ async fn home_row_is_the_target(cx: &mut TestAppContext) {
                 ..fake(n)
             })
             .to_vec();
-        for ws in &s.state.workspaces {
+        for ws in &s.state.tasks {
             fs::create_dir_all(ws.dir().join("api")).unwrap();
         }
         s.active = Some("one".into());
@@ -251,13 +253,13 @@ async fn home_row_is_the_target(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// Cancelling the discard dialog keeps the old workspace open, but the new one still gets
+/// Cancelling the discard dialog keeps the old task open, but the new one still gets
 /// its setup scripts; the Home prompt stays as typed.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext) {
+async fn cancelled_open_still_sets_up_the_new_task(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     fs::write(home.join("shark/workspaces/one/api/a.txt"), "a\n").unwrap();
@@ -285,7 +287,7 @@ async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext)
         s.home
             .prompt
             .update(cx, |p, cx| p.set_value("build it", w, cx));
-        s.create_workspace(
+        s.create_task_for_test(
             "two".into(),
             git::on_branch(&repos, "two"),
             vec![],
@@ -295,7 +297,7 @@ async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext)
         )
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.len() == 2
+        shark.read(cx).state.tasks.len() == 2
     })
     .await;
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
@@ -320,7 +322,7 @@ async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext)
 #[allow(clippy::await_holding_lock)]
 async fn home_offers_linear_only_while_it_is_in_use(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let on = on_app(window, shark.clone());
     let offered = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, w, cx| {
@@ -345,12 +347,10 @@ async fn home_offers_linear_only_while_it_is_in_use(cx: &mut TestAppContext) {
     });
     assert!(!offered(cx), "disconnected, nothing attached");
     on(cx, &|s, _, cx| {
-        s.state.workspaces[0]
-            .linear
-            .attach(crate::linear::IssueRef {
-                org: "acme-uuid".into(),
-                issue: "uuid-1".into(),
-            });
+        s.state.tasks[0].linear.attach(crate::linear::IssueRef {
+            org: "acme-uuid".into(),
+            issue: "uuid-1".into(),
+        });
         cx.notify();
     });
     assert!(offered(cx), "disconnected, with an issue");
@@ -363,12 +363,12 @@ async fn home_offers_linear_only_while_it_is_in_use(cx: &mut TestAppContext) {
 #[allow(clippy::await_holding_lock)]
 async fn palette_shows_attachments_with_nothing_pending(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let press = press_in(window);
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.state.workspaces[0].attaching.is_empty());
-        assert!(!s.state.workspaces[0].repos.is_empty());
+        assert!(s.state.tasks[0].attaching.is_empty());
+        assert!(!s.state.tasks[0].repos.is_empty());
     });
     press(cx, &["cmd-k"]);
     cx.update_window(window, |_, w, cx| w.input("Show attachments", cx))
@@ -388,7 +388,7 @@ async fn palette_shows_attachments_with_nothing_pending(cx: &mut TestAppContext)
     press(cx, &["c", "enter"]);
     let branch = cx.update(|cx| {
         let s = shark.read(cx);
-        let ws = &s.state.workspaces[0];
+        let ws = &s.state.tasks[0];
         ws.branch_of(&ws.repos[0]).to_string()
     });
     assert_eq!(
@@ -403,7 +403,7 @@ async fn palette_shows_attachments_with_nothing_pending(cx: &mut TestAppContext)
 #[allow(clippy::await_holding_lock)]
 async fn palette_rows_dispatch_their_actions(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, window, shark) = one_workspace(cx).await;
+    let (home, window, shark) = one_task(cx).await;
     let press = press_in(window);
     let pick = |cx: &mut TestAppContext, query: &str| {
         press(cx, &["cmd-k"]);
@@ -411,14 +411,13 @@ async fn palette_rows_dispatch_their_actions(cx: &mut TestAppContext) {
             .unwrap();
         press(cx, &["enter"]);
     };
-    let chats =
-        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces[0].chats.len());
+    let chats = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.tasks[0].chats.len());
     let before = chats(cx);
     pick(cx, "New chat");
     assert_eq!(chats(cx), before + 1, "New chat");
     cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
     pick(cx, "Copy branch name");
-    let branch = cx.update(|cx| shark.read(cx).state.workspaces[0].branch.clone());
+    let branch = cx.update(|cx| shark.read(cx).state.tasks[0].branch.clone());
     assert_eq!(
         cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
         Some(branch),
@@ -444,20 +443,261 @@ async fn sidebar_vim_keys_clamp(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.state.workspaces = ["one", "two", "three"].map(fake).to_vec();
+        s.state.tasks = ["one", "two", "three"].map(fake).to_vec();
         s.sidebar_focus.focus(w, cx);
     });
     let press = press_in(window);
     let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).sel);
     press(cx, &["shift-g"]);
-    assert_eq!(sel(cx), SideRow::Ws(2));
+    assert_eq!(sel(cx), SideRow::Task(2));
     press(cx, &["j"]);
-    assert_eq!(sel(cx), SideRow::Ws(2), "j stops at the last row");
+    assert_eq!(sel(cx), SideRow::Task(2), "j stops at the last row");
     press(cx, &["g", "g"]);
-    assert_eq!(sel(cx), SideRow::Ws(0));
+    assert_eq!(sel(cx), SideRow::Task(0));
     press(cx, &["k"]);
-    assert_eq!(sel(cx), SideRow::Ws(0), "k stops at the first row");
+    assert_eq!(sel(cx), SideRow::Task(0), "k stops at the first row");
     press(cx, &["j", "j"]);
-    assert_eq!(sel(cx), SideRow::Ws(2));
+    assert_eq!(sel(cx), SideRow::Task(2));
     fs::remove_dir_all(&home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, window, shark) = one_task(cx).await;
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    fs::write(home.join("shark/workspaces/one/api/a.txt"), "a\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.create_named_agent("Reviewer", cx).unwrap();
+        s.open_path("api/a.txt".into(), w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editor.is_some()
+    })
+    .await;
+    on(cx, &|s, w, cx| {
+        s.editor.as_ref().unwrap().update(cx, |e, _| e.dirty = true);
+        s.prefill_agent_task("designer", w, cx);
+        s.home
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("preserve this prompt", w, cx));
+    });
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.tasks.len(), 1);
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "preserve this prompt");
+    });
+    on(cx, &|s, w, cx| {
+        s.editor
+            .as_ref()
+            .unwrap()
+            .update(cx, |e, _| e.dirty = false);
+        s.state.read_only = true;
+        s.home.agent_prompt.update(cx, |p, cx| p.focus(w, cx));
+    });
+    press(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.tasks.len(), 1);
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "preserve this prompt");
+    });
+    on(cx, &|s, w, cx| {
+        s.state.read_only = false;
+        s.prefill_agent_task("reviewer", w, cx);
+        s.home
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("same prompt", w, cx));
+        s.home_prompt_used(Some("same prompt"), Some("designer"), w, cx);
+        assert_eq!(
+            s.home.agent_prompt.read(cx).value(),
+            "same prompt",
+            "another agent's pending task cannot clear this prompt"
+        );
+        s.prefill_agent_task("designer", w, cx);
+        assert_eq!(
+            s.home.agent_prompt.read(cx).value(),
+            "preserve this prompt",
+            "each agent keeps its own draft"
+        );
+    });
+    press(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.tasks.len(), 2);
+        assert_eq!(s.state.tasks[1].agent.as_ref().unwrap().slug, "designer");
+        assert_eq!(
+            s.home.agent_prompt.read(cx).value(),
+            "",
+            "an empty agent submission clears after success"
+        );
+    });
+}
+
+/// The visible picker shares the typed mention, and standalone selection clears only it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_agent_picker_preserves_draft_and_standalone_choice(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("fix spacing", w, cx))
+    });
+    let pick = |cx: &mut TestAppContext, query: &str| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("home-agent-picker", cx);
+            w.input(query, cx);
+        })
+        .unwrap();
+        press(cx, &["enter"]);
+    };
+    pick(cx, "Designer");
+    cx.read(|cx| {
+        assert_eq!(
+            shark.read(cx).home.prompt.read(cx).value(),
+            "@designer fix spacing"
+        )
+    });
+    pick(cx, "No agent");
+    cx.read(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), "fix spacing"));
+    press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks.len() == 1
+    })
+    .await;
+    cx.read(|cx| assert!(shark.read(cx).state.tasks[0].agent.is_none()));
+    on(cx, &|s, w, cx| s.open_agent("designer", w, cx));
+    press(cx, &["cmd-n"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.home.destination,
+            super::super::home::Destination::Agent("designer".into()),
+            "cmd-n on an agent page stays there"
+        );
+        assert_eq!(s.state.tasks.len(), 1);
+    });
+    on(cx, &|s, w, cx| {
+        s.home
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("another task", w, cx))
+    });
+    press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks.len() == 2
+    })
+    .await;
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.state
+                .tasks
+                .iter()
+                .any(|task| task.agent.as_ref().is_some_and(|a| a.slug == "designer"))
+        );
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "");
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+/// Group labels cannot merge distinct groups or change agent membership.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn all_tasks_groups_keep_ungrouped_separate_and_agent_instructions(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let link = crate::state::AgentLink {
+        slug: "designer".into(),
+        instructions: "Preserve these instructions".into(),
+        ..Default::default()
+    };
+    let mut grouped = fake("grouped");
+    grouped.agent = Some(link.clone());
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![grouped, fake("ungrouped")],
+            sections: vec![
+                Section {
+                    name: "Ungrouped".into(),
+                    icon: "folder".into(),
+                    tasks: vec!["grouped".into()],
+                    collapsed: false,
+                    agent: None,
+                },
+                Section {
+                    name: "Legacy agent group".into(),
+                    icon: "bot".into(),
+                    tasks: vec!["ungrouped".into()],
+                    collapsed: false,
+                    agent: Some("designer".into()),
+                },
+            ],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.enter_home(w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("task-grouping", cx);
+        w.input("Task group", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find(("home-group", 0usize)).is_some());
+        assert!(
+            w.try_find(("home-group", 2usize)).is_some(),
+            "a plain group named Ungrouped must not absorb ungrouped tasks"
+        );
+        let s = shark.read(cx);
+        assert_eq!(
+            s.home_rows(cx).len(),
+            2,
+            "legacy bound groups do not hide tasks"
+        );
+        assert_eq!(s.state.tasks[0].agent.as_ref(), Some(&link));
+    })
+    .unwrap();
+    on(cx, &|s, _, cx| {
+        s.move_to_section("grouped", None, cx);
+        assert_eq!(s.state.tasks[0].agent.as_ref(), Some(&link));
+        assert_eq!(s.home_rows(cx).len(), 2);
+    });
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| {
+        assert_eq!(
+            shark.read(cx).home.destination,
+            super::super::home::Destination::Home
+        )
+    });
+    fs::remove_dir_all(home).ok();
 }

@@ -32,23 +32,23 @@ fn fake_keychain() -> Keychain {
     Keychain {
         read: |_| {
             log("read");
-            Task::ready(Ok(STORED.lock().unwrap().clone()))
+            gpui_kit::Task::ready(Ok(STORED.lock().unwrap().clone()))
         },
         write: |_, c| {
             log("write");
             if WRITE_FAILS.load(Ordering::Relaxed) {
-                return Task::ready(Err(anyhow::anyhow!("keychain Update failed")));
+                return gpui_kit::Task::ready(Err(anyhow::anyhow!("keychain Update failed")));
             }
             *STORED.lock().unwrap() = Some(c.clone());
-            Task::ready(Ok(()))
+            gpui_kit::Task::ready(Ok(()))
         },
         delete: |_| {
             log("delete");
             if let Some(e) = *DELETE_ERROR.lock().unwrap() {
-                return Task::ready(Err(anyhow::anyhow!(e)));
+                return gpui_kit::Task::ready(Err(anyhow::anyhow!(e)));
             }
             *STORED.lock().unwrap() = None;
-            Task::ready(Ok(()))
+            gpui_kit::Task::ready(Ok(()))
         },
     }
 }
@@ -176,14 +176,10 @@ async fn credential(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Result<Cr
     task.await
 }
 
-/// Opens Settings on the Linear page; `ctrl-tab` walks there as a keyboard user would.
+/// Opens Settings on the Linear page through its shared entry point.
 fn open_page(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
     cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
-        w.render_frame(cx);
-        for _ in 0..4 {
-            w.press("ctrl-tab", cx);
-        }
+        shark.update(cx, |s, cx| crate::settings::open_linear(&s.state, w, cx));
         w.render_frame(cx);
     })
     .unwrap();
@@ -485,7 +481,7 @@ async fn a_failed_sign_in_reaches_the_user_with_settings_closed(cx: &mut TestApp
     let (window, shark) = setup(cx, None);
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            let failed = Task::ready(Err(Error::TimedOut));
+            let failed = gpui_kit::Task::ready(Err(Error::TimedOut));
             s.linear_adopt(failed, Method::OAuth, w, cx).detach();
         });
     })

@@ -31,9 +31,9 @@ pub fn open_repos(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     open_page(state, REPOS, window, cx)
 }
 
-/// Settings on its Linear page, the last.
+/// Settings on its Linear page.
 pub fn open_linear(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
-    open_page(state, PAGES.len() - 1, window, cx)
+    open_page(state, LINEAR, window, cx)
 }
 
 fn open_page(state: &State, tab: usize, window: &mut Window, cx: &mut Context<Shark>) {
@@ -279,14 +279,27 @@ impl Settings {
         cx.notify();
     }
 
-    pub(crate) fn set_repo_skills(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.with_state(cx, |s| {
+    pub(crate) fn set_repo_skills(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let errors = self.with_state(cx, |s| {
             s.no_repo_skills = !on;
             crate::git::set_repo_skills(on);
-            for ws in &s.workspaces {
-                crate::git::link_skills(ws, &ws.dir());
-            }
+            s.tasks
+                .iter()
+                .filter_map(|ws| crate::git::link_skills(ws, &ws.dir()).err())
+                .collect::<Vec<_>>()
         });
+        if let Some(errors) = errors.filter(|errors| !errors.is_empty()) {
+            crate::ui::notify_err(
+                window,
+                cx,
+                format!("Couldn't refresh skills: {}", errors.join("\n")),
+            );
+        }
         cx.notify();
     }
 
@@ -413,10 +426,11 @@ impl Settings {
                 theme,
                 true,
                 "Skills from repos",
-                "Agents can use the skills in each repo of a workspace",
+                "Agents can use the skills in each repo of a task",
                 Switch::new("repo-skills").checked(!no_skills).on_click({
-                    move |&v, _, cx| {
-                        this.update(cx, |s, cx| s.set_repo_skills(v, cx)).ok();
+                    move |&v, window, cx| {
+                        this.update(cx, |s, cx| s.set_repo_skills(v, window, cx))
+                            .ok();
                     }
                 }),
             ))
@@ -583,6 +597,7 @@ const PAGES: &[(IconName, (&str, &str))] = &[
 
 /// The Repositories page's index in `PAGES`.
 const REPOS: usize = 3;
+const LINEAR: usize = 4;
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
 fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
@@ -647,7 +662,8 @@ impl Render for Settings {
             1 => self.render_appearance(cx).into_any_element(),
             2 => self.render_prompts(cx).into_any_element(),
             REPOS => self.repos.clone().into_any_element(),
-            _ => self.linear.clone().into_any_element(),
+            LINEAR => self.linear.clone().into_any_element(),
+            _ => unreachable!("unknown settings page"),
         };
         let (title, desc) = PAGES[self.tab].1;
         let theme = cx.theme();

@@ -35,8 +35,8 @@ pub(super) struct Side {
     focus: FocusHandle,
     scroll: ScrollHandle,
     /// Dropping the card stops the process and its reader.
-    pub(super) agent: Option<Agent>,
-    _reader: Option<Task<()>>,
+    pub(super) harness: Option<Harness>,
+    _reader: Option<gpui_kit::Task<()>>,
     _sub: Option<Subscription>,
 }
 
@@ -52,7 +52,7 @@ impl Side {
             asked: false,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
-            agent: None,
+            harness: None,
             _reader: None,
             _sub: None,
         }
@@ -105,10 +105,10 @@ impl Chat {
     /// otherwise the card shows why.
     fn ask_side(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut side = Side::new(question.clone(), cx);
-        match agent::spawn_side(&self.ws, &self.meta) {
+        match harness::spawn_side(&self.ws, &self.meta) {
             Ok((mut a, rx)) => match a.send(&question) {
                 Ok(()) => {
-                    side.agent = Some(a);
+                    side.harness = Some(a);
                     side._reader = Some(read_events(rx, Self::apply_side, cx));
                 }
                 Err(e) => (side.done, side.error) = (true, Some(format!("send failed: {e}"))),
@@ -144,7 +144,7 @@ impl Chat {
             }
             Ev::Result { is_error, text, .. } => {
                 side.done = true;
-                side.agent = None; // stays alive on stdin otherwise
+                side.harness = None; // stays alive on stdin otherwise
                 if is_error {
                     side.error = Some(text);
                 }

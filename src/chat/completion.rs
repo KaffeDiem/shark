@@ -496,7 +496,7 @@ impl Chat {
                 if c.prs_errs.is_empty() {
                     c.prs_at = Some(Instant::now());
                 }
-                // A repo that left the workspace takes its PRs with it.
+                // A repo that left the task takes its PRs with it.
                 let repos = &c.ws.repos;
                 c.prs.retain(|p| repos.iter().any(|r| r.name == p.repo));
                 c.pr_items = complete::pr_items(&c.prs);
@@ -506,7 +506,7 @@ impl Chat {
         }));
     }
 
-    /// Dropped or pasted files: copied into the workspace off the main thread, then mentioned at
+    /// Dropped or pasted files: copied into the task off the main thread, then mentioned at
     /// the cursor in drop order. Pasted image bytes come as `(bytes, ext)`.
     pub(super) fn attach(
         &mut self,

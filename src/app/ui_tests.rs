@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod agent_navigation_tests;
+mod agent_pixels;
+mod agent_settings_tests;
 mod agent_tests;
 mod app_switcher_tests;
 mod attach_tests;
@@ -28,16 +31,17 @@ mod mixed_tab_tests;
 mod navigation_pixels;
 mod repo_menu_tests;
 mod repo_settings_tests;
+mod skill_import_tests;
 mod storage_tests;
 mod tab_tests;
+mod task_picker_tests;
+mod task_review_tests;
 mod tree_pixels;
 mod usage_regression_tests;
 mod usage_tests;
-mod workspace_picker_tests;
-mod workspace_review_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
-/// tests that make workspace dirs take it too: `test_home` wipes them.
+/// tests that make task dirs take it too: `test_home` wipes them.
 pub(crate) static UI_LOCK: Mutex<()> = Mutex::new(());
 
 pub(super) fn test_home() -> PathBuf {
@@ -107,7 +111,7 @@ pub(super) fn boot(
 /// Opens the branch and PR dialog, which has no key of its own.
 fn branch_dialog(cx: &mut TestAppContext, window: AnyWindowHandle) {
     cx.update_window(window, |_, w, cx| {
-        w.dispatch_action(Box::new(NewWorkspaceFromBranch), cx)
+        w.dispatch_action(Box::new(NewTaskFromBranch), cx)
     })
     .unwrap();
     cx.run_until_parked();
@@ -136,7 +140,7 @@ fn assert_menus_reachable(cx: &mut TestAppContext, window: AnyWindowHandle, at: 
     }
     cx.update_window(window, |_, w, cx| {
         // App-level handlers (Hide, About…) aren't on the window's dispatch path. Quit's
-        // global handler is registered in `main`, which the harness skips.
+        // global handler is registered in `main`, which the agent skips.
         let missing: Vec<_> = (items.iter())
             .filter(|(_, a)| !a.as_any().is::<crate::menubar::Quit>())
             .filter(|(_, a)| !w.is_action_available(*a, cx) && !cx.is_action_available(*a))
@@ -288,7 +292,7 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     for name in ["one", "two"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.into(),
                 git::on_branch(&repos, name),
                 vec![],
@@ -335,28 +339,28 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     press(cx, &["j"]);
     assert_ne!(sel(cx), top, "j moves with Vim on");
 
-    // The cursor is on a workspace that isn't open: cmd-k's archive takes that one.
+    // The cursor is on a task that isn't open: cmd-k's archive takes that one.
     let open = cx.update(|cx| shark.read(cx).active.clone().unwrap());
     let name = |cx: &mut TestAppContext| {
-        let SideRow::Ws(ix) = sel(cx) else {
+        let SideRow::Task(ix) = sel(cx) else {
             panic!("cursor on a workspace")
         };
-        cx.update(|cx| shark.read(cx).state.workspaces[ix].name.clone())
+        cx.update(|cx| shark.read(cx).state.tasks[ix].name.clone())
     };
     if name(cx) == open {
         press(cx, &["k"]);
     }
     assert_ne!(name(cx), open);
     press(cx, &["cmd-k"]);
-    cx.update_window(window, |_, w, cx| w.input("delete agent", cx))
+    cx.update_window(window, |_, w, cx| w.input("delete task", cx))
         .unwrap();
     press(cx, &["enter"]);
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.len() == 1
+        shark.read(cx).state.tasks.len() == 1
     })
     .await;
-    cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces[0].name, open));
+    cx.update(|cx| assert_eq!(shark.read(cx).state.tasks[0].name, open));
 }
 
 /// PR sources keep their identity through refreshes and failures, and create an isolated
@@ -490,7 +494,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
     );
     cx.update(|cx| {
         assert_eq!(
-            shark.read(cx).ws("pr-7").unwrap().repos[0].base,
+            shark.read(cx).task("pr-7").unwrap().repos[0].base,
             "refs/shark/pull/7/base"
         )
     });
@@ -514,7 +518,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
     );
 }
 
-/// The New workspace dialog's branch mode: cmd-b or the row label lists a repo's branches;
+/// The New task dialog's branch mode: cmd-b or the row label lists a repo's branches;
 /// enter picks one, tab goes back, a checked-out branch is refused, the first row restores
 /// the new branch, a fetch finds branches only origin has, and the branch name may be left
 /// empty when every ticked repo has an existing branch.
@@ -576,7 +580,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
         let wt = home.join("shark/workspaces").join(ws).join(repo);
         git::git(&wt, &["branch", "--show-current"]).unwrap()
     };
-    let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces.len());
+    let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.tasks.len());
 
     // The row label says new or existing as the name is typed.
     branch_dialog(cx, window);
@@ -672,7 +676,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     );
     cx.update(|cx| {
         let s = shark.read(cx);
-        let ws = s.ws("kd-a").unwrap();
+        let ws = s.task("kd-a").unwrap();
         assert_eq!(ws.branch, "kd/a", "named after the first picked branch");
         let own: Vec<_> = ws.repos.iter().map(|r| r.branch.clone()).collect();
         assert_eq!(own, [None, Some("fresh".into())]);
@@ -680,7 +684,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).unwrap();
 }
 
-/// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
+/// Drives the real keymap headlessly: create a task, vim focus moves, tabs, archive.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them
 async fn keyboard_flow(cx: &mut TestAppContext) {
@@ -690,7 +694,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         cx,
         State {
             repos: repos(&home, &["api", "web"]),
-            workspaces: vec![],
+            tasks: vec![],
             vim: false,
             last_repos: vec!["api".into()],
             ..Default::default()
@@ -722,11 +726,11 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         "only the last-used repos start ticked"
     );
 
-    // cmd-N opens the Nth workspace; past the end does nothing.
+    // cmd-N opens the Nth task; past the end does nothing.
     press(cx, &["cmd-9", "cmd-1"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui-x")));
 
-    // Opening a workspace focuses the composer: vim keys must type, not navigate.
+    // Opening a task focuses the composer: vim keys must type, not navigate.
     cx.update_window(window, |_, w, cx| w.input("jk g", cx))
         .unwrap();
     let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
@@ -760,7 +764,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     // cmd-shift-t brings back a closed chat that had a session.
     let tabs = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let ws = &shark.read(cx).state.workspaces[0];
+            let ws = &shark.read(cx).state.tasks[0];
             let ids: Vec<String> = ws.chats.iter().map(|c| c.id.clone()).collect();
             (ids, ws.active_chat, ws.closed.len())
         })
@@ -784,7 +788,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["cmd-shift-t"]);
     assert_eq!(tabs(cx), (vec!["ui-x".into(), "ui-x~2".into()], 1, 0));
     cx.update(|cx| {
-        let ws = &shark.read(cx).state.workspaces[0];
+        let ws = &shark.read(cx).state.tasks[0];
         assert_eq!(
             ws.chats[1].session_id.as_deref(),
             Some("s2"),
@@ -798,12 +802,12 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     assert_eq!(tabs(cx), (vec!["ui-x".into()], 0, 1));
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 
-    // Model shortcuts work while typing and keep the draft. Let the New workspace
+    // Model shortcuts work while typing and keep the draft. Let the New task
     // dialog's deferred focus restore run first (it targets the sidebar), then go back.
     cx.executor().advance_clock(Duration::from_secs(1));
     press(cx, &["cmd-alt-right", "i"]);
     let model = |cx: &mut TestAppContext| {
-        cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].model.clone())
+        cx.update(|cx| shark.read(cx).state.tasks[0].chats[0].model.clone())
     };
     press(cx, &["ctrl-cmd-2"]);
     assert_eq!(model(cx).as_deref(), Some("opus"));
@@ -826,7 +830,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     // mode's shift-tab works on codex too. Both keep the draft.
     let saved = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let m = &shark.read(cx).state.workspaces[0].chats[0];
+            let m = &shark.read(cx).state.tasks[0].chats[0];
             (m.fast, m.plan)
         })
     };
@@ -847,7 +851,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     // Thinking level: cmd-shift-. / cmd-shift-, step it, stopping at the top. The last pick
     // is remembered: cmd-t opens a chat on it.
     let effort = |cx: &mut TestAppContext| {
-        cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].effort.clone())
+        cx.update(|cx| shark.read(cx).state.tasks[0].chats[0].effort.clone())
     };
     press(
         cx,
@@ -861,7 +865,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     });
     press(cx, &["cmd-t"]);
     cx.update(|cx| {
-        let m = &shark.read(cx).state.workspaces[0].chats[1];
+        let m = &shark.read(cx).state.tasks[0].chats[1];
         assert_eq!(
             (m.model.as_deref(), m.effort.as_deref()),
             (Some("sonnet"), Some("xhigh"))
@@ -945,9 +949,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     let viewed = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).differ.read(cx).viewed(0));
     assert_eq!(viewed(cx), Viewed::Yes);
     assert!(
-        State::load().workspaces[0]
-            .viewed
-            .contains_key("api/new.txt"),
+        State::load().tasks[0].viewed.contains_key("api/new.txt"),
         "viewed is saved"
     );
     refresh(cx);
@@ -1055,17 +1057,17 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     });
 
     press(cx, &["ctrl-w", "h", "ctrl-w", "h"]);
-    run(cx, &ForceArchiveWorkspace);
+    run(cx, &ForceArchiveTask);
     cx.update(|cx| {
         assert_eq!(
-            shark.read(cx).state.workspaces.len(),
+            shark.read(cx).state.tasks.len(),
             1,
             "force archive waits for confirm"
         )
     });
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.is_empty()
+        shark.read(cx).state.tasks.is_empty()
     })
     .await;
     assert!(!ws_dir.exists());
@@ -1083,12 +1085,12 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     cx.run_until_parked();
     press(cx, &["space", "cmd-enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !shark.read(cx).state.workspaces.is_empty()
+        !shark.read(cx).state.tasks.is_empty()
     })
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        let names: Vec<&str> = s.state.workspaces[0]
+        let names: Vec<&str> = s.state.tasks[0]
             .repos
             .iter()
             .map(|r| r.name.as_str())
@@ -1097,7 +1099,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert_eq!(s.state.last_repos, ["web"]);
     });
 
-    // Sections: name inline, move with `m`, fold with h/l, delete keeps the workspace.
+    // Manual task groups are named in a dialog and do not hide sidebar tasks.
     press(cx, &["ctrl-w", "h"]);
     run(cx, &NewSection);
     cx.run_until_parked();
@@ -1106,40 +1108,26 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     let sections = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.sections.clone());
     assert_eq!(sections(cx)[0].name, "Later");
-    cx.update_window(window, |_, w, cx| {
-        let s = shark.read(cx);
-        assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
-    })
-    .unwrap();
-    press(cx, &["j", "m"]);
+    run(cx, &MoveToSection);
     cx.run_until_parked();
     press(cx, &["enter"]);
-    assert_eq!(sections(cx)[0].workspaces, ["kb"]);
-    press(cx, &["j", "h"]);
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        assert!(s.state.sections[0].collapsed && s.sel == SideRow::Section(0));
-        assert!(
-            s.ws_order(false).is_empty(),
-            "cmd-N skips folded workspaces"
-        );
-    });
-    press(cx, &["l"]);
+    assert_eq!(sections(cx)[0].tasks, ["kb"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).ws_order(false).len(), 1));
     run(cx, &DeleteSection);
     assert!(sections(cx).is_empty());
-    cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 1));
+    cx.update(|cx| assert_eq!(shark.read(cx).state.tasks.len(), 1));
     press(cx, &["ctrl-w", "h"]);
-    run(cx, &ArchiveWorkspace);
+    run(cx, &ArchiveTask);
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.is_empty()
+        shark.read(cx).state.tasks.is_empty()
     })
     .await;
 
-    // Clicking a repo in the sidebar starts a workspace with only that repo ticked.
+    // Clicking a repo in the sidebar starts a task with only that repo ticked.
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.new_workspace(vec!["web".into()], None, w, cx)
+        s.new_task_from_repos(vec!["web".into()], None, w, cx)
     });
     cx.update_window(window, |_, w, cx| w.input("only web", cx))
         .unwrap();
@@ -1210,7 +1198,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     );
     cx.update(|cx| {
         let s = shark.read(cx);
-        let ws = s.ws("new-x").unwrap();
+        let ws = s.task("new-x").unwrap();
         assert_eq!(ws.branch, "new-x");
         let api = ws.repos.iter().find(|r| r.name == "api").unwrap();
         assert_eq!(api.branch.as_deref(), Some("remote-only"));
@@ -1247,7 +1235,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "st".into(),
             git::on_branch(&repos, "st"),
             vec![],
@@ -1352,7 +1340,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
 
     // A git failure is not "no changes".
     on(cx, &|s, _, cx| {
-        s.state.workspaces[0].repos[0].base = "no/such-base".into();
+        s.state.tasks[0].repos[0].base = "no/such-base".into();
         s.refresh_diff(cx)
     });
     cx.update(|cx| {
@@ -1370,7 +1358,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     // New conversation forgets the session in state.json too.
     let chat = cx.update(|cx| shark.read(cx).chats["st"].clone());
     on(cx, &|s, _, cx| {
-        s.state.workspaces[0].chats[0].session_id = Some("old".into());
+        s.state.tasks[0].chats[0].session_id = Some("old".into());
         chat.update(cx, |c, _| c.meta.session_id = Some("old".into()));
     });
     let row = COMMANDS
@@ -1378,16 +1366,16 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         .position(|r| r.0.starts_with("Start a new conversation"))
         .unwrap();
     on(cx, &|s, w, cx| COMMANDS[row].run(s, w, cx));
-    assert_eq!(State::load().workspaces[0].chats[0].session_id, None);
+    assert_eq!(State::load().tasks[0].chats[0].session_id, None);
 
     // Archive runs in the background, once.
     on(cx, &|s, w, cx| {
-        s.remove_workspace("st", true, w, cx);
+        s.remove_task("st", true, w, cx);
         assert!(s.archiving.contains("st"));
-        s.remove_workspace("st", true, w, cx);
+        s.remove_task("st", true, w, cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.is_empty()
+        shark.read(cx).state.tasks.is_empty()
     })
     .await;
     cx.update(|cx| {
@@ -1403,7 +1391,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// A repo joins a running workspace; the open workspace and tab come back after a restart.
+/// A repo joins a running task; the open task and tab come back after a restart.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn add_repo_and_restore(cx: &mut TestAppContext) {
@@ -1420,7 +1408,7 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "grow".into(),
             git::on_branch(&repos[..1], "grow"),
             vec![],
@@ -1440,12 +1428,12 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
         s.queue_attachment("grow".into(), vec![web], w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces[0].repos.len() == 2
+        shark.read(cx).state.tasks[0].repos.len() == 2
     })
     .await;
     let ws_dir = home.join("shark/workspaces/grow");
     assert!(ws_dir.join("web").exists());
-    assert_eq!(State::load().workspaces[0].repos.len(), 2, "saved");
+    assert_eq!(State::load().tasks[0].repos.len(), 2, "saved");
     let chat = cx.update(|cx| shark.read(cx).chats["grow"].clone());
     cx.update(|cx| assert_eq!(chat.read(cx).ws.repos.len(), 2, "the chat knows"));
     let second = cx.update(|cx| shark.read(cx).chats["grow~2"].clone());
@@ -1470,16 +1458,16 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
 
     // Sends are refused while the worktrees are being removed.
     on(cx, &|s, w, cx| {
-        s.remove_workspace("grow", true, w, cx);
+        s.remove_task("grow", true, w, cx);
         assert!(chat.read(cx).archiving);
         // Also when it is first opened during the removal.
         s.chats.remove("grow");
         s.syncs.remove("grow");
-        s.open_workspace_now(0, w, cx);
+        s.open_task_now(0, w, cx);
         assert!(s.chats["grow"].read(cx).archiving);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.is_empty()
+        shark.read(cx).state.tasks.is_empty()
     })
     .await;
     assert!(!ws_dir.exists());
@@ -1507,7 +1495,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     press(cx, &["ctrl-1", "ctrl-9"]);
     cx.update(|cx| assert!(shark.read(cx).active.is_none()));
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "numbers".into(),
             git::on_branch(&repos, "numbers"),
             vec![],
@@ -1522,7 +1510,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     .await;
     press(cx, &["cmd-t", "cmd-t", "cmd-shift-d"]);
     let selected =
-        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_ws().unwrap().active_chat);
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_task().unwrap().active_chat);
     assert_eq!(selected(cx), 2);
     press(cx, &["ctrl-1"]);
     assert_eq!(selected(cx), 0);
@@ -1559,7 +1547,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
         })
         .unwrap();
     let mut visual = VisualTestContext::from_window(window, cx);
-    for (modifiers, tab_hints, workspace_hints) in [
+    for (modifiers, tab_hints, task_hints) in [
         (Modifiers::default(), false, false),
         (
             Modifiers {
@@ -1614,10 +1602,10 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
             assert_eq!(visual.debug_bounds(hint).is_some(), tab_hints, "{hint}");
         }
         assert!(visual.debug_bounds("kbd:ctrl-5").is_none());
-        assert_eq!(visual.debug_bounds("kbd:cmd-1").is_some(), workspace_hints);
+        assert_eq!(visual.debug_bounds("kbd:cmd-1").is_some(), task_hints);
         cx.update_window(window, |_, w, _| {
             let width = w.find("home-row").bounds().size.width;
-            if workspace_hints {
+            if task_hints {
                 assert!(
                     width > home_width,
                     "Home grows to show cmd-0 only while Command is held"
@@ -1634,7 +1622,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     assert_eq!(selected(cx), 1, "preview alone never switches chats");
     press(cx, &["ctrl-cmd-2"]);
     cx.update(|cx| {
-        assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 1);
+        assert_eq!(shark.read(cx).active_task().unwrap().active_chat, 1);
         assert_eq!(second.read(cx).meta.model.as_deref(), Some("opus"));
     });
 
@@ -1645,7 +1633,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
             cx.emit(ChatEvent::Meta);
         })
     });
-    let third = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats[2].id.clone());
+    let third = cx.update(|cx| shark.read(cx).active_task().unwrap().chats[2].id.clone());
     press(cx, &["cmd-w", "ctrl-2"]);
     cx.update(|cx| {
         assert_eq!(
@@ -1680,7 +1668,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Chat);
         assert_eq!(s.editor.as_ref(), Some(&editor));
-        assert_eq!(s.active_ws().unwrap().active_chat, 1);
+        assert_eq!(s.active_task().unwrap().active_chat, 1);
         assert!(
             s.active_chat()
                 .unwrap()
@@ -1693,9 +1681,9 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     })
     .unwrap();
 
-    // Numbers refer to this workspace, while Cmd+digits still chooses workspaces.
+    // Numbers refer to this task, while Cmd+digits still chooses tasks.
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "other".into(),
             git::on_branch(&repos, "other"),
             vec![],
@@ -1712,8 +1700,8 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.active.as_deref(), Some("other"));
-        assert_eq!(s.active_ws().unwrap().active_chat, 0);
-        assert_eq!(s.ws("numbers").unwrap().active_chat, 1);
+        assert_eq!(s.active_task().unwrap().active_chat, 0);
+        assert_eq!(s.task("numbers").unwrap().active_chat, 1);
     });
     press(cx, &["cmd-1"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("numbers")));
@@ -1771,7 +1759,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "drag-tabs".into(),
             git::on_branch(&repos, "drag-tabs"),
             vec![],
@@ -1788,7 +1776,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     let ids = cx.update(|cx| {
         shark
             .read(cx)
-            .active_ws()
+            .active_task()
             .unwrap()
             .chats
             .iter()
@@ -1805,7 +1793,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     let order = |cx: &mut TestAppContext, expected: &[usize]| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            let ws = s.active_ws().unwrap();
+            let ws = s.active_task().unwrap();
             assert_eq!(
                 ws.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 expected.iter().map(|&i| &ids[i]).collect::<Vec<_>>()
@@ -1823,11 +1811,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
                 );
             }
             let saved = State::load();
-            let saved = saved
-                .workspaces
-                .iter()
-                .find(|w| w.name == "drag-tabs")
-                .unwrap();
+            let saved = saved.tasks.iter().find(|w| w.name == "drag-tabs").unwrap();
             assert_eq!(
                 saved.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 expected.iter().map(|&i| &ids[i]).collect::<Vec<_>>()
@@ -1884,19 +1868,14 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     order(cx, &[0, 2, 1]);
     drag(cx, 0, None);
     order(cx, &[0, 2, 1]);
-    // Payloads from another workspace or tabs closed during a drag cannot reorder this strip.
-    for (workspace, from, to) in [
+    // Payloads from another task or tabs closed during a drag cannot reorder this strip.
+    for (task, from, to) in [
         ("other", ids[0].as_str(), ids[2].as_str()),
         ("drag-tabs", "closed-chat", ids[2].as_str()),
         ("drag-tabs", ids[0].as_str(), "closed-chat"),
     ] {
         on(cx, &|s, _, cx| {
-            s.move_tab(
-                workspace,
-                &TabId::Chat(from.into()),
-                &TabId::Chat(to.into()),
-                cx,
-            )
+            s.move_tab(task, &TabId::Chat(from.into()), &TabId::Chat(to.into()), cx)
         });
         order(cx, &[0, 2, 1]);
     }
@@ -1915,7 +1894,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     });
     press(cx, &["cmd-w", "ctrl-1", "cmd-shift-t"]);
     cx.update(|cx| {
-        let ws = shark.read(cx).active_ws().unwrap();
+        let ws = shark.read(cx).active_task().unwrap();
         assert_eq!(
             ws.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
             vec![&ids[0], &ids[2], &ids[1]]
@@ -1947,7 +1926,7 @@ async fn many_tabs_shrink(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "tabs".into(),
             git::on_branch(&repos, "tabs"),
             vec![],
@@ -1970,7 +1949,7 @@ async fn many_tabs_shrink(cx: &mut TestAppContext) {
             cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
                 let strip = w.find("chat-tabs").bounds();
-                let ws = shark.read(cx).active_ws().unwrap();
+                let ws = shark.read(cx).active_task().unwrap();
                 assert_eq!(ws.active_chat, selected);
                 let mut previous = None;
                 let mut widths = vec![];
@@ -2008,7 +1987,7 @@ async fn many_tabs_shrink(cx: &mut TestAppContext) {
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        for meta in &shark.read(cx).active_ws().unwrap().chats {
+        for meta in &shark.read(cx).active_task().unwrap().chats {
             let b = w
                 .find(SharedString::from(format!("chat-tab-{}", meta.id)))
                 .bounds();
@@ -2097,8 +2076,8 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                     assert_eq!(create.center().y, w.find("home-row").bounds().center().y);
                 }
                 assert!(
-                    w.is_action_available(&NewWorkspace, cx),
-                    "New agent, rail={rail}, width={width}, tab={:?}, tools={}",
+                    w.is_action_available(&NewTask, cx),
+                    "New task, rail={rail}, width={width}, tab={:?}, tools={}",
                     shark.read(cx).tab,
                     shark.read(cx).tree_shown(cx)
                 );
@@ -2106,14 +2085,14 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             .unwrap();
             cx.run_until_parked();
         };
-        // The create action is available before a workspace exists, in both sidebar modes.
+        // The create action is available before a task exists, in both sidebar modes.
         check_controls(cx, false);
         press(cx, &["cmd-b"]);
         check_controls(cx, true);
         press(cx, &["cmd-b"]);
         let name = format!("chrome-{}", width as usize);
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.clone(),
                 git::on_branch(&repos, &name),
                 vec![],
@@ -2134,7 +2113,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
                 let s = shark.read(cx);
-                let ws = s.active_ws().unwrap();
+                let ws = s.active_task().unwrap();
                 let tab = w.find(SharedString::from(format!(
                     "chat-tab-{}",
                     ws.chats[ws.active_chat].id
@@ -2157,7 +2136,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             .unwrap();
             cx.run_until_parked();
             cx.update(|cx| {
-                let ws = shark.read(cx).active_ws().unwrap();
+                let ws = shark.read(cx).active_task().unwrap();
                 assert_eq!(ws.chats.len(), if rail { 23 } else { 22 });
                 assert_eq!(ws.active_chat, ws.chats.len() - 1);
             });
@@ -2175,7 +2154,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
         on(cx, &|s, w, cx| s.open_path(path.clone(), w, cx));
         let file_tab = SharedString::from(format!("file-tab-{path}"));
         let chat_tab = cx.update(|cx| {
-            let ws = shark.read(cx).active_ws().unwrap();
+            let ws = shark.read(cx).active_task().unwrap();
             SharedString::from(format!("chat-tab-{}", ws.chats[ws.active_chat].id))
         });
         cx.update_window(window, |_, w, cx| {
@@ -2203,7 +2182,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
         })
         .unwrap();
         on(cx, &|s, w, cx| {
-            let active = s.active_ws().unwrap().active_chat;
+            let active = s.active_task().unwrap().active_chat;
             s.select_chat(active, w, cx);
             s.show(Tab::Chat, w, cx);
         });
@@ -2248,7 +2227,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// File tabs keep independent buffers, and leaving a workspace protects hidden dirty files.
+/// File tabs keep independent buffers, and leaving a task protects hidden dirty files.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
@@ -2267,7 +2246,7 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
     let press = press_in(window);
     for name in ["files", "other-files"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.into(),
                 git::on_branch(&repos, name),
                 vec![],
@@ -2281,7 +2260,7 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
         })
         .await;
     }
-    on(cx, &|s, w, cx| s.open_workspace(0, w, cx));
+    on(cx, &|s, w, cx| s.open_task(0, w, cx));
     let dir = home.join("shark/workspaces/files");
     for (path, text) in [
         ("api/shared.txt", "api text\n"),
@@ -2373,11 +2352,11 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
         );
     });
 
-    // An in-flight save cannot be discarded by closing or leaving the workspace.
+    // An in-flight save cannot be discarded by closing or leaving the task.
     let saving = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
     cx.update(|cx| saving.update(cx, |e, _| e.saving = true));
     on(cx, &|s, w, cx| s.close_file(w, cx));
-    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
+    on(cx, &|s, w, cx| s.open_task(1, w, cx));
     cx.update_window(window, |_, w, cx| {
         assert!(
             !w.has_active_dialog(cx),
@@ -2411,7 +2390,7 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
             "inline editing refuses hidden unsaved buffers"
         )
     });
-    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
+    on(cx, &|s, w, cx| s.open_task(1, w, cx));
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
         .unwrap();
     press(cx, &["escape"]);
@@ -2419,7 +2398,7 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
         assert_eq!(shark.read(cx).active.as_deref(), Some("files"));
         assert!(first.read(cx).dirty);
     });
-    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
+    on(cx, &|s, w, cx| s.open_task(1, w, cx));
     press(cx, &["enter"]);
     cx.update(|cx| {
         assert_eq!(shark.read(cx).active.as_deref(), Some("other-files"));
@@ -2455,7 +2434,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "click-files".into(),
             git::on_branch(&repos, "click-files"),
             vec![],
@@ -2636,7 +2615,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     press_in(window)(cx, &["cmd-w"]);
     cx.update(|cx| {
         assert_eq!(shark.read(cx).file_tabs.len(), 1);
-        assert_eq!(shark.read(cx).active_ws().unwrap().chats.len(), 1);
+        assert_eq!(shark.read(cx).active_task().unwrap().chats.len(), 1);
     });
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     press(cx, &["cmd-w"]);
@@ -2644,7 +2623,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
         // The file that slid into Diff's slot, not the chat.
         assert_eq!(shark.read(cx).tab, Tab::File);
         assert_eq!(
-            shark.read(cx).active_ws().unwrap().chats.len(),
+            shark.read(cx).active_task().unwrap().chats.len(),
             1,
             "closing Diff never closes the chat behind it"
         );
@@ -2692,7 +2671,7 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "tabs".into(),
             git::on_branch(&repos, "tabs"),
             vec![],
@@ -2718,7 +2697,7 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
     assert_eq!(labels(cx), ["New chat"]);
     on(cx, &|s, w, cx| s.new_chat(w, cx));
     on(cx, &|s, _, _cx| {
-        s.active_ws_mut().unwrap().chats[0].session_id = Some("s1".into())
+        s.active_task_mut().unwrap().chats[0].session_id = Some("s1".into())
     });
     assert_eq!(
         labels(cx),
@@ -2759,7 +2738,7 @@ async fn media_in_diff(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "media".into(),
             git::on_branch(&repos, "media"),
             vec![],
@@ -2986,7 +2965,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
         cx,
         State {
             repos: repos(&home, &["big"]),
-            workspaces: vec![],
+            tasks: vec![],
             vim: true,
             ..Default::default()
         },
@@ -3001,7 +2980,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 "perf".into(),
                 git::on_branch(&repos, "perf"),
                 vec![],
@@ -3046,7 +3025,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     };
     let mut report = vec![];
 
-    let ws = cx.update(|cx| shark.read(cx).active_ws().unwrap().clone());
+    let ws = cx.update(|cx| shark.read(cx).active_task().unwrap().clone());
     let t = Instant::now();
     let data = DiffData::load(&ws, false);
     report.push(format!(
@@ -3054,7 +3033,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
         ms(t)
     ));
     assert_eq!(data.files.len(), 2001);
-    // Not `space d`: the new workspace's composer has focus and would take the keys.
+    // Not `space d`: the new task's composer has focus and would take the keys.
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| s.show(Tab::Feature(Feature::Diff), w, cx))
     })
@@ -3214,7 +3193,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     );
     fs::remove_dir_all(&home).ok();
 }
-/// Open in an app: terminals take the workspace folder, Fork asks which repo, Xcode shows
+/// Open in an app: terminals take the task folder, Fork asks which repo, Xcode shows
 /// only where a repo has a project and opens it. Through cmd-k and the right-click menu.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -3243,7 +3222,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     });
     for (name, picked) in [("web-only", &repos[1..]), ("both", &repos[..])] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.into(),
                 git::on_branch(picked, name),
                 vec![],
@@ -3267,48 +3246,42 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     };
     let last = || OPENED.lock().unwrap().last().cloned();
 
-    // The right-click menu: (label, hint, submenu rows) per "Open in" entry.
+    // The right-click menu's "Open in…": (label, hint) per app. An app with several targets
+    // ends in "…" and opens a picker of them.
     let menu_of = |cx: &mut TestAppContext, ws: &str| {
         shark.update(cx, |s, cx| {
-            let ws = s.ws(ws).unwrap().clone();
+            let ws = s.task(ws).unwrap().clone();
             (ws_menu(s, &ws, cx).into_iter())
-                .filter_map(|e| match e {
-                    Entry::Item { label, hint, .. } if label.starts_with("Open in") => {
-                        Some((label.to_string(), hint.map(|h| h.to_string()), vec![]))
-                    }
-                    Entry::Sub { label, entries, .. } if label.starts_with("Open in") => {
-                        let rows = (entries.iter())
+                .find_map(|e| match e {
+                    Entry::Sub { label, entries, .. } if label == "Open in…" => Some(
+                        (entries.iter())
                             .filter_map(|r| match r {
-                                Entry::Item { label, .. } => Some(label.to_string()),
+                                Entry::Item { label, hint, .. } => {
+                                    Some((label.to_string(), hint.as_ref().map(|h| h.to_string())))
+                                }
                                 _ => None,
                             })
-                            .collect();
-                        Some((label.to_string(), None, rows))
-                    }
+                            .collect::<Vec<_>>(),
+                    ),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
+                .unwrap()
         })
     };
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    let all = s(&["Agent folder", "ios", "web"]);
     assert_eq!(
         menu_of(cx, "both"),
         [
-            ("Open in Terminal".into(), None, all.clone()),
-            ("Open in Code".into(), None, all),
-            ("Open in Fork".into(), None, s(&["ios", "web"])),
-            (
-                "Open in Xcode".into(),
-                Some("ios/App.xcodeproj".into()),
-                vec![]
-            ),
+            ("Terminal…".into(), None),
+            ("Code…".into(), None),
+            ("Fork…".into(), None),
+            ("Xcode".into(), Some("ios/App.xcodeproj".into())),
         ]
     );
-    // "Add repo" lists only the repos the workspace lacks, and hides when there are none.
+    // "Add repo" lists only the repos the task lacks, and hides when there are none.
     let add_repo = |cx: &mut TestAppContext, ws: &str| {
         shark.update(cx, |s, cx| {
-            let ws = s.ws(ws).unwrap().clone();
+            let ws = s.task(ws).unwrap().clone();
             (ws_menu(s, &ws, cx).into_iter()).find_map(|e| match e {
                 Entry::Sub { label, entries, .. } if label == "Attach repository" => Some(
                     (entries.iter())
@@ -3326,15 +3299,15 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     assert_eq!(add_repo(cx, "both"), None);
     let web_only = menu_of(cx, "web-only");
     assert!(
-        web_only.iter().all(|e| e.0 != "Open in Xcode"),
+        web_only.iter().all(|e| e.0 != "Xcode"),
         "no project, no Xcode"
     );
     assert!(
-        web_only.contains(&("Open in Fork".into(), Some("web".into()), vec![])),
+        web_only.contains(&("Fork".into(), Some("web".into()))),
         "one repo opens directly"
     );
 
-    // cmd-k on the open workspace.
+    // cmd-k on the open task.
     run(cx, "open in terminal");
     assert_eq!(last(), Some(("Terminal".into(), ws_dir.clone())));
     run(cx, "open in xcode");
@@ -3357,15 +3330,15 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     assert_eq!(last(), Some(("Fork".into(), ws_dir.join("web"))));
 
-    // A workspace without a project has no Xcode row.
+    // A task without a project has no Xcode row.
     on(cx, &|s, w, cx| {
         let ix = s
             .state
-            .workspaces
+            .tasks
             .iter()
             .position(|w| w.name == "web-only")
             .unwrap();
-        s.open_workspace(ix, w, cx)
+        s.open_task(ix, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.as_deref() == Some("web-only")
@@ -3385,7 +3358,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         Some(("Fork".into(), home.join("shark/workspaces/web-only/web")))
     );
 
-    // Cmd+O captures the sidebar target even while another workspace is open.
+    // Cmd+O captures the sidebar target even while another task is open.
     use gpui_kit::test::TestEventExt;
     on(cx, &|s, w, cx| {
         let apps = crate::apps::installed();
@@ -3402,11 +3375,11 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         s.state.recent_apps.clear();
         let ix = s
             .state
-            .workspaces
+            .tasks
             .iter()
             .position(|ws| ws.name == "both")
             .unwrap();
-        s.sel = SideRow::Ws(ix);
+        s.sel = SideRow::Task(ix);
         s.sidebar_focus.focus(w, cx);
     });
     let modifiers = |cx: &mut TestAppContext, platform: bool| {
@@ -3491,7 +3464,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     press(cx, &["cmd-o", "cmd-n"]);
     on(cx, &|s, w, cx| {
         assert!(s.app_switcher.is_some(), "unrelated commands stay blocked");
-        assert!(!w.has_active_dialog(cx), "Cmd+N cannot start an agent");
+        assert!(!w.has_active_dialog(cx), "Cmd+N cannot start a task");
     });
     press(cx, &["cmd-escape"]);
     modifiers(cx, false);
@@ -3542,11 +3515,11 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         let ix = s
             .state
-            .workspaces
+            .tasks
             .iter()
             .position(|ws| ws.name == "web-only")
             .unwrap();
-        s.sel = SideRow::Ws(ix);
+        s.sel = SideRow::Task(ix);
         s.sidebar_focus.focus(w, cx);
     });
     modifiers(cx, true);
@@ -3588,7 +3561,7 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "fm".into(),
             git::on_branch(&repos, "fm"),
             vec![],
@@ -3655,7 +3628,7 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// Cmd+P opens the highlighted workspace file, including unchanged and untracked files.
+/// Cmd+P opens the highlighted task file, including unchanged and untracked files.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn file_picker_opens_selected_file(cx: &mut TestAppContext) {
@@ -3682,7 +3655,7 @@ async fn file_picker_opens_selected_file(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "picker".into(),
             git::on_branch(&repos, "picker"),
             vec![],
@@ -3869,8 +3842,8 @@ async fn file_picker_opens_selected_file(cx: &mut TestAppContext) {
     );
 }
 
-/// Home shows while nothing is open; cmd-0 toggles it over a workspace, esc and opening a
-/// workspace leave it, the arrows and enter open a row, and a relaunch comes back to it.
+/// Home shows while nothing is open; cmd-0 toggles it over a task, esc and opening a
+/// task leave it, the arrows and enter open a row, and a relaunch comes back to it.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn home_navigation(cx: &mut TestAppContext) {
@@ -3917,7 +3890,7 @@ async fn home_navigation(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     for name in ["one", "two"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.into(),
                 git::on_branch(&repos, name),
                 vec![],
@@ -3977,7 +3950,7 @@ async fn home_navigation(cx: &mut TestAppContext) {
     assert_eq!(active(cx).as_deref(), Some("one"));
     assert!(!shown(cx));
 
-    // A relaunch restores Home over the workspace it was shown over.
+    // A relaunch restores Home over the task it was shown over.
     press(cx, &["cmd-0"]);
     let (window2, shark2) = open(cx, WindowOptions::default());
     cx.run_until_parked();
@@ -4062,21 +4035,21 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
         args.contains("--model haiku") && args.contains("# Shortcuts"),
         "{args}"
     );
-    assert!(args.contains("cmd-n: New agent"), "the live keymap: {args}");
+    assert!(args.contains("cmd-n: New task"), "the live keymap: {args}");
     let on = on_app(window, shark.clone());
     on(cx, &|s, _, cx| {
         let ask = s.home.ask.as_ref().unwrap();
         assert_eq!(ask.question, "how do I open PRs?");
-        assert!(!ask.done && ask.agent.is_some(), "asking");
+        assert!(!ask.done && ask.harness.is_some(), "asking");
         assert_eq!(
             s.home.prompt.read(cx).value().as_ref(),
             "",
             "the box is cleared"
         );
-        s.apply_ask(crate::agent::Ev::TextDelta("Forty".into()), cx);
-        s.apply_ask(crate::agent::Ev::Text("Forty-two".into()), cx);
+        s.apply_ask(crate::harness::Ev::TextDelta("Forty".into()), cx);
+        s.apply_ask(crate::harness::Ev::Text("Forty-two".into()), cx);
         s.apply_ask(
-            crate::agent::Ev::Result {
+            crate::harness::Ev::Result {
                 is_error: false,
                 text: String::new(),
                 secs: 0,
@@ -4104,7 +4077,7 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
         assert!(s.home.ask.as_ref().is_some_and(|a| !a.done));
         s.home_escape(w, cx);
         let ask = s.home.ask.as_ref().unwrap();
-        assert!(ask.done && ask.agent.is_none(), "esc stops it");
+        assert!(ask.done && ask.harness.is_none(), "esc stops it");
     });
     assert!(
         cx.update(|cx| shark.read(cx).home_shown()),
@@ -4115,9 +4088,9 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         s.ask("again?".into(), w, cx);
         let msg = "Invalid API key · Please run /login";
-        s.apply_ask(crate::agent::Ev::Text(msg.into()), cx);
+        s.apply_ask(crate::harness::Ev::Text(msg.into()), cx);
         s.apply_ask(
-            crate::agent::Ev::Result {
+            crate::harness::Ev::Result {
                 is_error: true,
                 text: msg.into(),
                 secs: 0,
@@ -4133,9 +4106,9 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
     assert_eq!(answer(cx), "", "not also as the answer");
 }
 
-/// The prompt's text survives a cancelled New workspace dialog and clears once the workspace
+/// The prompt's text survives a cancelled New task dialog and clears once the task
 /// is made from it. Chat keys on Home act on the chat and show it (cmd-w, with no chat shown,
-/// does nothing), and a turn's end re-reads what the workspace waits on.
+/// does nothing), and a turn's end re-reads what the task waits on.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
@@ -4167,7 +4140,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "one".into(),
             git::on_branch(&repos, "one"),
             vec![],
@@ -4185,7 +4158,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
     let chats = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            (s.home_shown(), s.active_ws().unwrap().chats.len())
+            (s.home_shown(), s.active_task().unwrap().chats.len())
         })
     };
     press(cx, &["cmd-0"]);
@@ -4255,7 +4228,7 @@ async fn home_checklist(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "ws".into(),
             git::on_branch(&repos, "ws"),
             vec![],
@@ -4321,7 +4294,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "tb".into(),
             git::on_branch(&repos, "tb"),
             vec![],
@@ -4340,7 +4313,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     fs::write(api.join("src/b.rs"), "1\n2\n").unwrap();
     fs::write(api.join("src/chat.rs"), "1\n2\n3\n").unwrap();
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
-    let base = cx.update(|cx| shark.read(cx).state.workspaces[0].repos[0].base.clone());
+    let base = cx.update(|cx| shark.read(cx).state.tasks[0].repos[0].base.clone());
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.differ.read(cx).changes_stats(), (base.clone(), 6, 0));
@@ -4535,7 +4508,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(paths, ["api/src/b.rs", "api/a.md", "api/new.txt"]);
         let patch =
-            git::combined_diff(s.active_ws().unwrap(), api.parent().unwrap(), true).unwrap();
+            git::combined_diff(s.active_task().unwrap(), api.parent().unwrap(), true).unwrap();
         assert!(
             patch.contains("-x\n+unstaged\n"),
             "HEAD is the original side: {patch}"
@@ -4683,7 +4656,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "rails".into(),
             git::on_branch(&repos, "rails"),
             vec![],
@@ -4702,12 +4675,8 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
-    let chat_tab = cx.update(|cx| {
-        format!(
-            "chat-tab-{}",
-            shark.read(cx).state.workspaces[0].chats[0].id
-        )
-    });
+    let chat_tab =
+        cx.update(|cx| format!("chat-tab-{}", shark.read(cx).state.tasks[0].chats[0].id));
     let bounds = |cx: &mut TestAppContext, id: &'static str| {
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
@@ -4899,7 +4868,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "ed".into(),
             git::on_branch(&repos, "ed"),
             vec![],
@@ -5217,7 +5186,7 @@ async fn review_targets(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "rt".into(),
             git::on_branch(&repos, "rt"),
             vec![],
@@ -5248,7 +5217,7 @@ async fn review_targets(cx: &mut TestAppContext) {
     };
     let chats = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let ws = shark.read(cx).active_ws().unwrap();
+            let ws = shark.read(cx).active_task().unwrap();
             (
                 ws.chats.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
                 ws.active_chat,
@@ -5313,7 +5282,7 @@ async fn review_targets(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Diff));
-        let meta = &s.active_ws().unwrap().chats[1];
+        let meta = &s.active_task().unwrap().chats[1];
         assert_eq!(
             (
                 meta.model.as_deref(),
@@ -5419,7 +5388,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "rq".into(),
             git::on_branch(&repos, "rq"),
             vec![],
@@ -5883,7 +5852,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         assert_eq!(s.differ.read(cx).comment(1).unwrap().github, None);
     });
     // The sheet publishes per repo: api's comment to api's PR; web has none, so its comment
-    // stays unshared. The URL lands in the workspace the post came from, though another
+    // stays unshared. The URL lands in the task the post came from, though another
     // one is open by the time gh answers.
     fs::remove_file(&fail).unwrap();
     fs::write(&log, "").unwrap();
@@ -6012,7 +5981,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         })
     });
 
-    // Another workspace opens: the composer and the sheet were about this one's comments.
+    // Another task opens: the composer and the sheet were about this one's comments.
     on(cx, &|s, w, cx| {
         let one = DiffLineRange::new("api/g", DiffSide::Modified, 1, 1);
         s.differ
@@ -6026,7 +5995,7 @@ async fn review_queue(cx: &mut TestAppContext) {
             s.differ.read(cx).review().composer.is_some()
                 && s.differ.read(cx).review().sheet.is_some()
         );
-        s.create_workspace(
+        s.create_task_for_test(
             "rq2".into(),
             git::on_branch(&repos, "rq2"),
             vec![],
@@ -6067,7 +6036,7 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "wide".into(),
             git::on_branch(&repos, "wide"),
             vec![],
@@ -6164,7 +6133,7 @@ async fn narrow_column_comments(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "nc".into(),
             git::on_branch(&repos, "nc"),
             vec![],
@@ -6258,7 +6227,7 @@ async fn thread_menu_labels(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "tm".into(),
             git::on_branch(&repos, "tm"),
             vec![],
@@ -6338,7 +6307,7 @@ async fn thread_menu_labels(cx: &mut TestAppContext) {
 /// In-place editing, round 2: the line input lines up with the code, owns tab and the
 /// letters, a click in it keeps its caret, a second ⌘S waits for the first, other writers
 /// are noticed, a refresh adding a file keeps the input's focus, the composer takes focus
-/// from it, and leaving edit mode or the workspace asks first.
+/// from it, and leaving edit mode or the task asks first.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn inline_edit_round2(cx: &mut TestAppContext) {
@@ -6366,7 +6335,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     let press = press_in(window);
     for name in ["ed", "other"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.into(),
                 git::on_branch(&repos, name),
                 vec![],
@@ -6381,10 +6350,8 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         .await;
     }
     on(cx, &|s, w, cx| {
-        let ix = (s.state.workspaces.iter())
-            .position(|w| w.name == "ed")
-            .unwrap();
-        s.open_workspace(ix, w, cx)
+        let ix = (s.state.tasks.iter()).position(|w| w.name == "ed").unwrap();
+        s.open_task(ix, w, cx)
     });
     let file = home.join("shark/workspaces/ed/api/f.txt");
     // A change every ten lines: a diff many screens tall.
@@ -6528,7 +6495,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         assert_eq!(e.input.read(cx).selected_range(), 2..4);
     });
 
-    // Unsaved: the editor won't open the same file; leaving the workspace asks.
+    // Unsaved: the editor won't open the same file; leaving the task asks.
     on(cx, &|s, w, cx| s.open_path("api/f.txt".into(), w, cx));
     cx.update(|cx| assert!(shark.read(cx).editor.is_none()));
     on(cx, &|s, w, cx| {
@@ -6807,7 +6774,7 @@ async fn review_round3(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "r3".into(),
             git::on_branch(&repos, "r3"),
             vec![],
@@ -7126,7 +7093,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "ed".into(),
             git::on_branch(&repos, "ed"),
             vec![],
@@ -7405,7 +7372,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
 }
 
 /// In-place editing, round 4: a refresh started before switching files leaves the new
-/// buffer alone; Quit, the window's close button, opening or removing the workspace ask
+/// buffer alone; Quit, the window's close button, opening or removing the task ask
 /// before unsaved edits go; back from Chat, `i` and ⌘S reach the line input; a viewed file
 /// stays open while edited; saving back to the base keeps editing; a deleted file is marked;
 /// symlinks aren't edited.
@@ -7431,7 +7398,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     let press = press_in(window);
     for name in ["other", "ed"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(
+            s.create_task_for_test(
                 name.into(),
                 git::on_branch(&repos, name),
                 vec![],
@@ -7575,20 +7542,20 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     assert!(dialog(cx), "the close button asks");
     cancel(cx);
     on(cx, &|s, w, cx| {
-        let ix = (s.state.workspaces.iter())
+        let ix = (s.state.tasks.iter())
             .position(|w| w.name == "other")
             .unwrap();
-        s.open_workspace(ix, w, cx)
+        s.open_task(ix, w, cx)
     });
     assert!(dialog(cx), "opening another workspace asks");
     cancel(cx);
-    on(cx, &|s, w, cx| s.remove_workspace("ed", false, w, cx));
+    on(cx, &|s, w, cx| s.remove_task("ed", false, w, cx));
     assert!(dialog(cx), "removing the workspace asks");
     cancel(cx);
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.active.as_deref(), Some("ed"));
-        assert!(s.ws("ed").is_some() && s.differ.read(cx).editing().as_ref().unwrap().dirty);
+        assert!(s.task("ed").is_some() && s.differ.read(cx).editing().as_ref().unwrap().dirty);
     });
 
     // Back from Chat the line input has the focus; with the focus on the diff, `i` and ⌘S
@@ -7821,7 +7788,7 @@ async fn review_thread_jumps_overlapping(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "tj".into(),
             git::on_branch(&repos, "tj"),
             vec![],
@@ -7893,7 +7860,7 @@ async fn review_followups(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "rf".into(),
             git::on_branch(&repos, "rf"),
             vec![],
@@ -7948,7 +7915,7 @@ async fn review_followups(cx: &mut TestAppContext) {
             c.last_reply.clone(),
             c.unread_review_ids(true),
         );
-        let dir = s.ws(&ws).unwrap().dir();
+        let dir = s.task(&ws).unwrap().dir();
         s.differ.update(cx, |d, cx| {
             d.review_turn_done(&ws, &dir, &id, turn, &reply, &held, cx)
         });
@@ -7964,7 +7931,7 @@ async fn review_followups(cx: &mut TestAppContext) {
             c.last_reply.clone(),
             c.unread_review_ids(true),
         );
-        let dir = s.ws(&ws).unwrap().dir();
+        let dir = s.task(&ws).unwrap().dir();
         s.differ.update(cx, |d, cx| {
             d.review_turn_done(&ws, &dir, &id, turn, &reply, &held, cx)
         });
@@ -8143,7 +8110,7 @@ async fn branch_menu(cx: &mut TestAppContext) {
     let mut picked = git::on_branch(&repos, "branch-menu");
     picked[1].1 = "web-branch".into();
     on(cx, &|s, w, cx| {
-        s.create_workspace("branch-menu".into(), picked.clone(), vec![], None, w, cx)
+        s.create_task_for_test("branch-menu".into(), picked.clone(), vec![], None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -8197,11 +8164,11 @@ async fn branch_menu(cx: &mut TestAppContext) {
 
     // Repo menus omit agent-wide stacking; an invalid repo cannot become an all-repo menu.
     shark.update(cx, |s, cx| {
-        let ws = s.active_ws().unwrap();
+        let ws = s.active_task().unwrap();
         let scoped = menus::branch_entries(s, ws, Some("api"), cx);
-        assert!(!scoped.iter().any(|e| matches!(e, Entry::Item { label, .. } if label == "New agent on top…" || label == "Insert agent below…")));
+        assert!(!scoped.iter().any(|e| matches!(e, Entry::Item { label, .. } if label == "New task on top…" || label == "Insert task below…")));
         let all = menus::branch_entries(s, ws, None, cx);
-        assert!(all.iter().any(|e| matches!(e, Entry::Item { label, .. } if label == "New agent on top…")));
+        assert!(all.iter().any(|e| matches!(e, Entry::Item { label, .. } if label == "New task on top…")));
         assert!(menus::branch_entries(s, ws, Some("missing"), cx).is_empty());
     });
     fs::remove_dir_all(&home).ok();
@@ -8228,7 +8195,7 @@ async fn change_base(cx: &mut TestAppContext) {
     let mut picked = git::on_branch(&repos, "rb");
     picked[0].1 = "kd/x".into();
     on(cx, &|s, w, cx| {
-        s.create_workspace("rb".into(), picked.clone(), vec![], None, w, cx)
+        s.create_task_for_test("rb".into(), picked.clone(), vec![], None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -8240,9 +8207,9 @@ async fn change_base(cx: &mut TestAppContext) {
         (git::remote_branches(&api).iter()).any(|(_, b)| b == "origin/release"),
         "a fetched origin branch is offered"
     );
-    let old = cx.update(|cx| shark.read(cx).ws("rb").unwrap().repos[0].base.clone());
+    let old = cx.update(|cx| shark.read(cx).task("rb").unwrap().repos[0].base.clone());
     let change = shark.update(cx, |s, cx| {
-        menus::branch_entries(s, s.ws("rb").unwrap(), Some("api"), cx)
+        menus::branch_entries(s, s.task("rb").unwrap(), Some("api"), cx)
             .into_iter()
             .find_map(|e| match e {
                 Entry::Item {
@@ -8265,7 +8232,7 @@ async fn change_base(cx: &mut TestAppContext) {
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        let ws = s.ws("rb").unwrap();
+        let ws = s.task("rb").unwrap();
         assert_eq!(ws.repos[0].base, "origin/release");
         assert_eq!(ws.repos[1].base, old, "web keeps its base");
         assert_eq!(menus::base_hint(ws), "per repo");
@@ -8284,13 +8251,13 @@ async fn change_base(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// Stacks, end to end on real git: alt-enter on a branch in the New workspace dialog bases the
-/// new branch on it; New workspace on top and Insert workspace below from the branch menu; the
-/// stack rows open their workspace; a merged parent moves the base and asks the agent to
+/// Stacks, end to end on real git: alt-enter on a branch in the New task dialog bases the
+/// new branch on it; New task on top and Insert task below from the branch menu; the
+/// stack rows open their task; a merged parent moves the base and asks the agent to
 /// restack after the recorded parent tip.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn stacked_workspaces(cx: &mut TestAppContext) {
+async fn stacked_tasks(cx: &mut TestAppContext) {
     use std::os::unix::fs::PermissionsExt;
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -8369,15 +8336,15 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
             .unwrap();
         cx.run_until_parked();
     };
-    let workspace_menu = |cx: &mut TestAppContext| {
+    let task_menu = |cx: &mut TestAppContext| {
         on(cx, &|s, w, cx| {
-            let entries = menus::branch_entries(s, s.active_ws().unwrap(), None, cx);
+            let entries = menus::branch_entries(s, s.active_task().unwrap(), None, cx);
             s.show_menu(point(px(100.), px(100.)), entries, w, cx);
         });
         cx.run_until_parked();
     };
     let ws = |cx: &mut TestAppContext, name: &str| {
-        cx.update(|cx| shark.read(cx).ws(name).cloned().unwrap())
+        cx.update(|cx| shark.read(cx).task(name).cloned().unwrap())
     };
     let head = |name: &str| {
         g(
@@ -8387,7 +8354,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     };
 
     // alt-enter on a branch: api's new branch starts on `logic` and targets it; web, unticked,
-    // isn't in the workspace.
+    // isn't in the task.
     branch_dialog(cx, window);
     input(cx, "ui");
     press(cx, &["tab", "cmd-b"]);
@@ -8419,7 +8386,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     // The header's stack: logic (#1, open) under ui.
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        let st = menus::stacks(s, s.ws("ui").unwrap(), cx);
+        let st = menus::stacks(s, s.task("ui").unwrap(), cx);
         st.len() == 1 && st[0].me == 1 && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 1)
     })
     .await;
@@ -8434,12 +8401,12 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     })
     .unwrap();
 
-    // New workspace on top stays in the workspace menu, once ui is pushed.
+    // New task on top stays in the task menu, once ui is pushed.
     let wt = home.join("shark/workspaces/ui/api");
     g(&wt, &["commit", "-q", "--allow-empty", "-m", "ui"]);
     g(&wt, &["push", "-q", "-u", "origin", "ui"]);
     let ui_head = head("ui");
-    workspace_menu(cx);
+    task_menu(cx);
     press(cx, &["n", "enter"]);
     input(cx, "wiring");
     press(cx, &["cmd-enter"]);
@@ -8451,7 +8418,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     assert_eq!(head("wiring"), ui_head);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        let st = menus::stacks(s, s.ws("wiring").unwrap(), cx);
+        let st = menus::stacks(s, s.task("wiring").unwrap(), cx);
         let names: Vec<&str> = st
             .iter()
             .flat_map(|s| s.nodes.iter().map(|n| n.branch.as_str()))
@@ -8460,7 +8427,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     })
     .await;
 
-    // A stack row opens its workspace; "Branch menu…" opens the menu from the keyboard.
+    // A stack row opens its task; "Branch menu…" opens the menu from the keyboard.
     cx.update_window(window, |_, w, cx| {
         w.dispatch_action(Box::new(crate::BranchMenu), cx)
     })
@@ -8470,15 +8437,15 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     press(cx, &["u", "enter"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui")));
 
-    // Insert workspace below ui: based on logic, pushed, and ui moves on top of it.
-    workspace_menu(cx);
+    // Insert task below ui: based on logic, pushed, and ui moves on top of it.
+    task_menu(cx);
     press(cx, &["i", "enter"]);
     input(cx, "models");
     press(cx, &["cmd-enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
         s.active.as_deref() == Some("models")
-            && s.ws("ui").unwrap().repos[0].base == "origin/models"
+            && s.task("ui").unwrap().repos[0].base == "origin/models"
     })
     .await;
     assert_eq!(ws(cx, "models").repos[0].base, "origin/logic");
@@ -8497,12 +8464,12 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
         shark
             .read(cx)
             .state
-            .workspaces
+            .tasks
             .iter()
             .position(|w| w.name == "wiring")
             .unwrap()
     });
-    on(cx, &|s, w, cx| s.open_workspace(ix, w, cx));
+    on(cx, &|s, w, cx| s.open_task(ix, w, cx));
     let sync = cx.update(|cx| shark.read(cx).syncs["wiring"].clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         (sync.read(cx).repos()).is_some_and(|r| r[0].stacked() == Some("ui"))
@@ -8534,7 +8501,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
 }
 
 /// alt-enter refuses what can't be a PR base (a branch not on origin, a fork's PR); enter
-/// (check out, review) replaces a stacked choice; in a two-repo workspace only the stacked repo
+/// (check out, review) replaces a stacked choice; in a two-repo task only the stacked repo
 /// targets the parent, and the header names that parent.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -8654,12 +8621,12 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
         shark.read(cx).active.as_deref() == Some("mixed")
     })
     .await;
-    let ws = cx.update(|cx| shark.read(cx).ws("mixed").cloned().unwrap());
+    let ws = cx.update(|cx| shark.read(cx).task("mixed").cloned().unwrap());
     let bases: Vec<&str> = ws.repos.iter().map(|r| r.base.as_str()).collect();
     assert_eq!(bases, ["origin/logic", "origin/main"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        let st = menus::stacks(s, s.ws("mixed").unwrap(), cx);
+        let st = menus::stacks(s, s.task("mixed").unwrap(), cx);
         st.len() == 1
             && st[0].repo == "api"
             && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 4)

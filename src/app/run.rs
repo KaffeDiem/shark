@@ -1,19 +1,15 @@
-//! The repo scripts in a workspace: cmd-r starts and stops its run scripts; setup runs after a
-//! worktree is made (`create_workspace_on`, `repo_added`), archive before removal (`workspace.rs`).
+//! The repo scripts in a task: cmd-r starts and stops its run scripts; setup runs after a
+//! worktree is made (`create_workspace_on`, `repo_added`), archive before removal (`task.rs`).
 use super::*;
 use crate::scripts::{self, Phase, Running};
 use gpui_kit::component::Selectable as _;
 
 impl Shark {
-    /// cmd-r: the active workspace's run scripts, in order; again stops them. On Home, the
+    /// cmd-r: the active task's run scripts, in order; again stops them. On Home, the
     /// highlighted row's.
     pub(super) fn toggle_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = match self.home_shown() {
-            true => self.home.sel.as_ref(),
-            false => self.active.as_ref(),
-        };
-        let Some(ws) = name.and_then(|n| self.ws(n)).cloned() else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(ws) = self.target(window) else {
+            return notify_err(window, cx, "Open a task first");
         };
         if self.archiving.contains(&ws.name) {
             return notify_err(
@@ -65,7 +61,7 @@ impl Shark {
                     };
                     let (exited, all) = run.reap();
                     for e in exited {
-                        let msg = format!("{}: run script exited: {e}", s.ws_title(&name));
+                        let msg = format!("{}: run script exited: {e}", s.task_title(&name));
                         window.push_notification(Notification::warning(msg), cx);
                     }
                     if all {
@@ -87,7 +83,7 @@ impl Shark {
     }
 
     /// Header control: run/stop
-    /// the active workspace; while running, its port in green beside it.
+    /// the active task; while running, its port in green beside it.
     /// Right-click: the same toggle, and the script output.
     pub(super) fn render_run(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -143,14 +139,14 @@ impl Shark {
             }))
     }
 
-    /// Setup scripts for a new workspace, or only `repo`'s for one just attached, in the background;
+    /// Setup scripts for a new task, or only `repo`'s for one just attached, in the background;
     /// how the latter went decides its attachment (`setup_finished`). `then`'s prompt is sent to
     /// its chat once they succeed, so the agent never works on a half-set-up worktree; if they
     /// fail or the chat is busy, it waits in the composer.
     /// False when there's nothing to run (and `then` wasn't taken).
     pub(super) fn run_setup(
         &mut self,
-        ws: &Workspace,
+        ws: &Task,
         repo: Option<&str>,
         then: Option<(String, Entity<Chat>)>,
         window: &mut Window,
@@ -211,7 +207,7 @@ impl Shark {
 
     /// Where the active agent's run scripts are edited: its one repo's settings, or the list.
     pub(super) fn edit_run_scripts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let repo = match self.active_ws().map(|ws| ws.repos.as_slice()) {
+        let repo = match self.active_task().map(|ws| ws.repos.as_slice()) {
             Some([r]) => self.state.repos.iter().find(|x| x.name == r.name).cloned(),
             _ => None,
         };
@@ -223,7 +219,7 @@ impl Shark {
 
     pub(super) fn show_script_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.active.clone() else {
-            return notify_err(window, cx, "Open an agent first");
+            return notify_err(window, cx, "Open a task first");
         };
         self.show_log_of(&name, window, cx);
     }
@@ -232,13 +228,13 @@ impl Shark {
         let log = scripts::log_path(name);
         match log.exists() {
             true => cx.open_with_system(&log),
-            false => notify_err(window, cx, "No script has run in this agent yet"),
+            false => notify_err(window, cx, "No script has run in this task yet"),
         }
     }
 }
 
 /// A run-menu action that runs only while `ws`, whose menu it is, is still the one shown: the
-/// menu outlives workspace switches.
+/// menu outlives task switches.
 fn on_shown(
     cx: &Context<Shark>,
     ws: Option<String>,

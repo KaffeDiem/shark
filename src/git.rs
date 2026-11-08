@@ -1,5 +1,5 @@
 use crate::proc::{finish, finish_bytes};
-use crate::state::{Attachment, Repo, Workspace, WsRepo};
+use crate::state::{AgentLink, Attachment, Repo, Task, TaskRepo};
 mod changes;
 mod copy;
 pub mod history;
@@ -141,19 +141,19 @@ pub(crate) fn default_base(src: &Path) -> String {
             .map(String::from)
             .ok_or_else(String::new)
     })
-    // Empty when unknown: the current branch is no trunk (in a worktree it is the workspace's own).
+    // Empty when unknown: the current branch is no trunk (in a worktree it is the task's own).
     .unwrap_or_default()
 }
 
-/// `branch` is the workspace's own; each repo comes with the branch it gets, usually the same.
+/// `branch` is the task's own; each repo comes with the branch it gets, usually the same.
 #[cfg(test)]
-pub fn create_workspace(
+pub fn create_task(
     dir: &Path,
     name: &str,
     branch: &str,
     repos: &[(Repo, String)],
-) -> Result<Workspace, String> {
-    create_workspace_with_prs(dir, name, branch, repos, &[], &[])
+) -> Result<Task, String> {
+    create_task_with_prs(dir, name, branch, repos, &[], &[], "", None, false)
 }
 
 #[derive(Clone, Debug)]
@@ -165,14 +165,19 @@ pub struct PullRequest {
 
 /// PR selections use fresh local review branches, preserving colleagues' branches. `parents`
 /// `(repo, branch)` stack a repo's new branch on another branch: it starts there and targets it.
-pub fn create_workspace_with_prs(
+/// Automatic task launches set `fresh` so retained branches cannot become a new task's work.
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_with_prs(
     dir: &Path,
     name: &str,
     branch: &str,
     repos: &[(Repo, String)],
     prs: &[(String, PullRequest)],
     parents: &[(String, String)],
-) -> Result<Workspace, String> {
+    title: &str,
+    agent: Option<AgentLink>,
+    fresh: bool,
+) -> Result<Task, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
     }
@@ -187,6 +192,7 @@ pub fn create_workspace_with_prs(
     let plans = crate::proc::par_map(repos, |(r, b)| {
         match prs.iter().find(|(name, _)| name == &r.name) {
             Some((_, pr)) => plan_pr_worktree(b, r, pr),
+            None if fresh => plan_fresh(b, r, ""),
             None => {
                 let parent = parents.iter().find(|(n, _)| n == &r.name);
                 plan_worktree(b, r, parent.map(|(_, p)| p.as_str()))
@@ -195,13 +201,12 @@ pub fn create_workspace_with_prs(
     })
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    fs::create_dir_all(dir.parent().ok_or("Workspace has no parent")?)
-        .map_err(|e| e.to_string())?;
+    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?).map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let root_identity = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
     let attempts = crate::proc::par_map(repos.iter().zip(&plans), |((r, b), p)| {
         let mut owned = OwnedWorktree::default();
-        let result = add_worktree(dir, b, r, p, &mut owned).map(|w| WsRepo {
+        let result = add_worktree(dir, b, r, p, &mut owned).map(|w| TaskRepo {
             branch: (b != branch).then(|| b.clone()),
             ..w
         });
@@ -212,7 +217,9 @@ pub fn create_workspace_with_prs(
             .iter()
             .map(|(result, _)| result.clone())
             .collect::<Result<Vec<_>, _>>()?;
-        let mut ws = Workspace {
+        let mut ws = Task {
+            title: title.into(),
+            agent,
             name: name.into(),
             branch: branch.into(),
             repos: done,
@@ -240,11 +247,16 @@ pub fn create_workspace_with_prs(
 
 /// An agent with no repositories yet: its directory, root docs and first chat, in Plan mode.
 /// Nothing is left behind on failure.
-pub fn create_empty_workspace(dir: &Path, name: &str, title: &str) -> Result<Workspace, String> {
-    fs::create_dir_all(dir.parent().ok_or("Workspace has no parent")?)
-        .map_err(|e| e.to_string())?;
+pub fn create_empty_task(
+    dir: &Path,
+    name: &str,
+    title: &str,
+    agent: Option<AgentLink>,
+) -> Result<Task, String> {
+    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?).map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut ws = Workspace {
+    let mut ws = Task {
+        agent,
         name: name.into(),
         title: title.into(),
         branch: name.into(),
@@ -281,17 +293,17 @@ impl From<String> for AttachError {
     }
 }
 
-/// Adds one more repo to an existing workspace on `branch` and rewrites the root CLAUDE.md; the
-/// first repo's branch becomes the workspace's. With `fresh`, the base (empty: the repo's default)
+/// Adds one more repo to an existing task on `branch` and rewrites the root CLAUDE.md; the
+/// first repo's branch becomes the task's. With `fresh`, the base (empty: the repo's default)
 /// of a branch that must be new; without, an existing branch is used as `plan_worktree` does.
 /// Blocking: it fetches.
-pub fn add_to_workspace(
-    ws: &Workspace,
+pub fn add_to_task(
+    ws: &Task,
     dir: &Path,
     r: &Repo,
     branch: &str,
     fresh: Option<&str>,
-) -> Result<Workspace, AttachError> {
+) -> Result<Task, AttachError> {
     if ws.repos.iter().any(|w| w.name == r.name) {
         return Err(format!("{} is already in {}", r.name, ws.display_title()).into());
     }
@@ -309,7 +321,7 @@ pub fn add_to_workspace(
     }
     let mut owned = OwnedWorktree::default();
     let added = add_worktree(dir, branch, r, &plan, &mut owned).and_then(|wr| {
-        ws.repos.push(WsRepo {
+        ws.repos.push(TaskRepo {
             branch: (branch != ws.branch).then(|| branch.into()),
             ..wr
         });
@@ -330,13 +342,13 @@ pub fn add_to_workspace(
 pub enum Found {
     Nothing,
     /// The worktree, on its branch: the work finished.
-    Worktree(WsRepo),
+    Worktree(TaskRepo),
     /// Something that can't be told from someone else's; says what.
     Unclear(String),
 }
 
 /// Looks at `a`'s source repo, branch and path. Reads only.
-pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
+pub fn find_attachment(ws: &Task, a: &Attachment) -> Found {
     let wt = ws.dir().join(&a.repo);
     let Ok(wts) = worktree_list(&a.src) else {
         return Found::Unclear(format!("{} can't be read", a.src.display()));
@@ -369,7 +381,7 @@ pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
             && git(&wt, &["symbolic-ref", "HEAD"])
                 .is_ok_and(|b| b == format!("refs/heads/{}", a.branch))
         {
-            return Found::Worktree(WsRepo {
+            return Found::Worktree(TaskRepo {
                 name: a.repo.clone(),
                 src: a.src.clone(),
                 base,
@@ -393,7 +405,7 @@ pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
     }
 }
 
-/// A branch of a source repo, as the New workspace dialog lists it.
+/// A branch of a source repo, as the New task dialog lists it.
 #[derive(Clone, Debug)]
 pub struct Branch {
     pub name: String,
@@ -545,7 +557,7 @@ impl Plan {
 /// Checks a repo can take the branch and decides where it starts. Fetches, so it blocks.
 /// With a `parent` branch, a new branch starts on it and the base is `origin/<parent>`.
 fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, String> {
-    // A workspace dir deleted by hand leaves a worktree entry that still claims its branch.
+    // A task dir deleted by hand leaves a worktree entry that still claims its branch.
     let _ = git(&r.path, &["worktree", "prune"]);
     if let Some(path) = holder(&worktree_list(&r.path)?, branch) {
         return Err(format!(
@@ -589,7 +601,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
             }
             None
         }
-        // Already in the base: left over from an archived workspace whose PR merged and lost
+        // Already in the base: left over from an archived task whose PR merged and lost
         // its remote branch; checking it out would restart on old, merged code. Anything else
         // is unpushed work and is reused. Only refused when origin answered: offline or
         // without origin, a local branch is all there is.
@@ -597,7 +609,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
             if fetched && git(&r.path, &["merge-base", "--is-ancestor", &local, &base]).is_ok() =>
         {
             return Err(format!(
-                "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from a deleted agent?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
+                "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from a deleted task?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
                 r.name,
                 r.path.display()
             ));
@@ -670,7 +682,7 @@ fn parent_start(r: &Repo, p: &str) -> Result<String, String> {
     ) {
         (true, _) => Ok(format!("origin/{p}")),
         (false, true) => Err(format!(
-            "{}: `{p}` isn't on GitHub yet; push it first (from its agent)",
+            "{}: `{p}` isn't on GitHub yet; push it first (from its task)",
             r.name
         )),
         (false, false) => Err(format!(
@@ -930,7 +942,7 @@ fn add_worktree(
     r: &Repo,
     plan: &Plan,
     owned: &mut OwnedWorktree,
-) -> Result<WsRepo, String> {
+) -> Result<TaskRepo, String> {
     let wt = dir.join(&r.name);
     if let Some(from) = &plan.from {
         let commit = git(
@@ -963,7 +975,7 @@ fn add_worktree(
     owned.untracked = untracked_fingerprint(&wt, &copied)
         .ok()
         .map(|fp| (fp, copied));
-    Ok(WsRepo {
+    Ok(TaskRepo {
         name: r.name.clone(),
         src: r.path.clone(),
         base: plan.base.clone(),
@@ -1008,22 +1020,24 @@ fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> V
     remaining
 }
 
-/// Rewrites the root CLAUDE.md and AGENTS.md from the workspace's repo list; a failure only
-/// leaves them stale.
-pub fn write_claude_md(ws: &Workspace) {
-    let _ = write_root_docs(ws, &ws.dir());
+/// Rewrites the root CLAUDE.md, AGENTS.md and skill links from the task snapshot.
+pub fn write_claude_md(ws: &Task) -> Result<(), String> {
+    write_root_docs(ws, &ws.dir())
 }
 
-/// The files the agent reads at the workspace root: CLAUDE.md for claude, AGENTS.md for codex.
+/// The files the agent reads at the task root: CLAUDE.md for claude, AGENTS.md for codex.
 const ROOT_DOCS: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
-fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
+fn write_root_docs(ws: &Task, dir: &Path) -> Result<(), String> {
+    write_instructions(ws, dir)?;
+    link_skills(ws, dir)
+}
+
+pub(crate) fn write_instructions(ws: &Task, dir: &Path) -> Result<(), String> {
     let [claude, agents] = ROOT_DOCS;
     fs::write(dir.join(claude), claude_md(ws, dir))
         .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
-        .map_err(|e| e.to_string())?;
-    link_skills(ws, dir);
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 /// Whether agents get the repos' skills: `State::no_repo_skills`, here for the spawn paths.
@@ -1039,7 +1053,7 @@ pub fn set_repo_skills(on: bool) {
 
 /// `--add-dir` for each repo: claude loads a repo's `.claude/skills` and `.claude/commands` at
 /// start only from its own cwd upward or from these. A clash shows as `/repo:skill`.
-pub fn claude_skill_args(ws: &Workspace) -> Vec<String> {
+pub fn claude_skill_args(ws: &Task) -> Vec<String> {
     if !repo_skills() {
         return vec![];
     }
@@ -1050,15 +1064,15 @@ pub fn claude_skill_args(ws: &Workspace) -> Vec<String> {
         .collect()
 }
 
-const AGENTS_DIR: &str = ".agents";
-/// Where codex looks at the workspace root.
-const SKILL_LINKS: &str = ".agents/skills";
+/// Where each harness discovers skills in its working directory (the task root).
+const HARNESS_SKILL_DIRS: &[&str] = &[".agents/skills", ".claude/skills"];
 
 const SKILL_OWNERS: &str = ".shark-skills.json";
 
-// Never follow a user's directory symlink while managing workspace-owned files.
-fn skill_dirs_owned(dir: &Path) -> bool {
-    [AGENTS_DIR, SKILL_LINKS]
+// Never follow a user's directory symlink while managing task-owned files.
+fn skill_dirs_owned(dir: &Path, folder: &str) -> bool {
+    let folder = Path::new(folder);
+    [folder.parent().unwrap(), folder]
         .iter()
         .all(|p| match fs::symlink_metadata(dir.join(p)) {
             Ok(m) => m.is_dir(),
@@ -1066,8 +1080,8 @@ fn skill_dirs_owned(dir: &Path) -> bool {
         })
 }
 
-fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
-    let path = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+fn owned_skill_links(dir: &Path, folder: &str) -> Option<BTreeMap<String, PathBuf>> {
+    let path = dir.join(folder).parent().unwrap().join(SKILL_OWNERS);
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(BTreeMap::new()),
         Ok(m) if m.is_file() => {
@@ -1086,29 +1100,68 @@ fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
     }
 }
 
-/// Link repo skills into Codex's root. Only recorded, unchanged links belong to Shark;
-/// pre-existing links (including ones from older Shark versions) stay user-owned.
-pub fn link_skills(ws: &Workspace, dir: &Path) {
+/// Link agent skills for every harness, and repo skills for Codex. Only recorded, unchanged
+/// links belong to Shark; pre-existing links stay user-owned.
+pub fn link_skills(ws: &Task, dir: &Path) -> Result<(), String> {
     // Keep the current preference and filesystem reconciliation under the same lock.
     let on = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
-    reconcile_skills(ws, dir, *on);
+    reconcile_skills(ws, dir, *on)
 }
 
-fn reconcile_skills(ws: &Workspace, dir: &Path, on: bool) {
-    if !skill_dirs_owned(dir) {
-        return;
+fn reconcile_skills(ws: &Task, dir: &Path, on: bool) -> Result<(), String> {
+    for folder in HARNESS_SKILL_DIRS {
+        reconcile_skill_folder(ws, dir, folder, on)
+            .map_err(|e| format!("{}: {e}", dir.join(folder).display()))?;
     }
-    let Some(mut owned) = owned_skill_links(dir) else {
-        return;
+    Ok(())
+}
+
+fn skill_entries(dir: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
+    let read = || {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+        let mut found = vec![];
+        for entry in entries {
+            let entry = entry?;
+            match fs::metadata(entry.path().join("SKILL.md")) {
+                Ok(meta) if meta.is_file() => found.push(entry),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        found.sort_by_key(|e| e.file_name());
+        Ok(found)
     };
-    let links = dir.join(SKILL_LINKS);
+    read().map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))
+}
+
+fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) -> std::io::Result<()> {
+    if !skill_dirs_owned(dir, folder) {
+        return Err(std::io::Error::other(
+            "Skill directory is unreadable or not an owned directory",
+        ));
+    }
+    let Some(mut owned) = owned_skill_links(dir, folder) else {
+        return Err(std::io::Error::other(
+            "Skill ownership manifest is unreadable or invalid",
+        ));
+    };
+    let links = dir.join(folder);
     owned.retain(|name, target| fs::read_link(links.join(name)).is_ok_and(|t| &t == target));
     let mut used = HashSet::new();
     let mut user_targets = HashSet::new();
     match fs::read_dir(&links) {
         Ok(entries) => {
             for entry in entries {
-                let Ok(entry) = entry else { return };
+                let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !owned.contains_key(&name) {
                     used.insert(name);
@@ -1119,79 +1172,98 @@ fn reconcile_skills(ws: &Workspace, dir: &Path, on: bool) {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return,
+        Err(e) => return Err(e),
     }
     let mut want = BTreeMap::new();
-    for r in ws.repos.iter().filter(|_| on) {
+    let mut add = |skill: String, target: PathBuf, prefix: &str| {
+        if user_targets.contains(&target) {
+            return;
+        }
+        let mut name = skill.clone();
+        if used.contains(&name) {
+            name = format!("{prefix}-{skill}");
+        }
+        let base = name.clone();
+        let mut suffix = 2;
+        while used.contains(&name) {
+            name = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        used.insert(name.clone());
+        want.insert(name, target);
+    };
+    // Agent skills claim plain names before repo skills, even when repo skills are disabled.
+    if let Some(agent) = &ws.agent {
+        for entry in skill_entries(&crate::state::agent_skills_dir(&agent.slug))? {
+            add(
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+                &agent.slug,
+            );
+        }
+    }
+    for r in ws
+        .repos
+        .iter()
+        .filter(|_| on && folder == HARNESS_SKILL_DIRS[0])
+    {
         let mut own = HashSet::new();
-        for src in [SKILL_LINKS, ".claude/skills"] {
-            let found = fs::read_dir(dir.join(&r.name).join(src));
-            let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
-            found.sort_by_key(|e| e.file_name());
-            for e in found {
+        for src in HARNESS_SKILL_DIRS {
+            for e in skill_entries(&dir.join(&r.name).join(src))? {
                 let skill = e.file_name().to_string_lossy().into_owned();
-                if !e.path().join("SKILL.md").exists() || !own.insert(skill.clone()) {
+                if !own.insert(skill.clone()) {
                     continue;
                 }
                 let target = Path::new("../..").join(&r.name).join(src).join(&skill);
-                if user_targets.contains(&target) {
-                    continue;
-                }
-                let mut name = skill.clone();
-                if used.contains(&name) {
-                    name = format!("{}-{skill}", r.name);
-                }
-                let base = name.clone();
-                let mut suffix = 2;
-                while used.contains(&name) {
-                    name = format!("{base}-{suffix}");
-                    suffix += 1;
-                }
-                used.insert(name.clone());
-                want.insert(name, target);
+                add(skill, target, &r.name);
             }
         }
     }
-    owned.retain(|name, target| {
-        want.get(name) == Some(target) || fs::remove_file(links.join(name)).is_err()
-    });
-    let manifest = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+    for (name, target) in &owned {
+        if want.get(name) != Some(target) {
+            fs::remove_file(links.join(name))?;
+        }
+    }
+    owned.retain(|name, target| want.get(name) == Some(target));
+    let manifest = links.parent().unwrap().join(SKILL_OWNERS);
     if want.is_empty() && owned.is_empty() {
-        let _ = fs::remove_file(manifest);
-        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(dir.join(AGENTS_DIR)));
-        return;
+        match fs::remove_file(manifest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(links.parent().unwrap()));
+        return Ok(());
     }
-    if fs::create_dir_all(&links).is_err() {
-        return;
-    }
+    fs::create_dir_all(&links)?;
     // Record before creating links: a failed write must never leave untracked owned links.
     for (name, target) in &want {
         if !owned.contains_key(name) {
             owned.insert(name.clone(), target.clone());
         }
     }
-    let Ok(bytes) = serde_json::to_vec(&owned) else {
-        return;
-    };
-    if crate::state::write(&manifest, &bytes).is_err() {
-        return;
-    }
+    let bytes = serde_json::to_vec(&owned)?;
+    crate::state::write(&manifest, &bytes)?;
     for (name, target) in want {
-        let _ = std::os::unix::fs::symlink(target, links.join(name));
+        let link = links.join(name);
+        if !fs::read_link(&link).is_ok_and(|current| current == target) {
+            std::os::unix::fs::symlink(target, link)?;
+        }
     }
+    Ok(())
 }
 
-/// What Shark itself leaves in a workspace root: its docs, Finder litter, the `.context` folder
+/// What Shark itself leaves in a task root: its docs, Finder litter, the `.context` folder
 /// of attachments and the skill links.
-fn root_owned() -> [&'static str; 5] {
+fn root_owned() -> impl Iterator<Item = &'static str> {
     let [claude, agents] = ROOT_DOCS;
-    [
-        claude,
-        agents,
-        ".DS_Store",
-        attachments_parts().0,
-        AGENTS_DIR,
-    ]
+    [claude, agents, ".DS_Store", attachments_parts().0]
+        .into_iter()
+        .chain(
+            HARNESS_SKILL_DIRS
+                .iter()
+                .map(|p| p.split_once('/').unwrap().0),
+        )
 }
 
 fn attachments_parts() -> (&'static str, &'static str) {
@@ -1201,26 +1273,28 @@ fn attachments_parts() -> (&'static str, &'static str) {
 }
 
 /// Whether `name` in the root is Shark's, not the user's: `.context` only counts while it
-/// holds nothing but attachments and `.agents` nothing but skill links (unreadable, or a file,
+/// holds nothing but attachments and harness folders nothing but skill links (unreadable, or a file,
 /// is unexpected: refuse before removing).
 fn shark_owned(dir: &Path, name: &str) -> bool {
     let (context, attachments) = attachments_parts();
-    root_owned().contains(&name)
+    root_owned().any(|owned| owned == name)
         && (name != context
             || fs::read_dir(dir.join(name))
                 .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == attachments))))
-        && (name != AGENTS_DIR || only_skill_links(dir))
+        && HARNESS_SKILL_DIRS.iter().all(|folder| {
+            folder.split_once('/').unwrap().0 != name || only_skill_links(dir, folder)
+        })
 }
 
-fn only_skill_links(dir: &Path) -> bool {
-    if !skill_dirs_owned(dir) {
+fn only_skill_links(dir: &Path, folder: &str) -> bool {
+    if !skill_dirs_owned(dir, folder) {
         return false;
     }
-    let Some(owned) = owned_skill_links(dir) else {
+    let Some(owned) = owned_skill_links(dir, folder) else {
         return false;
     };
-    let links = dir.join(SKILL_LINKS);
-    fs::read_dir(dir.join(AGENTS_DIR)).is_ok_and(|mut es| {
+    let links = dir.join(folder);
+    fs::read_dir(links.parent().unwrap()).is_ok_and(|mut es| {
         es.all(|e| e.is_ok_and(|e| e.file_name() == "skills" || e.file_name() == SKILL_OWNERS))
     }) && (!links.exists()
         || fs::read_dir(&links).is_ok_and(|mut es| {
@@ -1234,7 +1308,7 @@ fn only_skill_links(dir: &Path) -> bool {
         }))
 }
 
-fn claude_md(ws: &Workspace, dir: &Path) -> String {
+fn claude_md(ws: &Task, dir: &Path) -> String {
     let mut s = header(ws);
     for r in &ws.repos {
         if dir.join(&r.name).join("CLAUDE.md").exists() {
@@ -1252,7 +1326,7 @@ pub fn rules_file(repo_dir: &Path) -> Option<&'static str> {
 }
 
 /// Codex has no `@` imports and reads AGENTS.md only from here, so it is pointed at each repo's.
-fn agents_md(ws: &Workspace, dir: &Path) -> String {
+fn agents_md(ws: &Task, dir: &Path) -> String {
     let mut s = header(ws);
     for r in &ws.repos {
         if let Some(f) = rules_file(&dir.join(&r.name)) {
@@ -1270,43 +1344,48 @@ fn listed(repo: &str) -> String {
     format!("- `{repo}/`: worktree of ")
 }
 
-fn header(ws: &Workspace) -> String {
-    if ws.repos.is_empty() {
-        return format!(
-            "# Workspace `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
+fn header(ws: &Task) -> String {
+    let mut s = if ws.repos.is_empty() {
+        format!(
+            "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
             ws.name
+        )
+    } else {
+        let first = ws
+            .repos
+            .first()
+            .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
+        let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
+        let mut s = format!(
+            "# Task `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
+            ws.name,
+            match shared {
+                true => format!(" on branch `{first}`"),
+                false => String::new(),
+            }
         );
-    }
-    let first = ws
-        .repos
-        .first()
-        .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
-    let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
-    let mut s = format!(
-        "# Workspace `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
-        ws.name,
-        match shared {
-            true => format!(" on branch `{first}`"),
-            false => String::new(),
+        for r in &ws.repos {
+            let on = match shared {
+                true => String::new(),
+                false => format!(" on `{}`", ws.branch_of(r)),
+            };
+            // A PR URL names the GitHub repo, which needn't match the folder.
+            let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
+                .and_then(|o| crate::pr::github_url(&o))
+                .map_or(String::new(), |u| format!(", GitHub {u}"));
+            s += &format!(
+                "{}{}{on} (base `{}`{gh})\n",
+                listed(&r.name),
+                r.src.display(),
+                r.base
+            );
         }
-    );
-    for r in &ws.repos {
-        let on = match shared {
-            true => String::new(),
-            false => format!(" on `{}`", ws.branch_of(r)),
-        };
-        // A PR URL names the GitHub repo, which needn't match the folder.
-        let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
-            .and_then(|o| crate::pr::github_url(&o))
-            .map_or(String::new(), |u| format!(", GitHub {u}"));
-        s += &format!(
-            "{}{}{on} (base `{}`{gh})\n",
-            listed(&r.name),
-            r.src.display(),
-            r.base
-        );
+        s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\nThis task is already an isolated worktree managed by Shark. Don't create more git worktrees (no `isolation: \"worktree\"`, `--worktree` or EnterWorktree); split parallel work by file instead.\n\n";
+        s
+    };
+    if let Some(agent) = &ws.agent {
+        s += &format!("## Agent: {}\n\n{}\n\n", agent.name, agent.instructions);
     }
-    s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\n";
     s
 }
 
@@ -1339,7 +1418,7 @@ fn remove_blocker(src: &Path, wt: &Path, force: bool) -> Option<&'static str> {
 
 /// The refusals of `remove_workspace`, without removing anything: callers run it before any
 /// side effect (stopping servers, archive scripts).
-pub fn archive_preflight(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+pub fn archive_preflight(ws: &Task, dir: &Path, force: bool) -> Result<(), String> {
     // Up front, so a refusal in the second repo can't leave the first one removed.
     let blocked: Vec<String> = ws
         .repos
@@ -1384,7 +1463,7 @@ pub fn archive_preflight(ws: &Workspace, dir: &Path, force: bool) -> Result<(), 
     Ok(())
 }
 
-pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+pub fn remove_task(ws: &Task, dir: &Path, force: bool) -> Result<(), String> {
     archive_preflight(ws, dir, force)?;
     for r in &ws.repos {
         let wt = dir.join(&r.name);
@@ -1422,10 +1501,10 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
     Ok(())
 }
 
-/// After an archive: deletes the workspace branch in each `(repo, head)` source repo, but only
+/// After an archive: deletes the task branch in each `(repo, head)` source repo, but only
 /// while the branch still points at `head`, the commit that was found merged. `-D` because a
 /// squash merge leaves the branch unmerged as far as git can tell. Returns the repos done.
-pub fn delete_merged_branches(ws: &Workspace, merged: &[(String, String)]) -> Vec<String> {
+pub fn delete_merged_branches(ws: &Task, merged: &[(String, String)]) -> Vec<String> {
     ws.repos
         .iter()
         .filter(|r| {
@@ -1454,7 +1533,7 @@ pub fn compare_rev(repo_dir: &Path, base: &str, uncommitted_only: bool) -> Strin
 
 /// One unified patch for all repos. Every path is prefixed with the repo name.
 /// A failed `git diff` (e.g. a missing base) is an error naming the repo, not an empty patch.
-pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Result<String, String> {
+pub fn combined_diff(ws: &Task, dir: &Path, uncommitted_only: bool) -> Result<String, String> {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut out = String::new();
     for r in &ws.repos {

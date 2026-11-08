@@ -1,11 +1,13 @@
 # Git artifact
 
-Git follows the Diff artifact lifecycle: it starts closed, opens once per workspace,
+Git follows the Diff artifact lifecycle: it starts closed, opens once per task,
 participates in the saved tab order, and supports closing, reordering, shortcuts,
 pane navigation, the command palette, and the View menu. `cmd-shift-g` opens it.
-Saving from Home never posts a hidden Git draft.
-The existing workspace Git controls still own push, PR creation, readiness, merge,
-and archive.
+An agent can have several tasks, each with separate Git state and drafts. Open a
+task before running Git actions from an agent page or All tasks; saving from an
+overview never posts a hidden draft. The task Git controls own push, PR creation,
+readiness, merge and archive. See the [manual](manual.md) for the agent-to-task
+workflow.
 
 ## Conversation layout
 
@@ -105,7 +107,7 @@ videos. `cmd-s` never posts a draft while Commits or the full reader is shown.
 - The list shows the branch's own commits, `base..HEAD`, newest first in topological
   order, including commits merged in from side branches and local commits not yet
   pushed. The base is the host's effective comparison base, the same one Diff uses:
-  the host passes `Shark::effective_workspace(ws, cx)` to `GitFeature::set_workspace`.
+  the host passes `Shark::effective_task(ws, cx)` to `GitFeature::set_task`.
   Both ends are resolved to SHAs on each refresh. The list is one `git log`, bounded by
   `MAX_COMMITS` in `src/git/history.rs`; a list that hits the bound is labelled `N+`.
   There is no paging. A missing base is an explicit error; it never falls back to all
@@ -186,13 +188,13 @@ feature-author pattern.
 PR identity, and follows pagination for conversations, reviews, threads and nested
 replies. GraphQL error envelopes are failures even when HTTP succeeds.
 
-`src/features/git/mod.rs` owns a cached view per workspace. Drafts are keyed by the
+`src/features/git/mod.rs` owns a cached view per task. Drafts are keyed by the
 exact PR URL and thread ID, stored under the existing application support directory
-in `git-drafts/<workspace>.json`, and written with the existing private atomic file
+in `git-drafts/<task>.json`, and written with the existing private atomic file
 writer. Description drafts retain their original remote baseline across restarts.
 Read errors protect the original draft file. Storage failures participate in the
 app's unsaved-data banner and quit/archive guards. One background save worker per
-workspace serializes snapshots, including discards; typing never waits on its disk
+task serializes snapshots, including discards; typing never waits on its disk
 I/O. Changes made during a write become its next snapshot. Retry uses the same
 worker, and quit/archive wait for pending local saves as well as remote writes.
 
@@ -229,11 +231,11 @@ and the [GitHub CLI API manual](https://cli.github.com/manual/gh_api).
 Run the focused workflow tests with:
 
 ```sh
-cargo test --features test-support git_feature
-cargo test --features test-support ui_tests::git_tests
-cargo test --features test-support media
-cargo test --features test-support
-cargo test --features test-support --test rendering
+cargo test --features test-support git_feature -- --test-threads=1
+cargo test --features test-support ui_tests::git_tests -- --test-threads=1
+cargo test --features test-support media -- --test-threads=1
+cargo test --features test-support -- --test-threads=1
+cargo test --features test-support --test rendering -- --test-threads=1
 cargo fmt --check
 ```
 
@@ -243,28 +245,13 @@ PR is modified by these tests. History fixtures live in `src/git/history/tests.r
 UI tests in `src/app/ui_tests/git_tests.rs`, and the native harness (`--test rendering`)
 renders the commit browser alongside the rest of the artifact.
 
-Local measurements (development build, this machine; not universal latency guarantees):
-
-| Scenario | Observed result |
-| --- | --- |
-| Headless frame, 10 review threads | 1.52 ms mean across 10 frames |
-| Headless frame, 100 review threads | 1.49 ms mean across 10 frames |
-| Headless frame, 1,000 review threads | 1.49 ms mean across 10 frames |
-| 2,000-thread mock CLI payload | 133 ms; one subprocess, no per-thread requests |
-| Actual compiled read-only GitHub load + discovery, PR #60 | 1.23 seconds |
-| 65 KB inline-heavy Markdown preview | 3–4 ms settled redraw; 11–18 ms parsed and rendered |
-| Complete 65 KB source in read-only editor | 13–19 ms open; 1.4–1.6 ms redraw; exact clipboard copy verified |
-| Native Metal rendering | 800/1440 px, dark/light: overview, description editing, activity, inline reply, comment composer, local drafts, reader, states |
-
 Run the opt-in live read test explicitly (it never mutates the PR):
 
 ```sh
 SHARK_GIT_FEATURE_LIVE_PR=https://github.com/KaffeDiem/shark/pull/60 \
-  cargo test --features test-support pr::git_feature::tests::live_read_only_pull_request -- --ignored --nocapture
+  cargo test --features test-support pr::git_feature::tests::live_read_only_pull_request -- --test-threads=1 --ignored --nocapture
 ```
 
-See [QA and verification](git-feature-qa.md) for the test-isolation fixes and detailed
-evidence. A prior strict Clippy run exposed four existing lint categories in unrelated
-code (`type_complexity`, `needless_borrow`, `non_octal_unix_permissions`, and
-`unnecessary_unwrap`); checking with only those categories allowed passes. The
-existing `block` dependency also emits a future-Rust compatibility warning.
+See the [historical QA report](git-feature-qa.md) for the feature's original
+acceptance evidence, measurements and limitations. Those results describe that
+reviewed revision; they are not a verification result for the current checkout.

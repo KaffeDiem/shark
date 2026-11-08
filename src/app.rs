@@ -1,4 +1,4 @@
-//! Root view: sidebar of workspaces, Chat/Diff tabs, palette and dialogs.
+//! Root view: sidebar of tasks, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent};
 use crate::checkbox::Checkbox;
@@ -6,7 +6,7 @@ use crate::editor::{EditorEvent, FileEditor};
 use crate::linear::Snapshot;
 use crate::menu::{self, Entry};
 use crate::models::MODELS;
-use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
+use crate::state::{ChatMeta, Repo, Section, State, TabId, Task, move_item, tasks_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(crate) mod agent_settings;
 mod app_switcher;
 mod ask;
 mod attach;
@@ -49,26 +50,27 @@ mod interaction;
 pub(crate) mod linear_connection;
 mod linear_issues;
 pub(crate) mod menus;
-mod new_workspace;
+mod new_task;
 mod palette;
 mod picker;
 mod reorder;
 pub(crate) mod repo_settings;
 mod run;
 mod sidebar;
+mod skill_import;
 mod storage;
+mod task;
+mod task_picker;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
 mod usage;
-mod workspace;
-mod workspace_picker;
 
 use crate::features::{Feature, FeatureFocus, differ, git as git_feature};
 use crate::ui::*;
 use differ::Differ;
 use differ::Viewed;
 use menus::{on_shark, tilde, ws_menu};
-use sidebar::{Naming, SideRow, move_submenu};
+use sidebar::{SideRow, move_submenu};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
@@ -94,7 +96,8 @@ enum Pane {
 pub struct Shark {
     pub(crate) state: State,
     sel: SideRow,
-    naming: Option<Naming>,
+    /// Agent navigation folds independently of optional task groups.
+    collapsed_agents: HashSet<String>,
     pub(crate) active: Option<String>,
     /// By chat id; created when a chat is first shown.
     chats: HashMap<String, Entity<Chat>>,
@@ -103,7 +106,7 @@ pub struct Shark {
     /// When ⌘Q last warned that agents are at work, and the watch on the held key; see
     /// `quit_or_warn`.
     quit_warned: Option<std::time::Instant>,
-    quit_hold: Task<()>,
+    quit_hold: gpui_kit::Task<()>,
     /// Chats whose turn ended while another chat was shown.
     unread: HashSet<String>,
     tab: Tab,
@@ -118,8 +121,8 @@ pub struct Shark {
     chrome_pressed: Rc<std::cell::Cell<Option<&'static str>>>,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
-    creating: HashSet<String>,
-    /// Agents with a repository being created right now (`Workspace::attaching` has the rest).
+    creating: HashMap<String, Option<String>>,
+    /// Agents with a repository being created right now (`Task::attaching` has the rest).
     adding_repos: HashSet<String>,
     /// Per agent, how the attachment operation has gone.
     attach_results: HashMap<String, attach::Results>,
@@ -131,12 +134,13 @@ pub struct Shark {
     zen: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
-    /// The workspace's language servers by project; files share and outlive tabs on them.
+    /// The task's language servers by project; files share and outlive tabs on them.
     language_sessions: HashMap<String, (Entity<crate::lsp::Session>, Subscription)>,
-    /// Servers of workspaces switched away from, kept warm until their idle timer runs out.
-    parked_sessions: HashMap<String, (Vec<Entity<crate::lsp::Session>>, Task<()>)>,
+    /// Servers of tasks switched away from, kept warm until their idle timer runs out.
+    parked_sessions: HashMap<String, (Vec<Entity<crate::lsp::Session>>, gpui_kit::Task<()>)>,
     navigation: intelligence::History,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
+    pub(crate) sibling_refreshes: HashMap<String, gpui_kit::Task<()>>,
     sidebar_focus: FocusHandle,
     features_focus: FocusHandle,
     feature_sel: usize,
@@ -152,18 +156,18 @@ pub struct Shark {
     #[cfg(test)]
     usage_live: bool,
     usage_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
-    usage_poll: Option<Task<()>>,
+    usage_poll: Option<gpui_kit::Task<()>>,
     usage_due: Option<std::time::Instant>,
     content_focus: FocusHandle,
-    interaction_save: Option<Task<()>>,
+    interaction_save: Option<gpui_kit::Task<()>>,
     /// The latest dependency check; empty until the first one lands.
     pub(crate) deps: Vec<crate::deps::Dep>,
-    deps_check: Option<Task<()>>,
+    deps_check: Option<gpui_kit::Task<()>>,
     /// When the last dependency check started.
     deps_at: Option<std::time::Instant>,
     pub(crate) home: home::Home,
     linear: linear_connection::Linear,
-    /// Running run scripts by workspace (cmd-r); dropping one stops them.
+    /// Running run scripts by task (cmd-r); dropping one stops them.
     runs: HashMap<String, crate::scripts::Running>,
     _subs: Vec<Subscription>,
 }
@@ -183,8 +187,8 @@ impl Shark {
         let backup = state.corrupt_backup.take();
         let read_only = state.read_only;
         // A fresh install has nothing new to announce (Home's What's new line); an update
-        // from before the line existed has workspaces, and does.
-        if state.last_seen_version.is_empty() && state.workspaces.is_empty() {
+        // from before the line existed has tasks, and does.
+        if state.last_seen_version.is_empty() && state.tasks.is_empty() {
             state.last_seen_version = env!("CARGO_PKG_VERSION").into();
             let _ = state.save();
         }
@@ -192,6 +196,17 @@ impl Shark {
         let differ = cx.new(|cx| Differ::new(differ::Preferences::from(&state), window, cx));
         cx.defer_in(window, move |s, window, cx| {
             s.reconcile_attachments(window, cx);
+            // Settings save while typing; a quit before dialog close can leave older task docs.
+            let changed_agents: Vec<_> = s.state.agents.iter().filter(|agent| {
+                s.state.tasks.iter().any(|task| task.agent.as_ref().is_some_and(|link| {
+                    link.slug == agent.slug && (link.name != agent.name || link.instructions != agent.instructions)
+                }))
+            }).map(|agent| agent.slug.clone()).collect();
+            for slug in changed_agents {
+                if let Err(e) = s.sync_agent(&slug, true, cx) {
+                    notify_err(window, cx, format!("Couldn't refresh agent instructions: {e}"));
+                }
+            }
             s.restore_last_open(window, cx);
             s.check_deps(cx);
             s.usage_polling(window, cx);
@@ -231,7 +246,7 @@ impl Shark {
             }),
             // Keys need a rendered target. A closing dialog gives focus back to what had it
             // when it opened, which may be gone by then: a closed select's popover, or Home
-            // after what the dialog did (open a workspace) took Home away.
+            // after what the dialog did (open a task) took Home away.
             cx.on_focus_lost(window, |s, w, cx| s.focus_fallback(w, cx)),
             cx.observe_window_appearance(window, |s, _, cx| {
                 if s.state.appearance.mode == crate::state::Mode::System {
@@ -264,13 +279,13 @@ impl Shark {
         }));
         Shark {
             state,
-            sel: SideRow::Ws(0),
-            naming: None,
+            sel: SideRow::Task(0),
+            collapsed_agents: HashSet::new(),
             active: None,
             chats: HashMap::new(),
             awake: None,
             quit_warned: None,
-            quit_hold: Task::ready(()),
+            quit_hold: gpui_kit::Task::ready(()),
             unread: HashSet::new(),
             tab: Tab::Chat,
             differ,
@@ -282,7 +297,7 @@ impl Shark {
             restore_generation: 0,
             chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
-            creating: HashSet::new(),
+            creating: HashMap::new(),
             adding_repos: HashSet::new(),
             attach_results: HashMap::new(),
             setting_up: vec![],
@@ -294,6 +309,7 @@ impl Shark {
             parked_sessions: HashMap::new(),
             navigation: Default::default(),
             syncs: HashMap::new(),
+            sibling_refreshes: HashMap::new(),
             sidebar_focus,
             features_focus: cx.focus_handle(),
             feature_sel: 0,
@@ -363,25 +379,25 @@ impl Shark {
         menu::hold(self, m, |s| &mut s.menu, cx);
     }
 
-    fn ws(&self, name: &str) -> Option<&Workspace> {
-        self.state.workspaces.iter().find(|w| w.name == name)
+    fn task(&self, name: &str) -> Option<&Task> {
+        self.state.tasks.iter().find(|w| w.name == name)
     }
 
-    fn ws_mut(&mut self, name: &str) -> Option<&mut Workspace> {
-        self.state.workspaces.iter_mut().find(|w| w.name == name)
+    fn task_mut(&mut self, name: &str) -> Option<&mut Task> {
+        self.state.tasks.iter_mut().find(|w| w.name == name)
     }
 
-    fn active_ws(&self) -> Option<&Workspace> {
-        self.ws(self.active.as_ref()?)
+    fn active_task(&self) -> Option<&Task> {
+        self.task(self.active.as_ref()?)
     }
 
-    fn active_ws_mut(&mut self) -> Option<&mut Workspace> {
+    fn active_task_mut(&mut self) -> Option<&mut Task> {
         let name = self.active.clone()?;
-        self.ws_mut(&name)
+        self.task_mut(&name)
     }
 
     fn active_chat(&self) -> Option<&Entity<Chat>> {
-        let ws = self.active_ws()?;
+        let ws = self.active_task()?;
         self.chats.get(&ws.chats.get(ws.active_chat)?.id)
     }
 
@@ -395,19 +411,22 @@ impl Shark {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut GitSync, &mut Window, &mut Context<GitSync>),
     ) {
+        if self.home_shown() && self.home.destination != home::Destination::Home {
+            return notify_err(window, cx, "Open a task before running a Git action");
+        }
         match self.active_sync().cloned() {
-            _ if self.no_repos() => notify_err(window, cx, workspace::NO_REPO),
+            _ if self.no_repos() => notify_err(window, cx, task::NO_REPO),
             Some(sync) => sync.update(cx, |g, cx| f(g, window, cx)),
-            None => notify_err(window, cx, "Open an agent first"),
+            None => notify_err(window, cx, "Open a task first"),
         }
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         if let Tab::Feature(feature) = tab {
-            if self.active_ws().is_none() {
-                return notify_err(window, cx, "Open an agent first");
+            if self.active_task().is_none() {
+                return notify_err(window, cx, "Open a task first");
             }
-            let ws = self.active_ws_mut().unwrap();
+            let ws = self.active_task_mut().unwrap();
             let closed = feature.closed_mut(ws);
             if *closed {
                 *closed = false;
@@ -466,7 +485,7 @@ impl Shark {
             return cx.notify();
         }
         if self.home_shown() {
-            return notify_err(window, cx, "Open an agent first");
+            return notify_err(window, cx, "Open a task first");
         }
         // Out of the hidden sidebar or rail, into the content; a field already in the content
         // (a side question) keeps the focus.
@@ -621,9 +640,9 @@ impl Shark {
             .map(|b| quiet_toolbar("commands", b))
     }
 
-    fn render_new_workspace(&self, cx: &Context<Self>) -> impl IntoElement {
-        side_toggle("new-workspace", IconName::SquarePen, "New agent (cmd-n)")
-            .on_click(cx.listener(|this, _, window, cx| this.new_empty_agent(window, cx)))
+    fn render_new_task(&self, cx: &Context<Self>) -> impl IntoElement {
+        side_toggle("new-workspace", IconName::SquarePen, "New task (cmd-n)")
+            .on_click(cx.listener(|this, _, window, cx| this.new_empty_task(window, cx)))
             .map(|b| quiet_toolbar("new-workspace", b))
     }
 
@@ -687,10 +706,10 @@ impl Shark {
                     .when(self.rail, |d| {
                         d.child(self.render_sidebar_toggle(cx))
                             .child(self.render_commands(cx))
-                            .child(self.render_new_workspace(cx))
+                            .child(self.render_new_task(cx))
                     })
                     .children(tabs)
-                    .when(!self.home_shown() && self.active_ws().is_some(), |d| {
+                    .when(!self.home_shown() && self.active_task().is_some(), |d| {
                         d.child(
                             Button::new("new-chat")
                                 .ghost()
@@ -728,11 +747,49 @@ impl Shark {
         let has_controls = controls.is_some();
         let no_repos = self.no_repos();
         let attachments = self.render_attachments(window, cx);
+        let identity = self.active_task().and_then(|task| {
+            let link = task.agent.as_ref()?;
+            let name = self
+                .state
+                .agents
+                .iter()
+                .find(|a| a.slug == link.slug)
+                .map_or_else(|| link.name.clone(), |a| a.name.clone());
+            Some((link.slug.clone(), name, task.display_title().into_owned()))
+        });
         let theme = cx.theme();
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
+            .when_some(identity, |d, (slug, name, title)| {
+                d.child(
+                    h_flex()
+                        .id("task-identity")
+                        .h(px(32.))
+                        .flex_none()
+                        .min_w_0()
+                        .px_3()
+                        .gap_1()
+                        .child(
+                            Button::new("task-agent")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Bot)
+                                .label(name)
+                                .on_click(
+                                    cx.listener(move |s, _, w, cx| s.open_agent(&slug, w, cx)),
+                                ),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .with_size(px(12.))
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(div().min_w_0().text_sm().truncate().child(title))
+                        .test_support(),
+                )
+            })
             .child(
                 h_flex()
                     .h(px(44.))
@@ -876,27 +933,19 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_empty_agent(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspaceFromBranch, w, cx| {
-                this.new_workspace_default(w, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
+            .on_action(cx.listener(|this, _: &NewTask, w, cx| this.new_empty_task(w, cx)))
             .on_action(
-                cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
+                cx.listener(|this, _: &NewTaskFromBranch, w, cx| this.new_task_default(w, cx)),
             )
+            .on_action(cx.listener(|this, _: &ArchiveTask, w, cx| this.archive(false, w, cx)))
+            .on_action(cx.listener(|this, _: &ForceArchiveTask, w, cx| this.archive(true, w, cx)))
             .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
             .on_action(
                 cx.listener(|this, _: &CycleOpenApp, w, cx| this.cycle_open_app(false, w, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &OpenWorkspacePicker, w, cx| {
-                    this.open_workspace_picker(w, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &OpenTaskPicker, w, cx| this.open_task_picker(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
-            .on_action(cx.listener(|this, _: &AddRepoToWorkspace, w, cx| {
-                this.pick_repo_for_workspace(w, cx)
-            }))
+            .on_action(cx.listener(|this, _: &AddRepoToTask, w, cx| this.pick_repo_for_task(w, cx)))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowUsage, w, cx| this.show_usage(w, cx)))
@@ -968,15 +1017,15 @@ impl Render for Shark {
             }))
             .on_action(cx.listener(|this, _: &CopyBranch, w, cx| {
                 this.with_target(w, cx, |_, ws, w, cx| match ws.repos.is_empty() {
-                    true => notify_err(w, cx, workspace::NO_REPO),
+                    true => notify_err(w, cx, task::NO_REPO),
                     false => copy(ws.branch.clone(), w, cx),
                 })
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &NextAttention, w, cx| this.next_attention(w, cx)))
-            .on_action(cx.listener(|this, a: &OpenWorkspace, w, cx| {
+            .on_action(cx.listener(|this, a: &OpenTask, w, cx| {
                 if let Some(ix) = this.ws_order(false).get(a.0).copied() {
-                    this.open_workspace(ix, w, cx)
+                    this.open_task(ix, w, cx)
                 }
             }))
             .on_action(
@@ -992,7 +1041,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &DeleteSection, w, cx| {
                 this.with_section(w, cx, Shark::delete_section)
             }))
-            // Held modifiers reveal workspace and chat number shortcuts.
+            // Held modifiers reveal task and chat number shortcuts.
             .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, w, cx| {
                 this.app_switcher_modifiers(ev.modifiers.platform, w, cx);
                 cx.notify();

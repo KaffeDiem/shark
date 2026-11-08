@@ -2,8 +2,8 @@
 //! with the user's own `codex login` (a ChatGPT subscription or an API key). Its notifications
 //! become the same `Ev`s claude's stream-json does; tool items take claude's tool names so the
 //! chat summarizes them the same way.
-use crate::agent::{self, Agent, Ev, SESSION_GONE, text_of};
-use crate::state::{ChatMeta, Workspace};
+use crate::harness::{self, Ev, Harness, SESSION_GONE, text_of};
+use crate::state::{ChatMeta, Task};
 use crate::transcript::{clip_output, clip_strings, output, transcript_path};
 use gpui_kit::base::async_util::Receiver;
 use serde_json::{Value, json};
@@ -45,7 +45,7 @@ pub struct State {
     model: String,
 }
 
-pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
+pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<Ev>)> {
     // SHARK_CODEX swaps in another binary, like SHARK_CLAUDE.
     let mut cmd = Command::new(crate::proc::codex_bin());
     cmd.arg("app-server");
@@ -56,16 +56,19 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
         ..Default::default()
     }));
     if !ws.dir().join("AGENTS.md").exists() {
-        crate::git::write_claude_md(ws); // a workspace from before codex chats
+        crate::git::write_instructions(ws, &ws.dir()).map_err(std::io::Error::other)?;
     }
     // Also catches skills a pull brought in since the links were last written.
-    crate::git::link_skills(ws, &ws.dir());
-    let (agent, rx) = agent::start(
+    let notice = crate::git::link_skills(ws, &ws.dir())
+        .err()
+        .map(|e| format!("Couldn't refresh skills: {e}"));
+    let (agent, rx) = harness::start(
         cmd,
         &ws.dir(),
         &chat.id,
         Some(transcript_path(&chat.id)),
         Some(st),
+        notice,
     )?;
     let mut params = json!({"cwd": ws.dir(), "approvalPolicy": "never", "sandbox": SANDBOX});
     if let Some(m) = model_id(chat.model.as_deref()) {
@@ -100,7 +103,7 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     };
     for text in std::mem::take(&mut s.pending) {
         s.next += 1;
-        agent::write(stdin, &request(s, &thread, &text))?;
+        harness::write(stdin, &request(s, &thread, &text))?;
     }
     Ok(())
 }
@@ -177,7 +180,7 @@ fn fast_in(config: &str) -> bool {
 pub fn interrupt(st: &Mutex<State>, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     let s = st.lock().unwrap();
     match (&s.thread, &s.turn) {
-        (Some(thread), Some(turn)) => agent::write(
+        (Some(thread), Some(turn)) => harness::write(
             stdin,
             &json!({"id": "interrupt", "method": "turn/interrupt", "params": {"threadId": thread, "turnId": turn}}),
         ),
@@ -202,9 +205,12 @@ pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> 
 }
 
 /// Codex keys answers by question id and uses its TUI's free-text convention.
-pub(crate) fn question_reply(qs: &[agent::Question], answers: Option<&[agent::Answer]>) -> Value {
+pub(crate) fn question_reply(
+    qs: &[harness::Question],
+    answers: Option<&[harness::Answer]>,
+) -> Value {
     let by_id: serde_json::Map<String, Value> = match answers {
-        Some(answers) => agent::given(qs, answers)
+        Some(answers) => harness::given(qs, answers)
             .map(|(q, (labels, note), _)| {
                 let mut list = labels.clone();
                 if let Some(n) = note {
@@ -221,7 +227,7 @@ pub(crate) fn question_reply(qs: &[agent::Question], answers: Option<&[agent::An
             .map(|q| {
                 (
                     q.id.clone(),
-                    json!({"answers": [format!("user_note: {}", agent::ANSWER_IN_CHAT)]}),
+                    json!({"answers": [format!("user_note: {}", harness::ANSWER_IN_CHAT)]}),
                 )
             })
             .collect(),
@@ -231,7 +237,7 @@ pub(crate) fn question_reply(qs: &[agent::Question], answers: Option<&[agent::An
 
 pub fn reply(stdin: &Mutex<ChildStdin>, request_id: &str, result: Value) -> std::io::Result<()> {
     let id: Value = serde_json::from_str(request_id).unwrap_or(request_id.into());
-    agent::write(stdin, &json!({"id": id, "result": result}))
+    harness::write(stdin, &json!({"id": id, "result": result}))
 }
 
 /// Keeps `State` current from the server's lines, on the reader thread. A thread that can't
@@ -264,7 +270,7 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
                 json!({"id": v["id"], "error": {"code": -32601, "message": "not supported by shark"}})
             }
         };
-        let _ = agent::write(stdin, &reply);
+        let _ = harness::write(stdin, &reply);
         return true;
     }
     let mut s = st.lock().unwrap();
@@ -369,7 +375,7 @@ pub fn parse(v: &Value) -> Vec<Ev> {
                 _ => vec![result(false, String::new())],
             }
         }
-        (Some(USER_INPUT), _) => vec![Ev::Questions(agent::Questions::new(
+        (Some(USER_INPUT), _) => vec![Ev::Questions(harness::Questions::new(
             v["id"].to_string(),
             s(&p["itemId"]),
             json!({"questions": p["questions"]}),
@@ -582,7 +588,7 @@ mod tests {
 
     #[test]
     fn parses_app_server() {
-        let evs: Vec<Ev> = SESSION.lines().flat_map(agent::parse).collect();
+        let evs: Vec<Ev> = SESSION.lines().flat_map(harness::parse).collect();
         let done = |is_error: bool, text: &str, secs| Ev::Result {
             is_error,
             text: text.into(),
@@ -649,7 +655,7 @@ mod tests {
                     input: json!({"plan": ""}),
                 },
                 // Plan mode's question, normalized for the card.
-                Ev::Questions(agent::Questions::new(
+                Ev::Questions(harness::Questions::new(
                     "0".into(),
                     "call_1".into(),
                     json!({"questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}]}),
@@ -722,19 +728,19 @@ mod tests {
     fn clips_stored_lines() {
         let long = "é".repeat(MAX_OUTPUT + 5);
         let line = json!({"method": "item/completed", "params": {"item": {"type": "commandExecution", "id": "x", "aggregatedOutput": long, "exitCode": 0}}}).to_string();
-        let live = agent::parse(&line);
+        let live = harness::parse(&line);
         let stored = transcript::compact(&line);
         assert_eq!(
-            agent::parse(&stored),
+            harness::parse(&stored),
             live,
             "replay shows what the live turn did"
         );
         assert!(stored.contains(&format!("\"total_chars\":{}", MAX_OUTPUT + 5)));
         let diff = "+x\n".repeat(MAX_OUTPUT);
         let line = json!({"method": "item/completed", "params": {"item": {"type": "fileChange", "id": "f", "status": "completed", "changes": [{"path": "/a", "diff": diff}]}}}).to_string();
-        let live = agent::parse(&line);
+        let live = harness::parse(&line);
         assert_eq!(
-            agent::parse(&transcript::compact(&line)),
+            harness::parse(&transcript::compact(&line)),
             live,
             "a long diff replays the same"
         );
@@ -819,7 +825,7 @@ done
         });
         let root = std::env::temp_dir().join(format!("shark-codex-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("codex-{tag}-{}", std::process::id()),
             ..Default::default()
         };
@@ -832,10 +838,10 @@ done
             effort: Some("xhigh".into()),
             ..Default::default()
         };
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-        let (mut a, rx) = agent::spawn(&ws, &meta).unwrap();
+        let (mut a, rx) = harness::spawn(&ws, &meta).unwrap();
         a.send("hi").unwrap(); // before the thread exists: held until it does
         let mut evs = vec![];
         while let Ok(ev) = rx.recv_blocking() {

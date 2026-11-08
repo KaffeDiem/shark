@@ -1,9 +1,10 @@
-//! Linear issues on an agent: attaching one, its details, and starting an agent from one. An
+//! Linear issues on a task: attaching one, its details, and starting a task from one. An
 //! attachment is reference material: it starts no turn and waits for nothing, and chats hear of
-//! it through `Workspace::context`. Nothing here writes to Linear.
+//! it through `Task::context`. Nothing here writes to Linear.
 use super::attach::ChipCard;
 use super::*;
 use crate::linear::{self, Credential, Error, Hit, Http, IssueRef, Lists, Page, Target};
+use crate::state::AgentLink;
 use crate::sync::ago;
 use crate::ui::menu_dialog;
 use crate::usage::now;
@@ -308,8 +309,9 @@ enum Job {
 /// already on the wire: every timer is a task it owns, so closing it stops them.
 pub(super) struct IssuePicker {
     state: Entity<CommandState>,
-    /// The agent to attach to; None starts a new one.
-    agent: Option<String>,
+    /// The task to attach to; None starts a new one.
+    task: Option<String>,
+    agent: Option<AgentLink>,
     /// Why nothing can be asked of Linear; the row to Settings replaces the others.
     blocked: Option<Blocked>,
     /// Lists, cached results and marks belong to this connection.
@@ -339,11 +341,11 @@ pub(super) struct IssuePicker {
     /// The last failure; the query and the rows stay.
     failure: Option<(String, Job)>,
     shark: WeakEntity<Shark>,
-    _debounce: Task<()>,
-    _flight: Task<()>,
-    _wait: Task<()>,
+    _debounce: gpui_kit::Task<()>,
+    _flight: gpui_kit::Task<()>,
+    _wait: gpui_kit::Task<()>,
     /// Closing the dialog drops this: what it would have attached is abandoned.
-    _fetch: Task<()>,
+    _fetch: gpui_kit::Task<()>,
     _connection: Subscription,
     /// Settings over this picker, until its view is dropped with the dialog.
     settings: Option<WeakFocusHandle>,
@@ -423,12 +425,12 @@ impl IssuePicker {
         self.groups().get(at.section)?.1.get(at.row).cloned()
     }
 
-    /// The agent's issues as (UUID, identifier).
+    /// The task's issues as (UUID, identifier).
     fn attached(&self, cx: &App) -> Vec<(String, String)> {
         let shark = self.shark.upgrade();
-        let ws = (self.agent.as_ref())
+        let ws = (self.task.as_ref())
             .zip(shark.as_ref())
-            .and_then(|(n, s)| s.read(cx).ws(n));
+            .and_then(|(n, s)| s.read(cx).task(n));
         ws.map_or(vec![], |ws| {
             (ws.linear.ordered())
                 .map(|r| (r.issue.clone(), issue_label(ws, r)))
@@ -478,7 +480,7 @@ impl IssuePicker {
         let key = self.key();
         if self.cache.contains_key(&key) {
             self.shown = key;
-            self._debounce = Task::ready(());
+            self._debounce = gpui_kit::Task::ready(());
         } else {
             if key.chars().count() < MIN_QUERY {
                 self.shown.clear();
@@ -663,10 +665,10 @@ impl IssuePicker {
             self.pending = false;
             self.flying = false;
             self.fetching = false;
-            self._debounce = Task::ready(());
-            self._flight = Task::ready(());
-            self._wait = Task::ready(());
-            self._fetch = Task::ready(());
+            self._debounce = gpui_kit::Task::ready(());
+            self._flight = gpui_kit::Task::ready(());
+            self._wait = gpui_kit::Task::ready(());
+            self._fetch = gpui_kit::Task::ready(());
         }
         let unblocked = std::mem::replace(&mut self.blocked, now).is_some();
         if (unblocked || changed) && self.blocked.is_none() && self.connection.1.is_some() {
@@ -747,7 +749,7 @@ impl IssuePicker {
             Some(Row::Lookup(t)) => t,
             _ => return,
         };
-        if self.agent.is_none() {
+        if self.task.is_none() {
             return;
         }
         let before = self.marks.len();
@@ -794,11 +796,13 @@ impl IssuePicker {
 
     fn finish(&mut self, snapshots: Vec<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.close_dialog(cx);
+        let task = self.task.clone();
         let agent = self.agent.clone();
-        (self.shark.update(cx, |s, cx| match agent {
+        (self.shark.update(cx, |s, cx| match task {
             Some(name) => s.attach_issues(name, snapshots, window, cx),
             // Nothing can be marked here, so it's the one.
-            None => (snapshots.into_iter()).for_each(|one| s.preview_issue(one, window, cx)),
+            None => (snapshots.into_iter())
+                .for_each(|one| s.preview_issue(one, agent.clone(), window, cx)),
         }))
         .ok();
     }
@@ -817,7 +821,7 @@ impl Render for IssuePicker {
         let query = self.query.trim().to_string();
         let marked = self.marks.len();
         let (nav, close) = (("up down", "Navigate"), ("escape", "Close"));
-        let hints = match (&self.blocked, &self.agent, marked) {
+        let hints = match (&self.blocked, &self.task, marked) {
             (Some(b), ..) => vec![("enter", b.action()), close],
             (_, None, _) => vec![nav, ("enter", "Start"), close],
             (_, _, 0) => vec![nav, ("enter", "Attach"), ("cmd-enter", "Mark"), close],
@@ -924,7 +928,7 @@ impl Render for IssuePicker {
     }
 }
 
-/// The first request of an agent started from an issue: to plan, which is all it can do so far.
+/// The first request of a task started from an issue: to plan, which is all it can do so far.
 fn planning_request(s: &Snapshot) -> String {
     format!(
         "Read the attached Linear issue {} and draft a plan for it. List anything unclear before going further.",
@@ -1010,7 +1014,7 @@ fn issue_summary(
         .into_any_element()
 }
 
-fn issue_label(ws: &Workspace, r: &IssueRef) -> String {
+fn issue_label(ws: &Task, r: &IssueRef) -> String {
     r.of(&ws.issues)
         .map_or("Linear issue".into(), |s| s.identifier.clone())
 }
@@ -1042,7 +1046,7 @@ impl IssueDetails {
     /// `shark`'s view of the issue: its snapshot and whether it's primary.
     fn issue(&self, cx: &App) -> Option<(Option<Snapshot>, bool, String)> {
         let shark = self.shark.upgrade()?;
-        let ws = shark.read(cx).ws(&self.name)?;
+        let ws = shark.read(cx).task(&self.name)?;
         let primary = ws.linear.primary() == Some(&self.r);
         Some((
             self.r.of(&ws.issues).cloned(),
@@ -1179,7 +1183,7 @@ impl Shark {
     /// shows outside Settings hangs on this.
     pub(super) fn linear_in_use(&self) -> bool {
         self.state.linear.is_some()
-            || (self.state.workspaces.iter()).any(|w| w.linear.primary().is_some())
+            || (self.state.tasks.iter()).any(|w| w.linear.primary().is_some())
     }
 
     fn linear_blocked(&self) -> Option<Blocked> {
@@ -1192,15 +1196,20 @@ impl Shark {
 
     fn open_issue_picker(
         &mut self,
-        agent: Option<String>,
+        task: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let blocked = self.linear_blocked();
         let connection = (self.state.linear.clone(), self.linear_connection_epoch());
         let shark = cx.entity();
+        let agent = task
+            .is_none()
+            .then(|| self.selected_task_agent(cx))
+            .flatten();
         let picker = cx.new(|cx| IssuePicker {
             state: cx.new(|cx| CommandState::new(window, cx)),
+            task,
             agent,
             blocked,
             connection,
@@ -1218,10 +1227,10 @@ impl Shark {
             fetching: false,
             failure: None,
             shark: shark.downgrade(),
-            _debounce: Task::ready(()),
-            _flight: Task::ready(()),
-            _wait: Task::ready(()),
-            _fetch: Task::ready(()),
+            _debounce: gpui_kit::Task::ready(()),
+            _flight: gpui_kit::Task::ready(()),
+            _wait: gpui_kit::Task::ready(()),
+            _fetch: gpui_kit::Task::ready(()),
             _connection: cx.observe_in(&shark, window, |p: &mut IssuePicker, _, window, cx| {
                 p.connection_changed(window, cx)
             }),
@@ -1258,11 +1267,11 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = self.ws_title(&name);
+        let title = self.task_title(&name);
         if self.archiving.contains(&name) {
             return notify_err(window, cx, format!("{title} is being deleted"));
         }
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let (old, new): (Vec<_>, Vec<_>) = (snapshots.into_iter())
             .partition(|s| ws.linear.ordered().any(|x| *x == IssueRef::from(s)));
         for s in old {
@@ -1274,7 +1283,7 @@ impl Shark {
         }
     }
 
-    /// Writes `snapshots` off the UI thread; once that worked the agent and its chats have them.
+    /// Writes `snapshots` off the UI thread; once that worked the task and its chats have them.
     fn keep_snapshots(
         &mut self,
         name: String,
@@ -1283,9 +1292,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (agent, kept) = (name.clone(), snapshots.clone());
+        let (task, kept) = (name.clone(), snapshots.clone());
         let write = (cx.background_executor())
-            .spawn(async move { (kept.iter()).try_for_each(|s| linear::put_snapshot(&agent, s)) });
+            .spawn(async move { (kept.iter()).try_for_each(|s| linear::put_snapshot(&task, s)) });
         cx.spawn_in(window, async move |this, cx| {
             let written = write.await;
             this.update_in(cx, |s, window, cx| {
@@ -1294,7 +1303,7 @@ impl Shark {
                 if let Err(e) = written {
                     return notify_err(window, cx, format!("Couldn't save {ids}: {e}"));
                 }
-                let Some(ws) = s.ws_mut(&name) else {
+                let Some(ws) = s.task_mut(&name) else {
                     return linear::delete_snapshots(&name); // deleted meanwhile
                 };
                 for snapshot in &snapshots {
@@ -1306,9 +1315,9 @@ impl Shark {
                 if attach {
                     let _ = s.state.save();
                 }
-                s.publish_workspace(&name, cx);
+                s.publish_task(&name, cx);
                 let msg = match attach {
-                    true => format!("Attached {ids} to {}", s.ws_title(&name)),
+                    true => format!("Attached {ids} to {}", s.task_title(&name)),
                     false => format!("Refreshed {ids}"),
                 };
                 window.push_notification(Notification::success(msg), cx);
@@ -1340,9 +1349,12 @@ impl Shark {
         r: &IssueRef,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Task<()> {
-        let Some(ws) = self.ws(name).filter(|w| w.linear.ordered().any(|x| x == r)) else {
-            return Task::ready(());
+    ) -> gpui_kit::Task<()> {
+        let Some(ws) = self
+            .task(name)
+            .filter(|w| w.linear.ordered().any(|x| x == r))
+        else {
+            return gpui_kit::Task::ready(());
         };
         let old = r.of(&ws.issues).cloned().unwrap_or_else(|| Snapshot {
             org: r.org.clone(),
@@ -1352,7 +1364,7 @@ impl Shark {
         });
         if let Some(why) = self.refresh_refused(&old) {
             notify_err(window, cx, why);
-            return Task::ready(());
+            return gpui_kit::Task::ready(());
         }
         let id = old.identifier.clone();
         let task = self.linear_request(move |http, c| linear::refresh_issue(http, c, &old), cx);
@@ -1362,7 +1374,7 @@ impl Shark {
             this.update_in(cx, |s, window, cx| match result {
                 Ok(fresh) => {
                     let attached = s
-                        .ws(&name)
+                        .task(&name)
                         .is_some_and(|w| w.linear.ordered().any(|x| *x == r));
                     if attached {
                         s.keep_snapshots(name, vec![fresh], false, window, cx);
@@ -1376,25 +1388,27 @@ impl Shark {
 
     /// Never touches a branch or a title: `default_branch` only reads it for a first repository.
     pub(super) fn make_primary(&mut self, name: &str, r: &IssueRef, cx: &mut Context<Self>) {
-        if let Some(ws) = self.ws_mut(name) {
+        if let Some(ws) = self.task_mut(name) {
             ws.linear.make_primary(r);
             let _ = self.state.save();
-            self.publish_workspace(name, cx);
+            self.publish_task(name, cx);
         }
     }
 
     /// Stops it going into later turns; what chats were already told stays in them.
     pub(super) fn remove_issue(&mut self, name: &str, r: &IssueRef, cx: &mut Context<Self>) {
-        let Some(ws) = self.ws_mut(name) else { return };
+        let Some(ws) = self.task_mut(name) else {
+            return;
+        };
         ws.linear.remove(r);
         ws.issues.retain(|s| IssueRef::from(s) != *r);
         let _ = self.state.save();
-        self.publish_workspace(name, cx);
-        let (agent, r) = (name.to_string(), r.clone());
+        self.publish_task(name, cx);
+        let (task, r) = (name.to_string(), r.clone());
         (cx.background_executor())
             .spawn(async move {
-                // A failure leaves it in the file, unused, until the agent is deleted.
-                let _ = linear::remove_snapshot(&agent, &r);
+                // A failure leaves it in the file, unused, until the task is deleted.
+                let _ = linear::remove_snapshot(&task, &r);
             })
             .detach();
     }
@@ -1407,7 +1421,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let text = r
             .of(&ws.issues)
             .map_or(String::new(), |s| s.description.clone());
@@ -1446,7 +1460,7 @@ impl Shark {
 
     /// Show Linear issue: the one attached, or a choice.
     pub(super) fn pick_issue(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.ws(&name) else { return };
+        let Some(ws) = self.task(&name) else { return };
         let refs: Vec<IssueRef> = ws.linear.ordered().cloned().collect();
         if let [only] = refs.as_slice() {
             return self.issue_details(name, only.clone(), window, cx);
@@ -1473,7 +1487,13 @@ impl Shark {
     }
 
     /// Start from Linear issue's confirmation: nothing exists until it's accepted.
-    fn preview_issue(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+    fn preview_issue(
+        &mut self,
+        snapshot: Snapshot,
+        agent: Option<AgentLink>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = crate::chat::title_of(&snapshot.title);
         let title = cx.new(|cx| InputState::new(window, cx).default_value(title));
         let description = cx.new(|cx| TextViewState::markdown(&snapshot.description, cx));
@@ -1497,7 +1517,9 @@ impl Shark {
             window.close_dialog(cx);
             let issue = Some((title, issue.clone()));
             shark
-                .update(cx, |s, cx| s.new_agent(first, issue, window, cx))
+                .update(cx, |s, cx| {
+                    s.new_task(first, issue, agent.clone(), window, cx)
+                })
                 .ok();
         });
         window.open_dialog(cx, move |d, _, cx| {
@@ -1521,7 +1543,7 @@ impl Shark {
                                 .test_support()
                                 .px_3()
                                 .text_sm()
-                                .child("The agent starts in Plan mode, with no repository yet."),
+                                .child("The task starts in Plan mode, with no repository yet."),
                         )
                         .child(label("Title"))
                         .child(Input::new(&title))
@@ -1531,7 +1553,7 @@ impl Shark {
                 .footer(
                     Button::new("issue-start")
                         .primary()
-                        .label("Start agent")
+                        .label("Start task")
                         .on_click(move |_, window, cx| by_click(window, cx)),
                 )
                 .on_ok(move |_, window, cx| {
@@ -1551,7 +1573,7 @@ impl Shark {
     }
 
     /// An issue's row in Show attachments: what its chip says, in words, and its status icon.
-    pub(super) fn issue_row(&self, ws: &Workspace, r: &IssueRef, theme: &Theme) -> (String, Icon) {
+    pub(super) fn issue_row(&self, ws: &Task, r: &IssueRef, theme: &Theme) -> (String, Icon) {
         let Some(s) = r.of(&ws.issues) else {
             let icon = Icon::new(IconName::TriangleAlert).text_color(theme.warning_foreground);
             return (format!("{} · snapshot missing", issue_label(ws, r)), icon);
@@ -1570,7 +1592,7 @@ impl Shark {
     /// pushed them out of the row. Their cards and details say it for each.
     pub(super) fn disconnected_chip(
         &self,
-        ws: &Workspace,
+        ws: &Task,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let issues = (ws.linear.ordered()).filter_map(|r| r.of(&ws.issues));
@@ -1598,7 +1620,7 @@ impl Shark {
     /// The header's issue chips, primary first: state and identifier, a star on the primary.
     pub(super) fn issue_chips(
         &self,
-        ws: &Workspace,
+        ws: &Task,
         quiet: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {

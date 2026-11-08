@@ -1,4 +1,4 @@
-//! Shared UI styling and dialogs used by the host and workspace features.
+//! Shared UI styling and dialogs used by the host and task features.
 #[cfg(test)]
 use core::prelude::v1::test;
 #[cfg(all(test, feature = "test-support"))]

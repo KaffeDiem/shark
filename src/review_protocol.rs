@@ -87,7 +87,7 @@ pub(crate) fn may_report(text: &str) -> bool {
 /// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
 /// `[c<id>] <place>` and its quoted text. The diff it was sent with is unknown by then.
 pub(crate) fn card_of(prompt: &str) -> Option<ReviewCard> {
-    // A workspace note may come before it on the wire.
+    // A task note may come before it on the wire.
     let prompt = &prompt[prompt.find("Review comments on the diff.")?..];
     let (mut items, mut fence) = (Vec::<ReviewItem>::new(), None);
     for l in prompt.lines() {

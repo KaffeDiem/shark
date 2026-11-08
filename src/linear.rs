@@ -1137,25 +1137,25 @@ pub fn refresh_issue(http: &Http, c: &Credential, old: &Snapshot) -> Result<Snap
     }
 }
 
-fn snapshots_path(agent: &str) -> PathBuf {
-    support_dir().join("linear").join(format!("{agent}.json"))
+fn snapshots_path(task: &str) -> PathBuf {
+    support_dir().join("linear").join(format!("{task}.json"))
 }
 
-/// An agent's snapshots. Unreadable is an error, not empty, so `put_snapshot` can't wipe them.
-pub fn read_snapshots(agent: &str) -> io::Result<Vec<Snapshot>> {
-    match std::fs::read(snapshots_path(agent)) {
+/// A task's snapshots. Unreadable is an error, not empty, so `put_snapshot` can't wipe them.
+pub fn read_snapshots(task: &str) -> io::Result<Vec<Snapshot>> {
+    match std::fs::read(snapshots_path(task)) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
         Err(e) => Err(e),
     }
 }
 
-fn edit_snapshots(agent: &str, edit: impl FnOnce(&mut Vec<Snapshot>)) -> io::Result<()> {
+fn edit_snapshots(task: &str, edit: impl FnOnce(&mut Vec<Snapshot>)) -> io::Result<()> {
     static WRITES: Mutex<()> = Mutex::new(());
     let _turn = WRITES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut all = read_snapshots(agent)?;
+    let mut all = read_snapshots(task)?;
     edit(&mut all);
-    state::write(&snapshots_path(agent), &serde_json::to_vec_pretty(&all)?)
+    state::write(&snapshots_path(task), &serde_json::to_vec_pretty(&all)?)
 }
 
 /// `snapshot` in `all`, in place of an older one of the same issue.
@@ -1167,18 +1167,18 @@ pub fn keep(all: &mut Vec<Snapshot>, snapshot: &Snapshot) {
     }
 }
 
-/// `keep` for `agent`'s file.
-pub fn put_snapshot(agent: &str, snapshot: &Snapshot) -> io::Result<()> {
-    edit_snapshots(agent, |all| keep(all, snapshot))
+/// `keep` for `task`'s file.
+pub fn put_snapshot(task: &str, snapshot: &Snapshot) -> io::Result<()> {
+    edit_snapshots(task, |all| keep(all, snapshot))
 }
 
-pub fn remove_snapshot(agent: &str, r: &IssueRef) -> io::Result<()> {
-    edit_snapshots(agent, |all| all.retain(|s| IssueRef::from(s) != *r))
+pub fn remove_snapshot(task: &str, r: &IssueRef) -> io::Result<()> {
+    edit_snapshots(task, |all| all.retain(|s| IssueRef::from(s) != *r))
 }
 
-/// With the agent.
-pub fn delete_snapshots(agent: &str) {
-    let _ = std::fs::remove_file(snapshots_path(agent));
+/// With the task.
+pub fn delete_snapshots(task: &str) {
+    let _ = std::fs::remove_file(snapshots_path(task));
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1309,7 +1309,7 @@ fn content(s: &Snapshot) -> u64 {
     crate::files::fingerprint(serde_json::to_vec(&read).unwrap_or_default())
 }
 
-/// The attached issues as `Workspace::context` entries, primary first. Each stands alone: a chat
+/// The attached issues as `Task::context` entries, primary first. Each stands alone: a chat
 /// gets only what changed. A ref with no snapshot is skipped.
 pub fn context_notes(attached: &Attachments, snapshots: &[Snapshot]) -> Vec<(String, ContextNote)> {
     let primary = attached.primary();

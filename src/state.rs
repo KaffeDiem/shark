@@ -19,7 +19,10 @@ pub struct State {
     #[serde(skip)]
     pub save_error: std::cell::RefCell<Option<String>>,
     pub repos: Vec<Repo>,
-    pub workspaces: Vec<Workspace>,
+    #[serde(rename = "workspaces")]
+    pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<Agent>,
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
@@ -30,10 +33,10 @@ pub struct State {
     /// Repo names picked for the last agent made in the dialog; the next one starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
-    /// Applications opened through Shark, most recent first, shared by all workspaces.
+    /// Applications opened through Shark, most recent first, shared by all tasks.
     #[serde(default)]
     pub recent_apps: Vec<PathBuf>,
-    /// The workspace and tab (`chat`/`diff`/`git`, or `home` while Home was shown over it) open at
+    /// The task and tab (`chat`/`diff`/`git`, or `home` while Home was shown over it) open at
     /// quit; restored on launch.
     #[serde(default)]
     pub last_open: Option<(String, String)>,
@@ -42,7 +45,7 @@ pub struct State {
     /// Edited git-button prompts by id (`prompts::PROMPTS`); missing ids use the default.
     #[serde(default)]
     pub prompts: BTreeMap<String, String>,
-    /// Sidebar groups of workspaces, in display order; ungrouped workspaces follow them.
+    /// Sidebar groups of tasks, in display order; ungrouped tasks follow them.
     #[serde(default)]
     pub sections: Vec<Section>,
     /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
@@ -83,7 +86,7 @@ pub struct State {
     /// Changes shows one column instead of Original | Working copy (`s`).
     #[serde(default)]
     pub unified: bool,
-    /// Compare the working tree to HEAD instead of the workspace base.
+    /// Compare the working tree to HEAD instead of the task base.
     #[serde(default)]
     pub uncommitted_only: bool,
     /// The Files panel's width, once dragged.
@@ -104,12 +107,12 @@ pub struct State {
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 #[serde(default)]
 pub struct RepoSettings {
-    /// Model and thinking level new chats start on in workspaces with this repo.
+    /// Model and thinking level new chats start on in tasks with this repo.
     pub model: Option<String>,
     pub effort: Option<String>,
     /// After its worktree is created.
     pub setup: Vec<String>,
-    /// cmd-r in a workspace with this repo; cmd-r again stops them.
+    /// cmd-r in a task with this repo; cmd-r again stops them.
     pub run: Vec<String>,
     /// Before its worktree is removed.
     pub archive: Vec<String>,
@@ -137,14 +140,17 @@ impl RepoSettings {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Section {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub name: String,
     /// Lucide icon name from `app::sidebar::SECTION_ICONS`, e.g. `folder`.
     pub icon: String,
     #[serde(default)]
     pub collapsed: bool,
-    /// Workspace names, in the order they were added.
+    /// Task names, in the order they were added.
     #[serde(default)]
-    pub workspaces: Vec<String>,
+    #[serde(rename = "workspaces")]
+    pub tasks: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default, Debug)]
@@ -185,23 +191,69 @@ pub struct Repo {
     pub path: PathBuf,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Agent {
+    pub slug: String,
+    pub name: String,
+    pub icon: String,
+    pub instructions: String,
+    pub repos: Vec<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<TaskRecord>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TaskRecord {
+    pub title: String,
+    pub branch: String,
+    pub prs: Vec<(String, String)>,
+    pub merged: Option<bool>,
+    /// Archive time in Unix milliseconds.
+    pub at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct AgentLink {
+    pub slug: String,
+    pub name: String,
+    pub instructions: String,
+    #[serde(default)]
+    pub siblings: Vec<Sibling>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Sibling {
+    pub title: String,
+    pub branch: String,
+    pub dirs: Vec<String>,
+    pub files: Vec<String>,
+}
+
+pub fn agent_skills_dir(slug: &str) -> PathBuf {
+    support_dir().join("agents").join(slug).join("skills")
+}
+
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Workspace {
-    /// Distinguishes this agent from later agents that reuse its name.
+pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentLink>,
+    /// Distinguishes this task from later tasks that reuse its name.
     #[serde(default)]
     pub instance_id: String,
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
     pub last_interacted_at: Option<u64>,
-    /// Immutable identity: the directory, the first chat's id, every per-workspace key.
+    /// Immutable identity: the directory, the first chat's id, every per-task key.
     pub name: String,
-    /// What the user sees and edits; empty or `NEW_AGENT` shows `name` (`display_title`).
+    /// What the user sees and edits; empty or `NEW_TASK` shows `name` (`display_title`).
     #[serde(default)]
     pub title: String,
     /// With no repos: a placeholder equal to `name`, which nothing shows. The first repo replaces
     /// it with its branch (`default_branch` is what the dialog offers), and later repos inherit it.
     pub branch: String,
-    pub repos: Vec<WsRepo>,
+    pub repos: Vec<TaskRepo>,
     /// The attachment operation under way, in the order it runs. Saved before Git changes anything;
     /// while it holds anything, the agent's chats and Git steps wait.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -238,7 +290,7 @@ pub struct Workspace {
     #[serde(default)]
     pub viewed: HashMap<String, u64>,
     /// The tab strip, left to right. File entries are also the files reopened with the
-    /// workspace; `normalize_tabs` keeps chat and feature tabs in step with their open/closed state.
+    /// task; `normalize_tabs` keeps chat and feature tabs in step with their open/closed state.
     #[serde(default)]
     pub tab_order: Vec<TabId>,
 }
@@ -254,7 +306,7 @@ pub enum TabId {
     File(String),
 }
 
-/// What `Workspace::remove_chat` took out of the lists.
+/// What `Task::remove_chat` took out of the lists.
 pub struct RemovedChat {
     pub meta: ChatMeta,
     /// It was the only chat, so a fresh one took its place.
@@ -268,16 +320,17 @@ fn diff_closed_by_default() -> bool {
     true
 }
 
-fn workspace_instance_id() -> String {
+fn task_instance_id() -> String {
     let mut bytes = [0; 16];
-    getrandom::fill(&mut bytes).expect("workspace identity randomness");
+    getrandom::fill(&mut bytes).expect("task identity randomness");
     format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
-impl Default for Workspace {
+impl Default for Task {
     fn default() -> Self {
         Self {
-            instance_id: workspace_instance_id(),
+            agent: None,
+            instance_id: task_instance_id(),
             last_interacted_at: None,
             name: String::new(),
             title: String::new(),
@@ -303,7 +356,7 @@ impl Default for Workspace {
 /// One conversation: its own claude process, session and transcript.
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatMeta {
-    /// Transcript and log file name. The first chat's id is the workspace name, which is
+    /// Transcript and log file name. The first chat's id is the task name, which is
     /// where the single pre-tabs transcript already lives.
     pub id: String,
     /// First line of the first message; empty until then.
@@ -312,7 +365,7 @@ pub struct ChatMeta {
     #[serde(default)]
     pub session_id: Option<String>,
     /// Claude model alias (`opus`, `fable`, …) or `codex:<model id>`. Only chats saved before
-    /// every chat named one have `None` (the CLI default); `Workspace::fill_models` gives
+    /// every chat named one have `None` (the CLI default); `Task::fill_models` gives
     /// them one.
     #[serde(default)]
     pub model: Option<String>,
@@ -325,7 +378,7 @@ pub struct ChatMeta {
     /// codex's Fast service tier, once toggled; `None` follows codex's own config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
-    /// What this chat's session has been told of `Workspace::context`, by source, as text
+    /// What this chat's session has been told of `Task::context`, by source, as text
     /// fingerprints. Anything else goes out with its next normal message.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivered: BTreeMap<String, u64>,
@@ -357,7 +410,7 @@ pub enum AttachStage {
     Queued,
     /// Git may have started; a restart looks at what is there.
     Creating,
-    /// In `Workspace::repos`; its setup scripts are running.
+    /// In `Task::repos`; its setup scripts are running.
     Setup,
     /// Kept with its worktree until the user retries or continues.
     SetupFailed,
@@ -388,13 +441,13 @@ impl Attachment {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WsRepo {
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct TaskRepo {
     pub name: String,
     pub src: PathBuf,
     /// Ref the branch was cut from, e.g. `origin/main`.
     pub base: String,
-    /// Its own branch; set only when it differs from the workspace branch.
+    /// Its own branch; set only when it differs from the task branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }
@@ -428,23 +481,24 @@ pub fn support_dir() -> PathBuf {
     home().join("Library/Application Support/shark")
 }
 
-pub fn workspaces_dir() -> PathBuf {
+pub fn tasks_dir() -> PathBuf {
     home().join("shark/workspaces")
 }
 
 /// The saved title of an agent nothing has been said to yet; its first message replaces it. Only
 /// this means untitled: a user may title an agent after its name.
-pub const NEW_AGENT: &str = "New agent";
+pub const NEW_TASK: &str = "New agent";
 
-/// The key prefix of a repository in `Workspace::context`. A session reads these from the root
+/// The key prefix of a repository in `Task::context`. A session reads these from the root
 /// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
 pub const REPO_CONTEXT: &str = "repo:";
+pub const AGENT_CONTEXT: &str = "agent:";
 
-/// The key prefix of a Linear issue in `Workspace::context`, before its UUID. Unlike repositories
+/// The key prefix of a Linear issue in `Task::context`, before its UUID. Unlike repositories
 /// these are in no root doc, so every session gets them with its first normal turn.
 pub const ISSUE_CONTEXT: &str = "issue:";
 
-/// One entry of `Workspace::context`.
+/// One entry of `Task::context`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextNote {
     pub text: String,
@@ -452,7 +506,7 @@ pub struct ContextNote {
     pub fingerprint: u64,
 }
 
-/// `Workspace::context` as a chat records it (`ChatMeta::delivered`).
+/// `Task::context` as a chat records it (`ChatMeta::delivered`).
 pub fn context_record(context: &BTreeMap<String, ContextNote>) -> BTreeMap<String, u64> {
     (context.iter())
         .map(|(k, note)| (k.clone(), note.fingerprint))
@@ -637,7 +691,7 @@ pub const SEA_NAMES: &[&str] = &[
 
 /// A new agent's identity: a random entry of `SEA_NAMES` that isn't `taken`, or with all of them
 /// gone, a numbered one (`marlin-2`). `seed` stands in if the system has no randomness to give.
-pub fn agent_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
+pub fn task_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
     let pick = getrandom::u64().unwrap_or(seed) as usize;
     (1..)
         .find_map(|n| {
@@ -653,9 +707,26 @@ pub fn agent_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
         .expect("numbers outlast the agents")
 }
 
-impl Workspace {
+/// A short, branch-safe name shared by agent identities and task titles.
+pub fn slug(source: &str) -> String {
+    let mut slug = String::new();
+    for word in source
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        if slug.len() + word.len() > 40 {
+            break;
+        }
+        slug += &word.to_ascii_lowercase();
+        slug.push('-');
+    }
+    slug.pop();
+    slug
+}
+
+impl Task {
     pub fn dir(&self) -> PathBuf {
-        workspaces_dir().join(&self.name)
+        tasks_dir().join(&self.name)
     }
 
     /// What to call it on screen. Untitled, that's its name capitalised, but an `agent-<hex>` from
@@ -663,11 +734,12 @@ impl Workspace {
     pub fn display_title(&self) -> Cow<'_, str> {
         match self.title.as_str() {
             "" => self.name.as_str().into(),
-            NEW_AGENT if !self.name.starts_with("agent-") => {
+            NEW_TASK if !self.name.starts_with("agent-") => {
                 let mut c = self.name.chars();
                 let first = c.next().into_iter().flat_map(char::to_uppercase);
                 first.chain(c).collect::<String>().into()
             }
+            NEW_TASK => "New task".into(),
             title => title.into(),
         }
     }
@@ -692,20 +764,16 @@ impl Workspace {
         let title = self.display_title();
         let source = match self.primary_issue() {
             Some(issue) => &issue.identifier,
-            None if self.title == NEW_AGENT => "",
+            None if self.title == NEW_TASK => "",
             None => &title,
         };
-        let mut slug = String::new();
-        for w in (source.split(|c: char| !c.is_ascii_alphanumeric())).filter(|w| !w.is_empty()) {
-            if slug.len() + w.len() > 40 {
-                break;
-            }
-            slug += &w.to_ascii_lowercase();
-            slug.push('-');
-        }
-        match slug.is_empty() {
+        let title = slug(source);
+        match title.is_empty() {
             true => self.name.clone(),
-            false => slug + self.name.strip_prefix("agent-").unwrap_or(&self.name),
+            false => format!(
+                "{title}-{}",
+                self.name.strip_prefix("agent-").unwrap_or(&self.name)
+            ),
         }
     }
 
@@ -713,7 +781,7 @@ impl Workspace {
     /// `repo:<name>` for each repository, `issue:<uuid>` for each attached issue. A chat gets what
     /// it hasn't received (`ChatMeta::delivered`) with its next normal message.
     pub fn context(&self) -> BTreeMap<String, ContextNote> {
-        (self.repos.iter())
+        let mut notes: BTreeMap<_, _> = (self.repos.iter())
             .map(|r| {
                 let rules = crate::git::rules_file(&self.dir().join(&r.name))
                     .map_or(String::new(), |f| format!(" Read {}/{f} for its rules.", r.name));
@@ -731,7 +799,60 @@ impl Workspace {
                 )
             })
             .chain(crate::linear::context_notes(&self.linear, &self.issues))
-            .collect()
+            .collect();
+        if let Some(agent) = &self.agent {
+            let text = format!(
+                "[shark] Your instructions as {} changed: {}",
+                agent.name, agent.instructions
+            );
+            notes.insert(
+                format!("{AGENT_CONTEXT}{}", agent.slug),
+                ContextNote {
+                    fingerprint: crate::files::fingerprint(&agent.instructions),
+                    text,
+                },
+            );
+            let text = if agent.siblings.is_empty() {
+                format!("[shark] As {} you have no other open tasks.", agent.name)
+            } else {
+                let mut text = format!(
+                    "[shark] As {} you also have these open tasks:\n",
+                    agent.name
+                );
+                for sibling in &agent.siblings {
+                    let dirs = sibling
+                        .dirs
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let files = if sibling.files.is_empty() {
+                        "none reported".into()
+                    } else {
+                        sibling
+                            .files
+                            .iter()
+                            .map(|p| format!("`{p}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    text += &format!(
+                        "- \"{}\" on `{}` ({}), changed: {}\n",
+                        sibling.title, sibling.branch, dirs, files
+                    );
+                }
+                text += "\nThese tasks use separate worktrees. Their changed files do not restrict edits in this task.";
+                text
+            };
+            notes.insert(
+                format!("siblings:{}", agent.slug),
+                ContextNote {
+                    fingerprint: crate::files::fingerprint(&text),
+                    text,
+                },
+            );
+        }
+        notes
     }
 
     /// Its repos as (name, worktree path).
@@ -741,15 +862,15 @@ impl Workspace {
             .collect()
     }
 
-    /// The branch `r`'s worktree is on: its own, or the workspace's.
-    pub fn branch_of<'a>(&'a self, r: &'a WsRepo) -> &'a str {
+    /// The branch `r`'s worktree is on: its own, or the task's.
+    pub fn branch_of<'a>(&'a self, r: &'a TaskRepo) -> &'a str {
         r.branch.as_deref().unwrap_or(&self.branch)
     }
 
-    /// Gives a workspace saved before chat tabs (or a new one) its first chat.
+    /// Gives a task saved before chat tabs (or a new one) its first chat.
     pub fn migrate(&mut self) {
         if self.instance_id.is_empty() {
-            self.instance_id = workspace_instance_id();
+            self.instance_id = task_instance_id();
         }
         if self.chats.is_empty() {
             self.chats.push(ChatMeta {
@@ -764,7 +885,7 @@ impl Workspace {
     }
 
     /// Drops duplicate and stale entries, then appends open chats and feature tabs
-    /// the strip lacks: a workspace saved before `tab_order` gets its chats, then features. Open
+    /// the strip lacks: a task saved before `tab_order` gets its chats, then features. Open
     /// chats follow the strip's order, so chat-only cycling matches it.
     pub fn normalize_tabs(&mut self) {
         let mut seen = HashSet::new();
@@ -890,7 +1011,7 @@ impl Workspace {
         })
     }
 
-    /// Chats without a model (an old one on the CLI default, a new workspace's first) get
+    /// Chats without a model (an old one on the CLI default, a new task's first) get
     /// `model` and `effort`; old ones on codex's default get the model it was.
     pub fn fill_models(&mut self, model: &str, effort: Option<&String>) {
         for c in self.chats.iter_mut().chain(&mut self.closed) {
@@ -1024,9 +1145,9 @@ impl State {
                 ..State::default()
             }
         });
-        let migrated_instances = state.workspaces.iter().any(|ws| ws.instance_id.is_empty());
+        let migrated_instances = state.tasks.iter().any(|ws| ws.instance_id.is_empty());
         let (model, effort) = (state.new_model(), state.last_effort.clone());
-        for ws in &mut state.workspaces {
+        for ws in &mut state.tasks {
             ws.migrate();
             ws.fill_models(&model, effort.as_ref());
             if ws.linear.primary().is_some() {
@@ -1042,11 +1163,19 @@ impl State {
 
     /// The model and level a new chat in `ws` starts on: each from the first of its repos that
     /// sets it, else the last picked.
-    pub fn defaults_for(&self, ws: &Workspace) -> (String, Option<String>) {
+    pub fn defaults_for(&self, ws: &Task) -> (String, Option<String>) {
         let valid = |m: &String| crate::models::MODELS.contains(&m.as_str());
         let mut settings = (ws.repos.iter()).filter_map(|r| self.repo_settings.get(&r.name));
-        let model = settings.clone().find_map(|s| s.model.clone().filter(valid));
-        let effort = settings.find_map(|s| s.effort.clone());
+        let agent = ws
+            .agent
+            .as_ref()
+            .and_then(|link| self.agents.iter().find(|a| a.slug == link.slug));
+        let model = agent
+            .and_then(|a| a.model.clone().filter(valid))
+            .or_else(|| settings.clone().find_map(|s| s.model.clone().filter(valid)));
+        let effort = agent
+            .and_then(|a| a.effort.clone())
+            .or_else(|| settings.find_map(|s| s.effort.clone()));
         (
             model.unwrap_or_else(|| self.new_model()),
             effort.or(self.last_effort.clone()),
@@ -1061,7 +1190,7 @@ impl State {
     }
 
     /// A new chat `id` in `ws` on its repos' default model, else the last picked.
-    pub fn new_chat(&self, ws: &Workspace, id: String) -> ChatMeta {
+    pub fn new_chat(&self, ws: &Task, id: String) -> ChatMeta {
         let (model, effort) = self.defaults_for(ws);
         ChatMeta {
             id,
@@ -1071,71 +1200,27 @@ impl State {
         }
     }
 
-    /// Drag-and-drop of workspace `ws` onto workspace `target`: `ws` takes the target's
-    /// slot in the target's section (or among the ungrouped), like a list reorder.
-    pub fn drop_ws(&mut self, ws: &str, target: &str) {
-        let section_of = |st: &State, n: &str| {
-            st.sections
-                .iter()
-                .position(|s| s.workspaces.iter().any(|w| w == n))
-        };
-        let (from, to) = (section_of(self, ws), section_of(self, target));
-        if ws == target {
-            return;
-        }
-        let pos = |v: &[String], n: &str| v.iter().position(|w| w == n);
-        match to {
-            Some(i) if from == to => {
-                let v = &mut self.sections[i].workspaces;
-                let (f, t) = (pos(v, ws).unwrap(), pos(v, target).unwrap());
-                move_item(v, f, t);
-            }
-            Some(i) => {
-                for s in &mut self.sections {
-                    s.workspaces.retain(|w| w != ws);
-                }
-                let v = &mut self.sections[i].workspaces;
-                let t = pos(v, target).unwrap();
-                v.insert(t, ws.to_string());
-            }
-            None => {
-                for s in &mut self.sections {
-                    s.workspaces.retain(|w| w != ws);
-                }
-                let v = &self.workspaces;
-                let f = v.iter().position(|w| w.name == ws).unwrap();
-                let t = v.iter().position(|w| w.name == target).unwrap();
-                // Coming from a section it lands before the target; within the list it takes the slot.
-                let t = match from {
-                    Some(_) if f < t => t - 1,
-                    _ => t,
-                };
-                move_item(&mut self.workspaces, f, t);
-            }
-        }
-    }
-
-    /// Forgets workspace `name` everywhere the state lists it.
-    pub fn remove_workspace(&mut self, name: &str) {
-        self.workspaces.retain(|w| w.name != name);
+    /// Forgets task `name` everywhere the state lists it.
+    pub fn remove_task(&mut self, name: &str) {
+        self.tasks.retain(|w| w.name != name);
         self.reviewed.remove(name);
         self.merge_order.remove(name);
         for s in &mut self.sections {
-            s.workspaces.retain(|w| w != name);
+            s.tasks.retain(|w| w != name);
         }
     }
 
-    /// Moves workspace `ws` into section `to`, or out of all sections for `None`.
+    /// Moves task `ws` into section `to`, or out of all sections for `None`.
     pub fn move_to_section(&mut self, ws: &str, to: Option<usize>) {
-        let from = (self.sections.iter()).position(|s| s.workspaces.iter().any(|w| w == ws));
+        let from = (self.sections.iter()).position(|s| s.tasks.iter().any(|w| w == ws));
         if from == to {
             return;
         }
         for s in &mut self.sections {
-            s.workspaces.retain(|w| w != ws);
+            s.tasks.retain(|w| w != ws);
         }
         if let Some(s) = to.and_then(|i| self.sections.get_mut(i)) {
-            s.workspaces.push(ws.to_string());
+            s.tasks.push(ws.to_string());
         }
     }
 
@@ -1170,8 +1255,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_defaults_and_instruction_context() {
+        let mut state = State::default();
+        state.repo_settings.insert(
+            "api".into(),
+            RepoSettings {
+                model: Some(crate::models::MODELS[1].into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        state.agents.push(Agent {
+            slug: "designer".into(),
+            model: Some(crate::models::MODELS[0].into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        });
+        let mut task = Task {
+            agent: Some(AgentLink {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                instructions: "Use Mobbin".into(),
+                ..Default::default()
+            }),
+            repos: vec![TaskRepo {
+                name: "api".into(),
+                src: "/missing".into(),
+                base: "main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            state.defaults_for(&task),
+            (crate::models::MODELS[0].into(), Some("high".into()))
+        );
+        state.agents[0].model = Some("invalid model".into());
+        state.agents[0].effort = None;
+        assert_eq!(
+            state.defaults_for(&task),
+            (crate::models::MODELS[1].into(), Some("low".into()))
+        );
+        let before = task.context()["agent:designer"].clone();
+        assert!(before.text.contains("Use Mobbin"));
+        task.agent.as_mut().unwrap().name = "Design".into();
+        assert_eq!(
+            task.context()["agent:designer"].fingerprint,
+            before.fingerprint
+        );
+        task.agent.as_mut().unwrap().instructions = "Read the manual".into();
+        assert_ne!(
+            task.context()["agent:designer"].fingerprint,
+            before.fingerprint
+        );
+        assert_eq!(slug("  Design / UI! "), "design-ui");
+        assert_eq!(slug("!!!"), "");
+    }
+
+    #[test]
+    fn sibling_context_includes_empty_state_and_tracks_only_content_changes() {
+        let mut task = Task {
+            agent: Some(AgentLink {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let empty = task.context()["siblings:designer"].clone();
+        assert!(empty.text.contains("no other open tasks"));
+        task.agent.as_mut().unwrap().siblings.push(Sibling {
+            title: "Spacing".into(),
+            branch: "designer/spacing-marlin".into(),
+            dirs: vec!["/tasks/spacing/api".into()],
+            files: vec!["api/src/ui.rs".into()],
+        });
+        let note = task.context()["siblings:designer"].clone();
+        assert_ne!(note.fingerprint, empty.fingerprint);
+        assert!(note.text.contains("api/src/ui.rs"));
+        assert!(note.text.contains("do not restrict edits in this task"));
+        assert!(!note.text.contains("Avoid editing"));
+        assert_eq!(task.context()["siblings:designer"], note);
+        task.agent.as_mut().unwrap().instructions = "New instructions".into();
+        assert_eq!(task.context()["siblings:designer"], note);
+        task.agent.as_mut().unwrap().siblings[0]
+            .files
+            .push("api/src/tokens.rs".into());
+        assert_ne!(
+            task.context()["siblings:designer"].fingerprint,
+            note.fingerprint
+        );
+        task.agent.as_mut().unwrap().siblings.clear();
+        assert_eq!(task.context()["siblings:designer"], empty);
+    }
+
+    #[test]
+    fn pre_rename_state_round_trips_unchanged() {
+        let saved = include_str!("../tests/fixtures/pre-task-rename-state.json");
+        let state: State = serde_json::from_str(saved).unwrap();
+        assert_eq!(state.tasks[0].name, "agent-123");
+        assert!(state.tasks[0].agent.is_none());
+        assert_eq!(state.sections[0].tasks, ["agent-123"]);
+        assert_eq!(serde_json::to_string_pretty(&state).unwrap(), saved);
+    }
+
+    #[test]
     fn tests_never_touch_the_real_home() {
-        for dir in [support_dir(), workspaces_dir()] {
+        for dir in [support_dir(), tasks_dir()] {
             assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
         }
     }
@@ -1191,12 +1381,12 @@ mod tests {
         );
     }
 
-    /// A repo saved before per-repo branches is on the workspace branch, and one on the
-    /// workspace branch doesn't save the field.
+    /// A repo saved before per-repo branches is on the task branch, and one on the
+    /// task branch doesn't save the field.
     #[test]
     fn repo_branch_is_optional() {
         let old = r#"{"name":"w","branch":"feat","repos":[{"name":"api","src":"/x","base":"origin/main"}]}"#;
-        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        let mut ws: Task = serde_json::from_str(old).unwrap();
         assert_eq!(ws.repos[0].branch, None);
         assert_eq!(ws.branch_of(&ws.repos[0]), "feat");
         assert!(
@@ -1205,12 +1395,12 @@ mod tests {
                 .contains("\"branch\":null")
         );
         ws.repos[0].branch = Some("kd/x".into());
-        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        let back: Task = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         assert_eq!(back.branch_of(&back.repos[0]), "kd/x");
     }
 
-    /// Old workspaces get their chats then a shown Diff; the saved strip mixes kinds, round
-    /// trips per workspace, and drops duplicates and stale entries without inventing files.
+    /// Old tasks get their chats then a shown Diff; the saved strip mixes kinds, round
+    /// trips per task, and drops duplicates and stale entries without inventing files.
     #[test]
     fn tab_order_migrates_normalizes_and_moves() {
         use TabId::{Chat, Diff, File};
@@ -1218,7 +1408,7 @@ mod tests {
         let file = |p: &str| File(p.into());
         let old = r#"{"name":"w","branch":"b","repos":[],"diff_closed":false,
             "chats":[{"id":"w"},{"id":"w~2"}],"active_chat":1}"#;
-        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        let mut ws: Task = serde_json::from_str(old).unwrap();
         ws.migrate();
         assert_eq!(ws.tab_order, [chat("w"), chat("w~2"), Diff]);
 
@@ -1257,18 +1447,18 @@ mod tests {
         ws.open_tab(file("api/b.rs"));
         assert_eq!(ws.file_tabs().collect::<Vec<_>>(), ["api/b.rs"]);
 
-        let mut other = Workspace {
+        let mut other = Task {
             name: "x".into(),
             ..Default::default()
         };
         other.migrate();
         let st = State {
-            workspaces: vec![ws.clone(), other],
+            tasks: vec![ws.clone(), other],
             ..Default::default()
         };
         let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
-        assert_eq!(back.workspaces[0].tab_order, ws.tab_order);
-        assert_eq!(back.workspaces[1].tab_order, [chat("x")]);
+        assert_eq!(back.tasks[0].tab_order, ws.tab_order);
+        assert_eq!(back.tasks[1].tab_order, [chat("x")]);
 
         // Hand-edited or stale: duplicates, a closed chat, a hidden Diff, a missing chat.
         ws.tab_order = vec![chat("w~2"), chat("closed"), Diff, file("f"), chat("w~2")];
@@ -1346,12 +1536,12 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A pre-tabs workspace keeps its session, model and transcript as its first chat.
+    /// A pre-tabs task keeps its session, model and transcript as its first chat.
     /// Files from before attachments load, and a recorded one survives a round trip.
     #[test]
     fn issue_attachments_default_and_round_trip_without_their_text() {
         let old = r#"{"name":"a","branch":"b","repos":[]}"#;
-        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        let mut ws: Task = serde_json::from_str(old).unwrap();
         assert_eq!(ws.linear.primary(), None);
         let snapshot = crate::linear::Snapshot {
             org: "o".into(),
@@ -1367,7 +1557,7 @@ mod tests {
             !out.contains("secret plans") && !out.contains("ENG-1"),
             "{out}"
         );
-        let back: Workspace = serde_json::from_str(&out).unwrap();
+        let back: Task = serde_json::from_str(&out).unwrap();
         assert_eq!(back.linear, ws.linear);
         assert!(back.issues.is_empty(), "their file owns them");
     }
@@ -1382,7 +1572,7 @@ mod tests {
             ..Default::default()
         };
         let (one, two) = (issue("uuid-1", 1), issue("uuid-2", 2));
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: "agent-19a2b".into(),
             title: "Some title".into(),
             ..Default::default()
@@ -1394,14 +1584,14 @@ mod tests {
         assert_eq!(ws.default_branch(), "eng-1-19a2b");
         ws.linear.make_primary(&(&two).into());
         assert_eq!(ws.default_branch(), "eng-2-19a2b");
-        ws.title = NEW_AGENT.into();
+        ws.title = NEW_TASK.into();
         assert_eq!(ws.default_branch(), "eng-2-19a2b");
         let context = ws.context();
         let keys: Vec<&String> = context.keys().collect();
         assert_eq!(keys, ["issue:uuid-1", "issue:uuid-2"]);
         assert!(context.values().all(|n| n.text.starts_with("[shark] ")));
         ws.branch = "chosen".into();
-        ws.repos.push(WsRepo {
+        ws.repos.push(TaskRepo {
             name: "api".into(),
             src: "/src/api".into(),
             base: "main".into(),
@@ -1413,7 +1603,7 @@ mod tests {
     #[test]
     fn attachments_and_delivered_context_default_and_round_trip() {
         let json = r#"{"name":"feat","branch":"b","repos":[],"chats":[{"id":"feat"}]}"#;
-        let mut ws: Workspace = serde_json::from_str(json).unwrap();
+        let mut ws: Task = serde_json::from_str(json).unwrap();
         assert!(ws.attaching.is_empty() && ws.chats[0].delivered.is_empty());
         let out = serde_json::to_string(&ws).unwrap();
         assert!(
@@ -1433,7 +1623,7 @@ mod tests {
             )
         });
         ws.chats[0].delivered.insert("repo:api".into(), 7);
-        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        let back: Task = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         assert_eq!(back.attaching, ws.attaching);
         assert_eq!(back.chats, ws.chats);
     }
@@ -1443,7 +1633,7 @@ mod tests {
     #[test]
     #[ignore]
     fn context_fingerprint_workload() {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: "context-workload".into(),
             ..Default::default()
         };
@@ -1486,9 +1676,9 @@ mod tests {
     /// its identity. Readiness needs a repo and no attachment left.
     #[test]
     fn default_branch_and_readiness() {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: "agent-19a2b".into(),
-            title: NEW_AGENT.into(),
+            title: NEW_TASK.into(),
             branch: "agent-19a2b".into(),
             ..Default::default()
         };
@@ -1499,7 +1689,7 @@ mod tests {
             "fix-the-login-page-properly-please-19a2b"
         );
         assert!(!ws.ready());
-        ws.repos.push(WsRepo {
+        ws.repos.push(TaskRepo {
             name: "api".into(),
             src: "/src/api".into(),
             base: "main".into(),
@@ -1519,7 +1709,7 @@ mod tests {
     #[test]
     fn migrates_single_chat() {
         let json = r#"{"name":"feat","branch":"b","repos":[],"session_id":"s1","model":"opus"}"#;
-        let mut ws: Workspace = serde_json::from_str(json).unwrap();
+        let mut ws: Task = serde_json::from_str(json).unwrap();
         ws.migrate();
         assert_eq!(
             ws.chats,
@@ -1563,7 +1753,7 @@ mod tests {
         fs::write(&path, json("")).unwrap();
         let st = State::load_at(&path);
         let models = |st: &State| {
-            let w = &st.workspaces[0];
+            let w = &st.tasks[0];
             (w.chats.iter().chain(&w.closed))
                 .map(|c| (c.model.clone().unwrap(), c.effort.clone()))
                 .collect::<Vec<_>>()
@@ -1582,14 +1772,14 @@ mod tests {
         fs::write(&path, json(r#","last_model":"haiku","last_effort":"max""#)).unwrap();
         let st = State::load_at(&path);
         assert_eq!(models(&st)[0], m("haiku", Some("max")));
-        let new = st.new_chat(&st.workspaces[0], "x".into());
+        let new = st.new_chat(&st.tasks[0], "x".into());
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("haiku"), Some("max"))
         );
         // A repo's default beats the last pick; its level falls back to the last one.
         let mut st = st;
-        st.workspaces[0].repos = vec![WsRepo {
+        st.tasks[0].repos = vec![TaskRepo {
             name: "api".into(),
             src: "/api".into(),
             base: "origin/main".into(),
@@ -1602,17 +1792,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        let new = st.new_chat(&st.workspaces[0], "y".into());
+        let new = st.new_chat(&st.tasks[0], "y".into());
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("opus"), Some("max"))
         );
         // Model and level each come from the first repo that sets them.
-        let web = WsRepo {
+        let web = TaskRepo {
             name: "web".into(),
-            ..st.workspaces[0].repos[0].clone()
+            ..st.tasks[0].repos[0].clone()
         };
-        st.workspaces[0].repos.insert(0, web);
+        st.tasks[0].repos.insert(0, web);
         st.repo_settings.insert(
             "web".into(),
             RepoSettings {
@@ -1620,12 +1810,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        let new = st.new_chat(&st.workspaces[0], "z".into());
+        let new = st.new_chat(&st.tasks[0], "z".into());
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("opus"), Some("low"))
         );
-        let mut w: Workspace = serde_json::from_str(
+        let mut w: Task = serde_json::from_str(
             r#"{"name":"w","branch":"w","repos":[],"chats":[{"id":"a"},{"id":"b","session_id":"s"}]}"#,
         )
         .unwrap();
@@ -1648,38 +1838,29 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    fn ws(name: &str) -> Workspace {
-        Workspace {
-            name: name.into(),
-            branch: name.into(),
-            repos: vec![],
-            ..Default::default()
-        }
-    }
-
-    /// A workspace saved before titles shows its name and saves back loadable.
+    /// A task saved before titles shows its name and saves back loadable.
     #[test]
     fn old_state_has_no_title() {
         let old =
             r#"{"repos":[],"workspaces":[{"name":"kd-login","branch":"kd/login","repos":[]}]}"#;
         let st: State = serde_json::from_str(old).unwrap();
-        let ws = &st.workspaces[0];
+        let ws = &st.tasks[0];
         assert_eq!((ws.title.as_str(), &*ws.display_title()), ("", "kd-login"));
         let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
-        assert_eq!(back.workspaces[0].display_title(), "kd-login");
+        assert_eq!(back.tasks[0].display_title(), "kd-login");
     }
 
     /// A generated name comes from the table and skips what's taken; with the table used up, it
     /// counts up.
     #[test]
-    fn agent_names_skip_taken_ones() {
-        assert!(SEA_NAMES.contains(&agent_name(0, |_| false).as_str()));
-        assert_eq!(agent_name(0, |n| n != "marlin"), "marlin");
-        assert_eq!(agent_name(0, |n| n != "marlin-2"), "marlin-2");
+    fn task_names_skip_taken_ones() {
+        assert!(SEA_NAMES.contains(&task_name(0, |_| false).as_str()));
+        assert_eq!(task_name(0, |n| n != "marlin"), "marlin");
+        assert_eq!(task_name(0, |n| n != "marlin-2"), "marlin-2");
         let bare = |n: &str| SEA_NAMES.contains(&n);
-        let numbered = agent_name(0, bare);
+        let numbered = task_name(0, bare);
         assert!(bare(numbered.strip_suffix("-2").unwrap()), "{numbered}");
-        let next = agent_name(0, |n| bare(n) || n.ends_with("-2"));
+        let next = task_name(0, |n| bare(n) || n.ends_with("-2"));
         assert!(bare(next.strip_suffix("-3").unwrap()), "{next}");
     }
 
@@ -1701,9 +1882,9 @@ mod tests {
 
     #[test]
     fn untitled_agents_show_and_branch_on_their_name() {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: "marlin".into(),
-            title: NEW_AGENT.into(),
+            title: NEW_TASK.into(),
             ..Default::default()
         };
         assert_eq!(ws.display_title(), "Marlin");
@@ -1718,13 +1899,13 @@ mod tests {
 
     /// An `agent-<hex>` saved before `SEA_NAMES` looks and branches as it did.
     #[test]
-    fn old_agent_names_stay_as_they_were() {
-        let mut ws = Workspace {
+    fn old_task_names_stay_as_they_were() {
+        let mut ws = Task {
             name: "agent-19a2b".into(),
-            title: NEW_AGENT.into(),
+            title: NEW_TASK.into(),
             ..Default::default()
         };
-        assert_eq!(ws.display_title(), NEW_AGENT);
+        assert_eq!(ws.display_title(), "New task");
         assert_eq!(ws.default_branch(), "agent-19a2b");
         ws.title = "Fix login".into();
         assert_eq!(ws.default_branch(), "fix-login-19a2b");
@@ -1733,78 +1914,42 @@ mod tests {
     #[test]
     fn diff_closure_defaults_and_round_trips() {
         let legacy = r#"{"name":"legacy","branch":"main","repos":[]}"#;
-        let mut ws: Workspace = serde_json::from_str(legacy).unwrap();
+        let mut ws: Task = serde_json::from_str(legacy).unwrap();
         assert!(ws.diff_closed);
-        assert!(Workspace::default().diff_closed);
+        assert!(Task::default().diff_closed);
         for closed in [false, true] {
             ws.diff_closed = closed;
             let saved = serde_json::to_string(&ws).unwrap();
             assert_eq!(
-                serde_json::from_str::<Workspace>(&saved)
-                    .unwrap()
-                    .diff_closed,
+                serde_json::from_str::<Task>(&saved).unwrap().diff_closed,
                 closed
             );
         }
     }
 
     #[test]
-    fn drop_ws_reorders() {
-        let mut st = State {
-            workspaces: ["a", "b", "c", "d"].map(ws).into(),
-            sections: vec![Section {
-                name: "S".into(),
-                icon: "folder".into(),
-                collapsed: false,
-                workspaces: vec!["c".into(), "d".into()],
-            }],
-            ..Default::default()
-        };
-        let names = |st: &State| {
-            st.workspaces
-                .iter()
-                .map(|w| w.name.clone())
-                .collect::<Vec<_>>()
-        };
-        st.drop_ws("a", "b"); // down within the ungrouped: takes b's slot
-        assert_eq!(names(&st), ["b", "a", "c", "d"]);
-        st.drop_ws("a", "b"); // and back up
-        assert_eq!(names(&st), ["a", "b", "c", "d"]);
-        st.drop_ws("d", "c"); // within a section
-        assert_eq!(st.sections[0].workspaces, ["d", "c"]);
-        st.drop_ws("a", "c"); // into a section, before the target
-        assert_eq!(st.sections[0].workspaces, ["d", "a", "c"]);
-        st.drop_ws("d", "b"); // out to the ungrouped, before the target
-        assert_eq!(st.sections[0].workspaces, ["a", "c"]);
-        let ungrouped: Vec<_> = names(&st)
-            .into_iter()
-            .filter(|n| !st.sections[0].workspaces.contains(n))
-            .collect();
-        assert_eq!(ungrouped, ["d", "b"]);
-    }
-
-    #[test]
-    fn remove_workspace_clears_every_list() {
-        let ws = |n: &str| Workspace {
+    fn remove_task_clears_every_list() {
+        let task = |n: &str| Task {
             name: n.into(),
             ..Default::default()
         };
         let mut st = State {
-            workspaces: vec![ws("a"), ws("b")],
+            tasks: vec![task("a"), task("b")],
             sections: vec![Section {
+                agent: None,
                 name: "S".into(),
                 icon: "folder".into(),
                 collapsed: false,
-                workspaces: vec!["a".into(), "b".into()],
+                tasks: vec!["a".into(), "b".into()],
             }],
             ..Default::default()
         };
         st.reviewed.insert("a".into(), vec!["f".into()]);
         st.reviewed.insert("b".into(), vec![]);
         st.merge_order.insert("a".into(), vec!["b".into()]);
-        st.remove_workspace("a");
-        assert_eq!(st.workspaces.len(), 1);
-        assert_eq!(st.sections[0].workspaces, ["b"]);
+        st.remove_task("a");
+        assert_eq!(st.tasks.len(), 1);
+        assert_eq!(st.sections[0].tasks, ["b"]);
         assert_eq!(st.reviewed.keys().collect::<Vec<_>>(), ["b"]);
         assert!(st.merge_order.is_empty());
     }
@@ -1818,7 +1963,7 @@ mod tests {
 
     #[test]
     fn remove_last_chat_keeps_the_slot_with_a_fresh_one() {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: "w".into(),
             diff_closed: false,
             ..Default::default()
@@ -1845,16 +1990,16 @@ mod tests {
         )
         .unwrap();
         let first = State::load_at(&path);
-        let id = &first.workspaces[0].instance_id;
+        let id = &first.tasks[0].instance_id;
         assert!(!id.is_empty());
-        assert_eq!(State::load_at(&path).workspaces[0].instance_id, *id);
-        assert_ne!(Workspace::default().instance_id, *id);
+        assert_eq!(State::load_at(&path).tasks[0].instance_id, *id);
+        assert_ne!(Task::default().instance_id, *id);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn chat_ids_stay_reserved_after_history_eviction_and_reload() {
-        let mut ws: Workspace = serde_json::from_value(serde_json::json!({
+        let mut ws: Task = serde_json::from_value(serde_json::json!({
             "name": "one", "branch": "one", "repos": [],
             "chats": (1..=22).map(|n| serde_json::json!({"id": format!("one~{n}")})).collect::<Vec<_>>()
         })).unwrap();
@@ -1865,7 +2010,7 @@ mod tests {
                 .unwrap();
         }
         assert!(!ws.closed.iter().any(|c| c.id == "one~22"));
-        let mut ws: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        let mut ws: Task = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         ws.migrate();
         let id = ws.next_chat_id();
         assert!(id.rsplit_once('~').unwrap().1.parse::<u64>().unwrap() > 22);
@@ -1874,7 +2019,7 @@ mod tests {
 
     #[test]
     fn remove_chat_skips_untouched_and_caps_closed_at_twenty() {
-        let mut ws = Workspace {
+        let mut ws = Task {
             chats: vec![chat("a"), chat("b")],
             active_chat: 1,
             closed: (0..20).map(|i| chat(&format!("old{i}"))).collect(),
@@ -1898,21 +2043,22 @@ mod tests {
     #[test]
     fn move_to_section_is_idempotent_and_ungroups() {
         let section = |n: &str, ws: &[&str]| Section {
+            agent: None,
             name: n.into(),
             icon: "folder".into(),
             collapsed: false,
-            workspaces: ws.iter().map(|w| w.to_string()).collect(),
+            tasks: ws.iter().map(|w| w.to_string()).collect(),
         };
         let mut st = State {
             sections: vec![section("A", &["x", "y"]), section("B", &[])],
             ..Default::default()
         };
         st.move_to_section("x", Some(0));
-        assert_eq!(st.sections[0].workspaces, ["x", "y"]);
+        assert_eq!(st.sections[0].tasks, ["x", "y"]);
         st.move_to_section("x", Some(1));
-        assert_eq!(st.sections[0].workspaces, ["y"]);
-        assert_eq!(st.sections[1].workspaces, ["x"]);
+        assert_eq!(st.sections[0].tasks, ["y"]);
+        assert_eq!(st.sections[1].tasks, ["x"]);
         st.move_to_section("x", None);
-        assert!(st.sections[1].workspaces.is_empty());
+        assert!(st.sections[1].tasks.is_empty());
     }
 }

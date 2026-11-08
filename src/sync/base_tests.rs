@@ -4,13 +4,13 @@ use super::{
     worktrees,
 };
 use crate::git::{git, review_pr_url};
-use crate::state::Workspace;
+use crate::state::Task;
 use serde_json::{Value, json};
 use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 struct Fixture {
     root: PathBuf,
-    ws: Workspace,
+    ws: Task,
     wt: PathBuf,
     path: OsString,
     head: String,
@@ -24,7 +24,7 @@ impl Fixture {
             .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
         let name = format!("sync-base-{name}-{}", std::process::id());
         let root = std::env::temp_dir().join(&name);
-        let mut ws = Workspace {
+        let mut ws = Task {
             name,
             branch: "feature".into(),
             ..Default::default()
@@ -78,7 +78,7 @@ impl Fixture {
             ],
         )
         .unwrap();
-        ws.repos.push(crate::state::WsRepo {
+        ws.repos.push(crate::state::TaskRepo {
             name: "api".into(),
             src: wt.clone(),
             base: "refs/shark/pull/7/base".into(),

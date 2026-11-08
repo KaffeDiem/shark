@@ -4,7 +4,7 @@ use gpui_kit::test::TestEventExt;
 fn fixture() -> State {
     let mut state = State::default();
     for name in ["Alpha", "Beta", "Gamma"] {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: name.into(),
             branch: "main".into(),
             chats: ["one", "two", "three"]
@@ -18,12 +18,13 @@ fn fixture() -> State {
         };
         ws.normalize_tabs();
         fs::create_dir_all(ws.dir()).unwrap();
-        state.workspaces.push(ws);
+        state.tasks.push(ws);
         state.sections.push(Section {
+            agent: None,
             name: format!("{name} section"),
             icon: "folder".into(),
             collapsed: false,
-            workspaces: vec![name.into()],
+            tasks: vec![name.into()],
         });
     }
     state.last_open = Some(("Alpha".into(), "chat".into()));
@@ -57,7 +58,7 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let state = fixture();
-    let original = state.workspaces[0].tab_order.clone();
+    let original = state.tasks[0].tab_order.clone();
     let (window, shark) = boot(cx, state, options());
     cx.run_until_parked();
     let (source, target) = cx
@@ -80,8 +81,8 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         .update_window(window, |_, w, cx| {
             w.simulate_next_frame(cx);
             w.render_frame(cx);
-            assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, original);
-            assert_eq!(State::load().workspaces[0].tab_order, original);
+            assert_eq!(shark.read(cx).active_task().unwrap().tab_order, original);
+            assert_eq!(State::load().tasks[0].tab_order, original);
             let middle = w.find("chat-tab-Alpha-three").bounds();
             assert!(
                 middle.left() < target.left(),
@@ -113,11 +114,11 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         assert_inside(preview, shark.read(cx).tab_scroll.bounds());
         w.pointer_up(outside, MouseButton::Left, cx);
         assert_eq!(
-            shark.read(cx).active_ws().unwrap().tab_order,
+            shark.read(cx).active_task().unwrap().tab_order,
             original,
             "release outside cancels"
         );
-        assert_eq!(State::load().workspaces[0].tab_order, original);
+        assert_eq!(State::load().tasks[0].tab_order, original);
     })
     .unwrap();
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -145,8 +146,8 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         w.pointer_up(target.center(), MouseButton::Left, cx);
         let mut expected = original.clone();
         move_item(&mut expected, 0, 2);
-        assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, expected);
-        assert_eq!(State::load().workspaces[0].tab_order, expected);
+        assert_eq!(shark.read(cx).active_task().unwrap().tab_order, expected);
+        assert_eq!(State::load().tasks[0].tab_order, expected);
     })
     .unwrap();
     cx.update_window(window, |_, w, cx| {
@@ -156,205 +157,168 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         w.pointer_down(source, MouseButton::Left, cx);
         w.pointer_move(source + point(px(-8.), px(0.)), Some(MouseButton::Left), cx);
         shark.update(cx, |s, cx| s.close_chat(w, cx));
-        let remaining = shark.read(cx).active_ws().unwrap().tab_order.clone();
+        let remaining = shark.read(cx).active_task().unwrap().tab_order.clone();
         assert!(!remaining.contains(&TabId::Chat("Alpha-one".into())));
         w.pointer_move(target, Some(MouseButton::Left), cx);
         w.pointer_up(target, MouseButton::Left, cx);
         assert_eq!(
-            shark.read(cx).active_ws().unwrap().tab_order,
+            shark.read(cx).active_task().unwrap().tab_order,
             remaining,
             "closed drag source cannot reorder remaining tabs"
         );
-        assert_eq!(State::load().workspaces[0].tab_order, remaining);
+        assert_eq!(State::load().tasks[0].tab_order, remaining);
     })
     .unwrap();
 }
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) {
+async fn sidebar_drag_reorders_only_within_agent_and_group(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
-    let state = fixture();
-    let original = state.sections.clone();
+    let mut state = fixture();
+    state.sections.clear();
+    state.agents = ["designer", "developer", "empty"]
+        .map(|slug| crate::state::Agent {
+            slug: slug.into(),
+            name: slug.into(),
+            icon: "bot".into(),
+            ..Default::default()
+        })
+        .to_vec();
+    for (i, task) in state.tasks.iter_mut().enumerate() {
+        let slug = if i < 2 { "designer" } else { "developer" };
+        task.agent = Some(crate::state::AgentLink {
+            slug: slug.into(),
+            name: slug.into(),
+            instructions: String::new(),
+            siblings: vec![],
+        });
+    }
+    state.tasks.push(Task {
+        name: "Oneoff".into(),
+        ..Default::default()
+    });
     let (window, shark) = boot(cx, state, options());
     cx.run_until_parked();
-    let (source, target) = cx
-        .update_window(window, |_, w, cx| {
-            w.render_frame(cx);
-            let source = w.within("sidebar").find(("section", 0usize)).bounds();
-            let target = w.within("sidebar").find(("section", 2usize)).bounds();
-            w.pointer_down(source.center(), MouseButton::Left, cx);
-            w.pointer_move(
-                source.center() + point(px(0.), px(8.)),
-                Some(MouseButton::Left),
-                cx,
-            );
-            // Crossing more than one header must keep the original dragged section.
-            let second = w
-                .within("sidebar")
-                .find(("section", 1usize))
-                .bounds()
-                .center();
-            w.pointer_move(second, Some(MouseButton::Left), cx);
-            w.pointer_move(target.center(), Some(MouseButton::Left), cx);
-            (source, target)
-        })
-        .unwrap();
-    cx.executor().advance_clock(Duration::from_millis(50));
-    let middle = cx
-        .update_window(window, |_, w, cx| {
-            w.simulate_next_frame(cx);
-            w.render_frame(cx);
-            assert_eq!(shark.read(cx).state.sections, original);
-            assert_eq!(State::load().sections, original);
-            let middle = w.within("sidebar").find(("section", 2usize)).bounds();
-            assert!(middle.top() < target.top(), "section moves before release");
-            assert_eq!(
-                middle.left(),
-                target.left(),
-                "section animation stays vertical"
-            );
-            middle
-        })
-        .unwrap();
-    cx.executor().advance_clock(Duration::from_millis(300));
-    cx.update_window(window, |_, w, cx| {
-        w.simulate_next_frame(cx);
-        w.render_frame(cx);
-        assert!(w.within("sidebar").find(("section", 2usize)).bounds().top() < middle.top());
-        let outside = point(px(900.), px(1100.));
-        w.pointer_move(outside, Some(MouseButton::Left), cx);
-        let preview = w.find("reorder-preview").bounds();
+    cx.update(|cx| {
+        let s = shark.read(cx);
         assert_eq!(
-            preview.left(),
-            source.left(),
-            "preview locks the horizontal axis"
+            s.side_rows(false),
+            vec![
+                SideRow::Agent(0),
+                SideRow::Task(0),
+                SideRow::Task(1),
+                SideRow::Agent(1),
+                SideRow::Task(2),
+                SideRow::Agent(2),
+                SideRow::Task(3)
+            ]
         );
-        assert_inside(preview, shark.read(cx).sidebar_scroll.bounds());
-        w.pointer_move(target.center(), Some(MouseButton::Left), cx);
-        w.pointer_up(target.center(), MouseButton::Left, cx);
-        let mut expected = original.clone();
-        move_item(&mut expected, 0, 2);
-        assert_eq!(shark.read(cx).state.sections, expected);
-        assert_eq!(State::load().sections, expected);
-    })
-    .unwrap();
-    // Moving into a collapsed section keeps it collapsed and preserves the other members.
-    on_app(window, shark.clone())(cx, &|s, _, cx| {
-        s.state.sections[0].collapsed = true;
-        cx.notify();
-    });
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        let source = w.within("sidebar").find(0usize).bounds().center();
-        let target = w
-            .within("sidebar")
-            .find(("section", 0usize))
-            .bounds()
-            .center();
-        w.pointer_down(source, MouseButton::Left, cx);
-        w.pointer_move(source + point(px(0.), px(-8.)), Some(MouseButton::Left), cx);
-        w.pointer_move(target, Some(MouseButton::Left), cx);
-        assert_eq!(shark.read(cx).section_of("Alpha"), Some(2));
-        w.pointer_up(target, MouseButton::Left, cx);
-        assert_eq!(
-            shark.read(cx).state.sections[0].workspaces,
-            ["Beta", "Alpha"]
-        );
-        assert!(shark.read(cx).state.sections[0].collapsed);
-        assert!(shark.read(cx).state.sections[2].workspaces.is_empty());
-        assert_eq!(State::load().sections, shark.read(cx).state.sections);
-    })
-    .unwrap();
-    on_app(window, shark.clone())(cx, &|s, _, cx| {
-        s.state.sections[0].collapsed = false;
-        cx.notify();
     });
     cx.update(|cx| cx.set_reduce_motion(true));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        let source = w.within("sidebar").find(1usize).bounds().center();
-        let neighbor = w.within("sidebar").find(0usize).bounds();
-        let header = w
-            .within("sidebar")
-            .find(("section", 0usize))
-            .bounds()
-            .center();
-        w.pointer_down(source, MouseButton::Left, cx);
-        w.pointer_move(source + point(px(0.), px(-8.)), Some(MouseButton::Left), cx);
-        w.pointer_move(header, Some(MouseButton::Left), cx);
-        assert_eq!(
-            w.within("sidebar").find(0usize).bounds(),
-            neighbor,
-            "own section header is a live-preview no-op"
-        );
-        w.pointer_up(header, MouseButton::Left, cx);
-        assert_eq!(
-            shark.read(cx).state.sections[0].workspaces,
-            ["Beta", "Alpha"]
-        );
-    })
-    .unwrap();
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        let source = w.within("sidebar").find(0usize).bounds().center();
-        let target = w.find("ws-header").bounds().center();
-        w.pointer_down(source, MouseButton::Left, cx);
-        w.pointer_move(source + point(px(0.), px(-8.)), Some(MouseButton::Left), cx);
-        w.pointer_move(target, Some(MouseButton::Left), cx);
-        w.pointer_up(target, MouseButton::Left, cx);
-        assert_eq!(shark.read(cx).section_of("Alpha"), None);
-        assert_eq!(shark.read(cx).state.sections[0].workspaces, ["Beta"]);
-        assert_eq!(State::load().sections, shark.read(cx).state.sections);
-    })
-    .unwrap();
-    on_app(window, shark.clone())(cx, &|s, _, cx| {
-        s.state.sections[0].name =
-            "A very long section name that must stay within the narrow rail".into();
-        s.toggle_sidebar(cx);
-    });
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        let source = w.within("sidebar").find(("section", 0usize)).bounds();
+        let source = w.within("sidebar").find(0usize).bounds();
+        let target = w.within("sidebar").find(1usize).bounds();
+        let next_agent = w.within("sidebar").find(("agent", 1usize)).bounds();
         w.pointer_down(source.center(), MouseButton::Left, cx);
         w.pointer_move(
             source.center() + point(px(0.), px(8.)),
             Some(MouseButton::Left),
             cx,
         );
-        for outside in [point(px(-100.), px(-100.)), point(px(1000.), px(1100.))] {
-            w.pointer_move(outside, Some(MouseButton::Left), cx);
-            let preview = w.find("reorder-preview").bounds();
-            assert_eq!(preview.left(), source.left());
-            assert_inside(preview, shark.read(cx).sidebar_scroll.bounds());
-        }
-        w.pointer_up(point(px(1000.), px(1100.)), MouseButton::Left, cx);
-    })
-    .unwrap();
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        let source = w.within("sidebar").find(0usize).bounds().center();
-        let target = w.within("sidebar").find(1usize).bounds().center();
-        w.pointer_down(source, MouseButton::Left, cx);
-        w.pointer_move(source + point(px(0.), px(-8.)), Some(MouseButton::Left), cx);
-        w.pointer_move(target, Some(MouseButton::Left), cx);
-        let preview_neighbor = w.within("sidebar").find(1usize).bounds();
-        w.pointer_up(target, MouseButton::Left, cx);
-        let beta = shark
-            .read(cx)
-            .state
-            .workspaces
-            .iter()
-            .position(|ws| ws.name == "Beta")
-            .unwrap();
+        w.pointer_move(target.center(), Some(MouseButton::Left), cx);
+        let preview = w.find("reorder-preview").bounds();
+        assert_eq!(preview.left(), source.left());
         assert_eq!(
-            w.within("sidebar").find(beta).bounds(),
-            preview_neighbor,
-            "last rail row has the same spacing during preview and after release"
+            w.within("sidebar").find(1usize).bounds(),
+            source,
+            "last agent task moves into the first task slot"
+        );
+        assert_eq!(
+            w.within("sidebar").find(("agent", 1usize)).bounds(),
+            next_agent,
+            "next agent header stays still"
+        );
+        assert_inside(preview, shark.read(cx).sidebar_scroll.bounds());
+        assert_eq!(
+            shark.read(cx).state.tasks[0].name,
+            "Alpha",
+            "only release persists order"
+        );
+        w.pointer_up(target.center(), MouseButton::Left, cx);
+        assert_eq!(shark.read(cx).state.tasks[0].name, "Beta");
+        assert_eq!(State::load().tasks[0].name, "Beta");
+        // Crossing into another agent is not an assignment or a reorder.
+        w.render_frame(cx);
+        let source = w.within("sidebar").find(1usize).bounds().center();
+        let target = w.within("sidebar").find(2usize).bounds().center();
+        w.pointer_down(source, MouseButton::Left, cx);
+        w.pointer_move(source + point(px(0.), px(8.)), Some(MouseButton::Left), cx);
+        w.pointer_move(target, Some(MouseButton::Left), cx);
+        w.pointer_up(target, MouseButton::Left, cx);
+        assert_eq!(shark.read(cx).state.tasks[1].name, "Alpha");
+        assert_eq!(
+            shark.read(cx).state.tasks[1].agent.as_ref().unwrap().slug,
+            "designer"
         );
     })
     .unwrap();
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        // A legacy section binding cannot assign the unrelated task to the empty agent.
+        s.state.sections.push(Section {
+            agent: Some("empty".into()),
+            name: "Legacy".into(),
+            tasks: vec!["Oneoff".into()],
+            icon: "folder".into(),
+            collapsed: false,
+        });
+        s.sel = SideRow::Task(1);
+        s.set_agent_collapsed(0, true, cx);
+        assert_eq!(s.sel, SideRow::Agent(0));
+        assert_eq!(s.ws_order(false), vec![2, 3]);
+        assert_eq!(s.ws_order(true), vec![0, 1, 2, 3]);
+        assert!(!s.can_reorder_tasks("Alpha", "Gamma"));
+        s.state.sections.push(Section {
+            name: "Manual".into(),
+            tasks: vec!["Alpha".into()],
+            agent: None,
+            icon: "folder".into(),
+            collapsed: false,
+        });
+        assert!(!s.can_reorder_tasks("Alpha", "Beta"));
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.within("sidebar").find(("agent", 2usize));
+        w.within("sidebar").find(3usize);
+        w.within("sidebar").click(("collapse-agent", 0usize), cx);
+        assert!(!shark.read(cx).collapsed_agents.contains("designer"));
+        assert!(!matches!(&shark.read(cx).home.destination, home::Destination::Agent(slug) if slug == "designer"),
+            "chevron does not navigate");
+        w.within("sidebar").click(("agent", 0usize), cx);
+        assert!(matches!(&shark.read(cx).home.destination, home::Destination::Agent(slug) if slug == "designer"));
+    }).unwrap();
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.sections.push(Section {
+            name: "Other group".into(),
+            tasks: vec!["Gamma".into()],
+            agent: None,
+            icon: "folder".into(),
+            collapsed: false,
+        });
+        s.active = Some("Gamma".into());
+        s.enter_home(w, cx);
+        s.home.sel = Some("Alpha".into());
+        let mut target = None;
+        s.with_section(w, cx, |_, i, _, _| target = Some(i));
+        assert_eq!(
+            target,
+            Some(1),
+            "group actions follow the selected task, not hidden active task"
+        );
+    });
 }
 
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
@@ -365,6 +329,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         (crate::state::Mode::Light, "light"),
     ] {
         let mut state = fixture();
+        state.sections.clear();
         state.appearance.mode = mode;
         state.save().unwrap();
         let (window, _) = cx
@@ -387,14 +352,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     w.render_frame(cx);
                     let (start, end) = if sidebar {
                         (
-                            w.within("sidebar")
-                                .find(("section", 0usize))
-                                .bounds()
-                                .center(),
-                            w.within("sidebar")
-                                .find(("section", 2usize))
-                                .bounds()
-                                .center(),
+                            w.within("sidebar").find(0usize).bounds().center(),
+                            w.within("sidebar").find(2usize).bounds().center(),
                         )
                     } else {
                         (
