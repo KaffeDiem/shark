@@ -93,6 +93,9 @@ def install_once(artifact):
         if not artifact["url"].startswith("https://"):
             raise ValueError("artifact URL must use HTTPS")
         request = urllib.request.Request(artifact["url"], headers={"Accept": "application/octet-stream"})
+        if request.host == "api.github.com" and os.environ.get("GH_TOKEN"):
+            # Authenticate only the API request, never the redirected asset download.
+            request.add_unredirected_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
         with urllib.request.urlopen(request, timeout=30) as response, archive.open("xb") as output:
             if not response.url.startswith("https://"):
                 raise ValueError("artifact redirected outside HTTPS")
@@ -220,6 +223,19 @@ def self_test():
                 assert request.call_count == 2 and sleep.call_count == 1
                 assert not list(executable.parent.parent.parent.glob(".stage-*"))
             shutil.rmtree(root / "cache")
+            with patch.dict(os.environ, GH_TOKEN="test-token"):
+                for url, authorized in [(artifact["url"], False),
+                                        ("https://api.github.com/repos/owner/repo/releases/assets/1", True)]:
+                    response = io.BytesIO(data)
+                    response.url = url
+                    with patch("urllib.request.urlopen", return_value=response) as download:
+                        install(dict(artifact, url=url))
+                        request = download.call_args.args[0]
+                        assert request.has_header("Authorization") == authorized
+                        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+                            request, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/tool")
+                        assert not redirected.has_header("Authorization")
+                    shutil.rmtree(root / "cache")
             with patch("urllib.request.urlopen", side_effect=unavailable) as request:
                 try:
                     install(artifact)

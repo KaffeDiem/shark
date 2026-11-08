@@ -64,6 +64,8 @@ jobs:
           if-no-files-found: error
 
       - name: Verify shipped language tools
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           rustup component add rust-analyzer rust-src
           python3 scripts/check-language-tools.py --self-test
