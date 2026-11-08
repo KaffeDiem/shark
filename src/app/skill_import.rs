@@ -32,6 +32,7 @@ impl Shark {
         let shown = panel.clone();
         window.open_dialog(cx, move |d, _, cx| {
             let installing = shown.read(cx).installing;
+            let footer = shown.update(cx, |panel, cx| panel.footer(cx));
             crate::ui::dialog(d)
                 .title(title.clone())
                 .w(px(680.))
@@ -40,6 +41,7 @@ impl Shark {
                 .keyboard(!installing)
                 .on_ok(|_, _, _| false)
                 .child(shown.clone())
+                .footer(footer)
         });
         panel
             .read(cx)
@@ -222,18 +224,78 @@ impl SkillImport {
             }).ok();
         }).detach();
     }
+
+    fn footer(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let count = self.selected.iter().filter(|selected| **selected).count();
+        v_flex()
+            .border_t_1()
+            .border_color(theme.border)
+            .pt_3()
+            .gap_3()
+            .when_some(self.error.clone(), |footer, error| {
+                footer.child(
+                    div()
+                        .id("skill-import-error")
+                        .test_support()
+                        .max_h(px(80.))
+                        .overflow_y_scroll()
+                        .text_color(theme.danger_foreground)
+                        .child(
+                            div()
+                                .id("skill-import-error-details")
+                                .test_support()
+                                .child(error),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(if count == 0 {
+                                "No skills selected".into()
+                            } else {
+                                format!("{count} selected")
+                            }),
+                    )
+                    .child(
+                        Button::new("skill-cancel")
+                            .label("Cancel")
+                            .disabled(self.installing)
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("skill-add")
+                            .primary()
+                            .label(if count > 1 {
+                                format!("Add {count} skills")
+                            } else {
+                                "Add skill".into()
+                            })
+                            .disabled(self.busy || count == 0)
+                            .on_click(cx.listener(|this, _, window, cx| this.install(window, cx))),
+                    ),
+            )
+    }
 }
 
 impl Render for SkillImport {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let count = self.selected.iter().filter(|selected| **selected).count();
-        let mut content = v_flex()
-            .gap_3()
+        let source = v_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("Source"))
             .child(
-                div().text_color(theme.muted_foreground).child(
-                    "Paste a GitHub repository or skill URL, or choose a local skill folder.",
-                ),
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Find skills from a GitHub URL or choose a local folder."),
             )
             .child(
                 h_flex()
@@ -262,8 +324,16 @@ impl Render for SkillImport {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("Choosing SKILL.md includes its containing folder and resources."),
+                    .child("Choosing SKILL.md includes its folder and resources."),
             );
+
+        // The dialog owns scrolling; sections and the preview keep their natural height.
+        let mut content = v_flex()
+            .id("skill-import")
+            .test_support()
+            .flex_shrink_0()
+            .gap_4()
+            .child(source);
 
         if self.busy {
             content = content.child(h_flex().gap_2().child(Spinner::new()).child(
@@ -276,30 +346,36 @@ impl Render for SkillImport {
         }
         if let Some(import) = &self.prepared {
             content = content.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("Adds skill folders only. Plugin hooks and account connections require separate setup."),
-            );
-            content = content.child(div().text_xs().text_color(theme.muted_foreground).child(
-                format!("Source: {}{}", import.source,
-                    import.revision.as_ref().map_or(String::new(), |r| format!(" · {r}"))),
-            ));
-            if import.plugin {
-                content = content.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.warning_foreground)
-                        .child("This source also contains a plugin."),
-                );
-            }
-            content = content.child(
                 v_flex()
                     .id("skill-choices")
-                    .max_h(px(160.))
-                    .overflow_y_scroll()
+                    .test_support()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .pt_4()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Skills to add"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Select the skills you want to give this agent."),
+                    )
+                    .when(import.plugin, |section| {
+                        section.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("This source includes a plugin. Only its skill folders will be added; hooks and account connections require separate setup."),
+                        )
+                    })
                     .children(import.skills.iter().enumerate().map(|(index, skill)| {
                         h_flex()
+                            .flex_shrink_0()
                             .gap_2()
                             .py_1()
                             .child(
@@ -329,7 +405,23 @@ impl Render for SkillImport {
             if let Some(skill) = import.skills.get(self.preview) {
                 content = content.child(
                     v_flex()
-                        .gap_1()
+                        .id("skill-preview")
+                        .test_support()
+                        .flex_shrink_0()
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded(theme.radius)
+                        .bg(theme.secondary)
+                        .p_3()
+                        .gap_3()
+                        .child(
+                            div()
+                                .id("skill-preview-heading")
+                                .test_support()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("Preview"),
+                        )
                         .child(
                             div()
                                 .font_weight(FontWeight::SEMIBOLD)
@@ -353,8 +445,9 @@ impl Render for SkillImport {
                             div()
                                 .id("skill-instructions")
                                 .test_support()
-                                .max_h(px(180.))
-                                .overflow_y_scroll()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .pt_3()
                                 .text_sm()
                                 .child(crate::ui::markdown(
                                     &self.instructions,
@@ -365,46 +458,6 @@ impl Render for SkillImport {
                 );
             }
         }
-        if let Some(error) = &self.error {
-            content = content.child(
-                div()
-                    .id("skill-import-error")
-                    .test_support()
-                    .text_color(theme.danger_foreground)
-                    .child(error.clone()),
-            );
-        }
-        v_flex()
-            .id("skill-import")
-            .test_support()
-            .gap_3()
-            .child(
-                content
-                    .id("skill-import-content")
-                    .max_h(px(520.))
-                    .overflow_y_scroll(),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("skill-cancel")
-                            .label("Cancel")
-                            .disabled(self.installing)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("skill-add")
-                            .primary()
-                            .label(if count > 1 {
-                                format!("Add {count} skills")
-                            } else {
-                                "Add skill".into()
-                            })
-                            .disabled(self.busy || count == 0)
-                            .on_click(cx.listener(|this, _, window, cx| this.install(window, cx))),
-                    ),
-            )
+        content
     }
 }
