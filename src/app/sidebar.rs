@@ -889,8 +889,7 @@ impl Shark {
                         .font_weight(FontWeight::MEDIUM)
                         .child(agent.name.clone()),
                 )
-                .children(badge)
-                // New task, shown while the row is hovered: Linear's "+" on a team.
+                // Keep hover controls before the badge so its spacing and position stay fixed.
                 .child(
                     div()
                         .invisible()
@@ -909,6 +908,7 @@ impl Shark {
                                 })),
                         ),
                 )
+                .children(badge)
                 .child(
                     Button::new(("collapse-agent", i))
                         .accessibility_label(format!(
