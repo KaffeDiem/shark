@@ -505,7 +505,9 @@ impl Shark {
             evicted,
         }) = ws.remove_chat(id, fresh, |meta| {
             // No session can also mean one just dropped (a backend switch): the transcript tells.
-            meta.session_id.is_none() && !crate::transcript::transcript_path(&meta.id).exists()
+            meta.handoff.is_none()
+                && meta.session_id.is_none()
+                && !crate::transcript::transcript_path(&meta.id).exists()
         })
         else {
             return;

@@ -3751,36 +3751,41 @@ done
 
     #[gpui_kit::test]
     fn handoff_context_is_per_chat_and_cleared_on_echo(cx: &mut TestAppContext) {
-        let chat = open_chat("handoff-context", cx);
-        cx.update(|cx| {
-            chat.update(cx, |c, cx| {
-                c.meta.agent = Some("designer".into());
-                c.ws.agent = Some(crate::state::AgentLink {
-                    slug: "planner".into(),
-                    name: "Planner".into(),
-                    instructions: "Plan carefully".into(),
-                    ..Default::default()
-                });
-                let notes = c.context();
-                assert!(!notes.contains_key("agent:planner"));
-                assert!(!notes.contains_key("siblings:planner"));
-                assert!(notes.contains_key("stage:planner"));
-                c.meta.handoff = Some(crate::state::Handoff {
-                    from: "Designer".into(),
-                    title: "Ideas".into(),
-                    text: "Build three steps".into(),
-                });
-                assert!(c.pending_handoff());
-                c.blocks
-                    .push(Block::User("Continue from here.".into(), true));
-                c.unread.push_back(0);
-                c.told
-                    .push((0, context_record(&c.context()), "wire".into()));
-                c.on_echo("wire".into(), cx);
-                assert!(c.meta.handoff.is_none());
-                assert!(c.pending_context().is_empty());
-            })
-        });
+        for agent in [Some("designer".to_string()), None] {
+            let chat = open_chat("handoff-context", cx);
+            cx.update(|cx| {
+                chat.update(cx, |c, cx| {
+                    c.meta.agent = agent;
+                    assert!(c.ws.agent.is_none());
+                    assert!(!c.context().keys().any(|key| key.starts_with("stage:")));
+                    c.ws.agent = Some(crate::state::AgentLink {
+                        slug: "planner".into(),
+                        name: "Planner".into(),
+                        instructions: "Plan carefully".into(),
+                        ..Default::default()
+                    });
+                    let notes = c.context();
+                    assert!(!notes.contains_key("agent:planner"));
+                    assert!(!notes.contains_key("siblings:planner"));
+                    assert!(notes.contains_key("stage:planner"));
+                    assert_eq!(c.pending_context().len(), 1);
+                    c.meta.handoff = Some(crate::state::Handoff {
+                        from: "Designer".into(),
+                        title: "Ideas".into(),
+                        text: "Build three steps".into(),
+                    });
+                    assert!(c.pending_handoff());
+                    c.blocks
+                        .push(Block::User("Continue from here.".into(), true));
+                    c.unread.push_back(0);
+                    c.told
+                        .push((0, context_record(&c.context()), "wire".into()));
+                    c.on_echo("wire".into(), cx);
+                    assert!(c.meta.handoff.is_none());
+                    assert!(c.pending_context().is_empty());
+                })
+            });
+        }
     }
 
     #[gpui_kit::test]

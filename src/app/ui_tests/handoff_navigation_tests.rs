@@ -200,3 +200,111 @@ async fn handoff_save_failure_restores_agent_chats_and_instructions(cx: &mut Tes
     });
     assert_eq!(fs::read(docs).unwrap(), original_docs);
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn handoff_target_follows_receiver_name_and_icon_edits(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    test_home();
+    let mut agents = agents();
+    agents[0].next = Some("planner".into());
+    let task = git::create_empty_task(
+        &tasks_dir().join("target-edits"),
+        "target-edits",
+        "Target",
+        Some(AgentLink::from(&agents[0])),
+    )
+    .unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents,
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.open_task_named("target-edits", w, cx);
+        s.rename_agent("planner", w, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.input("Implementation planner", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        let target = s
+            .chats
+            .values()
+            .next()
+            .unwrap()
+            .read(cx)
+            .next_agent
+            .as_ref()
+            .unwrap();
+        assert_eq!(target.name, "Implementation planner");
+    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.pick_agent_icon("planner", w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.input("star", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.agent("planner").unwrap().icon, "star");
+        let target = s
+            .chats
+            .values()
+            .next()
+            .unwrap()
+            .read(cx)
+            .next_agent
+            .as_ref()
+            .unwrap();
+        assert_eq!(target.icon, IconName::Star);
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn handoff_historical_chat_agents_reserve_deleted_slugs(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let task = Task {
+        name: "history".into(),
+        chats: vec![ChatMeta {
+            id: "history".into(),
+            agent: Some("designer".into()),
+            ..Default::default()
+        }],
+        closed: vec![ChatMeta {
+            id: "history~2".into(),
+            agent: Some("designer-2".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        assert_eq!(s.create_named_agent("Designer", cx).unwrap(), "designer-3");
+        assert_eq!(s.state.tasks[0].chats[0].agent.as_deref(), Some("designer"));
+        assert_eq!(
+            s.state.tasks[0].closed[0].agent.as_deref(),
+            Some("designer-2")
+        );
+    });
+}

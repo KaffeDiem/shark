@@ -289,3 +289,59 @@ async fn handoff_composer_shortcut_moves_task(cx: &mut TestAppContext) {
         )
     });
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn closing_unsent_handoff_preserves_quote_for_reopen_and_restart(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let agents = agents();
+    let mut task = git::create_empty_task(
+        &tasks_dir().join("handoff"),
+        "handoff",
+        "Design",
+        Some(AgentLink::from(&agents[1])),
+    )
+    .unwrap();
+    let quote = crate::state::Handoff {
+        from: "Designer".into(),
+        title: "Onboarding ideas".into(),
+        text: "Use three steps".into(),
+    };
+    task.chats[0].handoff = Some(quote.clone());
+    let id = task.chats[0].id.clone();
+    assert!(!crate::transcript::transcript_path(&id).exists());
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents,
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.open_task_now(0, w, cx);
+        s.close_chat(w, cx);
+    });
+    let saved = State::load();
+    assert_eq!(saved.tasks[0].closed.len(), 1);
+    assert_eq!(saved.tasks[0].closed[0].id, id);
+    assert_eq!(saved.tasks[0].closed[0].handoff.as_ref(), Some(&quote));
+    assert_ne!(
+        saved.tasks[0].chats[0].id, id,
+        "replacement must have a fresh identity"
+    );
+    on(cx, &|s, w, cx| s.reopen_chat(None, w, cx));
+    cx.read(|cx| {
+        let c = shark.read(cx).active_chat().unwrap().read(cx);
+        assert_eq!(c.meta.id, id);
+        assert_eq!(c.meta.handoff.as_ref(), Some(&quote));
+        assert_eq!(c.meta.agent.as_deref(), Some("planner"));
+    });
+    let saved = State::load();
+    let task = &saved.tasks[0];
+    assert!(task.closed.is_empty());
+    assert_eq!(task.chats[task.active_chat].handoff.as_ref(), Some(&quote));
+}

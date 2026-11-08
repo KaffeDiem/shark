@@ -18,7 +18,6 @@ impl Chat {
                 .is_none_or(|slug| Some(slug) == self.meta.agent.as_deref())
         });
         if let Some(current) = &self.ws.agent
-            && self.meta.agent.is_some()
             && self.meta.agent.as_deref() != Some(current.slug.as_str())
         {
             let text = format!(

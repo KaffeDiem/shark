@@ -220,6 +220,12 @@ impl Shark {
         let mut slug = base.to_string();
         let mut suffix = 2;
         while self.state.agents.iter().any(|a| a.slug == slug)
+            || self
+                .state
+                .tasks
+                .iter()
+                .flat_map(|task| task.chats.iter().chain(&task.closed))
+                .any(|chat| chat.agent.as_deref() == Some(slug.as_str()))
             || crate::state::agent_skills_dir(&slug)
                 .parent()
                 .is_some_and(|p| p.exists())
@@ -329,11 +335,20 @@ impl Shark {
     }
 
     /// Changes an agent and saves. A thinking level its model can't do falls back to the default.
-    fn update_agent(&mut self, slug: &str, f: impl FnOnce(&mut Agent), cx: &mut Context<Self>) {
+    pub(super) fn update_agent(
+        &mut self,
+        slug: &str,
+        f: impl FnOnce(&mut Agent),
+        cx: &mut Context<Self>,
+    ) {
         let Some(i) = self.state.agents.iter().position(|a| a.slug == slug) else {
             return;
         };
         let old_next = self.state.agents[i].next.clone();
+        let old_identity = (
+            self.state.agents[i].name.clone(),
+            self.state.agents[i].icon.clone(),
+        );
         f(&mut self.state.agents[i]);
         let a = &self.state.agents[i];
         let model = a
@@ -348,9 +363,27 @@ impl Shark {
             a.effort = None;
         }
         let next_changed = old_next != a.next;
+        let identity_changed = old_identity != (a.name.clone(), a.icon.clone());
         let _ = self.state.save();
         if next_changed {
             let _ = self.sync_agent(slug, false, cx);
+        }
+        if identity_changed {
+            let incoming: Vec<_> = self
+                .state
+                .tasks
+                .iter()
+                .filter(|task| {
+                    task.agent
+                        .as_ref()
+                        .and_then(|a| self.agent(&a.slug))
+                        .is_some_and(|a| a.next.as_deref() == Some(slug))
+                })
+                .map(|task| task.name.clone())
+                .collect();
+            for task in incoming {
+                self.publish_task(&task, cx);
+            }
         }
         cx.notify();
     }
