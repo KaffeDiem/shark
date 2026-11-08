@@ -22,7 +22,7 @@ Worktrees isolate branches, not the filesystem. Coding sessions can write outsid
 
 ## Agents and navigation
 
-The sidebar gives direct access to Home and each agent. An agent's header is its settings: click the icon to change it, click the name to rename it, and type into the instructions under the name. The chips below set default repositories, model, thinking level and skills; **Attach** adds a default repository, jumps to the instructions or opens the skills folder. Each change saves immediately. The header's **…** and a right-click on the agent in the sidebar offer New task, Rename, Change icon, Edit instructions, Open skills folder, Refresh skills, Open in… and Delete agent. Its slug is stable even when its name changes. Below the header are the task prompt, the agent's tasks and its history.
+The sidebar gives direct access to Home and each agent. An agent's header is its settings: click the icon to change it, click the name to rename it, and type into the instructions under the name. The chips below set default repositories, model, thinking level and skills; **Attach** adds a default repository, jumps to the instructions or opens the skill importer. Each change saves immediately. The header's **…** and a right-click on the agent in the sidebar offer New task, Rename, Change icon, Edit instructions, Add skills, Open skills folder, Refresh skills, Open in… and Delete agent. Its slug is stable even when its name changes. Below the header are the task prompt, the agent's tasks and its history.
 
 Type into an agent page's prompt and press `enter` to start a task with that agent; `cmd-n`, `i` and `a` focus that prompt. Each agent keeps its own draft. Elsewhere `cmd-n` opens an empty standalone task. The Home picker and `@slug` shortcut share the same selection, so changing the picker preserves the prompt's body. Typing `@` on Home lists matching agents; `up`/`down` move and `tab` or `enter` completes. A cancelled or failed creation keeps the draft.
 
@@ -36,13 +36,23 @@ History keeps the latest 100 deleted tasks, with their titles, PR links, merge s
 
 ### Skills
 
-The skills chip, or **Attach › Skill…**, opens (and creates):
+Choose **Attach › Skill…**, or **Add skills…** from the skills menu, to import skills:
+
+1. Paste a GitHub repository or skill URL, or choose a local skill folder or `SKILL.md` file.
+2. Inspect the discovered skills, select the ones to add, and review their instructions and requirements. Selecting `SKILL.md` imports its containing folder, including scripts, references and other supporting files; put loose downloaded files in a dedicated skill folder first.
+3. Add the selected skills. Shark copies them into this agent's storage and refreshes its open tasks. Existing skills are never silently overwritten.
+
+For example, paste `https://github.com/DietrichGebert/ponytail`, select `ponytail`, and add it. This imports the skill instructions; plugin hooks require the plugin's own installation. Importing does not execute scripts or connect external accounts. Skills that require tools or services still need those available in the chosen harness.
+
+Adding a skill makes it available to the agent; it does not force the agent to use it on every task. Ask the agent to use the skill when needed, or include that preference in the agent's instructions. If a running harness does not discover a new skill, start a new conversation.
+
+**Open skills folder** remains available for manual editing. The original files live at:
 
 ```text
 ~/Library/Application Support/shark/agents/<slug>/skills/
 ```
 
-Create a `<skill>/SKILL.md` file inside that folder for each skill, then choose **Refresh skills** to refresh every open task. Shark exposes agent skills to both harnesses through links in the task root. The original skill files remain in the agent's folder when a task is deleted. If a running harness does not discover a new skill, start a new conversation.
+Each skill has a `<skill>/SKILL.md` file. After manual changes, choose **Refresh skills** to refresh every open task. Shark exposes agent skills to both harnesses through links in the task root. The original skill files remain in the agent's folder when a task is deleted. Imported skills record their source and, for GitHub imports, the resolved revision; they do not update automatically. A failed task refresh is reported separately from a successful import so you can retry without importing again.
 
 **Skills from repos** in Settings › General controls repository skills only; agent skills stay enabled. Claude discovers repository skills and commands through its added repository directories. Codex receives links to repository skills from `.agents/skills` or `.claude/skills`. Agent skills get the plain names first; collisions from repositories use prefixed names. Turning repository skills off removes only Shark's recorded repository links. Skill refresh preserves user files and links it does not own.
 

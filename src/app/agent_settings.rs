@@ -345,16 +345,24 @@ impl Shark {
     }
 
     fn refresh_agent_skills(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.sync_agent_skills(slug, cx) {
+            Ok(()) => window.push_notification(Notification::success("Agent skills refreshed"), cx),
+            Err(e) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
+        }
+    }
+
+    pub(super) fn sync_agent_skills(
+        &mut self,
+        slug: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         if let Some(header) = self.home.agent_header.clone()
             && header.read(cx).slug == slug
         {
             header.update(cx, |h, _| h.skills = skill_names(slug));
         }
-        match self.sync_agent(slug, true, cx) {
-            Ok(()) => window.push_notification(Notification::success("Agent skills refreshed"), cx),
-            Err(e) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
-        }
         cx.notify();
+        self.sync_agent(slug, true, cx)
     }
 
     /// What an agent offers, from its sidebar row's right-click and its header's `…`.
@@ -378,6 +386,12 @@ impl Shark {
             menu::item(IconName::Shapes, "Change icon…", act(Shark::pick_agent_icon)),
             menu::item(IconName::FileText, "Edit instructions", act(Shark::edit_agent)),
             Entry::Sep,
+            menu::item(IconName::BookOpen, "Add skills…", {
+                let s = s.clone();
+                on_shark(cx, move |shark, w, cx| {
+                    shark.add_agent_skills(&s, w, cx);
+                })
+            }),
             menu::item(IconName::FolderOpen, "Open skills folder", {
                 let s = s.clone();
                 move |w, cx| reveal_skills(&s, w, cx)
@@ -472,6 +486,14 @@ impl Shark {
             entries.push(Entry::Sep);
         }
         let s = slug.to_string();
+        entries.push(menu::item(
+            IconName::Plus,
+            "Add skills…",
+            on_shark(cx, move |shark, w, cx| {
+                shark.add_agent_skills(&s, w, cx);
+            }),
+        ));
+        let s = slug.to_string();
         entries.push(
             menu::item(IconName::FolderOpen, "Open skills folder", move |w, cx| {
                 reveal_skills(&s, w, cx)
@@ -532,12 +554,13 @@ impl Shark {
             on_shark(cx, move |shark, w, cx| shark.edit_agent(&s, w, cx)),
         ));
         let s = slug.to_string();
-        entries.push(
-            menu::item(IconName::BookOpen, "Skill…", move |w, cx| {
-                reveal_skills(&s, w, cx)
-            })
-            .hint("Opens the skills folder"),
-        );
+        entries.push(menu::item(
+            IconName::BookOpen,
+            "Skill…",
+            on_shark(cx, move |shark, w, cx| {
+                shark.add_agent_skills(&s, w, cx);
+            }),
+        ));
         self.show_menu(pos, entries, window, cx);
     }
 
