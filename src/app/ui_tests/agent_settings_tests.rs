@@ -560,3 +560,59 @@ async fn agent_drafts_keep_context_and_only_unedited_repos_follow_defaults(
         assert!(draft.plan);
     });
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn ui_review_regression_skill_refresh_reaches_both_drafts(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.open_agent("designer", w, cx);
+        s.enter_home(w, cx);
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("@designer ", w, cx));
+        s.draft_composer_event(false, &crate::task_composer::Event::Change, w, cx);
+        let skill = crate::state::agent_skills_dir("designer").join("regression-research");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "# Research").unwrap();
+        s.sync_agent_skills("designer", cx).unwrap();
+    });
+    cx.run_until_parked();
+    for agent in [false, true] {
+        on(cx, &|s, w, cx| {
+            if agent {
+                s.home.destination = super::super::home::Destination::Agent("designer".into());
+            }
+            let input = if agent {
+                s.home.agent_prompt.clone()
+            } else {
+                s.home.prompt.clone()
+            };
+            input.update(cx, |p, cx| {
+                p.set_value(if agent { "" } else { "@designer " }, w, cx);
+                let end = p.value().len();
+                p.set_selected_range(end..end, cx);
+                p.focus(w, cx);
+                p.insert("/regression-res", w, cx);
+            });
+        });
+        press_in(window)(cx, &["enter"]);
+        cx.read(|cx| {
+            let s = shark.read(cx);
+            let input = if agent {
+                &s.home.agent_prompt
+            } else {
+                &s.home.prompt
+            };
+            assert!(
+                input.read(cx).value().ends_with("/regression-research "),
+                "refreshed skill must complete in the cached draft (agent={agent})"
+            );
+        });
+    }
+    fs::remove_dir_all(home).ok();
+}

@@ -450,6 +450,12 @@ impl Shark {
         {
             header.update(cx, |h, _| h.skills = skill_names(slug));
         }
+        if self.home.agent_prompt_for.as_deref() == Some(slug) {
+            self.refresh_draft_sources(true, cx);
+        }
+        if self.home.draft_agent.as_deref() == Some(slug) {
+            self.refresh_draft_sources(false, cx);
+        }
         cx.notify();
         self.sync_agent(slug, true, cx)
     }

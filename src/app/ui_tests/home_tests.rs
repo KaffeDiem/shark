@@ -474,8 +474,8 @@ async fn sidebar_vim_keys_clamp(cx: &mut TestAppContext) {
 #[allow(clippy::await_holding_lock)]
 async fn agent_prompt_survives_failed_creation_and_agent_switching(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
-    let _claude = ClaudeGuard::set(&quiet);
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
     let (home, window, shark) = one_task(cx).await;
     let on = on_app(window, shark.clone());
     let press = press_in(window);
@@ -926,4 +926,69 @@ async fn branch_picker_stays_in_draft_flow_after_home_ask_mode(cx: &mut TestAppC
         );
         assert!(s.state.tasks.is_empty());
     });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn ui_review_regression_composer_escape_stops_answer(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let quiet = quiet_claude();
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.toggle_ask_mode(w, cx);
+        s.ask("Keep streaming".into(), w, cx);
+        s.home.prompt.update(cx, |p, cx| p.focus(w, cx));
+        assert!(!s.home.ask.as_ref().unwrap().done);
+    });
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| {
+        let ask = shark.read(cx).home.ask.as_ref().unwrap();
+        assert!(
+            ask.done && ask.harness.is_none(),
+            "first Escape from the composer stops the answer"
+        );
+    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.toggle_ask_mode(w, cx);
+        s.ask("Keep streaming with completion open".into(), w, cx);
+        s.home.prompt.update(cx, |p, cx| {
+            p.focus(w, cx);
+            p.insert("see @", w, cx);
+        });
+    });
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| {
+        assert!(
+            !shark.read(cx).home.ask.as_ref().unwrap().done,
+            "completion consumes the first Escape"
+        )
+    });
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| {
+        assert!(
+            shark.read(cx).home.ask.as_ref().unwrap().done,
+            "next Escape stops the answer"
+        )
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn ui_review_regression_claude_guards_are_inside_ui_lock() {
+    for test in include_str!("home_tests.rs").split("async fn ").skip(1) {
+        let body = test.split("#[gpui_kit::test]").next().unwrap();
+        if let Some(guard) = body.find("ClaudeGuard::set") {
+            let lock = body
+                .find("UI_LOCK.lock()")
+                .expect("environment mutation requires UI_LOCK");
+            assert!(
+                lock < guard,
+                "{}: acquire UI_LOCK before ClaudeGuard so restoration also holds the lock",
+                body.split('(').next().unwrap()
+            );
+        }
+    }
 }

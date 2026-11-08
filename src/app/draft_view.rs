@@ -140,6 +140,9 @@ impl Shark {
                 cx.notify();
             }
             ComposerEvent::Escape => {
+                if !agent {
+                    self.cancel_ask(cx);
+                }
                 self.home.focus.focus(window, cx);
                 cx.notify();
             }
