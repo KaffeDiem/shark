@@ -123,9 +123,16 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         }),
         ("agent-skill-preview", |s, w, cx| {
             s.open_agent("designer", w, cx);
-            let source = crate::state::support_dir().join("preview-skills/review");
-            fs::create_dir_all(&source).unwrap();
-            fs::write(source.join("SKILL.md"), "---\nname: review\ndescription: Review a change for correctness and unnecessary complexity.\ncompatibility: Requires git.\n---\n# Review\n\nRead the changed code and its callers.\n\n1. Identify behavior changes.\n2. Check edge cases and tests.\n3. Report actionable findings with file references.\n").unwrap();
+            let source = crate::state::support_dir().join("preview-skills");
+            fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+            for name in ["review", "spacing"] {
+                let skill = source.join(name);
+                fs::create_dir_all(&skill).unwrap();
+                fs::write(skill.join("SKILL.md"), format!(
+                    "---\nname: {name}\ndescription: Review a change for correctness and unnecessary complexity.\ncompatibility: Requires git.\n---\n{}",
+                    "# Review\n\nRead the changed code and its callers.\n\n1. Identify behavior changes.\n2. Check edge cases and tests.\n3. Report actionable findings with file references.\n\n".repeat(8),
+                )).unwrap();
+            }
             let panel = s.add_agent_skills("designer", w, cx).unwrap();
             panel.update(cx, |p, cx| {
                 p.source.update(cx, |input, cx| {
