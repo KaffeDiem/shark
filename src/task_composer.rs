@@ -201,8 +201,7 @@ impl TaskComposer {
                         .iter()
                         .map(|source| {
                             let reference = if let Some(pr) = &source.pr {
-                                crate::git::fetch_review_refs(&source.path, pr, true)?;
-                                crate::git::review_ref(pr.number, "head")
+                                crate::git::fetch_composer_pr_head(&source.path, pr)?
                             } else {
                                 source.start_ref.clone()
                             };
@@ -269,17 +268,40 @@ impl TaskComposer {
                         prs.extend(found);
                         errors.extend(error);
                     }
-                    this.prs = complete::pr_items(&prs);
                     this.loading_prs = false;
                     this.pr_error = (!errors.is_empty()).then(|| errors.join(" · "));
-                    if this.has_menu() {
-                        this.update_menu(cx);
-                    }
+                    this.refresh_prs(complete::pr_items(&prs), cx);
                     cx.notify();
                 })
                 .ok();
             })
             .detach();
+        }
+    }
+
+    fn refresh_prs(&mut self, prs: Vec<Item>, cx: &mut Context<Self>) {
+        let selection = self
+            .menu
+            .as_ref()
+            .filter(|menu| menu.source == '#')
+            .and_then(|menu| {
+                let item = self.prs.get(*menu.matches.get(menu.selected)?)?;
+                Some((item.insert.clone(), menu.armed))
+            });
+        self.prs = prs;
+        if !self.has_menu() {
+            return;
+        }
+        self.update_menu(cx);
+        if let Some((url, armed)) = selection
+            && let Some(menu) = self.menu.as_mut().filter(|menu| menu.source == '#')
+        {
+            let selected = menu.matches.iter().position(|&i| self.prs[i].insert == url);
+            menu.armed = selected.is_some() && armed;
+            if let Some(selected) = selected {
+                menu.selected = selected;
+                self.scroll.scroll_to_item(selected);
+            }
         }
     }
 
@@ -866,6 +888,170 @@ mod tests {
         });
         assert!(!cx.update(|cx| composer.read(cx).has_menu()));
     }
+    #[gpui_kit::test]
+    fn pr_completion_loading_preserves_review_refs(cx: &mut TestAppContext) {
+        let root =
+            std::env::temp_dir().join(format!("shark-composer-review-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("source");
+        let remote = root.join("upstream.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| crate::git::git(&repo, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["init", "--bare", "-q", remote.to_str().unwrap()]);
+        let commit = |name: &str| {
+            std::fs::write(repo.join(name), name).unwrap();
+            git(&["add", "."]);
+            git(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                name,
+            ]);
+            git(&["rev-parse", "HEAD"])
+        };
+        let baseline = commit("original.md");
+        git(&["update-ref", &crate::git::review_ref(7, "base"), &baseline]);
+        git(&["update-ref", &crate::git::review_ref(7, "head"), &baseline]);
+        commit("base.md");
+        git(&[
+            "push",
+            "-q",
+            remote.to_str().unwrap(),
+            "HEAD:refs/heads/release",
+        ]);
+        commit("head.md");
+        git(&[
+            "push",
+            "-q",
+            remote.to_str().unwrap(),
+            "HEAD:refs/pull/7/head",
+        ]);
+        git(&[
+            "config",
+            &format!("url.{}.insteadOf", remote.display()),
+            "https://github.com/o/upstream.git",
+        ]);
+        cx.update(gpui_kit::init);
+        let (_, composer) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| TaskComposer::new(window, cx))
+                })
+            })
+            .unwrap();
+        cx.update(|cx| {
+            composer.update(cx, |this, cx| {
+                this.set_sources(
+                    vec![super::Source {
+                        name: "api".into(),
+                        path: repo.clone(),
+                        start_ref: String::new(),
+                        new_branch: false,
+                        pr: Some(crate::git::PullRequest {
+                            number: 7,
+                            url: "https://github.com/o/upstream/pull/7".into(),
+                            base: "release".into(),
+                        }),
+                    }],
+                    vec![],
+                    false,
+                    false,
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let composer = composer.read(cx);
+            assert!(!composer.loading, "source completion loading must finish");
+            assert!(
+                composer
+                    .files
+                    .iter()
+                    .any(|item| item.insert == "@api/head.md"),
+                "{:?}",
+                composer.file_error
+            );
+        });
+        assert_eq!(
+            git(&["rev-parse", &crate::git::review_ref(7, "head")]),
+            baseline,
+            "completion must preserve review head baseline"
+        );
+        assert_eq!(
+            git(&["rev-parse", &crate::git::review_ref(7, "base")]),
+            baseline,
+            "completion must preserve review base baseline"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pr_refresh_preserves_selected_identity_and_disarms_removed_pr(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, composer) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| TaskComposer::new(window, cx))
+                })
+            })
+            .unwrap();
+        let rows = |numbers: &[u64]| {
+            crate::complete::pr_items(
+                &numbers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &number)| crate::prs::Pr {
+                        repo: "api".into(),
+                        number,
+                        title: "Fix".into(),
+                        author: None,
+                        head_ref_name: String::new(),
+                        base_ref_name: String::new(),
+                        url: format!("https://github.com/o/api/pull/{number}"),
+                        state: "OPEN".into(),
+                        is_draft: false,
+                        updated_at: format!("{}", 9 - i),
+                        is_cross_repository: false,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (refreshed, expected) in [
+            (vec![2, 1], Some("https://github.com/o/api/pull/2 ")),
+            (vec![3, 1], None),
+        ] {
+            cx.update_window(window, |_, window, cx| {
+                composer.update(cx, |this, cx| {
+                    this.prs = rows(&[1, 2]);
+                    this.close_menu(cx);
+                    this.input.update(cx, |input, cx| {
+                        input.set_value("", window, cx);
+                        input.insert("#", window, cx);
+                    });
+                    this.update_menu(cx);
+                    this.move_menu(1, cx);
+                    this.refresh_prs(rows(&refreshed), cx);
+                    let picked = this.pick(None, window, cx);
+                    assert_eq!(
+                        picked,
+                        expected.is_some(),
+                        "removed selection must be disarmed"
+                    );
+                    assert_eq!(
+                        this.input.read(cx).value().as_ref(),
+                        expected.unwrap_or("#")
+                    );
+                });
+            })
+            .unwrap();
+        }
+    }
+
     #[gpui_kit::test]
     fn file_drop_after_typing_emits_attachment(cx: &mut TestAppContext) {
         cx.update(|cx| {
