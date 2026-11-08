@@ -214,14 +214,15 @@ impl TaskComposer {
                             ))
                         })
                         .collect();
-                    let files = repos.and_then(|repos| complete::committed_files(&repos));
-                    let repos = sources
-                        .iter()
-                        .filter(|_| repo_skills)
-                        .map(|source| (source.name.clone(), source.path.clone()))
-                        .collect::<Vec<_>>();
-                    let skills = complete::draft_skill_names(&skills, &repos, codex);
-                    (files, skills)
+                    match repos.and_then(|repos| complete::committed_paths(&repos)) {
+                        Ok(repos) => {
+                            let files = complete::file_items(&repos.files);
+                            let repos = if repo_skills { repos.skills } else { vec![] };
+                            let skills = complete::draft_skill_names(&skills, &repos, codex);
+                            (Ok(files), skills)
+                        }
+                        Err(error) => (Err(error), skills),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {

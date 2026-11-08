@@ -50,7 +50,20 @@ pub fn files(repos: &[(String, PathBuf)]) -> Vec<Item> {
 }
 
 /// Committed paths only: a new worktree never contains the checkout's local-only files.
+#[cfg(test)]
 pub fn committed_files(repos: &[(String, PathBuf, String, bool)]) -> Result<Vec<Item>, String> {
+    committed_paths(repos).map(|repos| file_items(&repos.files))
+}
+
+pub(crate) struct CommittedPaths {
+    pub files: Vec<(String, Vec<String>)>,
+    pub skills: Vec<(String, Vec<String>)>,
+}
+
+/// Resolve each source once, keeping its committed paths available to both completion menus.
+pub(crate) fn committed_paths(
+    repos: &[(String, PathBuf, String, bool)],
+) -> Result<CommittedPaths, String> {
     let lists = crate::proc::par_map(repos, |(name, dir, start, fresh)| {
         let reference = if *fresh || start.is_empty() {
             crate::git::resolve_base(dir, start)
@@ -90,20 +103,68 @@ pub fn committed_files(repos: &[(String, PathBuf, String, bool)]) -> Result<Vec<
                 &format!("{reference}^{{commit}}"),
             ],
         )?;
-        let out =
-            crate::git::git_bytes(dir, &["ls-tree", "-r", "-z", "--name-only", &commit, "--"])?;
-        let paths = out
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect();
-        Ok((name.clone(), paths))
+        let out = crate::git::git_bytes(dir, &["ls-tree", "-r", "-z", &commit, "--"])?;
+        let mut paths = vec![];
+        let mut links = vec![];
+        let mut skills = vec![];
+        for record in out.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let Some(tab) = record.iter().position(|b| *b == b'\t') else {
+                continue;
+            };
+            let path = String::from_utf8_lossy(&record[tab + 1..]).into_owned();
+            if record.starts_with(b"120000 ") {
+                let header = String::from_utf8_lossy(&record[..tab]);
+                if let Some(oid) = header.split_whitespace().nth(2) {
+                    links.push((path.clone(), oid.to_string()));
+                }
+            }
+            if (record.starts_with(b"100644 ") || record.starts_with(b"100755 "))
+                && path.ends_with("/SKILL.md")
+            {
+                skills.push(path.clone());
+            }
+            paths.push(path);
+        }
+        let definitions: BTreeSet<_> = skills.iter().cloned().collect();
+        for (path, oid) in links {
+            let Some((folder, skill)) = path.rsplit_once('/') else {
+                continue;
+            };
+            if !matches!(folder, ".agents/skills" | ".claude/skills") || skill.is_empty() {
+                continue;
+            }
+            let target = crate::git::git_bytes(dir, &["cat-file", "blob", &oid])?;
+            let target = String::from_utf8_lossy(&target);
+            let mut parts: Vec<_> = folder.split('/').collect();
+            let within_repo = !target.starts_with('/')
+                && target.split('/').all(|part| match part {
+                    "" | "." => true,
+                    ".." => parts.pop().is_some(),
+                    part => {
+                        parts.push(part);
+                        true
+                    }
+                });
+            // shortcut: resolve direct in-tree skill links; extend if chained or external links are needed.
+            if within_repo && definitions.contains(&format!("{}/SKILL.md", parts.join("/"))) {
+                skills.push(format!("{path}/SKILL.md"));
+            }
+        }
+        Ok::<_, String>((name.clone(), paths, skills))
     });
-    let lists: Result<Vec<_>, String> = lists.into_iter().collect();
-    lists.map(|lists| file_items(&lists))
+    let mut result = CommittedPaths {
+        files: vec![],
+        skills: vec![],
+    };
+    for list in lists {
+        let (name, files, skills) = list?;
+        result.files.push((name.clone(), files));
+        result.skills.push((name, skills));
+    }
+    Ok(result)
 }
 
-fn file_items(lists: &[(String, Vec<String>)]) -> Vec<Item> {
+pub(crate) fn file_items(lists: &[(String, Vec<String>)]) -> Vec<Item> {
     let mut items = vec![];
     for (repo, out) in lists {
         let mut dirs = BTreeSet::new();
@@ -352,7 +413,7 @@ fn commands(cmds: Vec<Cmd>) -> Vec<Item> {
 /// Match the skill names the selected harness receives, keeping repository collisions visible.
 pub(crate) fn draft_skill_names(
     agent: &[String],
-    repos: &[(String, PathBuf)],
+    repos: &[(String, Vec<String>)],
     codex: bool,
 ) -> Vec<String> {
     let mut names = agent.to_vec();
@@ -362,11 +423,17 @@ pub(crate) fn draft_skill_names(
     } else {
         &[".claude/skills"]
     };
-    for (repo, path) in repos {
+    for (repo, paths) in repos {
         let mut own = BTreeSet::new();
         for folder in folders {
-            for entry in crate::git::skill_entries(&path.join(folder)).unwrap_or_default() {
-                let skill = entry.file_name().to_string_lossy().into_owned();
+            let prefix = format!("{folder}/");
+            let skills: BTreeSet<_> = paths
+                .iter()
+                .filter_map(|path| path.strip_prefix(&prefix)?.strip_suffix("/SKILL.md"))
+                .filter(|skill| !skill.is_empty() && !skill.contains('/'))
+                .collect();
+            for skill in skills {
+                let skill = skill.to_string();
                 if !own.insert(skill.clone()) {
                     continue;
                 }
@@ -713,20 +780,72 @@ mod tests {
     }
 
     #[test]
+    fn draft_skills_follow_selected_commit_instead_of_source_checkout() {
+        let root =
+            std::env::temp_dir().join(format!("shark-selected-skills-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".claude/skills/old")).unwrap();
+        let git = |args: &[&str]| crate::git::git(&root, args).unwrap();
+        git(&["init", "-q"]);
+        fs::write(root.join(".claude/skills/old/SKILL.md"), "old").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "old",
+        ]);
+        let old = git(&["rev-parse", "HEAD"]);
+        fs::remove_dir_all(root.join(".claude/skills/old")).unwrap();
+        fs::create_dir_all(root.join(".claude/skills/new")).unwrap();
+        fs::write(root.join(".claude/skills/new/SKILL.md"), "new").unwrap();
+        std::os::unix::fs::symlink("new", root.join(".claude/skills/linked")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join(".claude/skills/external")).unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "new",
+        ]);
+        let selected = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--detach", &old]);
+        fs::create_dir_all(root.join(".claude/skills/local-only")).unwrap();
+        fs::write(root.join(".claude/skills/local-only/SKILL.md"), "local").unwrap();
+        let sources = vec![("api".into(), root.clone(), selected, false)];
+        assert!(
+            committed_files(&sources)
+                .unwrap()
+                .iter()
+                .any(|i| i.insert.ends_with("new/SKILL.md"))
+        );
+        let repos = committed_paths(&sources).unwrap();
+        assert_eq!(
+            draft_skill_names(&["attached".into()], &repos.skills, false),
+            ["attached", "linked", "new"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn draft_skill_collisions_match_each_harness() {
-        let root = std::env::temp_dir().join(format!("shark-draft-skills-{}", std::process::id()));
-        for path in [
-            "api/.agents/skills/review",
-            "api/.claude/skills/review",
-            "api/.claude/skills/deploy",
-            "web/.claude/skills/review",
-        ] {
-            fs::create_dir_all(root.join(path)).unwrap();
-            fs::write(root.join(path).join("SKILL.md"), "Review").unwrap();
-        }
         let repos = vec![
-            ("api".into(), root.join("api")),
-            ("web".into(), root.join("web")),
+            (
+                "api".into(),
+                vec![
+                    ".agents/skills/review/SKILL.md".into(),
+                    ".claude/skills/review/SKILL.md".into(),
+                    ".claude/skills/deploy/SKILL.md".into(),
+                    ".claude/skills/nested/invalid/SKILL.md".into(),
+                ],
+            ),
+            ("web".into(), vec![".claude/skills/review/SKILL.md".into()]),
         ];
         let agent = vec!["review".into(), "api-review".into()];
         assert_eq!(
@@ -752,7 +871,6 @@ mod tests {
             agent,
             "disabled repository skills retain agent skills"
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
