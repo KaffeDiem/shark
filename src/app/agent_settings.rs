@@ -414,21 +414,7 @@ impl Shark {
             let _ = self.sync_agent(slug, false, cx);
         }
         if identity_changed {
-            let incoming: Vec<_> = self
-                .state
-                .tasks
-                .iter()
-                .filter(|task| {
-                    task.agent
-                        .as_ref()
-                        .and_then(|a| self.agent(&a.slug))
-                        .is_some_and(|a| a.next.as_deref() == Some(slug))
-                })
-                .map(|task| task.name.clone())
-                .collect();
-            for task in incoming {
-                self.publish_task(&task, cx);
-            }
+            self.publish_agent_identity(slug, cx);
         }
         cx.notify();
     }
@@ -488,6 +474,12 @@ impl Shark {
                 act(Shark::pick_agent_icon),
             ),
             menu::item(
+                IconName::Image,
+                "Paste Image as Icon",
+                act(Shark::paste_agent_icon),
+            )
+            .hint("⌘D"),
+            menu::item(
                 IconName::FileText,
                 "Edit instructions",
                 act(Shark::edit_agent),
@@ -544,12 +536,9 @@ impl Shark {
                 .iter()
                 .filter(|a| a.slug != slug)
                 .map(|a| {
-                    menu::item(
-                        super::sidebar::section_icon(&a.icon),
-                        a.name.clone(),
-                        pick(Some(a.slug.clone())),
-                    )
-                    .checked(current == Some(a.slug.as_str()))
+                    menu::item(None, a.name.clone(), pick(Some(a.slug.clone())))
+                        .agent_icon(a.icon.clone())
+                        .checked(current == Some(a.slug.as_str()))
                 }),
         );
         self.show_menu(pos, entries, window, cx);
@@ -807,7 +796,7 @@ impl Shark {
                     .accessibility_label("Change agent icon")
                     .ghost()
                     .ml(px(-6.))
-                    .icon(Icon::new(super::sidebar::section_icon(&agent.icon)).with_size(px(20.)))
+                    .child(super::agent_icon_view::agent_icon(&agent.icon))
                     .tooltip("Change icon")
                     .on_click(cx.listener(move |s, _, w, cx| s.pick_agent_icon(&icon_slug, w, cx))),
             )
@@ -1009,11 +998,7 @@ impl Shark {
         let agents = self.state.agents.clone();
         let items = agents
             .iter()
-            .map(|a| {
-                CommandItem::new()
-                    .label(a.name.clone())
-                    .icon(super::sidebar::section_icon(&a.icon))
-            })
+            .map(|a| super::agent_icon_view::command(a))
             .collect();
         open_menu(
             cx.entity().downgrade(),
@@ -1152,6 +1137,16 @@ impl Shark {
                     s.state.agents = agents;
                     s.state.sections = sections;
                     return notify_err(window, cx, e.to_string());
+                }
+                if let Some(deleted) = agents.iter().find(|a| a.slug == slug)
+                    && !s.state.agents.iter().any(|a| a.icon == deleted.icon)
+                    && let Err(error) = crate::agent_icon::remove(&deleted.icon)
+                {
+                    notify_err(
+                        window,
+                        cx,
+                        format!("Agent deleted, but couldn't remove its image: {error}"),
+                    );
                 }
                 for task in affected {
                     s.publish_task(&task, cx);

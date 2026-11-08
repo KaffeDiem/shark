@@ -258,7 +258,10 @@ async fn handoff_target_follows_receiver_name_and_icon_edits(cx: &mut TestAppCon
     press_in(window)(cx, &["enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.agent("planner").unwrap().icon, "star");
+        assert_eq!(
+            s.agent("planner").unwrap().icon,
+            crate::state::AgentIcon::from("star")
+        );
         let target = s
             .chats
             .values()
@@ -268,7 +271,7 @@ async fn handoff_target_follows_receiver_name_and_icon_edits(cx: &mut TestAppCon
             .next_agent
             .as_ref()
             .unwrap();
-        assert_eq!(target.icon, IconName::Star);
+        assert_eq!(target.icon, crate::state::AgentIcon::from("star"));
     });
 }
 
@@ -307,4 +310,53 @@ async fn handoff_historical_chat_agents_reserve_deleted_slugs(cx: &mut TestAppCo
             Some("designer-2")
         );
     });
+}
+
+#[gpui_kit::test]
+async fn agent_chat_identity_keeps_its_own_space_beside_status(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    test_home();
+    let agents = agents();
+    let task = git::create_empty_task(
+        &tasks_dir().join("identity-status"),
+        "identity-status",
+        "Identity status",
+        Some(AgentLink::from(&agents[0])),
+    )
+    .unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents,
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_named("identity-status", w, cx));
+    let chat = cx.read(|cx| shark.read(cx).chats.values().next().unwrap().clone());
+    for scale in [1., 2.] {
+        cx.simulate_window_scale_factor_change(window, scale);
+        for working in [false, true] {
+            on_app(window, shark.clone())(cx, &|s, _, cx| {
+                let id = chat.read(cx).meta.id.clone();
+                s.unread.insert(id);
+                chat.update(cx, |c, cx| {
+                    c.busy = working;
+                    cx.notify();
+                });
+                cx.notify();
+            });
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let identity = w.find("chat-agent-identity").bounds();
+                let status = w.find("chat-agent-status").bounds();
+                assert_eq!(identity.size, size(px(16.), px(16.)));
+                assert!(identity.right() <= status.left());
+            })
+            .unwrap();
+        }
+    }
 }

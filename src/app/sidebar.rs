@@ -559,26 +559,6 @@ impl Shark {
         );
     }
 
-    pub(super) fn pick_agent_icon(
-        &mut self,
-        slug: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(a) = self.state.agents.iter().find(|a| a.slug == slug) else {
-            return;
-        };
-        let slug = slug.to_string();
-        self.pick_named_icon(
-            a.icon.clone(),
-            move |s, icon, cx| {
-                s.update_agent(&slug, |a| a.icon = icon, cx);
-            },
-            window,
-            cx,
-        );
-    }
-
     fn pick_named_icon(
         &mut self,
         current: String,
@@ -811,8 +791,11 @@ impl Shark {
             .count();
         let slug = agent.slug.clone();
         let (menu_slug, new_slug) = (slug.clone(), slug.clone());
+        let (icon_slug, drop_slug, anchor_slug) = (slug.clone(), slug.clone(), slug.clone());
+        let anchors = self.icon_anchors.clone();
         let tip: SharedString = format!("{} · {} tasks", agent.name, tasks.len()).into();
         let group = SharedString::from(format!("agent-row-{i}"));
+        let accent = theme.sidebar_accent;
         let bright = active || (selected && focused);
         let quiet = if bright {
             theme.foreground
@@ -875,10 +858,67 @@ impl Shark {
                     this.show_menu(e.position, entries, w, cx);
                 }),
             )
+            .when(
+                self.agent_icon_drop
+                    .as_ref()
+                    .is_some_and(|(slug, _)| slug == &agent.slug),
+                |d| d.bg(accent),
+            )
+            // Finder drags after typing do not set GPUI's hover state.
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    if event.bounds.contains(&event.event.position) {
+                        if let Some(path) = event.drag(cx).paths().first() {
+                            this.agent_icon_drop = Some((drop_slug.clone(), path.clone()));
+                            cx.notify();
+                        }
+                    } else if this
+                        .agent_icon_drop
+                        .as_ref()
+                        .is_some_and(|(slug, _)| slug == &drop_slug)
+                    {
+                        this.agent_icon_drop = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_file_drop_exit(cx.listener(|this, _, _, cx| {
+                this.agent_icon_drop = None;
+                cx.notify();
+            }))
             .child(
-                Icon::new(section_icon(&agent.icon))
-                    .with_size(ISZ)
-                    .when(needs > 0, |i| i.text_color(theme.warning_foreground)),
+                div()
+                    .id(("agent-icon", i))
+                    .relative()
+                    .size(ISZ)
+                    .flex_none()
+                    .cursor_pointer()
+                    .role(gpui_kit::accesskit::Role::Button)
+                    .aria_label(format!("Change {} icon", agent.name))
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        cx.stop_propagation();
+                        this.sel = SideRow::Agent(i);
+                        this.pick_agent_icon(&icon_slug, w, cx);
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .inset(px(-2.))
+                            .rounded(px(4.))
+                            .hover(move |d| d.bg(accent)),
+                    )
+                    .child(agent_icon_view::agent_icon(&agent.icon))
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                anchors.borrow_mut().insert(anchor_slug.clone(), bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .test_support(),
             )
             .when(!rail, |d| {
                 d.child(
@@ -1130,6 +1170,35 @@ impl Shark {
                     ),
             )
             .child(self.render_usage_footer(cx))
+            .child({
+                let owner = cx.entity().downgrade();
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let owner = owner.clone();
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, w, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
+                            }
+                            owner
+                                .update(cx, |this, cx| {
+                                    if let Some((slug, path)) = this.agent_icon_drop.take() {
+                                        this.pick_agent_icon(&slug, w, cx);
+                                        if let Some(panel) = &this.icon_picker {
+                                            panel.picker.clone().update(cx, |p, cx| {
+                                                p.load_path(&path, true, w, cx)
+                                            });
+                                        }
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+            })
             .test_support()
     }
 }

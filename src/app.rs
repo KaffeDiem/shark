@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(crate) mod agent_icon_view;
 pub(crate) mod agent_settings;
 mod app_switcher;
 mod ask;
@@ -45,6 +46,8 @@ mod features;
 mod file_changes;
 mod handoff;
 mod home;
+mod icon_picker;
+mod icon_picker_host;
 mod intelligence;
 #[cfg(all(test, feature = "test-support"))]
 mod intelligence_tests;
@@ -153,6 +156,9 @@ pub struct Shark {
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
+    icon_picker: Option<icon_picker_host::Panel>,
+    icon_anchors: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    agent_icon_drop: Option<(String, PathBuf)>,
     usage: Vec<crate::usage::Snapshot>,
     #[cfg(test)]
     usage_queries: Vec<usize>,
@@ -321,6 +327,9 @@ impl Shark {
             menu: None,
             app_switcher: None,
             usage_panel: None,
+            icon_picker: None,
+            icon_anchors: Rc::default(),
+            agent_icon_drop: None,
             usage: vec![Default::default(); crate::usage::Provider::ALL.len()],
             #[cfg(test)]
             usage_queries: vec![0; crate::usage::Provider::ALL.len()],
@@ -752,13 +761,10 @@ impl Shark {
         let attachments = self.render_attachments(window, cx);
         let agent = self.active_task().and_then(|task| {
             let link = task.agent.as_ref()?;
-            let name = self
-                .state
-                .agents
-                .iter()
-                .find(|a| a.slug == link.slug)
-                .map_or_else(|| link.name.clone(), |a| a.name.clone());
-            Some((link.slug.clone(), name))
+            let agent = self.state.agents.iter().find(|a| a.slug == link.slug);
+            let name = agent.map_or_else(|| link.name.clone(), |a| a.name.clone());
+            let icon = agent.map(|a| a.icon.clone()).unwrap_or_default();
+            Some((link.slug.clone(), name, icon))
         });
         let theme = cx.theme();
         v_flex()
@@ -774,9 +780,19 @@ impl Shark {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(self.render_run(cx))
-                    .when_some(agent, |d, (slug, name)| {
+                    .when_some(agent, |d, (slug, name, icon)| {
                         d.child(
-                            Self::chip("task-agent", IconName::Bot, name.clone())
+                            Button::new("task-agent")
+                                .ghost()
+                                .flex_none()
+                                .accessibility_label(name.clone())
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .min_w_0()
+                                        .child(agent_icon_view::agent_icon(&icon))
+                                        .child(div().min_w_0().truncate().child(name.clone())),
+                                )
                                 .max_w(px(160.))
                                 .flex_shrink_1()
                                 .tooltip(format!("Open {name}"))
@@ -1036,6 +1052,22 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &PasteAgentIcon, w, cx| {
+                let slug = if this.sidebar_focus.is_focused(w) {
+                    match this.sel {
+                        SideRow::Agent(i) => this.state.agents.get(i).map(|a| a.slug.clone()),
+                        SideRow::Task(_) => None,
+                    }
+                } else {
+                    match &this.home.destination {
+                        home::Destination::Agent(slug) => Some(slug.clone()),
+                        home::Destination::Home => None,
+                    }
+                };
+                if let Some(slug) = slug {
+                    this.paste_agent_icon(&slug, w, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleZen, w, cx| this.toggle_zen(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
@@ -1077,6 +1109,7 @@ impl Render for Shark {
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .children(self.render_app_switcher(window, cx))
             .children(self.render_usage(window, cx))
+            .children(self.render_icon_picker(window, cx))
             .when(self.zen_shown(), |d| d.bg(cx.theme().background))
             .child(match self.zen_shown() {
                 true => self.render_zen(cx),

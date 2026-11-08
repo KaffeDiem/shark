@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 pub(crate) struct HandoffTarget {
     pub slug: String,
     pub name: String,
-    pub icon: IconName,
+    pub icon: crate::state::AgentIcon,
 }
 
 impl Chat {
@@ -83,8 +83,15 @@ impl Chat {
                             Button::new("handoff-go")
                                 .small()
                                 .ghost()
-                                .icon(target.icon)
-                                .label(format!("Hand off to {} ⌘⌥↵", target.name))
+                                .accessibility_label(format!("Hand off to {}", target.name))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(crate::app::agent_icon_view::agent_icon(
+                                            &target.icon,
+                                        ))
+                                        .child(format!("Hand off to {} ⌘⌥↵", target.name)),
+                                )
                                 .tooltip("Hand off · ⌘⌥↵")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.emit(ChatEvent::HandOff {

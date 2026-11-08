@@ -867,39 +867,82 @@ impl Shark {
                     0 => label,
                     n => format!("{label} · {n}").into(),
                 };
-                let icon = ctrl_chip(ctrl_held, tab_ix).unwrap_or_else(|| {
-                    match (
-                        chat.is_some_and(|c| c.working()),
-                        self.unread.contains(&meta.id),
-                    ) {
-                        // Waiting on answers to its questions.
-                        _ if chat.is_some_and(|c| c.asking()) => {
+                let agent = meta.agent.as_deref().and_then(|slug| self.agent(slug));
+                let icon = if let Some(agent) = agent {
+                    let status = if chat.is_some_and(|c| c.asking()) {
+                        Some(
                             Icon::new(IconName::MessageCircleQuestionMark)
                                 .with_size(px(14.))
                                 .text_color(theme.warning_foreground)
-                                .into_any_element()
+                                .into_any_element(),
+                        )
+                    } else if chat.is_some_and(|c| c.working()) {
+                        Some(
+                            Spinner::new()
+                                .icon(IconName::LoaderCircle)
+                                .color(theme.primary)
+                                .with_size(px(14.))
+                                .into_any_element(),
+                        )
+                    } else if self.unread.contains(&meta.id) {
+                        Some(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(theme.primary)
+                                .into_any_element(),
+                        )
+                    } else {
+                        None
+                    };
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("chat-agent-identity")
+                                .test_support()
+                                .size(px(16.))
+                                .flex_none()
+                                .child(super::agent_icon_view::agent_icon(&agent.icon)),
+                        )
+                        .children(status.map(|status| {
+                            div()
+                                .id("chat-agent-status")
+                                .test_support()
+                                .size(px(14.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(status)
+                        }))
+                        .children(ctrl_chip(ctrl_held, tab_ix))
+                        .into_any_element()
+                } else {
+                    ctrl_chip(ctrl_held, tab_ix).unwrap_or_else(|| {
+                        match (
+                            chat.is_some_and(|c| c.working()),
+                            self.unread.contains(&meta.id),
+                        ) {
+                            _ if chat.is_some_and(|c| c.asking()) => {
+                                Icon::new(IconName::MessageCircleQuestionMark)
+                                    .with_size(px(14.))
+                                    .text_color(theme.warning_foreground)
+                                    .into_any_element()
+                            }
+                            (true, _) => Spinner::new()
+                                .icon(IconName::LoaderCircle)
+                                .color(theme.primary)
+                                .with_size(px(14.))
+                                .into_any_element(),
+                            (false, unread) => div()
+                                .relative()
+                                .child(Icon::new(IconName::MessageSquare).with_size(px(14.)))
+                                .when(unread, |d| d.child(dot(-2., theme)))
+                                .into_any_element(),
                         }
-                        (true, _) => Spinner::new()
-                            .icon(IconName::LoaderCircle)
-                            .color(theme.primary)
-                            .with_size(px(14.))
-                            .into_any_element(),
-                        (false, unread) => div()
-                            .relative()
-                            .child(
-                                Icon::new(
-                                    meta.agent
-                                        .as_deref()
-                                        .and_then(|slug| self.agent(slug))
-                                        .map(|a| sidebar::section_icon(&a.icon))
-                                        .unwrap_or(IconName::MessageSquare),
-                                )
-                                .with_size(px(14.)),
-                            )
-                            .when(unread, |d| d.child(dot(-2., theme)))
-                            .into_any_element(),
-                    }
-                });
+                    })
+                };
                 let tooltip = meta
                     .agent
                     .as_deref()

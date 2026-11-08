@@ -194,11 +194,79 @@ pub struct Repo {
     pub path: PathBuf,
 }
 
+/// Accept pre-avatar states where the icon was a plain Lucide name.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum AgentIcon {
+    Symbol {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tint: Option<String>,
+    },
+    Emoji {
+        value: String,
+    },
+    Image {
+        file: String,
+    },
+}
+
+impl Default for AgentIcon {
+    fn default() -> Self {
+        "bot".into()
+    }
+}
+
+impl From<&str> for AgentIcon {
+    fn from(name: &str) -> Self {
+        name.to_owned().into()
+    }
+}
+
+impl From<String> for AgentIcon {
+    fn from(name: String) -> Self {
+        Self::Symbol { name, tint: None }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentIcon {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "lowercase")]
+        enum Tagged {
+            Symbol {
+                name: String,
+                #[serde(default)]
+                tint: Option<String>,
+            },
+            Emoji {
+                value: String,
+            },
+            Image {
+                file: String,
+            },
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Legacy(String),
+            Current(Tagged),
+        }
+        Ok(match Stored::deserialize(d)? {
+            Stored::Legacy(name) => name.into(),
+            Stored::Current(Tagged::Symbol { name, tint }) => Self::Symbol { name, tint },
+            Stored::Current(Tagged::Emoji { value }) => Self::Emoji { value },
+            Stored::Current(Tagged::Image { file }) => Self::Image { file },
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct Agent {
     pub slug: String,
     pub name: String,
-    pub icon: String,
+    #[serde(default)]
+    pub icon: AgentIcon,
     pub instructions: String,
     pub repos: Vec<String>,
     pub model: Option<String>,
@@ -1298,6 +1366,42 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_agent_icons_and_variants_roundtrip() {
+        let legacy = r#"{"repos":[],"workspaces":[],"agents":[{"slug":"a","name":"A","icon":"Palette","instructions":"","repos":[],"model":null,"effort":null}]}"#;
+        let mut state: State = serde_json::from_str(legacy).unwrap();
+        assert_eq!(state.agents[0].icon, AgentIcon::from("Palette"));
+        for icon in [
+            AgentIcon::default(),
+            AgentIcon::Symbol {
+                name: "star".into(),
+                tint: Some("#ff0000".into()),
+            },
+            AgentIcon::Emoji {
+                value: "🦈".into()
+            },
+            AgentIcon::Image {
+                file: "agent-icons/a.png".into(),
+            },
+        ] {
+            state.agents[0].icon = icon.clone();
+            let saved = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                serde_json::from_str::<State>(&saved).unwrap().agents[0].icon,
+                icon
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_state_agent_without_icon_loads() {
+        let state: State = serde_json::from_str(r#"{"repos":[],"workspaces":[],"agents":[{"slug":"a","name":"A","instructions":"","repos":[],"model":null,"effort":null}]}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(&state.agents[0].icon).unwrap(),
+            serde_json::json!({"kind":"symbol","name":"bot"})
+        );
+    }
 
     #[test]
     fn handoff_fields_roundtrip_and_legacy_defaults() {
