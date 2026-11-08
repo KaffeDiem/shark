@@ -46,9 +46,10 @@ async fn handoff_next_chip_sets_clears_and_deleted_target_is_cleared(cx: &mut Te
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("agent-next", cx);
+        w.click("agent-more", cx);
     })
     .unwrap();
+    press_in(window)(cx, &["t", "enter"]);
     press_in(window)(cx, &["p", "enter"]);
     cx.read(|cx| {
         assert_eq!(
@@ -65,9 +66,10 @@ async fn handoff_next_chip_sets_clears_and_deleted_target_is_cleared(cx: &mut Te
     cx.read(|cx| assert!(shark.read(cx).state.agents[0].next.is_none()));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("agent-next", cx);
+        w.click("agent-more", cx);
     })
     .unwrap();
+    press_in(window)(cx, &["t", "enter"]);
     press_in(window)(cx, &["p", "enter"]);
     on_app(window, shark.clone())(cx, &|s, w, cx| s.delete_agent("planner", w, cx));
     press_in(window)(cx, &["enter"]);

@@ -11,7 +11,7 @@ Use `cmd-k` for the complete command list and current shortcuts. This guide cove
 Shark needs `git`, `gh` logged into GitHub, and `claude` on your login shell's PATH. Codex models also need `codex`, logged in with `codex login`. Home shows missing tools and a setup checklist.
 
 1. **Add repo** from `cmd-k` or Settings › Repositories. Repositories are registered once and can serve many agents and tasks.
-2. Choose **New agent** in the sidebar and give it a name. Its page opens with editable instructions and a **Defaults** row for repositories and other settings. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
+2. Choose **New agent** in the sidebar and give it a name. Its page opens with a compact profile and task composer. Use **Edit** for instructions and the composer controls to choose repositories and model defaults. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
 3. On Home, choose the agent, describe the work and press `enter`. The first line becomes the task's title. `@designer fix the onboarding spacing` selects the same agent.
 4. Plan or work in its chat, review the changes with **Differ**, and use the git button to commit, open PRs and merge.
 5. Delete the completed task when you no longer need its worktrees and conversations. The agent remains ready for its next task, with the completed task in History.
@@ -22,7 +22,7 @@ Worktrees isolate branches, not the filesystem. Coding sessions can write outsid
 
 ## Agents and navigation
 
-The sidebar gives direct access to Home and each agent. An agent's header is its settings: click the icon to change it, click the name to rename it, and type into the instructions under the name. The quiet **Defaults** row sets repositories, model, thinking level, skills and the next agent under **Then**. **Repos** includes **Add repository…**; **Skills** includes **Add skills…**. **Inherit** uses repository or app settings. These controls save defaults for future tasks; controls inside the composer affect only its draft. Each change saves immediately. The header's **…** and a right-click on the agent in the sidebar offer New task, Rename, Change icon, Edit instructions, Add skills, Open skills folder, Refresh skills, Open in… and Delete agent. Its slug is stable even when its name changes. Below the header are the task prompt, the agent's tasks and its history.
+The sidebar gives direct access to Home and each agent. Click the agent's icon to change it, its name to rename it, or **Edit** to expand its instructions. Each edit saves immediately. The profile lists installed skills and the next agent under **Then** when set. Use **…** (or right-click the agent in the sidebar) to add skills or set Then. Choose repositories, model and thinking in the composer; choices affect the draft until you choose **Make default for <agent>** in that control's menu. A dot marks choices that differ from defaults. The model menu can also restore repository inheritance. The agent's slug stays stable when renamed. Below the composer, Needs you and Running show current tasks; Done shows the five newest archived tasks and their PR links, with **Show all** for older work.
 
 Type into an agent page's composer and press `enter` or `cmd-enter` to start; `shift-enter` adds a line. `cmd-n`, `i` and `a` focus that composer. Each agent keeps its text, attachments, model overrides and Plan setting as a draft. Elsewhere `cmd-n` opens an empty standalone task. Home uses the same composer, with an agent picker first in its footer. The picker and leading `@slug` share the same selection and preserve the prompt's body. A leading `@` on Home lists agents; `@` elsewhere lists committed files, `#` lists PRs and `/` lists skills. `up`/`down` move through completions and `tab` or `enter` picks one. A cancelled or failed creation keeps the draft.
 
@@ -32,7 +32,7 @@ Several tasks can run for one agent, including in the same repository. Each has 
 
 Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through `AGENTS.md`. Open tasks refresh shortly after you stop typing the instructions; existing chats receive changed instructions with their next normal message. A failed refresh is reported so you can retry. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
 
-History keeps the latest 100 deleted tasks, with their titles, PR links, merge status and dates. **PR state unknown** means Shark lacked enough reliable status to determine the result for the whole task, even if some repositories had known PR states. Deleting an agent requires finishing or deleting its open tasks first; confirmation then removes its instructions, history and skills folder.
+Done keeps the latest 100 archived tasks, showing five at first with **Show all** for the rest. PR links show their Open, Closed or Merged state when known at archival time; older records with unknown state show the PR number alone. Tasks without PRs show **No PR**. Dates read Today, Yesterday or a calendar date. Deleting an agent requires finishing or deleting its open tasks first; confirmation then removes its instructions, history and skills folder.
 
 ### Handing a task to another agent
 

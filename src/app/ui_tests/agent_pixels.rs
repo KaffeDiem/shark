@@ -87,6 +87,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 TaskRecord {
                     title: "Settings page polish".into(),
                     at: 1_730_000_000_000,
+                    pr_states: Default::default(),
                     merged: Some(true),
                     branch: "designer/settings".into(),
                     prs: vec![("web".into(), "https://github.com/acme/web/pull/12".into())],
@@ -94,6 +95,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 TaskRecord {
                     title: "Dark mode contrast".into(),
                     at: 1_729_000_000_000,
+                    pr_states: Default::default(),
                     merged: Some(false),
                     branch: "designer/contrast".into(),
                     prs: vec![],

@@ -78,6 +78,19 @@ enum Block {
 }
 
 impl Block {
+    fn latest_tool_step(&self) -> Option<String> {
+        let call = match self {
+            Self::Tools { calls, .. } => calls.last()?,
+            Self::Tool(call) => call,
+            _ => return None,
+        };
+        Some(if call.summary.is_empty() {
+            call.name.clone()
+        } else {
+            format!("{} · {}", call.name, call.summary)
+        })
+    }
+
     /// A message's text (a review's prompt) and whether it is still queued; `None` for the rest.
     fn message(&self) -> Option<(&str, bool)> {
         match self {
@@ -480,6 +493,11 @@ impl Chat {
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
+    }
+
+    /// The current tool uses the transcript's cached summary, with no history scan.
+    pub(crate) fn latest_tool_step(&self) -> Option<String> {
+        self.blocks.last()?.latest_tool_step()
     }
 
     /// Nothing is running or about to: no turn, background task or question, and no message sent
@@ -5102,5 +5120,48 @@ done
         keys(cx, &["escape"]);
         assert_eq!(value(cx), "jk");
         assert!(in_transcript(cx));
+    }
+}
+
+#[cfg(test)]
+mod latest_step_tests {
+    use super::*;
+
+    fn call(name: &str, summary: &str) -> Call {
+        Call {
+            id: "test".into(),
+            name: name.into(),
+            summary: summary.into(),
+            input: String::new(),
+            result: None,
+            is_error: false,
+            open: false,
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn activity_uses_only_the_latest_block_and_cached_call_summary() {
+        let calls = Block::Tools {
+            calls: vec![call("Read", "old.rs"), call("Bash", "cargo test")],
+            open: false,
+        };
+        assert_eq!(calls.latest_tool_step(), Some("Bash · cargo test".into()));
+        assert_eq!(
+            Block::Tool(call("Agent", "Review changes")).latest_tool_step(),
+            Some("Agent · Review changes".into())
+        );
+        assert_eq!(Block::Info("Thinking".into()).latest_tool_step(), None);
+        assert_eq!(
+            Block::Tools {
+                calls: vec![],
+                open: false
+            }
+            .latest_tool_step(),
+            None
+        );
+        assert_eq!(
+            Block::Tool(call("Bash", "")).latest_tool_step(),
+            Some("Bash".into())
+        );
     }
 }

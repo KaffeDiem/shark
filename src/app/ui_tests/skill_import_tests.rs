@@ -32,7 +32,7 @@ async fn skill_import_skills_entry_and_cancelled_picker_leave_agent_unchanged(
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("agent-skills", cx);
+        w.click("agent-more", cx);
     })
     .unwrap();
     press_in(window)(cx, &["a", "enter"]);

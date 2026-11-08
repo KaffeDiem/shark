@@ -215,6 +215,8 @@ pub struct TaskRecord {
     pub branch: String,
     pub prs: Vec<(String, String)>,
     pub merged: Option<bool>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pr_states: HashMap<String, String>,
     /// Archive time in Unix milliseconds.
     pub at: u64,
 }
@@ -1298,6 +1300,18 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_history_preserves_legacy_records_and_per_pr_states() {
+        let old = r#"{"title":"Done","branch":"agent/task","prs":[["web","https://github.com/acme/web/pull/1"]],"merged":false,"at":123}"#;
+        let mut record: TaskRecord = serde_json::from_str(old).unwrap();
+        assert!(record.pr_states.is_empty());
+        record
+            .pr_states
+            .insert(record.prs[0].1.clone(), "closed".into());
+        let saved = serde_json::to_string(&record).unwrap();
+        assert_eq!(serde_json::from_str::<TaskRecord>(&saved).unwrap(), record);
+    }
 
     #[test]
     fn handoff_fields_roundtrip_and_legacy_defaults() {

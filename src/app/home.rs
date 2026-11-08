@@ -1180,7 +1180,7 @@ impl Shark {
                     .test_support()
                     .h(px(28.))
                     .mt(if items.is_empty() { px(0.) } else { px(12.) })
-                    .px_3()
+                    .when(on_home, |d| d.px_3())
                     .gap_2()
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
@@ -1215,18 +1215,20 @@ impl Shark {
             items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
         }
         list.children(items)
-            .child(
-                h_flex()
-                    .pt_3()
-                    .px_3()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(faint(theme))
-                    .child(crate::ui::hint("enter", "open"))
-                    .child(crate::ui::hint("i", "prompt"))
-                    .child(crate::ui::hint("cmd-backspace", "delete"))
-                    .child(div().child("right-click for more")),
-            )
+            .when(on_home, |d| {
+                d.child(
+                    h_flex()
+                        .pt_3()
+                        .px_3()
+                        .gap_3()
+                        .text_xs()
+                        .text_color(faint(theme))
+                        .child(crate::ui::hint("enter", "open"))
+                        .child(crate::ui::hint("i", "prompt"))
+                        .child(crate::ui::hint("cmd-backspace", "delete"))
+                        .child(div().child("right-click for more")),
+                )
+            })
             .into_any_element()
     }
 
@@ -1295,9 +1297,18 @@ impl Shark {
             1 => "1 chat".to_string(),
             n => format!("{n} chats"),
         };
-        let status = r.label.clone().or_else(|| match r.running {
-            0 | 1 => None,
-            n => Some(format!("{n} chats running")),
+        let status = r.label.clone().or_else(|| {
+            if r.running == 0 {
+                return None;
+            }
+            w.chats
+                .iter()
+                .rev()
+                .find_map(|meta| {
+                    let chat = self.chats.get(&meta.id)?.read(cx);
+                    chat.working().then(|| chat.latest_tool_step()).flatten()
+                })
+                .or_else(|| Some("Working…".into()))
         });
         let agent = (self.home.destination == Destination::Home)
             .then(|| {
@@ -1333,7 +1344,7 @@ impl Shark {
             ))
             .test_support()
             .h(px(36.))
-            .px_3()
+            .when(self.home.destination == Destination::Home, |d| d.px_3())
             .gap_3()
             .rounded(theme.radius)
             .text_sm()
@@ -1365,7 +1376,7 @@ impl Shark {
             .child(
                 div()
                     .min_w_0()
-                    .flex_shrink(1.)
+                    .flex_1()
                     .truncate()
                     .font_weight(FontWeight::MEDIUM)
                     .child(title),
@@ -1375,7 +1386,6 @@ impl Shark {
                     .flex_none()
                     .max_w(px(260.))
                     .truncate()
-                    .text_xs()
                     .text_color(match r.label.is_some() {
                         true => theme.warning_foreground,
                         false => theme.muted_foreground,
@@ -1387,18 +1397,15 @@ impl Shark {
                     h_flex()
                         .flex_none()
                         .gap_1()
-                        .text_xs()
                         .text_color(theme.success_foreground)
                         .child(Icon::new(IconName::GitMerge).with_size(px(12.)))
                         .child("Merged"),
                 )
             })
-            .child(div().flex_1().min_w(px(12.)))
             .children(agent.map(|a| {
                 h_flex()
                     .flex_none()
                     .gap_1()
-                    .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(Icon::new(super::sidebar::section_icon(&a.icon)).with_size(px(12.)))
                     .child(a.name.clone())
@@ -1409,7 +1416,6 @@ impl Shark {
                     .max_w(px(240.))
                     .flex_shrink(1.)
                     .truncate()
-                    .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(names),
             )
@@ -1418,7 +1424,6 @@ impl Shark {
                     .flex_none()
                     .w(px(56.))
                     .text_right()
-                    .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(t)
             }))

@@ -1424,6 +1424,20 @@ impl Shark {
                             .iter()
                             .map(|(repo, url, _)| (repo.clone(), url.clone()))
                             .collect(),
+                        pr_states: prs
+                            .iter()
+                            .map(|(_, url, state)| {
+                                (
+                                    url.clone(),
+                                    match state {
+                                        sync::PrState::Open => "open",
+                                        sync::PrState::Closed => "closed",
+                                        sync::PrState::Merged => "merged",
+                                    }
+                                    .into(),
+                                )
+                            })
+                            .collect(),
                         merged: if !task.repos.is_empty()
                             && task.repos.iter().all(|r| {
                                 deleted.contains(&r.name)

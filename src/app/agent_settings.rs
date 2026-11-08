@@ -1,8 +1,7 @@
-//! Persistent agents. An agent's page is its settings: the header holds its identity,
-//! instructions and defaults, edited in place; below sit its composer, tasks and history.
+//! Persistent agents: compact profile, task composer, current work and completed tasks.
 use super::menus::on_shark;
 use super::*;
-use crate::models::{effort_label, efforts, model_label};
+use crate::models::efforts;
 use crate::state::Agent;
 use gpui_kit::component::input::{Textarea, TextareaState};
 use std::cell::Cell;
@@ -83,8 +82,41 @@ pub(super) fn empty_state(
         .into_any_element()
 }
 
-/// Deleted tasks, newest first, under a heading like the task list's groups.
-fn render_history(agent: &Agent, theme: &Theme) -> Option<AnyElement> {
+fn history_date(at: u64, today: chrono::NaiveDate) -> String {
+    let Some(at) = i64::try_from(at)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+    else {
+        return "Date unknown".into();
+    };
+    let date = at.with_timezone(&chrono::Local).date_naive();
+    if date == today {
+        "Today".into()
+    } else if Some(date) == today.pred_opt() {
+        "Yesterday".into()
+    } else {
+        date.format("%b %-d, %Y").to_string()
+    }
+}
+
+fn history_pr_label(url: &str, state: Option<&str>) -> String {
+    let number = url.trim_end_matches('/').rsplit('/').next().unwrap_or(url);
+    let state = match state {
+        Some("merged") => " Merged",
+        Some("closed") => " Closed",
+        Some("open") => " Open",
+        _ => "",
+    };
+    format!("#{number}{state}")
+}
+
+/// Archived tasks retain their PR links after their worktrees are deleted.
+fn render_history(
+    agent: &Agent,
+    theme: &Theme,
+    expanded: bool,
+    cx: &Context<Shark>,
+) -> Option<AnyElement> {
     if agent.history.is_empty() {
         return None;
     }
@@ -94,75 +126,122 @@ fn render_history(agent: &Agent, theme: &Theme) -> Option<AnyElement> {
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme.muted_foreground)
-        .child("History")
+        .child("Done")
         .child(
             div()
                 .font_weight(FontWeight::NORMAL)
                 .child(agent.history.len().to_string()),
         );
-    let rows = agent.history.iter().enumerate().map(|(i, record)| {
-        let status = match record.merged {
-            Some(true) => "Merged",
-            Some(false) => "Not merged",
-            None => "PR state unknown",
-        };
-        let date = i64::try_from(record.at)
-            .ok()
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .map_or_else(
-                || "Date unknown".into(),
-                |at| {
-                    at.with_timezone(&chrono::Local)
-                        .format("%b %-d, %Y")
-                        .to_string()
-                },
-            );
-        let (icon, color) = match record.merged {
-            Some(true) => (IconName::GitMerge, theme.muted_foreground),
-            _ => (IconName::Archive, theme.muted_foreground),
-        };
-        h_flex()
-            .id(("agent-history", i))
-            .aria_label(format!("{}, {status}, {date}", record.title))
-            .test_support()
-            .h(px(36.))
-            .px_3()
-            .gap_3()
-            .rounded(theme.radius)
-            .text_sm()
-            .child(Icon::new(icon).with_size(px(14.)).text_color(color))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(theme.muted_foreground)
-                    .child(record.title.clone()),
-            )
-            .child(div().flex_1())
-            .children(record.prs.iter().enumerate().map(|(j, (repo, url))| {
-                let url = url.clone();
-                Button::new(SharedString::from(format!("agent-history-pr-{i}-{j}")))
-                    .ghost()
-                    .xsmall()
-                    .role(Role::Link)
-                    .label(format!("{repo} PR"))
-                    .tooltip(url.clone())
-                    .on_click(move |_, _, cx| cx.open_url(&url))
-            }))
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{status} · {date}")),
-            )
-    });
+    let today = chrono::Local::now().date_naive();
+    let mut records: Vec<_> = agent.history.iter().collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.at));
+    let rows = records
+        .into_iter()
+        .take(if expanded { usize::MAX } else { 5 })
+        .enumerate()
+        .map(|(i, record)| {
+            let date = history_date(record.at, today);
+            let prs: Vec<_> = record
+                .prs
+                .iter()
+                .map(|(_, url)| {
+                    let state = record
+                        .pr_states
+                        .get(url)
+                        .map(String::as_str)
+                        .or_else(|| (record.merged == Some(true)).then_some("merged"));
+                    (url.clone(), history_pr_label(url, state))
+                })
+                .collect();
+            let status = if prs.is_empty() {
+                "No PR".into()
+            } else {
+                prs.iter()
+                    .map(|(_, label)| label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let first_pr = prs.first().map(|(url, _)| url.clone());
+            h_flex()
+                .id(("agent-history", i))
+                .aria_label(format!("{}, {status}, {date}", record.title))
+                .test_support()
+                .h(px(36.))
+                .gap_3()
+                .rounded(theme.radius)
+                .text_sm()
+                .when_some(first_pr, |row, url| {
+                    row.cursor_pointer()
+                        .hover(|row| row.bg(theme.list_hover))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                })
+                .child(
+                    Icon::new(if record.merged == Some(true) {
+                        IconName::GitMerge
+                    } else {
+                        IconName::Archive
+                    })
+                    .with_size(px(14.))
+                    .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(record.title.clone()),
+                )
+                .when(prs.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.muted_foreground)
+                            .child("No PR"),
+                    )
+                })
+                .children(prs.into_iter().enumerate().map(|(j, (url, label))| {
+                    Button::new(SharedString::from(format!("agent-history-pr-{i}-{j}")))
+                        .ghost()
+                        .xsmall()
+                        .role(Role::Link)
+                        .label(label)
+                        .tooltip(url.clone())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(&url)
+                        })
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.muted_foreground)
+                        .child(date),
+                )
+        });
     Some(
         v_flex()
             .id("agent-history")
             .test_support()
             .child(heading)
             .children(rows)
+            .when(!expanded && agent.history.len() > 5, |list| {
+                list.child(
+                    Button::new("agent-history-show-all")
+                        .ghost()
+                        .small()
+                        .label(format!("Show all {}", agent.history.len()))
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            if let Some(header) = &s.home.agent_header {
+                                header.update(cx, |header, cx| {
+                                    header.history_expanded = true;
+                                    cx.notify();
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element(),
     )
 }
@@ -310,7 +389,12 @@ impl Shark {
             .update(cx, |c, cx| c.set_read_only(starting, cx));
         self.refresh_draft_sources(true, cx);
         let placeholder = self.home.agent_draft.issues.first().map_or_else(
-            || format!("Describe a task for {}", agent.name),
+            || {
+                format!(
+                    "Describe a task for {} · @ file · # PR · / skill",
+                    agent.name
+                )
+            },
             |issue| format!("Add notes, or press Enter to plan {}", issue.identifier),
         );
         self.home
@@ -492,6 +576,12 @@ impl Shark {
                 "Edit instructions",
                 act(Shark::edit_agent),
             ),
+            menu::item(IconName::ArrowRight, "Then…", {
+                let s = s.clone();
+                on_shark(cx, move |shark, w, cx| {
+                    shark.agent_next_menu(&s, w.mouse_position(), w, cx);
+                })
+            }),
             Entry::Sep,
             menu::item(IconName::BookOpen, "Add skills…", {
                 let s = s.clone();
@@ -555,71 +645,6 @@ impl Shark {
         self.show_menu(pos, entries, window, cx);
     }
 
-    fn agent_model_menu(
-        &mut self,
-        slug: &str,
-        pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agent(slug) else {
-            return;
-        };
-        let inherited = model_label(&repo_defaults(&self.state, agent).0);
-        let current = agent.model.clone();
-        let pick = |model: Option<&'static str>| {
-            let s = slug.to_string();
-            on_shark(cx, move |shark, _, cx| {
-                shark.update_agent(&s, |a| a.model = model.map(Into::into), cx)
-            })
-        };
-        let mut entries = vec![
-            menu::item(None, "Inherit", pick(None))
-                .hint(inherited)
-                .checked(current.is_none()),
-            Entry::Sep,
-        ];
-        entries.extend(MODELS.iter().map(|m| {
-            menu::item(None, model_label(m), pick(Some(m))).checked(current.as_deref() == Some(*m))
-        }));
-        self.show_menu(pos, entries, window, cx);
-    }
-
-    fn agent_effort_menu(
-        &mut self,
-        slug: &str,
-        pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agent(slug) else {
-            return;
-        };
-        let model = (agent.model.clone()).unwrap_or_else(|| repo_defaults(&self.state, agent).0);
-        let inherited = crate::models::effort_of(&ChatMeta {
-            model: Some(model.clone()),
-            effort: repo_defaults(&self.state, agent).1,
-            ..Default::default()
-        });
-        let current = agent.effort.clone();
-        let pick = |effort: Option<&'static str>| {
-            let s = slug.to_string();
-            on_shark(cx, move |shark, _, cx| {
-                shark.update_agent(&s, |a| a.effort = effort.map(Into::into), cx)
-            })
-        };
-        let mut entries = vec![
-            menu::item(None, "Inherit", pick(None))
-                .hint(effort_label(inherited))
-                .checked(current.is_none()),
-            Entry::Sep,
-        ];
-        entries.extend(efforts(&model).iter().map(|l| {
-            menu::item(None, effort_label(l), pick(Some(l))).checked(current.as_deref() == Some(*l))
-        }));
-        self.show_menu(pos, entries, window, cx);
-    }
-
     fn agent_skills_menu(
         &mut self,
         slug: &str,
@@ -667,55 +692,7 @@ impl Shark {
         self.show_menu(pos, entries, window, cx);
     }
 
-    fn agent_repos_menu(
-        &mut self,
-        slug: &str,
-        pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agent(slug) else {
-            return;
-        };
-        let mut entries: Vec<Entry> = self
-            .state
-            .repos
-            .iter()
-            .map(|r| {
-                let on = agent.repos.contains(&r.name);
-                let (slug, repo) = (slug.to_string(), r.name.clone());
-                menu::item(
-                    IconName::FolderGit2,
-                    r.name.clone(),
-                    on_shark(cx, move |s, _, cx| {
-                        s.update_agent(
-                            &slug,
-                            |a| {
-                                if on {
-                                    a.repos.retain(|r| r != &repo);
-                                } else {
-                                    a.repos.push(repo.clone());
-                                }
-                            },
-                            cx,
-                        )
-                    }),
-                )
-                .checked(on)
-            })
-            .collect();
-        if !entries.is_empty() {
-            entries.push(Entry::Sep);
-        }
-        entries.push(menu::item(
-            IconName::FolderPlus,
-            "Add repository…",
-            on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
-        ));
-        self.show_menu(pos, entries, window, cx);
-    }
-
-    /// Icon, name, @handle and `…`; instructions; then quiet, explicitly labelled defaults.
+    /// Identity and a compact, editable profile.
     fn render_agent_header(
         &self,
         agent: &Agent,
@@ -814,134 +791,101 @@ impl Shark {
             .child(name)
             .child(more);
         let editing = h.instructions.read(cx).focus_handle(cx).is_focused(window);
-        let instructions =
-            v_flex()
-                .gap_1()
+        let instructions = if editing {
+            div()
+                .id("agent-instructions")
+                .test_support()
+                .p_2()
+                .mx(px(-8.))
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(Textarea::new(&h.instructions).appearance(false))
+                .into_any_element()
+        } else {
+            let header = header.clone();
+            h_flex()
+                .items_start()
+                .gap_2()
                 .child(
                     div()
-                        .id("agent-instructions")
+                        .id("agent-instructions-preview")
                         .test_support()
-                        .px_2()
-                        .py_1()
-                        .mx(px(-8.))
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(if editing {
-                            theme.border
-                        } else {
-                            theme.transparent
-                        })
-                        .when(!editing, |d| d.hover(|d| d.bg(theme.list_hover)))
-                        .text_size(px(14.))
-                        .line_height(relative(1.5))
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child(Textarea::new(&h.instructions).appearance(false)),
+                        .line_clamp(2)
+                        .child(if agent.instructions.is_empty() {
+                            "Add instructions…".to_string()
+                        } else {
+                            agent
+                                .instructions
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }),
                 )
-                .when(editing, |d| {
-                    d.child(div().text_xs().text_color(theme.muted_foreground).child(
-                        "Every task of this agent reads these through CLAUDE.md and AGENTS.md.",
-                    ))
-                });
-        let repos = agent
-            .repos
-            .iter()
-            .filter(|r| self.state.repos.iter().any(|x| &x.name == *r))
-            .cloned()
-            .collect::<Vec<_>>();
-        let chip = |id: &'static str, key: &'static str, value: String, tip: &'static str, open: fn(&mut Shark, &str, Point<Pixels>, &mut Window, &mut Context<Shark>)| {
-            let s = slug.clone();
+                .child(
+                    Button::new("agent-instructions")
+                        .ghost()
+                        .xsmall()
+                        .label("Edit")
+                        .accessibility_label("Edit agent instructions")
+                        .on_click(move |_, w, cx| {
+                            header.update(cx, |h, cx| {
+                                h.instructions.update(cx, |i, cx| i.focus(w, cx));
+                                cx.notify();
+                            });
+                        }),
+                )
+                .into_any_element()
+        };
+        let chip = |id: &'static str, label: String, open: fn(&mut Shark, &str, Point<Pixels>, &mut Window, &mut Context<Shark>)| {
+            let slug = slug.clone();
             anchored_button(
                 id.into(),
                 true,
-                Button::new(id)
-                    .ghost()
-                    .accessibility_label(format!("{key} {value}"))
-                    .tooltip(tip)
-                    .child(h_flex().gap_1()
-                        .child(div().text_color(theme.muted_foreground).child(key))
-                        .child(div().max_w(px(180.)).truncate().text_color(theme.foreground).child(value))
-                        .child(Icon::new(IconName::ChevronDown).with_size(px(12.)))),
-                move |sh, pos, w, cx| open(sh, &s, pos, w, cx),
+                Button::new(id).ghost().xsmall().label(label),
+                move |s, pos, w, cx| open(s, &slug, pos, w, cx),
                 cx,
             )
         };
-        let chips = vec![
-            chip(
-                "agent-repos",
-                "Repos",
-                if repos.is_empty() {
-                    "None".into()
-                } else {
-                    repos.join(", ")
-                },
-                "Repositories for new tasks",
-                Shark::agent_repos_menu,
-            ),
-            chip(
-                "agent-model",
-                "Model",
-                agent
-                    .model
-                    .as_deref()
-                    .map(model_label)
-                    .unwrap_or_else(|| "Inherit".into()),
-                "Model for new tasks",
-                Shark::agent_model_menu,
-            ),
-            chip(
-                "agent-effort",
-                "Thinking",
-                agent
-                    .effort
-                    .as_deref()
-                    .map(effort_label)
-                    .unwrap_or_else(|| "Inherit".into()),
-                "Thinking level for new tasks",
-                Shark::agent_effort_menu,
-            ),
-            chip(
+        let mut chips = Vec::new();
+        if !h.skills.is_empty() {
+            chips.push(chip(
                 "agent-skills",
-                "Skills",
-                h.skills.len().to_string(),
-                "This agent's skills",
+                format!("{} skills", h.skills.len()),
                 Shark::agent_skills_menu,
-            ),
-            chip(
+            ));
+        }
+        if let Some(next) = agent.next.as_deref().and_then(|s| self.agent(s)) {
+            if !chips.is_empty() {
+                chips.push(div().child("·").into_any_element());
+            }
+            chips.push(chip(
                 "agent-next",
-                "Then",
-                agent
-                    .next
-                    .as_deref()
-                    .and_then(|s| self.agent(s))
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| "None".into()),
-                "Hand off finished work to",
+                format!("Then {}", next.name),
                 Shark::agent_next_menu,
-            ),
-        ];
+            ));
+        }
         v_flex()
             .id("agent-settings")
             .test_support()
             .gap_2()
             .child(identity)
             .child(instructions)
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("agent-defaults-label")
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Defaults")
-                            .tooltip(|w, cx| {
-                                Tooltip::new("Used when a task starts. Saved for this agent.")
-                                    .build(w, cx)
-                            }),
-                    )
-                    .children(chips),
-            )
+            .when(!chips.is_empty(), |d| {
+                d.child(
+                    h_flex()
+                        .gap_1()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .children(chips),
+                )
+            })
             .into_any_element()
     }
 
@@ -957,7 +901,12 @@ impl Shark {
         let header = self.render_agent_header(&agent, window, cx);
         let list = self.render_ws_list(window, cx);
         let theme = cx.theme();
-        let history = render_history(&agent, theme);
+        let expanded = self
+            .home
+            .agent_header
+            .as_ref()
+            .is_some_and(|header| header.read(cx).history_expanded);
+        let history = render_history(&agent, theme, expanded, cx);
         let composer_slug = slug.to_string();
         let composer = self.render_task_composer(true, window, cx);
         v_flex()
@@ -1201,6 +1150,7 @@ pub(super) struct AgentHeader {
     /// The name shows as an input while it's being edited.
     pub(super) renaming: bool,
     pub(super) skills: Vec<String>,
+    history_expanded: bool,
     /// Bumped per name or instructions edit; only the latest edit's timer syncs open tasks.
     edits: Rc<Cell<u64>>,
     _subs: Vec<Subscription>,
@@ -1223,6 +1173,7 @@ impl AgentHeader {
         let mut this = Self {
             shark,
             skills: skill_names(&a.slug),
+            history_expanded: false,
             slug: a.slug,
             name,
             instructions,
@@ -1329,6 +1280,41 @@ impl AgentHeader {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[test]
+    fn done_dates_are_relative_and_pr_numbers_keep_unknown_states_quiet() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        let at = |day| {
+            let local = chrono::NaiveDate::from_ymd_opt(2026, 11, day)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap();
+            chrono::TimeZone::from_local_datetime(&chrono::Local, &local)
+                .earliest()
+                .unwrap()
+                .timestamp_millis() as u64
+        };
+        assert_eq!(history_date(at(8), today), "Today");
+        assert_eq!(history_date(at(7), today), "Yesterday");
+        assert_eq!(history_date(at(6), today), "Nov 6, 2026");
+        assert_eq!(history_date(u64::MAX, today), "Date unknown");
+        assert_eq!(
+            history_pr_label("https://github.com/acme/web/pull/212", Some("merged")),
+            "#212 Merged"
+        );
+        assert_eq!(
+            history_pr_label("https://github.com/acme/web/pull/198", Some("closed")),
+            "#198 Closed"
+        );
+        assert_eq!(
+            history_pr_label("https://github.com/acme/web/pull/205", Some("open")),
+            "#205 Open"
+        );
+        assert_eq!(
+            history_pr_label("https://github.com/acme/web/pull/205", None),
+            "#205"
+        );
+    }
 
     #[test]
     fn repository_model_controls_effort_without_overriding_an_explicit_agent_model() {

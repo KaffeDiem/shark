@@ -34,11 +34,19 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         assert!(w.try_find("agent-settings").is_some());
         w.click("agent-instructions", cx);
         w.input("Always use Mobbin to ground your research", cx);
-        // Defaults › Repos › api makes it a default repository.
-        w.click("agent-repos", cx);
+        assert!(w.try_find("agent-defaults-label").is_none());
+        w.click("draft-repositories", cx);
     })
     .unwrap();
     press_in(window)(cx, &["a", "enter"]);
+    cx.read(|cx| assert!(shark.read(cx).state.agents[0].repos.is_empty()));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("draft-add", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["r", "enter"]);
+    press_in(window)(cx, &["m", "enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         let a = &s.state.agents[0];
@@ -76,21 +84,12 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
             w.try_find("agent-page").is_some(),
             "settings are edited on the agent's page"
         );
-        assert!(w.try_find("agent-skills").is_some());
-        assert!(w.try_find("agent-attach").is_none());
-        assert_eq!(
-            w.find("agent-model").label().as_deref(),
-            Some("Model Inherit")
-        );
-        assert_eq!(
-            w.find("agent-effort").label().as_deref(),
-            Some("Thinking Inherit")
-        );
-        assert_eq!(w.find("agent-next").label().as_deref(), Some("Then None"));
-        assert!(
-            w.try_find("agent-repos").is_some(),
-            "the default shows as a chip"
-        );
+        assert!(w.try_find("agent-skills").is_none());
+        assert!(w.try_find("agent-next").is_none());
+        assert!(w.try_find("agent-model").is_none());
+        assert!(w.try_find("agent-effort").is_none());
+        assert!(w.try_find("draft-model").is_some());
+        assert!(w.try_find(("draft-repo", 0usize)).is_some());
         assert!(w.try_find("agent-empty-tasks").is_some());
         assert!(w.try_find("agent-composer").is_some());
         assert!(
@@ -235,7 +234,7 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
     .unwrap();
     let unrelated =
         git::create_empty_task(&tasks_dir().join("other"), "other", "Other task", None).unwrap();
-    let history = [Some(true), Some(false), None]
+    let history = [Some(true), Some(false), None, None, None, None, None]
         .into_iter()
         .enumerate()
         .map(|(i, merged)| crate::state::TaskRecord {
@@ -247,6 +246,7 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
                 vec![]
             },
             merged,
+            pr_states: Default::default(),
             at: 1_700_000_000_000,
         })
         .collect();
@@ -281,11 +281,11 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
         let skill = crate::state::agent_skills_dir("designer").join("research");
         fs::create_dir_all(&skill).unwrap();
         fs::write(skill.join("SKILL.md"), "# Research").unwrap();
-        w.click("agent-skills", cx);
+        w.click("agent-more", cx);
     })
     .unwrap();
-    // The skills chip's menu: Refresh skills links the new skill into the agent's tasks.
-    press_in(window)(cx, &["r", "enter"]);
+    // Refresh skills from the menu also works before the profile has any skills.
+    press_in(window)(cx, &["r", "e", "f", "enter"]);
     cx.update_window(window, |_, w, cx| {
         let skill = crate::state::agent_skills_dir("designer").join("research");
         for folder in [".agents/skills", ".claude/skills"] {
@@ -297,16 +297,19 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
         let header = shark.read(cx).home.agent_header.clone().unwrap();
         assert_eq!(header.read(cx).skills, ["research"]);
         w.render_frame(cx);
-        for (i, status) in ["Merged", "Not merged", "PR state unknown"]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, status) in ["#1 Merged", "No PR", "No PR"].into_iter().enumerate() {
             let row = w.find(("agent-history", i));
             let label = row.label().unwrap();
             assert!(label.contains(status), "{label}");
             assert!(label.contains("2023"), "history includes its date: {label}");
         }
         assert!(w.try_find("agent-history-pr-0-0").is_some());
+        assert!(w.try_find(("agent-history", 4usize)).is_some());
+        assert!(w.try_find(("agent-history", 5usize)).is_none());
+        w.click("agent-history-show-all", cx);
+        w.render_frame(cx);
+        assert!(w.try_find(("agent-history", 6usize)).is_some());
+        assert!(w.try_find("agent-history-show-all").is_none());
         w.click(("home-ws", 0usize), cx);
         w.render_frame(cx);
         assert!(!w.has_active_dialog(cx), "task selection opens directly");
@@ -615,4 +618,77 @@ async fn ui_review_regression_skill_refresh_reaches_both_drafts(cx: &mut TestApp
         });
     }
     fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn composer_model_defaults_are_explicit_and_can_return_to_inheritance(
+    cx: &mut TestAppContext,
+) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.open_agent("designer", w, cx);
+        s.home.agent_draft.model = Some("sonnet".into());
+        s.home.agent_draft.effort = Some("medium".into());
+        assert!(s.state.agents[0].model.is_none());
+        s.draft_model_menu(w, cx);
+    });
+    press_in(window)(cx, &["m", "a", "k", "e", "enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.agents[0].model.as_deref(), Some("sonnet"));
+        assert_eq!(s.state.agents[0].effort.as_deref(), Some("medium"));
+        assert_eq!(
+            s.home.agent_draft.defaults(&s.state, Some("designer")),
+            ("sonnet".into(), Some("medium".into()))
+        );
+    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.draft_model_menu(w, cx));
+    press_in(window)(cx, &["u", "down", "enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.state.agents[0].model.is_none());
+        assert!(s.state.agents[0].effort.is_none());
+        assert_eq!(
+            s.home.agent_draft.defaults(&s.state, Some("designer")),
+            ("sonnet".into(), Some("medium".into())),
+            "resetting defaults preserves the current draft"
+        );
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_profile_preview_stays_within_two_lines(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.create_named_agent("Designer", cx).unwrap();
+        s.update_agent(
+            "designer",
+            |a| a.instructions = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.".into(),
+            cx,
+        );
+        s.open_agent("designer", w, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let preview = w.find("agent-instructions-preview").bounds();
+        assert!(
+            preview.size.height <= px(42.),
+            "profile must fit two lines: {preview:?}"
+        );
+        w.click("agent-instructions", cx);
+        w.render_frame(cx);
+        let header = shark.read(cx).home.agent_header.as_ref().unwrap().read(cx);
+        assert_eq!(
+            header.instructions.read(cx).value(),
+            "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."
+        );
+    })
+    .unwrap();
 }
