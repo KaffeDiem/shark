@@ -238,8 +238,15 @@ impl SkillImport {
                     div()
                         .id("skill-import-error")
                         .test_support()
+                        .max_h(px(80.))
+                        .overflow_y_scroll()
                         .text_color(theme.danger_foreground)
-                        .child(error),
+                        .child(
+                            div()
+                                .id("skill-import-error-details")
+                                .test_support()
+                                .child(error),
+                        ),
                 )
             })
             .child(

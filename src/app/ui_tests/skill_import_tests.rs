@@ -306,6 +306,84 @@ async fn skill_import_collision_preserves_existing_skill_and_keeps_error_visible
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn skill_import_long_error_keeps_actions_visible(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let source = home.join("invalid-skill");
+    write_skill(&source, &"invalid skill name ".repeat(100));
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                Point::default(),
+                size(px(480.), px(400.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    let panel = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.add_agent_skills("designer", w, cx).unwrap())
+        })
+        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        panel.update(cx, |p, cx| {
+            p.source.update(cx, |input, cx| {
+                input.set_value(source.to_string_lossy().into_owned(), w, cx)
+            });
+            p.inspect(w, cx);
+        });
+    })
+    .unwrap();
+    until(cx, window, |_, cx| !panel.read(cx).busy).await;
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            panel
+                .read(cx)
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Invalid skill name")
+        );
+        w.render_frame(cx);
+        for id in ["skill-import-error", "skill-cancel", "skill-add"] {
+            let control = w.find(id);
+            assert!(control.visible(), "{id} must remain visible");
+            assert!(control.bounds().top() >= px(0.));
+            assert!(
+                control.bounds().bottom() <= px(400.),
+                "{id} must fit in the window"
+            );
+        }
+        let add_bounds = w.find("skill-add").bounds();
+        w.scroll(
+            "skill-import-error",
+            ScrollDelta::Pixels(point(px(0.), px(-10000.))),
+            cx,
+        );
+        w.render_frame(cx);
+        assert!(
+            w.find("skill-import-error-details").bounds().bottom()
+                <= w.find("skill-import-error").bounds().bottom() + px(1.),
+            "the end of the diagnostic remains reachable"
+        );
+        assert_eq!(w.find("skill-add").bounds(), add_bounds);
+        w.click("skill-cancel", cx);
+        assert!(!w.has_active_dialog(cx));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn skill_import_changing_source_requires_a_new_preview(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
