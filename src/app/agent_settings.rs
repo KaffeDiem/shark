@@ -335,9 +335,15 @@ impl Shark {
         };
         f(&mut self.state.agents[i]);
         let a = &self.state.agents[i];
-        let model = a.model.clone().unwrap_or_else(|| repo_model(&self.state, a));
+        let model = a
+            .model
+            .clone()
+            .unwrap_or_else(|| repo_model(&self.state, a));
         let a = &mut self.state.agents[i];
-        if a.effort.as_deref().is_some_and(|e| !efforts(&model).contains(&e)) {
+        if a.effort
+            .as_deref()
+            .is_some_and(|e| !efforts(&model).contains(&e))
+        {
             a.effort = None;
         }
         let _ = self.state.save();
@@ -380,11 +386,23 @@ impl Shark {
             super::menus::open_in(Some(&("Agent folder".to_string(), folder)), &[], cx)
         });
         let mut entries = vec![
-            menu::item(IconName::SquarePen, "New task", act(Shark::prefill_agent_task)),
+            menu::item(
+                IconName::SquarePen,
+                "New task",
+                act(Shark::prefill_agent_task),
+            ),
             Entry::Sep,
             menu::item(IconName::Pencil, "Rename", act(Shark::rename_agent)),
-            menu::item(IconName::Shapes, "Change icon…", act(Shark::pick_agent_icon)),
-            menu::item(IconName::FileText, "Edit instructions", act(Shark::edit_agent)),
+            menu::item(
+                IconName::Shapes,
+                "Change icon…",
+                act(Shark::pick_agent_icon),
+            ),
+            menu::item(
+                IconName::FileText,
+                "Edit instructions",
+                act(Shark::edit_agent),
+            ),
             Entry::Sep,
             menu::item(IconName::BookOpen, "Add skills…", {
                 let s = s.clone();
@@ -417,7 +435,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.agent(slug) else { return };
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
         let inherited = model_label(&repo_model(&self.state, agent));
         let current = agent.model.clone();
         let pick = |model: Option<&'static str>| {
@@ -445,7 +465,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.agent(slug) else { return };
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
         let model = (agent.model.clone()).unwrap_or_else(|| repo_model(&self.state, agent));
         let current = agent.effort.clone();
         let pick = |effort: Option<&'static str>| {
@@ -504,7 +526,9 @@ impl Shark {
         entries.push(menu::item(
             IconName::RefreshCw,
             "Refresh skills",
-            on_shark(cx, move |shark, w, cx| shark.refresh_agent_skills(&s, w, cx)),
+            on_shark(cx, move |shark, w, cx| {
+                shark.refresh_agent_skills(&s, w, cx)
+            }),
         ));
         self.show_menu(pos, entries, window, cx);
     }
@@ -517,7 +541,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.agent(slug) else { return };
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
         let repos: Vec<Entry> = (self.state.repos.iter())
             .map(|r| {
                 let on = agent.repos.contains(&r.name);
@@ -584,7 +610,12 @@ impl Shark {
     }
 
     /// Icon, name, @handle and `…`; instructions; then the defaults as chips and Attach.
-    fn render_agent_header(&self, agent: &Agent, window: &Window, cx: &Context<Self>) -> AnyElement {
+    fn render_agent_header(
+        &self,
+        agent: &Agent,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let Some(header) = self.home.agent_header.as_ref() else {
             return div().into_any_element();
         };
@@ -677,32 +708,34 @@ impl Shark {
             .child(name)
             .child(more);
         let editing = h.instructions.read(cx).focus_handle(cx).is_focused(window);
-        let instructions = v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .id("agent-instructions")
-                    .test_support()
-                    .px_2()
-                    .py_1()
-                    .mx(px(-8.))
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(if editing { theme.border } else { theme.transparent })
-                    .when(!editing, |d| d.hover(|d| d.bg(theme.list_hover)))
-                    .text_size(px(14.))
-                    .line_height(relative(1.5))
-                    .text_color(theme.muted_foreground)
-                    .child(Textarea::new(&h.instructions).appearance(false)),
-            )
-            .when(editing, |d| {
-                d.child(
+        let instructions =
+            v_flex()
+                .gap_1()
+                .child(
                     div()
-                        .text_xs()
+                        .id("agent-instructions")
+                        .test_support()
+                        .px_2()
+                        .py_1()
+                        .mx(px(-8.))
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(if editing {
+                            theme.border
+                        } else {
+                            theme.transparent
+                        })
+                        .when(!editing, |d| d.hover(|d| d.bg(theme.list_hover)))
+                        .text_size(px(14.))
+                        .line_height(relative(1.5))
                         .text_color(theme.muted_foreground)
-                        .child("Every task of this agent reads these through CLAUDE.md and AGENTS.md."),
+                        .child(Textarea::new(&h.instructions).appearance(false)),
                 )
-            });
+                .when(editing, |d| {
+                    d.child(div().text_xs().text_color(theme.muted_foreground).child(
+                        "Every task of this agent reads these through CLAUDE.md and AGENTS.md.",
+                    ))
+                });
         let mut chips: Vec<AnyElement> = (agent.repos.iter())
             .filter(|r| self.state.repos.iter().any(|x| &x.name == *r))
             .map(|repo| {
@@ -1062,7 +1095,12 @@ pub(super) struct AgentHeader {
 }
 
 impl AgentHeader {
-    fn new(shark: WeakEntity<Shark>, a: Agent, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        shark: WeakEntity<Shark>,
+        a: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).default_value(a.name.clone()));
         let instructions = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -1096,16 +1134,20 @@ impl AgentHeader {
             }),
         );
         this._subs.push(
-            cx.subscribe_in(&this.instructions, window, |this, field, ev, w, cx| match ev {
-                InputEvent::Change => {
-                    let text = field.read(cx).value().to_string();
-                    this.update(cx, |a| a.instructions = text);
-                    this.sync_soon(w, cx);
-                }
-                // Shark's render reads this entity, so notifying here redraws the page.
-                InputEvent::Focus | InputEvent::Blur => cx.notify(),
-                _ => {}
-            }),
+            cx.subscribe_in(
+                &this.instructions,
+                window,
+                |this, field, ev, w, cx| match ev {
+                    InputEvent::Change => {
+                        let text = field.read(cx).value().to_string();
+                        this.update(cx, |a| a.instructions = text);
+                        this.sync_soon(w, cx);
+                    }
+                    // Shark's render reads this entity, so notifying here redraws the page.
+                    InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                    _ => {}
+                },
+            ),
         );
         this
     }

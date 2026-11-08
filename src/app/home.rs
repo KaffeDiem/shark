@@ -552,11 +552,7 @@ impl Shark {
         let selected = slug
             .and_then(|slug| agents.iter().position(|a| a.slug == slug))
             .map_or(0, |i| i + 1);
-        let mut rows = vec![
-            CommandItem::new()
-                .label("No agent")
-                .icon(IconName::AtSign),
-        ];
+        let mut rows = vec![CommandItem::new().label("No agent").icon(IconName::AtSign)];
         rows.extend(agents.iter().map(|agent| {
             CommandItem::new()
                 .label(agent.name.clone())
@@ -978,13 +974,12 @@ impl Shark {
                     Button::new("home-agent-picker")
                         .xsmall()
                         .ghost()
-                        .icon(selected.map_or(IconName::AtSign, |a| {
-                            super::sidebar::section_icon(&a.icon)
-                        }))
-                        .label(selected.map_or_else(
-                            || "No agent".to_string(),
-                            |a| a.name.clone(),
-                        ))
+                        .icon(
+                            selected.map_or(IconName::AtSign, |a| {
+                                super::sidebar::section_icon(&a.icon)
+                            }),
+                        )
+                        .label(selected.map_or_else(|| "No agent".to_string(), |a| a.name.clone()))
                         .tooltip("Pick an agent, or type @")
                         .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
                 )
@@ -1032,9 +1027,9 @@ impl Shark {
                                 .text_color(theme.muted_foreground)
                                 .child(format!("@{}", a.slug)),
                         )
-                        .on_click(cx.listener(move |s, _, w, cx| {
-                            s.complete_mention(Some(i), w, cx)
-                        }))
+                        .on_click(
+                            cx.listener(move |s, _, w, cx| s.complete_mention(Some(i), w, cx)),
+                        )
                 }))
         });
         v_flex()
@@ -1066,7 +1061,10 @@ impl Shark {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(crate::ui::hint("enter", enter))
-                    .child(crate::ui::hint("tab", if hits.is_empty() { other } else { "complete" }))
+                    .child(crate::ui::hint(
+                        "tab",
+                        if hits.is_empty() { other } else { "complete" },
+                    ))
                     .when(!self.home.asking && hits.is_empty(), |d| {
                         d.child(crate::ui::hint("@", "agent"))
                     }),
@@ -1269,7 +1267,9 @@ impl Shark {
                         cx.entity().downgrade(),
                         "Group tasks by…",
                         vec![
-                            CommandItem::new().label("Status").checked(!s.home.group_tasks),
+                            CommandItem::new()
+                                .label("Status")
+                                .checked(!s.home.group_tasks),
                             CommandItem::new()
                                 .label("Task group")
                                 .checked(s.home.group_tasks),
@@ -1438,7 +1438,10 @@ impl Shark {
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!(
                 "Open task {title}{}: {detail}",
-                status.as_deref().map(|s| format!(", {s}")).unwrap_or_default()
+                status
+                    .as_deref()
+                    .map(|s| format!(", {s}"))
+                    .unwrap_or_default()
             ))
             .test_support()
             .h(px(36.))

@@ -132,9 +132,7 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
     );
     cx.run_until_parked();
     let on = on_app(window, shark.clone());
-    for (destination, branch) in [
-        (home::Destination::Agent("designer".into()), "from-agent"),
-    ] {
+    for (destination, branch) in [(home::Destination::Agent("designer".into()), "from-agent")] {
         on(cx, &|s, w, cx| {
             s.enter_home(w, cx);
             s.home
