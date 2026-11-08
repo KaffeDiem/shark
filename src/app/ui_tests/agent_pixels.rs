@@ -117,6 +117,23 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             s.set_agent_collapsed(0, true, cx);
         }),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
+        ("agent-add-skills", |s, w, cx| {
+            s.open_agent("designer", w, cx);
+            s.add_agent_skills("designer", w, cx);
+        }),
+        ("agent-skill-preview", |s, w, cx| {
+            s.open_agent("designer", w, cx);
+            let source = crate::state::support_dir().join("preview-skills/review");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("SKILL.md"), "---\nname: review\ndescription: Review a change for correctness and unnecessary complexity.\ncompatibility: Requires git.\n---\n# Review\n\nRead the changed code and its callers.\n\n1. Identify behavior changes.\n2. Check edge cases and tests.\n3. Report actionable findings with file references.\n").unwrap();
+            let panel = s.add_agent_skills("designer", w, cx).unwrap();
+            panel.update(cx, |p, cx| {
+                p.source.update(cx, |input, cx| {
+                    input.set_value(source.to_string_lossy().into_owned(), w, cx)
+                });
+                p.inspect(w, cx);
+            });
+        }),
         ("agent-rename", |s, w, cx| s.rename_agent("designer", w, cx)),
         ("agent-menu", |s, w, cx| {
             s.open_agent("designer", w, cx);

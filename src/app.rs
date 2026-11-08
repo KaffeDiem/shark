@@ -58,6 +58,7 @@ mod reorder;
 pub(crate) mod repo_settings;
 mod run;
 mod sidebar;
+mod skill_import;
 mod storage;
 mod task;
 mod task_picker;

@@ -30,6 +30,7 @@ mod prs;
 mod review_protocol;
 mod scripts;
 mod settings;
+mod skills;
 mod stack;
 mod state;
 mod sync;

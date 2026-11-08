@@ -1141,7 +1141,7 @@ fn snapshots_path(task: &str) -> PathBuf {
     support_dir().join("linear").join(format!("{task}.json"))
 }
 
-/// An task's snapshots. Unreadable is an error, not empty, so `put_snapshot` can't wipe them.
+/// A task's snapshots. Unreadable is an error, not empty, so `put_snapshot` can't wipe them.
 pub fn read_snapshots(task: &str) -> io::Result<Vec<Snapshot>> {
     match std::fs::read(snapshots_path(task)) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
