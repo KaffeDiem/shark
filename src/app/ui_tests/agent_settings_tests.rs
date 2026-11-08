@@ -77,10 +77,16 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
             "settings are edited on the agent's page"
         );
         assert!(w.try_find("agent-skills").is_some());
-        assert!(w.try_find("agent-repo-api").is_some(), "the default shows as a chip");
+        assert!(
+            w.try_find("agent-repo-api").is_some(),
+            "the default shows as a chip"
+        );
         assert!(w.try_find("agent-empty-tasks").is_some());
         assert!(w.try_find("agent-composer").is_some());
-        assert!(w.try_find("agent-settings").is_some(), "settings sit in the header");
+        assert!(
+            w.try_find("agent-settings").is_some(),
+            "settings sit in the header"
+        );
     })
     .unwrap();
     let saved = State::load();

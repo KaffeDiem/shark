@@ -177,6 +177,23 @@ pub fn read_history(path: &Path, len: u64) -> Vec<Ev> {
     read_range(path, 0, len, true)
 }
 
+/// Assistant text after the last user message, without repeated result summaries.
+pub fn last_reply(path: &Path) -> String {
+    let events = read_history(path, u64::MAX);
+    let after = events
+        .iter()
+        .rposition(|ev| matches!(ev, Ev::User(_)))
+        .map_or(0, |i| i + 1);
+    events[after..]
+        .iter()
+        .filter_map(|ev| match ev {
+            Ev::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn read_range(path: &Path, mut start: u64, end: u64, include_completed_answers: bool) -> Vec<Ev> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let wanted = end.saturating_sub(start);
@@ -504,6 +521,33 @@ mod tests {
             None,
             "the question wasn't its last word"
         );
+    }
+
+    #[test]
+    fn last_reply_uses_only_the_last_turn() {
+        let path =
+            std::env::temp_dir().join(format!("shark-handoff-reply-{}.jsonl", std::process::id()));
+        let fixture = [
+            json!({"type":"user","message":{"content":"First"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Old reply"}]}}),
+            json!({"type":"user","message":{"content":"Second"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"New reply"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"More detail"}]}}),
+            json!({"type":"result","result":"New reply\nMore detail","is_error":false}),
+        ];
+        fs::write(
+            &path,
+            fixture
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(last_reply(&path), "New reply\nMore detail");
+        fs::write(&path, "").unwrap();
+        assert_eq!(last_reply(&path), "");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

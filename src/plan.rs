@@ -47,6 +47,17 @@ fn load(chat: &str) -> std::io::Result<Store> {
     }
 }
 
+/// The approved plan, or the latest version when none was approved.
+pub(crate) fn handoff_text(chat: &str) -> Option<String> {
+    let store = load(chat).ok()?;
+    store
+        .approved
+        .and_then(|i| store.versions.get(i))
+        .or_else(|| store.versions.last())
+        .map(|version| version.text.clone())
+        .filter(|text| !text.trim().is_empty())
+}
+
 /// The chat's latest plan is still waiting for the user's approval.
 pub fn unapproved(chat: &str) -> bool {
     load(chat).is_ok_and(|s| !s.versions.is_empty() && s.approved != Some(s.versions.len() - 1))
@@ -526,6 +537,39 @@ impl Render for PlanPane {
 mod tests {
     use super::title;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn handoff_prefers_approved_then_latest_plan() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let chat = format!("handoff-plan-test-{}", std::process::id());
+        let path = super::store_path(&chat);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = super::Store {
+            versions: vec![
+                super::Version {
+                    id: "one".into(),
+                    text: "Approved".into(),
+                    resubmits: vec![],
+                },
+                super::Version {
+                    id: "two".into(),
+                    text: "Latest".into(),
+                    resubmits: vec![],
+                },
+            ],
+            approved: Some(0),
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(super::handoff_text(&chat).as_deref(), Some("Approved"));
+        store.approved = None;
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(super::handoff_text(&chat).as_deref(), Some("Latest"));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(super::handoff_text(&chat), None);
+    }
 
     #[test]
     fn title_is_the_first_line_without_hashes() {

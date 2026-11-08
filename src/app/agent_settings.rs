@@ -333,14 +333,25 @@ impl Shark {
         let Some(i) = self.state.agents.iter().position(|a| a.slug == slug) else {
             return;
         };
+        let old_next = self.state.agents[i].next.clone();
         f(&mut self.state.agents[i]);
         let a = &self.state.agents[i];
-        let model = a.model.clone().unwrap_or_else(|| repo_model(&self.state, a));
+        let model = a
+            .model
+            .clone()
+            .unwrap_or_else(|| repo_model(&self.state, a));
         let a = &mut self.state.agents[i];
-        if a.effort.as_deref().is_some_and(|e| !efforts(&model).contains(&e)) {
+        if a.effort
+            .as_deref()
+            .is_some_and(|e| !efforts(&model).contains(&e))
+        {
             a.effort = None;
         }
+        let next_changed = old_next != a.next;
         let _ = self.state.save();
+        if next_changed {
+            let _ = self.sync_agent(slug, false, cx);
+        }
         cx.notify();
     }
 
@@ -372,11 +383,23 @@ impl Shark {
             super::menus::open_in(Some(&("Agent folder".to_string(), folder)), &[], cx)
         });
         let mut entries = vec![
-            menu::item(IconName::SquarePen, "New task", act(Shark::prefill_agent_task)),
+            menu::item(
+                IconName::SquarePen,
+                "New task",
+                act(Shark::prefill_agent_task),
+            ),
             Entry::Sep,
             menu::item(IconName::Pencil, "Rename", act(Shark::rename_agent)),
-            menu::item(IconName::Shapes, "Change icon…", act(Shark::pick_agent_icon)),
-            menu::item(IconName::FileText, "Edit instructions", act(Shark::edit_agent)),
+            menu::item(
+                IconName::Shapes,
+                "Change icon…",
+                act(Shark::pick_agent_icon),
+            ),
+            menu::item(
+                IconName::FileText,
+                "Edit instructions",
+                act(Shark::edit_agent),
+            ),
             Entry::Sep,
             menu::item(IconName::FolderOpen, "Open skills folder", {
                 let s = s.clone();
@@ -396,6 +419,44 @@ impl Shark {
         entries
     }
 
+    pub(super) fn agent_next_menu(
+        &mut self,
+        slug: &str,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
+        let current = agent.next.as_deref().filter(|s| self.agent(s).is_some());
+        let pick = |next: Option<String>| {
+            let slug = slug.to_string();
+            on_shark(cx, move |s, _, cx| {
+                s.update_agent(&slug, |a| a.next = next.clone(), cx)
+            })
+        };
+        let mut entries = vec![
+            menu::item(None, "None", pick(None)).checked(current.is_none()),
+            Entry::Sep,
+        ];
+        entries.extend(
+            self.state
+                .agents
+                .iter()
+                .filter(|a| a.slug != slug)
+                .map(|a| {
+                    menu::item(
+                        super::sidebar::section_icon(&a.icon),
+                        a.name.clone(),
+                        pick(Some(a.slug.clone())),
+                    )
+                    .checked(current == Some(a.slug.as_str()))
+                }),
+        );
+        self.show_menu(pos, entries, window, cx);
+    }
+
     fn agent_model_menu(
         &mut self,
         slug: &str,
@@ -403,7 +464,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.agent(slug) else { return };
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
         let inherited = model_label(&repo_model(&self.state, agent));
         let current = agent.model.clone();
         let pick = |model: Option<&'static str>| {
@@ -431,7 +494,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.agent(slug) else { return };
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
         let model = (agent.model.clone()).unwrap_or_else(|| repo_model(&self.state, agent));
         let current = agent.effort.clone();
         let pick = |effort: Option<&'static str>| {
@@ -482,7 +547,9 @@ impl Shark {
         entries.push(menu::item(
             IconName::RefreshCw,
             "Refresh skills",
-            on_shark(cx, move |shark, w, cx| shark.refresh_agent_skills(&s, w, cx)),
+            on_shark(cx, move |shark, w, cx| {
+                shark.refresh_agent_skills(&s, w, cx)
+            }),
         ));
         self.show_menu(pos, entries, window, cx);
     }
@@ -495,7 +562,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent) = self.agent(slug) else { return };
+        let Some(agent) = self.agent(slug) else {
+            return;
+        };
         let repos: Vec<Entry> = (self.state.repos.iter())
             .map(|r| {
                 let on = agent.repos.contains(&r.name);
@@ -561,7 +630,12 @@ impl Shark {
     }
 
     /// Icon, name, @handle and `…`; instructions; then the defaults as chips and Attach.
-    fn render_agent_header(&self, agent: &Agent, window: &Window, cx: &Context<Self>) -> AnyElement {
+    fn render_agent_header(
+        &self,
+        agent: &Agent,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let Some(header) = self.home.agent_header.as_ref() else {
             return div().into_any_element();
         };
@@ -654,32 +728,34 @@ impl Shark {
             .child(name)
             .child(more);
         let editing = h.instructions.read(cx).focus_handle(cx).is_focused(window);
-        let instructions = v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .id("agent-instructions")
-                    .test_support()
-                    .px_2()
-                    .py_1()
-                    .mx(px(-8.))
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(if editing { theme.border } else { theme.transparent })
-                    .when(!editing, |d| d.hover(|d| d.bg(theme.list_hover)))
-                    .text_size(px(14.))
-                    .line_height(relative(1.5))
-                    .text_color(theme.muted_foreground)
-                    .child(Textarea::new(&h.instructions).appearance(false)),
-            )
-            .when(editing, |d| {
-                d.child(
+        let instructions =
+            v_flex()
+                .gap_1()
+                .child(
                     div()
-                        .text_xs()
+                        .id("agent-instructions")
+                        .test_support()
+                        .px_2()
+                        .py_1()
+                        .mx(px(-8.))
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(if editing {
+                            theme.border
+                        } else {
+                            theme.transparent
+                        })
+                        .when(!editing, |d| d.hover(|d| d.bg(theme.list_hover)))
+                        .text_size(px(14.))
+                        .line_height(relative(1.5))
                         .text_color(theme.muted_foreground)
-                        .child("Every task of this agent reads these through CLAUDE.md and AGENTS.md."),
+                        .child(Textarea::new(&h.instructions).appearance(false)),
                 )
-            });
+                .when(editing, |d| {
+                    d.child(div().text_xs().text_color(theme.muted_foreground).child(
+                        "Every task of this agent reads these through CLAUDE.md and AGENTS.md.",
+                    ))
+                });
         let mut chips: Vec<AnyElement> = (agent.repos.iter())
             .filter(|r| self.state.repos.iter().any(|x| &x.name == *r))
             .map(|repo| {
@@ -732,6 +808,18 @@ impl Shark {
             skills,
             "This agent's skills",
             Shark::agent_skills_menu,
+        ));
+        chips.push(chip(
+            "agent-next",
+            IconName::ArrowRight,
+            agent
+                .next
+                .as_deref()
+                .and_then(|s| self.agent(s))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "Hand off…".into()),
+            "Agent this one hands its tasks to",
+            Shark::agent_next_menu,
         ));
         let s = slug.clone();
         chips.push(anchored_button(
@@ -977,7 +1065,24 @@ impl Shark {
                 let cursor_at = s.side_rows(false).iter().position(|row| *row == s.sel);
                 let agents = s.state.agents.clone();
                 let sections = s.state.sections.clone();
+                let affected: Vec<_> = s
+                    .state
+                    .tasks
+                    .iter()
+                    .filter(|task| {
+                        task.agent
+                            .as_ref()
+                            .and_then(|a| s.agent(&a.slug))
+                            .is_some_and(|a| a.next.as_deref() == Some(&slug))
+                    })
+                    .map(|task| task.name.clone())
+                    .collect();
                 s.state.agents.retain(|a| a.slug != slug);
+                for agent in &mut s.state.agents {
+                    if agent.next.as_deref() == Some(&slug) {
+                        agent.next = None;
+                    }
+                }
                 for section in &mut s.state.sections {
                     if section.agent.as_deref() == Some(&slug) {
                         section.agent = None;
@@ -987,6 +1092,9 @@ impl Shark {
                     s.state.agents = agents;
                     s.state.sections = sections;
                     return notify_err(window, cx, e.to_string());
+                }
+                for task in affected {
+                    s.publish_task(&task, cx);
                 }
                 if let Some(cursor_slug) = cursor_slug {
                     s.sel = s
@@ -1039,7 +1147,12 @@ pub(super) struct AgentHeader {
 }
 
 impl AgentHeader {
-    fn new(shark: WeakEntity<Shark>, a: Agent, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        shark: WeakEntity<Shark>,
+        a: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).default_value(a.name.clone()));
         let instructions = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -1073,16 +1186,20 @@ impl AgentHeader {
             }),
         );
         this._subs.push(
-            cx.subscribe_in(&this.instructions, window, |this, field, ev, w, cx| match ev {
-                InputEvent::Change => {
-                    let text = field.read(cx).value().to_string();
-                    this.update(cx, |a| a.instructions = text);
-                    this.sync_soon(w, cx);
-                }
-                // Shark's render reads this entity, so notifying here redraws the page.
-                InputEvent::Focus | InputEvent::Blur => cx.notify(),
-                _ => {}
-            }),
+            cx.subscribe_in(
+                &this.instructions,
+                window,
+                |this, field, ev, w, cx| match ev {
+                    InputEvent::Change => {
+                        let text = field.read(cx).value().to_string();
+                        this.update(cx, |a| a.instructions = text);
+                        this.sync_soon(w, cx);
+                    }
+                    // Shark's render reads this entity, so notifying here redraws the page.
+                    InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                    _ => {}
+                },
+            ),
         );
         this
     }

@@ -665,7 +665,11 @@ impl Shark {
             return;
         };
         for chat in self.started_chats(name) {
-            chat.update(cx, |c, cx| c.task_changed(&ws, cx));
+            let next = self.handoff_target(&ws, &chat.read(cx).meta);
+            chat.update(cx, |c, cx| {
+                c.next_agent = next;
+                c.task_changed(&ws, cx);
+            });
         }
         if let Some(sync) = self.syncs.get(name) {
             sync.update(cx, |g, _| g.set_attaching(ws.attaching));

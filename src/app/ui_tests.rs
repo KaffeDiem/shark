@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod agent_handoff_tests;
 mod agent_navigation_tests;
 mod agent_pixels;
 mod agent_settings_tests;
@@ -8653,3 +8654,5 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
 }
 
 mod boundary_tests;
+
+mod handoff_navigation_tests;

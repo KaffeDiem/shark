@@ -120,6 +120,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
         on_task(cx, &ws.name, |s, n, w, cx| s.rename_task(n, w, cx)),
     ));
     entries.push(move_submenu(this, &ws.name, cx));
+    entries.extend(handoff_submenu(this, ws, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
         .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
         .map(|r| {
@@ -717,4 +718,46 @@ pub(super) fn on_task(
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     let name = name.to_string();
     on_shark(cx, move |s, w, cx| f(s, name.clone(), w, cx))
+}
+
+/// The next stage leads the same explicit agent choices everywhere.
+pub(super) fn handoff_submenu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Option<Entry> {
+    let next = ws
+        .agent
+        .as_ref()
+        .and_then(|a| this.agent(&a.slug))
+        .and_then(|a| a.next.as_deref());
+    let mut agents: Vec<_> = this
+        .state
+        .agents
+        .iter()
+        .filter(|a| {
+            ws.agent
+                .as_ref()
+                .is_none_or(|current| current.slug != a.slug)
+        })
+        .collect();
+    agents.sort_by_key(|a| Some(a.slug.as_str()) != next);
+    if agents.is_empty() {
+        return None;
+    }
+    let entries = agents
+        .into_iter()
+        .map(|a| {
+            let to = a.slug.clone();
+            let entry = menu::item(
+                sidebar::section_icon(&a.icon),
+                a.name.clone(),
+                on_task(cx, &ws.name, move |s, n, w, cx| {
+                    s.hand_off(&n, &to, None, w, cx)
+                }),
+            );
+            if Some(a.slug.as_str()) == next {
+                entry.hint("next")
+            } else {
+                entry
+            }
+        })
+        .collect();
+    Some(menu::sub(IconName::ArrowRightLeft, "Hand off to…", entries))
 }

@@ -3,6 +3,8 @@ mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
 mod critters;
+mod handoff;
+pub(crate) use handoff::HandoffTarget;
 mod model;
 mod planmode;
 mod question;
@@ -95,6 +97,9 @@ pub enum ChatEvent {
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
     Picked,
     TurnDone,
+    HandOff {
+        to: Option<String>,
+    },
     GitReviewsSent(Vec<String>),
     /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
     Asking,
@@ -116,6 +121,9 @@ pub enum ChatEvent {
 pub struct Chat {
     pub ws: Task,
     pub meta: ChatMeta,
+    pub(crate) next_agent: Option<HandoffTarget>,
+    handoff_dismissed: bool,
+    handoff_expanded: bool,
     blocks: Vec<Block>,
     /// What the list shows, derived from `blocks`; see `sync_rows`.
     rows: Vec<Row>,
@@ -267,7 +275,14 @@ impl Chat {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
-                .placeholder("Message the agent (@ to add files, / for skills)")
+                .placeholder(if meta.handoff.is_some() {
+                    format!(
+                        "Tell {} what to do with it…",
+                        ws.agent.as_ref().map_or("the agent", |a| a.name.as_str())
+                    )
+                } else {
+                    "Message the agent (@ to add files, / for skills)".into()
+                })
                 .submit_on_enter(true)
         });
         let _sub =
@@ -311,6 +326,9 @@ impl Chat {
         let mut chat = Chat {
             ws,
             meta,
+            next_agent: None,
+            handoff_dismissed: false,
+            handoff_expanded: false,
             blocks: vec![],
             rows: vec![],
             sel: 0,
@@ -599,6 +617,13 @@ impl Chat {
     /// Enter: sends, or queues while a turn or git step runs. `now` (cmd-enter) steers the
     /// running turn instead; claude reads it at its next tool call.
     fn send(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer.read(cx).value().trim().is_empty()
+            && self.editing.is_none()
+            && self.pending_handoff()
+        {
+            self.composer
+                .update(cx, |c, cx| c.set_value("Continue from here.", window, cx));
+        }
         let content = self.composer.read(cx).content();
         let text = content.text().trim().to_string();
         if text.is_empty() {
@@ -726,7 +751,7 @@ impl Chat {
         if self.harness.is_none() {
             // A session starting now reads the repos from the root docs, and has nothing else.
             if self.meta.session_id.is_none() {
-                let mut context = self.ws.context();
+                let mut context = self.context();
                 context.retain(|k, _| {
                     k.starts_with(REPO_CONTEXT) || k.starts_with(crate::state::AGENT_CONTEXT)
                 });
@@ -777,7 +802,7 @@ impl Chat {
         if !notes.is_empty() {
             self.blocks.extend(info_notes(&notes.join("\n")));
             self.told
-                .push((self.blocks.len(), context_record(&self.ws.context()), wire));
+                .push((self.blocks.len(), context_record(&self.context()), wire));
         }
         let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
@@ -834,13 +859,14 @@ impl Chat {
     /// normal message. Derived from what is saved, so it needs no event: chats closed, not yet
     /// loaded or from before a restart catch up the same way.
     pub(crate) fn pending_context(&self) -> Vec<String> {
-        (self.ws.context().into_iter())
+        (self.context().into_iter())
             .filter(|(k, note)| self.meta.delivered.get(k) != Some(&note.fingerprint))
             .map(|(_, note)| note.text)
             .collect()
     }
 
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
+        self.handoff_dismissed = false;
         // codex runs `/compact` as a request of its own, with no user message to echo.
         let echoed = !(self.active_codex() && text.trim() == "/compact");
         let queued = self.busy && echoed;
@@ -958,6 +984,7 @@ impl Chat {
         });
         if was_working {
             self.keep_reply();
+            self.handoff_dismissed = false;
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -1110,6 +1137,7 @@ impl Chat {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
                     self.keep_reply();
+                    self.handoff_dismissed = false;
                     cx.emit(ChatEvent::TurnDone);
                 } else {
                     let first = msg.lines().next().unwrap_or_default();
@@ -1172,6 +1200,9 @@ impl Chat {
                 self.remeasure(bi);
                 if let Some(i) = self.told.iter().position(|(b, ..)| *b == bi) {
                     self.meta.delivered = self.told.remove(i).1;
+                    if !self.pending_handoff() {
+                        self.meta.handoff = None;
+                    }
                     cx.emit(ChatEvent::Meta);
                 }
                 // codex reads a steer into the running turn, with no new init after.
@@ -1353,6 +1384,7 @@ impl Chat {
                 cx.emit(ChatEvent::Meta);
             }
             self.keep_reply();
+            self.handoff_dismissed = false;
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -1730,6 +1762,8 @@ impl Chat {
             .pb_4()
             .pt_1()
             .children(self.render_side(window, cx))
+            .children(self.render_handoff(cx))
+            .children(self.render_handoff_quote(cx))
             .children(asked_card)
             .child(
                 v_flex()
@@ -1758,6 +1792,11 @@ impl Chat {
                     .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
                         this.focus.focus(window, cx);
                         cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, _: &HandOff, _, cx| {
+                        if this.show_handoff() {
+                            cx.emit(ChatEvent::HandOff { to: this.next_agent.as_ref().map(|a| a.slug.clone()) });
+                        }
                     }))
                     .on_action(cx.listener(|this, _: &AskSide, window, cx| {
                         this.ask_draft_aside(window, cx)
@@ -3708,6 +3747,79 @@ done
                 assert_eq!(c.blocks.len(), 2);
             })
         });
+    }
+
+    #[gpui_kit::test]
+    fn handoff_context_is_per_chat_and_cleared_on_echo(cx: &mut TestAppContext) {
+        let chat = open_chat("handoff-context", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.agent = Some("designer".into());
+                c.ws.agent = Some(crate::state::AgentLink {
+                    slug: "planner".into(),
+                    name: "Planner".into(),
+                    instructions: "Plan carefully".into(),
+                    ..Default::default()
+                });
+                let notes = c.context();
+                assert!(!notes.contains_key("agent:planner"));
+                assert!(!notes.contains_key("siblings:planner"));
+                assert!(notes.contains_key("stage:planner"));
+                c.meta.handoff = Some(crate::state::Handoff {
+                    from: "Designer".into(),
+                    title: "Ideas".into(),
+                    text: "Build three steps".into(),
+                });
+                assert!(c.pending_handoff());
+                c.blocks
+                    .push(Block::User("Continue from here.".into(), true));
+                c.unread.push_back(0);
+                c.told
+                    .push((0, context_record(&c.context()), "wire".into()));
+                c.on_echo("wire".into(), cx);
+                assert!(c.meta.handoff.is_none());
+                assert!(c.pending_context().is_empty());
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn handoff_empty_send_queues_default_message_while_held(cx: &mut TestAppContext) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fake_claude();
+        let chat = open_chat("handoff-held", cx);
+        let window = cx.windows()[0];
+        cx.update_window(window, |_, w, cx| {
+            chat.update(cx, |c, cx| {
+                c.attach_hold = true;
+                c.meta.handoff = Some(crate::state::Handoff {
+                    from: "Designer".into(),
+                    title: "Ideas".into(),
+                    text: "Three steps".into(),
+                });
+                c.send(false, w, cx);
+                assert_eq!(c.queue.len(), 1);
+                assert_eq!(c.queue[0].text(), "Continue from here.");
+                assert!(c.pending_handoff());
+                assert!(c.meta.handoff.is_some());
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.attach_hold = false;
+                c.drain(cx);
+                assert!(c.queue.is_empty());
+                assert!(c.pending_handoff(), "sending alone is not delivery");
+                let wire = c.told.last().unwrap().2.clone();
+                assert!(wire.contains("Three steps"));
+                assert!(wire.ends_with("Continue from here."));
+                c.on_echo(wire, cx);
+                assert!(c.meta.handoff.is_none());
+                assert!(c.pending_context().is_empty());
+                c.drop_process(cx);
+                std::fs::remove_dir_all(c.ws.dir()).unwrap();
+            })
+        })
+        .unwrap();
     }
 
     /// A message the agent never read leaves its context pending: only an echo records it.

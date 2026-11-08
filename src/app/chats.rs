@@ -109,6 +109,7 @@ impl Shark {
         let chat = cx.new(|cx| {
             let mut c = Chat::new(ws.clone(), meta.clone(), vim, window, cx);
             c.archiving = archiving;
+            c.next_agent = self.handoff_target(ws, meta);
             c
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
@@ -130,6 +131,10 @@ impl Shark {
             move |this, chat, ev: &ChatEvent, window, cx| {
                 match ev {
                     ChatEvent::Meta => this.save_meta(chat, cx),
+                    ChatEvent::HandOff { to } => match to {
+                        Some(to) => this.hand_off(&name, to, Some(id.clone()), window, cx),
+                        None => this.hand_off_picker(&name, Some(id.clone()), window, cx),
+                    },
                     ChatEvent::NeedsRepo => this.offer_attach(&name, window, cx),
                     ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                     ChatEvent::Picked => {
@@ -879,15 +884,30 @@ impl Shark {
                             .into_any_element(),
                         (false, unread) => div()
                             .relative()
-                            .child(Icon::new(IconName::MessageSquare).with_size(px(14.)))
+                            .child(
+                                Icon::new(
+                                    meta.agent
+                                        .as_deref()
+                                        .and_then(|slug| self.agent(slug))
+                                        .map(|a| sidebar::section_icon(&a.icon))
+                                        .unwrap_or(IconName::MessageSquare),
+                                )
+                                .with_size(px(14.)),
+                            )
                             .when(unread, |d| d.child(dot(-2., theme)))
                             .into_any_element(),
                     }
                 });
+                let tooltip = meta
+                    .agent
+                    .as_deref()
+                    .and_then(|slug| self.agent(slug))
+                    .map(|a| format!("{} · {label}", a.name))
+                    .unwrap_or_else(|| label.to_string());
                 (
                     TabId::Chat(meta.id.clone()),
                     pill(format!("chat-tab-{}", meta.id), on, theme)
-                        .aria_label(label.clone())
+                        .aria_label(tooltip.clone())
                         .pl_2p5()
                         .pr_1()
                         .map(|d| self.tab_drag(d, TabId::Chat(meta.id.clone()), label.clone()))
@@ -912,7 +932,7 @@ impl Shark {
                                 .id("tab-label")
                                 .test_support(),
                         )
-                        .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
+                        .tooltip(move |w, cx| Tooltip::new(tooltip.clone()).build(w, cx))
                         .child(tab_close(
                             crate::ui::close_button("close-chat", "Close chat (cmd-w)").on_click({
                                 let (task, id) = (ws.name.clone(), meta.id.clone());
@@ -1065,6 +1085,7 @@ impl Shark {
             "New chat",
             on_shark(cx, |s, w, cx| s.new_chat(w, cx)),
         )];
+        entries.extend(super::menus::handoff_submenu(self, ws, cx));
         if !ws.closed.is_empty() {
             entries.push(menu::item(
                 IconName::RotateCcw,

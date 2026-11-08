@@ -22,6 +22,8 @@
 
 You start each task and decide what ships. Tasks of the same agent share instructions and sibling activity notes; conversations stay separate. Shark does not schedule or automatically start work.
 
+Hand tasks from Designer to Planner to Coder while keeping the same folder, branches and earlier chats; the next agent receives the previous result in a new chat.
+
 Claude and Codex work across a task's repositories. Shark brings versioned plans, editable diffs, review comments, linked PRs and stacked branches into one native, keyboard-driven app.
 
 ## Install

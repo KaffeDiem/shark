@@ -10,6 +10,9 @@ use std::{
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
+    /// Legacy chat identities have been copied from their tasks exactly once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chat_agents_migrated: bool,
     #[serde(default, deserialize_with = "tolerant_lists")]
     pub reviewed: HashMap<String, Vec<String>>,
     #[serde(default, deserialize_with = "tolerant_lists")]
@@ -200,6 +203,8 @@ pub struct Agent {
     pub repos: Vec<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<TaskRecord>,
 }
@@ -221,6 +226,17 @@ pub struct AgentLink {
     pub instructions: String,
     #[serde(default)]
     pub siblings: Vec<Sibling>,
+}
+
+impl From<&Agent> for AgentLink {
+    fn from(agent: &Agent) -> Self {
+        Self {
+            slug: agent.slug.clone(),
+            name: agent.name.clone(),
+            instructions: agent.instructions.clone(),
+            siblings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -359,6 +375,10 @@ pub struct ChatMeta {
     /// Transcript and log file name. The first chat's id is the task name, which is
     /// where the single pre-tabs transcript already lives.
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
     /// First line of the first message; empty until then.
     #[serde(default)]
     pub title: String,
@@ -382,6 +402,13 @@ pub struct ChatMeta {
     /// fingerprints. Anything else goes out with its next normal message.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivered: BTreeMap<String, u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Handoff {
+    pub from: String,
+    pub title: String,
+    pub text: String,
 }
 
 /// A repository on its way into an agent. The stage says how far it got, so a restart can
@@ -493,6 +520,7 @@ pub const NEW_TASK: &str = "New agent";
 /// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
 pub const REPO_CONTEXT: &str = "repo:";
 pub const AGENT_CONTEXT: &str = "agent:";
+pub const SIBLINGS_CONTEXT: &str = "siblings:";
 
 /// The key prefix of a Linear issue in `Task::context`, before its UUID. Unlike repositories
 /// these are in no root doc, so every session gets them with its first normal turn.
@@ -845,7 +873,7 @@ impl Task {
                 text
             };
             notes.insert(
-                format!("siblings:{}", agent.slug),
+                format!("{SIBLINGS_CONTEXT}{}", agent.slug),
                 ContextNote {
                     fingerprint: crate::files::fingerprint(&text),
                     text,
@@ -875,6 +903,7 @@ impl Task {
         if self.chats.is_empty() {
             self.chats.push(ChatMeta {
                 id: self.name.clone(),
+                agent: self.agent.as_ref().map(|a| a.slug.clone()),
                 session_id: self.session_id.take(),
                 model: self.model.take(),
                 ..Default::default()
@@ -1122,7 +1151,12 @@ impl State {
     fn load_at(path: &Path) -> State {
         let bytes = match fs::read(path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return State {
+                    chat_agents_migrated: true,
+                    ..State::default()
+                };
+            }
             // Saving would replace a file we never read.
             Err(_) => {
                 return State {
@@ -1140,22 +1174,32 @@ impl State {
                 bak.display()
             );
             State {
+                chat_agents_migrated: true,
                 read_only: moved.is_err(),
                 corrupt_backup: moved.ok().map(|_| bak),
                 ..State::default()
             }
         });
+        let migrate_agents = !state.chat_agents_migrated;
         let migrated_instances = state.tasks.iter().any(|ws| ws.instance_id.is_empty());
         let (model, effort) = (state.new_model(), state.last_effort.clone());
         for ws in &mut state.tasks {
             ws.migrate();
             ws.fill_models(&model, effort.as_ref());
+            if migrate_agents && let Some(agent) = &ws.agent {
+                for chat in ws.chats.iter_mut().chain(&mut ws.closed) {
+                    if chat.agent.is_none() {
+                        chat.agent = Some(agent.slug.clone());
+                    }
+                }
+            }
             if ws.linear.primary().is_some() {
                 // Unreadable shows as missing snapshots; `put_snapshot` still won't overwrite it.
                 ws.issues = crate::linear::read_snapshots(&ws.name).unwrap_or_default();
             }
         }
-        if migrated_instances {
+        state.chat_agents_migrated = true;
+        if migrated_instances || migrate_agents {
             let _ = state.save_at(path);
         }
         state
@@ -1194,6 +1238,7 @@ impl State {
         let (model, effort) = self.defaults_for(ws);
         ChatMeta {
             id,
+            agent: ws.agent.as_ref().map(|a| a.slug.clone()),
             model: Some(model),
             effort,
             ..Default::default()
@@ -1253,6 +1298,94 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_fields_roundtrip_and_legacy_defaults() {
+        let agent: Agent = serde_json::from_str(r#"{"slug":"designer","name":"Designer","icon":"Palette","instructions":"Design","repos":[],"model":null,"effort":null}"#).unwrap();
+        assert!(agent.next.is_none());
+        assert!(serde_json::to_value(&agent).unwrap().get("next").is_none());
+        let mut chat: ChatMeta = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert!(chat.agent.is_none() && chat.handoff.is_none());
+        let value = serde_json::to_value(&chat).unwrap();
+        assert!(value.get("agent").is_none() && value.get("handoff").is_none());
+        chat.agent = Some("planner".into());
+        chat.handoff = Some(Handoff {
+            from: "Designer".into(),
+            title: "Ideas".into(),
+            text: "Build this".into(),
+        });
+        assert_eq!(
+            serde_json::from_value::<ChatMeta>(serde_json::to_value(&chat).unwrap()).unwrap(),
+            chat
+        );
+        let mut agent = agent;
+        agent.next = Some("planner".into());
+        assert_eq!(
+            serde_json::from_value::<Agent>(serde_json::to_value(&agent).unwrap()).unwrap(),
+            agent
+        );
+        let task = Task {
+            agent: Some(AgentLink::from(&agent)),
+            ..Default::default()
+        };
+        let mut initial = task.clone();
+        initial.migrate();
+        assert_eq!(initial.chats[0].agent.as_deref(), Some("designer"));
+        assert_eq!(
+            State::default()
+                .new_chat(&task, "new".into())
+                .agent
+                .as_deref(),
+            Some("designer")
+        );
+    }
+
+    #[test]
+    fn load_tags_legacy_open_and_closed_chats_only_in_agent_tasks() {
+        let path = std::env::temp_dir().join(format!(
+            "shark-handoff-migration-{}.json",
+            std::process::id()
+        ));
+        let mut task = Task {
+            name: "design".into(),
+            agent: Some(AgentLink {
+                slug: "designer".into(),
+                ..Default::default()
+            }),
+            chats: vec![
+                chat("open"),
+                ChatMeta {
+                    agent: Some("previous".into()),
+                    ..chat("tagged")
+                },
+            ],
+            closed: vec![chat("closed")],
+            ..Default::default()
+        };
+        let mut state = State {
+            tasks: vec![task.clone()],
+            ..Default::default()
+        };
+        task.name = "plain".into();
+        task.agent = None;
+        state.tasks.push(task);
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let mut loaded = State::load_at(&path);
+        assert_eq!(loaded.tasks[0].chats[0].agent.as_deref(), Some("designer"));
+        assert_eq!(loaded.tasks[0].closed[0].agent.as_deref(), Some("designer"));
+        assert_eq!(loaded.tasks[0].chats[1].agent.as_deref(), Some("previous"));
+        assert!(loaded.tasks[1].chats[0].agent.is_none());
+        assert!(loaded.tasks[1].closed[0].agent.is_none());
+        loaded.tasks[1].agent = loaded.tasks[0].agent.clone();
+        loaded.save_at(&path).unwrap();
+        let reloaded = State::load_at(&path);
+        assert!(
+            reloaded.tasks[1].chats[0].agent.is_none(),
+            "handoff must not retag unassigned chats on restart"
+        );
+        assert!(reloaded.tasks[1].closed[0].agent.is_none());
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn agent_defaults_and_instruction_context() {
@@ -1722,6 +1855,7 @@ mod tests {
                 plan: false,
                 fast: None,
                 delivered: Default::default(),
+                ..Default::default()
             }]
         );
         assert_eq!(ws.next_chat_id(), "feat~2");

@@ -34,6 +34,16 @@ Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through
 
 History keeps the latest 100 deleted tasks, with their titles, PR links, merge status and dates. **PR state unknown** means Shark lacked enough reliable status to determine the result for the whole task, even if some repositories had known PR states. Deleting an agent requires finishing or deleting its open tasks first; confirmation then removes its instructions, history and skills folder.
 
+### Handing a task to another agent
+
+Set an agent's **Hand off…** chip to its usual next agent. When its current chat finishes a turn, **Hand off to <agent>** appears above the composer; click it or press `cmd-alt-enter`. **Other…**, the task and chat-tab **Hand off to…** menus, and the command palette let you choose another agent. Dismiss the bar with ×; it returns after the next turn.
+
+The task keeps its folder, branches, worktrees, issues and earlier chats. It moves to the receiving agent's sidebar group, updates root instructions and skill links, and opens a focused chat using that agent's model and thinking defaults. Missing default repositories attach in the background. Finish any existing repository attachment before handing off. Plan mode is still a separate toggle.
+
+The new chat shows a removable quote of the source chat's approved plan, latest plan, or last assistant reply. Expand it to read more, remove it with ×, or send your instructions. Sending an empty composer with a quote continues from that result. The quote survives a restart and accompanies the first delivered message, including one queued while repositories attach.
+
+Earlier chats keep their agent identity, model and thinking level. They receive a note that the task moved on instead of the new agent's instruction updates. The task folder has one set of instructions and skill links, so a restarted earlier chat can read the receiving agent's root instructions and no longer has its previous agent's skill links. Home's task tooltip shows the agent chain; History remains for deleted tasks.
+
 ### Skills
 
 The skills chip, or **Attach › Skill…**, opens (and creates):

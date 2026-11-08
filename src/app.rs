@@ -42,6 +42,7 @@ mod differ_host;
 mod editor_pane;
 mod features;
 mod file_changes;
+mod handoff;
 mod home;
 mod intelligence;
 #[cfg(all(test, feature = "test-support"))]
