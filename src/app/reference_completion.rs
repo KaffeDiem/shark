@@ -350,20 +350,7 @@ impl Shark {
                     }
                     match result {
                         Ok(snapshot) if Some(snapshot.org.as_str()) == org.as_deref() => {
-                            let added = s.draft_at_mut(&destination).is_some_and(|draft| {
-                                !draft.issues.iter().any(|issue| {
-                                    issue.id == snapshot.id && issue.org == snapshot.org
-                                })
-                            });
-                            if added
-                                && let Some(paste) = s
-                                    .reference_completion
-                                    .pastes
-                                    .iter_mut()
-                                    .find(|paste| paste.id == id)
-                            {
-                                paste.applied = Some(PastedMutation::Issue(snapshot.clone()));
-                            }
+                            s.track_pasted_issue(id, &destination, &snapshot);
                             s.add_draft_issues_to(&destination, vec![snapshot], window, cx)
                         }
                         Ok(_) => s.fail_pasted_reference(
@@ -470,6 +457,35 @@ impl Shark {
             .ok();
         })
         .detach();
+    }
+
+    fn track_pasted_issue(&mut self, id: u64, destination: &Destination, snapshot: &Snapshot) {
+        let Some(draft) = self
+            .draft_at_mut(destination)
+            .filter(|draft| !draft.starting)
+        else {
+            return;
+        };
+        let existing = draft
+            .issues
+            .iter()
+            .find(|issue| issue.id == snapshot.id && issue.org == snapshot.org)
+            .cloned();
+        let applied = match existing {
+            None => snapshot.clone(),
+            Some(existing) if self.reference_completion.pastes.iter().any(|paste| {
+                &paste.destination == destination && matches!(&paste.applied, Some(PastedMutation::Issue(owned)) if owned == &existing)
+            }) => existing,
+            Some(_) => return,
+        };
+        if let Some(paste) = self
+            .reference_completion
+            .pastes
+            .iter_mut()
+            .find(|paste| paste.id == id && &paste.destination == destination)
+        {
+            paste.applied = Some(PastedMutation::Issue(applied));
+        }
     }
 
     fn apply_pasted_pr(
@@ -668,6 +684,12 @@ impl Shark {
             return;
         };
         let before = self.reference_completion.pastes.remove(index);
+        let shared_issue = match &before.applied {
+            Some(PastedMutation::Issue(issue)) => self.reference_completion.pastes.iter().any(|paste| {
+                paste.destination == destination && matches!(&paste.applied, Some(PastedMutation::Issue(owned)) if owned.id == issue.id && owned.org == issue.org)
+            }),
+            _ => false,
+        };
         if let Some(draft) = self
             .draft_at_mut(&destination)
             .filter(|draft| !draft.starting)
@@ -677,7 +699,9 @@ impl Shark {
             }
             match before.applied {
                 Some(PastedMutation::Issue(issue)) => {
-                    draft.issues.retain(|current| current != &issue)
+                    if !shared_issue {
+                        draft.issues.retain(|current| current != &issue);
+                    }
                 }
                 Some(PastedMutation::Repo(applied)) => {
                     if let Some(index) = draft.repos.iter().position(|current| {
@@ -927,5 +951,95 @@ mod ui_tests {
     #[gpui_kit::test]
     fn pr_completion_undo_restores_apply_time_branch(cx: &mut TestAppContext) {
         pr_completion_race(cx, 2);
+    }
+    fn pasted_issue_ownership(cx: &mut TestAppContext, reverse: bool, preexisting: bool) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, window, cx| {
+            shark.update(cx, |s, cx| {
+                let issue = Snapshot {
+                    id: "issue".into(),
+                    org: "org".into(),
+                    title: "actual stored title".into(),
+                    ..Default::default()
+                };
+                if preexisting {
+                    s.home.draft.issues.push(issue.clone());
+                }
+                for id in 1..=2 {
+                    s.reference_completion.pastes.push(PastedReference {
+                        id,
+                        composer_id: id,
+                        destination: Destination::Home,
+                        text: "https://linear.app/acme/issue/ENG-1".into(),
+                        repos: vec![],
+                        repos_edited: false,
+                        pending: false,
+                        applied: None,
+                    });
+                }
+                if preexisting {
+                    s.reference_completion.pastes.push(PastedReference {
+                        id: 3,
+                        composer_id: 3,
+                        destination: Destination::Agent("other".into()),
+                        text: String::new(),
+                        repos: vec![],
+                        repos_edited: false,
+                        pending: false,
+                        applied: Some(PastedMutation::Issue(issue.clone())),
+                    });
+                }
+                let order = if reverse { [2, 1] } else { [1, 2] };
+                for (index, id) in order.into_iter().enumerate() {
+                    let mut fetched = issue.clone();
+                    if index == 1 {
+                        fetched.title = "newly fetched title".into();
+                    }
+                    s.track_pasted_issue(id, &Destination::Home, &fetched);
+                    s.add_draft_issues_to(&Destination::Home, vec![fetched], window, cx);
+                }
+                if preexisting {
+                    assert!(
+                        s.reference_completion
+                            .pastes
+                            .iter()
+                            .filter(|paste| paste.destination == Destination::Home)
+                            .all(|paste| paste.applied.is_none()),
+                        "an owner in another draft must not claim a preexisting attachment"
+                    );
+                }
+                s.undo_draft_reference(false, 2, window, cx);
+                assert_eq!(
+                    s.home.draft.issues,
+                    vec![issue.clone()],
+                    "undo B must preserve A's attachment and its actual stored snapshot"
+                );
+                s.undo_draft_reference(false, 1, window, cx);
+                assert_eq!(
+                    s.home.draft.issues,
+                    if preexisting { vec![issue] } else { vec![] },
+                    "only the final owning paste may remove an attachment"
+                );
+            })
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn issue_ownership_reverse_completion(cx: &mut TestAppContext) {
+        pasted_issue_ownership(cx, true, false);
+    }
+
+    #[gpui_kit::test]
+    fn issue_ownership_forward_completion(cx: &mut TestAppContext) {
+        pasted_issue_ownership(cx, false, false);
+    }
+
+    #[gpui_kit::test]
+    fn issue_ownership_preserves_preexisting_attachment(cx: &mut TestAppContext) {
+        pasted_issue_ownership(cx, true, true);
     }
 }
