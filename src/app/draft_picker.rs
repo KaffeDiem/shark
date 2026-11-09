@@ -3,6 +3,7 @@ use super::task_draft::{BranchSpec, DraftRepo};
 use super::*;
 use crate::linear::{self, Hit};
 use gpui_kit::component::dialog::Cancel;
+use gpui_kit::component::tab::{Tab as PickerTab, TabBar};
 
 pub(super) struct DraftPickerHost {
     view: AnyView,
@@ -167,25 +168,48 @@ impl Shark {
                 suggested.push(pick);
             }
         }
-        let picker = cx.new(|cx| AddPicker {
-            suggested: SuggestionCache {
-                repos: agent_repos.clone(),
-                sources,
-                epoch,
-                rows: suggested,
-            },
-            state: cx.new(|cx| CommandState::new(window, cx)),
-            pending_key: None,
-            rows,
-            marks: Vec::new(),
-            issues: Vec::new(),
-            own_prs: Vec::new(),
-            query_seq: 0,
-            sends: Vec::new(),
-            failure: None,
-            attaching: false,
-            destination: self.home.destination.clone(),
-            shark,
+        let picker = cx.new(|cx| {
+            let weak = cx.entity().downgrade();
+            let keys = cx.intercept_keystrokes(move |event, w, cx| {
+                let key = &event.keystroke;
+                if key.key != "tab"
+                    || (key.modifiers != Modifiers::default()
+                        && key.modifiers != Modifiers::shift())
+                {
+                    return;
+                }
+                weak.update(cx, |p: &mut AddPicker, cx| {
+                    if p.state.focus_handle(cx).is_focused(w) {
+                        let count = AttachmentTab::ALL.len();
+                        let step = if key.modifiers.shift { count - 1 } else { 1 };
+                        p.change_tab(AttachmentTab::ALL[(p.tab as usize + step) % count], w, cx);
+                        cx.stop_propagation();
+                    }
+                })
+                .ok();
+            });
+            AddPicker {
+                suggested: SuggestionCache {
+                    repos: agent_repos.clone(),
+                    sources,
+                    epoch,
+                    rows: suggested,
+                },
+                state: cx.new(|cx| CommandState::new(window, cx)),
+                tab: AttachmentTab::All,
+                pending_selection: None,
+                rows,
+                marks: Vec::new(),
+                issues: Vec::new(),
+                own_prs: Vec::new(),
+                query_seq: 0,
+                sends: Vec::new(),
+                failure: None,
+                attaching: false,
+                destination: self.home.destination.clone(),
+                shark,
+                _keys: keys,
+            }
         });
         let input = picker.read(cx).state.clone();
         self.hold_draft_picker(picker.clone().into(), position, window, cx);
@@ -334,10 +358,55 @@ fn suggestions(rows: &[Pick], issues: &[String], own_prs: &[String]) -> Vec<Pick
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentTab {
+    All,
+    Repositories,
+    PullRequests,
+    Issues,
+    Files,
+}
+
+impl AttachmentTab {
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Repositories,
+        Self::PullRequests,
+        Self::Issues,
+        Self::Files,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Repositories => "Repositories",
+            Self::PullRequests => "Pull requests",
+            Self::Issues => "Issues",
+            Self::Files => "Files",
+        }
+    }
+
+    fn includes(self, pick: &Pick) -> bool {
+        match self {
+            Self::All => true,
+            Self::Repositories => matches!(pick, Pick::Repo(_) | Pick::Add),
+            Self::PullRequests => matches!(pick, Pick::Pr(_)),
+            Self::Issues => matches!(pick, Pick::Issue(_)),
+            Self::Files => matches!(pick, Pick::Files),
+        }
+    }
+}
+
+enum PendingSelection {
+    First,
+    Key(Option<String>),
+}
+
 struct AddPicker {
     suggested: SuggestionCache,
     state: Entity<CommandState>,
-    pending_key: Option<Option<String>>,
+    tab: AttachmentTab,
+    pending_selection: Option<PendingSelection>,
     rows: Vec<Pick>,
     marks: Vec<String>,
     issues: Vec<String>,
@@ -348,6 +417,7 @@ struct AddPicker {
     attaching: bool,
     destination: home::Destination,
     shark: WeakEntity<Shark>,
+    _keys: Subscription,
 }
 impl AddPicker {
     fn remember_suggestions(&self, cx: &mut Context<Self>) {
@@ -359,7 +429,7 @@ impl AddPicker {
     }
 
     fn preserve_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_key.is_some() {
+        if self.pending_selection.is_some() {
             return;
         }
         let key = self
@@ -368,11 +438,37 @@ impl AddPicker {
             .selected_index()
             .and_then(|at| self.selected(at))
             .map(|r| r.key());
-        self.pending_key = Some(key);
+        self.pending_selection = Some(PendingSelection::Key(key));
         self.state
             .update(cx, |s, cx| s.set_selected_index(None, window, cx));
     }
+    fn change_tab(&mut self, tab: AttachmentTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.state
+                .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+            self.tab = tab;
+            self.pending_selection = Some(PendingSelection::First);
+            cx.notify();
+        }
+        self.state.update(cx, |s, cx| s.focus(window, cx));
+    }
+
     fn groups(&self) -> Vec<(&'static str, Vec<Pick>)> {
+        let groups = self.all_groups();
+        if self.tab == AttachmentTab::All {
+            return groups;
+        }
+        vec![(
+            self.tab.label(),
+            groups
+                .into_iter()
+                .flat_map(|(_, rows)| rows)
+                .filter(|r| self.tab.includes(r))
+                .collect(),
+        )]
+    }
+
+    fn all_groups(&self) -> Vec<(&'static str, Vec<Pick>)> {
         // Refresh the next opening, not the rows under the user's pointer.
         let suggested = &self.suggested.rows;
         let mut groups = vec![("Suggested", suggested.clone())];
@@ -494,7 +590,7 @@ impl AddPicker {
         let picks: Vec<_> = if self.marks.is_empty() {
             vec![selected]
         } else {
-            self.groups()
+            self.all_groups()
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
                 .filter(|r| self.marks.contains(&r.key()))
@@ -618,63 +714,53 @@ impl Render for AddPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().downgrade();
         let typed = cx.entity().downgrade();
-        let command = self
-            .groups()
-            .into_iter()
+        let groups = self.groups();
+        let command = groups
+            .iter()
             .fold(
                 crate::ui::command(&self.state, window),
                 |c, (name, rows)| {
-                    c.group(
-                        CommandGroup::new()
-                            .label(name)
-                            .items(rows.into_iter().map(|r| {
-                                let label = r.label();
-                                let row_id =
-                                    SharedString::from(format!("draft-context-{}", r.key()));
-                                let hint = r.hint();
-                                let marked = self.marks.contains(&r.key());
-                                let icon = match r {
-                                    Pick::Repo(_) | Pick::Add => IconName::FolderGit2,
-                                    Pick::Files => IconName::Paperclip,
-                                    Pick::Pr(_) => IconName::GitPullRequest,
-                                    Pick::Issue(_) => IconName::Tag,
-                                };
-                                CommandItem::new()
-                                    .label(label.clone())
-                                    .keywords([hint.clone()])
-                                    .child(move |_, cx| {
-                                        h_flex()
-                                            .id(row_id.clone())
-                                            .test_support()
-                                            .aria_label(format!(
-                                                "{label}, {hint}, {}",
-                                                if marked { "marked" } else { "unmarked" }
-                                            ))
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_2()
-                                            .child(if marked { "✓" } else { "  " })
-                                            .child(Icon::new(icon).size_4())
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .child(label.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(hint.clone()),
-                                            )
-                                    })
-                            })),
-                    )
+                    c.group(CommandGroup::new().label(*name).items(rows.iter().map(|r| {
+                        let label = r.label();
+                        let row_id = SharedString::from(format!("draft-context-{}", r.key()));
+                        let hint = r.hint();
+                        let marked = self.marks.contains(&r.key());
+                        let icon = match r {
+                            Pick::Repo(_) | Pick::Add => IconName::FolderGit2,
+                            Pick::Files => IconName::Paperclip,
+                            Pick::Pr(_) => IconName::GitPullRequest,
+                            Pick::Issue(_) => IconName::Tag,
+                        };
+                        CommandItem::new()
+                            .label(label.clone())
+                            .keywords([hint.clone()])
+                            .child(move |_, cx| {
+                                h_flex()
+                                    .id(row_id.clone())
+                                    .test_support()
+                                    .aria_label(format!(
+                                        "{label}, {hint}, {}",
+                                        if marked { "marked" } else { "unmarked" }
+                                    ))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(if marked { "✓" } else { "  " })
+                                    .child(Icon::new(icon).size_4())
+                                    .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(hint.clone()),
+                                    )
+                            })
+                    })))
                 },
             )
             .bordered(false)
-            .max_h(px(380.))
+            // Leave room for the tabs within the anchored menu's 460px height allowance.
+            .max_h(px(350.))
             .placeholder("Search issues, pull requests, repositories…")
             .on_query(move |q, w, cx| {
                 typed.update(cx, |p, cx| p.search(q, w, cx)).ok();
@@ -683,19 +769,36 @@ impl Render for AddPicker {
                 entity.update(cx, |p, cx| p.attach(at, w, cx)).ok();
             });
         let command = RenderOnce::render(command, window, cx).into_any_element();
-        if let Some(key) = self.pending_key.take() {
-            let at = key.and_then(|key| {
-                self.groups()
-                    .iter()
-                    .enumerate()
-                    .find_map(|(section, (_, rows))| {
+        if let Some(selection) = self.pending_selection.take() {
+            let first = matches!(selection, PendingSelection::First);
+            let at = match selection {
+                PendingSelection::Key(key) => key.and_then(|key| {
+                    groups.iter().enumerate().find_map(|(section, (_, rows))| {
                         rows.iter()
                             .position(|r| r.key() == key)
                             .map(|row| IndexPath::new(row).section(section))
                     })
+                }),
+                PendingSelection::First => None,
+            };
+            self.state.update(cx, |s, cx| {
+                s.set_selected_index(at, window, cx);
+                if first && s.matched_count() > 0 {
+                    // Let CommandState resolve query matches against the newly installed groups.
+                    'first: for (section, (_, rows)) in groups.iter().enumerate() {
+                        for row in 0..rows.len() {
+                            s.set_selected_index(
+                                Some(IndexPath::new(row).section(section)),
+                                window,
+                                cx,
+                            );
+                            if s.selected_index().is_some() {
+                                break 'first;
+                            }
+                        }
+                    }
+                }
             });
-            self.state
-                .update(cx, |s, cx| s.set_selected_index(at, window, cx));
         }
         v_flex()
             .key_context("NewTask")
@@ -717,21 +820,39 @@ impl Render for AddPicker {
             .on_action(cx.listener(|p, _: &Cancel, w, cx| {
                 p.shark.update(cx, |s, cx| s.close_draft_picker(w, cx)).ok();
             }))
+            .child(
+                TabBar::new("draft-picker-tabs")
+                    .underline()
+                    .small()
+                    .px_3()
+                    .selected_index(self.tab as usize)
+                    .children(AttachmentTab::ALL.map(|tab| PickerTab::new().label(tab.label())))
+                    .on_click(cx.listener(|p, index: &usize, w, cx| {
+                        p.change_tab(AttachmentTab::ALL[*index], w, cx)
+                    })),
+            )
             .child(command)
             .children(
                 self.failure
                     .clone()
                     .map(|e| div().px_3().text_sm().child(e)),
             )
-            .child(crate::ui::key_footer(
-                &[
-                    ("up down", "Move"),
-                    ("space", "Mark"),
-                    ("enter", "Attach"),
-                    ("escape", "Close"),
-                ],
-                None,
-            ))
+            .child(
+                crate::ui::key_footer(
+                    &[
+                        ("up down", "Move"),
+                        ("tab", "Switch"),
+                        ("space", "Mark"),
+                        ("enter", "Attach"),
+                        ("escape", "Close"),
+                    ],
+                    None,
+                )
+                .gap_2()
+                .flex_wrap()
+                .id("draft-picker-footer")
+                .test_support(),
+            )
     }
 }
 
@@ -739,6 +860,398 @@ impl Render for AddPicker {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt;
+
+    fn picker(shark: &Entity<Shark>, w: &mut Window, cx: &mut App) -> Entity<AddPicker> {
+        shark.update(cx, |s, cx| {
+            s.draft_add_picker(point(px(100.), px(100.)), w, cx);
+            s.draft_picker
+                .as_ref()
+                .unwrap()
+                .view
+                .clone()
+                .downcast::<AddPicker>()
+                .ok()
+                .unwrap()
+        })
+    }
+
+    fn pr(number: u64) -> Pick {
+        Pick::Pr(serde_json::from_value(serde_json::json!({
+            "repo": "web", "number": number, "title": format!("Web fix {number}"),
+            "url": format!("https://github.com/test/web/pull/{number}"), "state": "OPEN", "baseRefName": "main"
+        })).unwrap())
+    }
+
+    fn selected_key(p: &AddPicker, cx: &App) -> Option<String> {
+        p.state
+            .read(cx)
+            .selected_index()
+            .and_then(|at| p.selected(at))
+            .map(|r| r.key())
+    }
+
+    fn repositories(home: &std::path::Path) -> Vec<Repo> {
+        ["api", "web"]
+            .map(|name| Repo {
+                name: name.into(),
+                path: home.join(name),
+            })
+            .to_vec()
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attachment_tabs_are_visible_even_without_results(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let (window, shark) =
+            super::super::ui_tests::boot(cx, State::default(), WindowOptions::default());
+        window
+            .update(cx, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    s.enter_home(w, cx);
+                    s.draft_add_picker(point(px(100.), px(100.)), w, cx);
+                });
+                w.render_frame(cx);
+                for tab in AttachmentTab::ALL {
+                    assert!(
+                        w.within("draft-picker-tabs")
+                            .find_by_label(tab.label())
+                            .visible()
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn draft_picker_stays_inside_bottom_edge(cx: &mut gpui_kit::TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        window
+            .update(cx, |_, w, cx| {
+                let p = picker(&shark, w, cx);
+                p.update(cx, |p, cx| {
+                    p.rows.extend((1..20).map(pr));
+                    cx.notify();
+                });
+                shark.update(cx, |s, cx| {
+                    s.draft_picker.as_mut().unwrap().anchor.y = w.viewport_size().height;
+                    cx.notify();
+                });
+                w.render_frame(cx);
+                w.render_frame(cx);
+                let footer = w.find("draft-picker-footer").bounds();
+                assert!(
+                    footer.bottom() <= w.viewport_size().height,
+                    "footer must fit inside the window: {footer:?}"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn category_tabs_include_suggestions_once_and_keep_special_actions(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        window
+            .update(cx, |_, w, cx| {
+                let picker = picker(&shark, w, cx);
+                picker.update(cx, |p, _| {
+                    let issue = Pick::Issue(Hit {
+                        id: "issue".into(),
+                        identifier: "SHA-1".into(),
+                        title: "Fix issue".into(),
+                        url: String::new(),
+                        status: "Started".into(),
+                        state_type: "started".into(),
+                        priority: 0,
+                        team: String::new(),
+                        assignee: None,
+                        updated_at: String::new(),
+                    });
+                    p.rows.extend([pr(1), issue.clone()]);
+                    p.suggested.rows.extend([pr(1), issue]);
+                    assert_eq!(p.groups()[0].0, "Suggested");
+                });
+                for (tab, expected) in [
+                    (
+                        AttachmentTab::Repositories,
+                        vec!["repo:api".to_string(), "repo:web".into(), "add".into()],
+                    ),
+                    (AttachmentTab::PullRequests, vec![pr(1).key()]),
+                    (AttachmentTab::Issues, vec!["issue".into()]),
+                    (AttachmentTab::Files, vec!["files".into()]),
+                ] {
+                    picker.update(cx, |p, cx| p.change_tab(tab, w, cx));
+                    w.render_frame(cx);
+                    let groups = picker.read(cx).groups();
+                    assert_eq!(groups.len(), 1);
+                    assert_eq!(groups[0].0, tab.label());
+                    assert_eq!(
+                        groups[0].1.iter().map(Pick::key).collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(selected_key(picker.read(cx), cx), expected.first().cloned());
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tabs_click_cycle_wrap_and_reopen_with_search_focus(cx: &mut gpui_kit::TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                agents: vec![crate::state::Agent {
+                    slug: "designer".into(),
+                    name: "Designer".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        window
+            .update(cx, |_, w, cx| {
+                for agent in [false, true] {
+                    shark.update(cx, |s, cx| {
+                        if agent {
+                            s.prefill_agent_task("designer", w, cx);
+                        } else {
+                            s.enter_home(w, cx);
+                        }
+                    });
+                    let p = picker(&shark, w, cx);
+                    p.update(cx, |p, _| p.rows.push(pr(1)));
+                    w.render_frame(cx);
+                    let focus = p.read(cx).state.focus_handle(cx);
+                    w.input("web", cx);
+                    for (tab, expected) in [
+                        (AttachmentTab::Repositories, Some("repo:web".to_string())),
+                        (AttachmentTab::PullRequests, Some(pr(1).key())),
+                        (AttachmentTab::Issues, None),
+                        (AttachmentTab::Files, None),
+                        (AttachmentTab::All, Some("repo:web".into())),
+                    ] {
+                        w.press("tab", cx);
+                        assert_eq!(p.read(cx).tab, tab);
+                        assert_eq!(selected_key(p.read(cx), cx), expected);
+                        assert_eq!(p.read(cx).state.read(cx).query(cx).as_ref(), "web");
+                        assert!(focus.is_focused(w));
+                    }
+                    for tab in AttachmentTab::ALL.into_iter().rev() {
+                        w.press("shift-tab", cx);
+                        assert_eq!(p.read(cx).tab, tab);
+                        assert!(focus.is_focused(w));
+                    }
+                    for tab in AttachmentTab::ALL {
+                        w.within("draft-picker-tabs").click(tab as usize, cx);
+                        assert_eq!(p.read(cx).tab, tab);
+                        assert!(focus.is_focused(w));
+                        assert_eq!(p.read(cx).state.read(cx).query(cx).as_ref(), "web");
+                    }
+                    for key in ["alt-tab", "ctrl-tab", "cmd-tab", "fn-tab", "ctrl-shift-tab"] {
+                        w.press(key, cx);
+                        assert_eq!(p.read(cx).tab, AttachmentTab::Files, "{key}");
+                    }
+                    shark.update(cx, |s, cx| s.close_draft_picker(w, cx));
+                    let reopened = picker(&shark, w, cx);
+                    w.render_frame(cx);
+                    assert_eq!(reopened.read(cx).tab, AttachmentTab::All);
+                    assert!(reopened.read(cx).state.read(cx).query(cx).is_empty());
+                    shark.update(cx, |s, cx| s.close_draft_picker(w, cx));
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn marked_attachments_survive_category_and_query_changes(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        window
+            .update(cx, |_, w, cx| {
+                shark.update(cx, |s, cx| s.enter_home(w, cx));
+                let p = picker(&shark, w, cx);
+                p.update(cx, |p, _| {
+                    p.rows.push(pr(1));
+                    p.suggested.rows.push(pr(1));
+                });
+                w.render_frame(cx);
+                w.press("space", cx);
+                w.press("tab", cx);
+                w.press("tab", cx);
+                w.press("space", cx);
+                assert_eq!(p.read(cx).marks, vec!["repo:api".to_string(), pr(1).key()]);
+                w.press("shift-tab", cx);
+                w.input("api", cx);
+                assert_eq!(selected_key(p.read(cx), cx), Some("repo:api".into()));
+                w.press("enter", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let s = shark.read(cx);
+            assert!(s.draft_picker.is_none());
+            assert_eq!(s.home.draft.repos.len(), 2);
+            assert_eq!(s.home.draft.repos[0].repo.name, "api");
+            assert_eq!(s.home.draft.repos[1].repo.name, "web");
+            assert!(matches!(&s.home.draft.repos[1].branch, BranchSpec::Pr(pr) if pr.number == 1));
+            assert!(s.state.tasks.is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn category_actions_open_existing_path_prompts_without_attaching_marks(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        for tab in [AttachmentTab::Repositories, AttachmentTab::Files] {
+            window
+                .update(cx, |_, w, cx| {
+                    shark.update(cx, |s, cx| s.enter_home(w, cx));
+                    let p = picker(&shark, w, cx);
+                    w.render_frame(cx);
+                    w.press("space", cx);
+                    p.update(cx, |p, cx| p.change_tab(tab, w, cx));
+                    w.render_frame(cx);
+                    if tab == AttachmentTab::Repositories {
+                        w.input("Add", cx);
+                    }
+                    w.press("enter", cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.read(|cx| assert!(shark.read(cx).draft_picker.is_none()));
+            assert!(cx.did_prompt_for_paths());
+            cx.simulate_path_prompt_response(|options| {
+                assert_eq!(options.files, tab == AttachmentTab::Files);
+                assert_eq!(options.directories, tab == AttachmentTab::Repositories);
+                assert!(options.multiple);
+                None
+            });
+            cx.run_until_parked();
+            cx.read(|cx| assert!(shark.read(cx).home.draft.repos.is_empty()));
+        }
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_keeps_tab_query_and_identity_when_rows_reorder_or_disappear(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        for remove in [true, false] {
+            window
+                .update(cx, |_, w, cx| {
+                    shark.update(cx, |s, cx| s.enter_home(w, cx));
+                    let p = picker(&shark, w, cx);
+                    p.update(cx, |p, cx| {
+                        p.rows.extend([pr(1), pr(2)]);
+                        p.change_tab(AttachmentTab::PullRequests, w, cx);
+                    });
+                    w.render_frame(cx);
+                    w.input("fix", cx);
+                    w.press("down", cx);
+                    assert_eq!(selected_key(p.read(cx), cx), Some(pr(2).key()));
+                    p.update(cx, |p, cx| {
+                        p.preserve_selection(w, cx);
+                        p.rows.reverse();
+                        if remove {
+                            p.rows.retain(|r| r.key() != pr(2).key());
+                        }
+                        assert!(p.state.read(cx).selected_index().is_none());
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    assert_eq!(p.read(cx).tab, AttachmentTab::PullRequests);
+                    assert_eq!(p.read(cx).state.read(cx).query(cx).as_ref(), "fix");
+                    assert_eq!(selected_key(p.read(cx), cx), (!remove).then(|| pr(2).key()));
+                    w.press("enter", cx);
+                    if remove {
+                        assert!(shark.read(cx).draft_picker.is_some());
+                        assert!(shark.read(cx).home.draft.repos.is_empty());
+                        shark.update(cx, |s, cx| s.close_draft_picker(w, cx));
+                    }
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.read(|cx| {
+            assert!(matches!(&shark.read(cx).home.draft.repos[0].branch, BranchSpec::Pr(pr) if pr.number == 2));
+        });
+    }
 
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
