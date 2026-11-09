@@ -215,11 +215,11 @@ impl Shark {
                 self.attach_draft_reference(agent, reference.clone(), window, cx)
             }
             ComposerEvent::SearchIssues(query) => self.search_reference_issues(query.clone(), cx),
-            ComposerEvent::PasteReference { text } => {
-                self.paste_draft_reference(agent, text.clone(), window, cx)
+            ComposerEvent::PasteReference { id, text } => {
+                self.paste_draft_reference(agent, *id, text.clone(), window, cx)
             }
-            ComposerEvent::UndoReference { text } => {
-                self.undo_draft_reference(agent, text.clone(), window, cx)
+            ComposerEvent::UndoReference { id, .. } => {
+                self.undo_draft_reference(agent, *id, window, cx)
             }
             ComposerEvent::Submit => {
                 if agent {

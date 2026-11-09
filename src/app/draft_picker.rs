@@ -203,7 +203,6 @@ impl Shark {
                 issues: Vec::new(),
                 own_prs: Vec::new(),
                 query_seq: 0,
-                sends: Vec::new(),
                 failure: None,
                 attaching: false,
                 destination: self.home.destination.clone(),
@@ -241,9 +240,7 @@ impl Shark {
                         p.preserve_selection(window, cx);
                         for (repo, result) in refreshed {
                             if let Ok(prs) = result {
-                                p.rows
-                                    .retain(|r| !matches!(r,Pick::Pr(pr) if pr.repo == repo));
-                                p.rows.extend(prs.into_iter().map(Pick::Pr));
+                                p.refresh_prs(&repo, prs);
                             }
                         }
                         if let Some(login) = login {
@@ -422,7 +419,6 @@ struct AddPicker {
     issues: Vec<String>,
     own_prs: Vec<String>,
     query_seq: u64,
-    sends: Vec<std::time::Instant>,
     failure: Option<String>,
     attaching: bool,
     destination: home::Destination,
@@ -430,6 +426,14 @@ struct AddPicker {
     _keys: Subscription,
 }
 impl AddPicker {
+    fn refresh_prs(&mut self, repo: &str, prs: Vec<complete::Pr>) {
+        self.rows.retain(|r| {
+            !matches!(r, Pick::Pr(pr) if pr.repo == repo
+                && (!self.marks.contains(&r.key()) || prs.iter().any(|next| next.url == pr.url)))
+        });
+        self.rows.extend(prs.into_iter().map(Pick::Pr));
+    }
+
     fn remember_suggestions(&self, cx: &mut Context<Self>) {
         let mut next = self.suggested.clone();
         next.rows = suggestions(&self.rows, &self.issues, &self.own_prs);
@@ -509,6 +513,24 @@ impl AddPicker {
     fn selected(&self, at: IndexPath) -> Option<Pick> {
         self.groups().get(at.section)?.1.get(at.row).cloned()
     }
+    fn allow_search(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(allowed) = self
+            .shark
+            .update(cx, |s, _| {
+                s.linear_in_use().then(|| s.allow_reference_search())
+            })
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        if !allowed {
+            self.failure = Some("Search unavailable. Try again later.".into());
+            cx.notify();
+        }
+        allowed
+    }
+
     fn search(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.query_seq += 1;
         let seq = self.query_seq;
@@ -526,27 +548,32 @@ impl AddPicker {
                     if p.query_seq != seq {
                         return false;
                     }
-                    p.sends
-                        .retain(|sent| sent.elapsed() < std::time::Duration::from_secs(60));
-                    if p.sends.len() >= 25 {
-                        p.failure = Some("Search limit reached. Try again in a minute.".into());
-                        cx.notify();
-                        return false;
-                    }
-                    p.sends.push(std::time::Instant::now());
-                    true
+                    p.allow_search(cx)
                 })
                 .unwrap_or(false);
             if !current {
                 return;
             }
-            let Ok(Some(request)) = shark.update(cx, |s, cx| {
-                s.linear_in_use()
-                    .then(|| s.linear_request(move |http, c| linear::find(http, c, &query), cx))
+            let Ok((epoch, request)) = shark.update(cx, |s, cx| {
+                (
+                    s.linear_connection_epoch(),
+                    s.linear_request(move |http, c| linear::find(http, c, &query), cx),
+                )
             }) else {
                 return;
             };
             let result = request.await;
+            let current_connection = shark
+                .update(cx, |s, _| {
+                    if let Err(error) = &result {
+                        s.reference_search_failed(epoch, error);
+                    }
+                    s.linear_connection_epoch() == epoch
+                })
+                .unwrap_or(false);
+            if !current_connection {
+                return;
+            }
             this.update_in(cx, |p, window, cx| {
                 if p.query_seq != seq {
                     return;
@@ -1441,6 +1468,112 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn local_picker_search_without_linear_stays_silent(cx: &mut gpui_kit::TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let (window, shark) =
+            super::super::ui_tests::boot(cx, State::default(), WindowOptions::default());
+        window
+            .update(cx, |_, w, cx| {
+                let picker = picker(&shark, w, cx);
+                picker.update(cx, |p, cx| {
+                    assert!(!p.allow_search(cx));
+                    assert!(
+                        p.failure.is_none(),
+                        "local filtering must not show a Linear connection error"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn reopened_picker_obeys_shared_search_budget(cx: &mut gpui_kit::TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::super::ui_tests::test_home();
+        let (window, shark) =
+            super::super::ui_tests::boot(cx, State::default(), WindowOptions::default());
+        window
+            .update(cx, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    s.linear_connected(
+                        "key",
+                        linear::Connection {
+                            org_id: "workspace-id".into(),
+                            org: "workspace".into(),
+                            user: "Ada".into(),
+                            method: linear::Method::ApiKey,
+                        },
+                        &|_| Err(linear::Error::Http(503)),
+                        cx,
+                    );
+                    for _ in 0..25 {
+                        assert!(s.allow_reference_search());
+                    }
+                    s.enter_home(w, cx);
+                });
+                let first = picker(&shark, w, cx);
+                assert!(!first.update(cx, |p, cx| p.allow_search(cx)));
+                shark.update(cx, |s, cx| s.close_draft_picker(w, cx));
+                let reopened = picker(&shark, w, cx);
+                assert!(!reopened.update(cx, |p, cx| p.allow_search(cx)));
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn marked_pr_survives_background_refresh_omission(cx: &mut gpui_kit::TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        window
+            .update(cx, |_, w, cx| {
+                shark.update(cx, |s, cx| s.enter_home(w, cx));
+                let picker = picker(&shark, w, cx);
+                picker.update(cx, |p, cx| {
+                    p.rows.push(pr(42));
+                    p.change_tab(AttachmentTab::PullRequests, w, cx);
+                });
+                w.render_frame(cx);
+                w.press("space", cx);
+                assert_eq!(picker.read(cx).marks, vec![pr(42).key()]);
+                picker.update(cx, |p, cx| {
+                    p.preserve_selection(w, cx);
+                    p.refresh_prs("web", vec![]);
+                    cx.notify();
+                });
+                w.render_frame(cx);
+                w.press("enter", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let draft = &shark.read(cx).home.draft;
+            assert_eq!(draft.repos.len(), 1);
+            assert!(matches!(&draft.repos[0].branch, BranchSpec::Pr(pr) if pr.number == 42));
+        });
     }
 
     #[cfg(feature = "test-support")]

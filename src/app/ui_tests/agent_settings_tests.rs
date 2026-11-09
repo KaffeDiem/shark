@@ -675,7 +675,7 @@ async fn reference_attachment_changes_only_the_draft_and_paste_undo_cancels_pend
         );
         assert!(s.state.tasks.is_empty(), "attaching never starts a task");
         let url = "https://linear.app/acme/issue/SHA-42/test".to_string();
-        s.paste_draft_reference(false, url.clone(), w, cx);
+        s.paste_draft_reference(false, 1, url, w, cx);
         assert_eq!(
             s.home.draft.staging, 1,
             "a pending full snapshot blocks submit"
@@ -684,7 +684,7 @@ async fn reference_attachment_changes_only_the_draft_and_paste_undo_cancels_pend
             id: "unrelated".into(),
             ..Default::default()
         });
-        s.undo_draft_reference(false, url, w, cx);
+        s.undo_draft_reference(false, 1, w, cx);
         assert_eq!(s.home.draft.staging, 0);
         assert_eq!(
             s.home.draft.issues[0].id, "unrelated",

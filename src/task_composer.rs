@@ -9,6 +9,9 @@ use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_PASTE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Source {
@@ -24,10 +27,11 @@ pub(crate) enum Event {
     AttachReference(complete::Reference),
     SearchIssues(String),
     PasteReference {
+        id: u64,
         text: String,
     },
     UndoReference {
-        text: String,
+        id: u64,
     },
     Change,
     Escape,
@@ -43,12 +47,12 @@ pub(crate) enum Event {
 }
 
 struct PastedReference {
+    id: u64,
     restored: String,
     restored_content: InputContent,
     removed: String,
     text: String,
     start: usize,
-    undone: bool,
 }
 
 struct Menu {
@@ -83,6 +87,8 @@ pub(crate) struct TaskComposer {
     read_only: bool,
     dropping: Option<Vec<PathBuf>>,
     pasted_references: Vec<PastedReference>,
+    undone_references: Vec<PastedReference>,
+    history_reference_replayed: bool,
     history_redo: Option<bool>,
     _subscription: Subscription,
 }
@@ -171,26 +177,35 @@ impl TaskComposer {
                     }
                     InputEvent::Change => {
                         if let Some(redo) = this.history_redo {
-                            let value = this.input.read(cx).value().to_string();
-                            if let Some(paste) = this.pasted_references.iter_mut().rfind(|paste| {
-                                paste.undone == redo
-                                    && &value
-                                        == if redo {
-                                            &paste.removed
-                                        } else {
-                                            &paste.restored
-                                        }
-                            }) {
-                                paste.undone = !redo;
-                                let text = paste.text.clone();
-                                cx.emit(if redo {
-                                    Event::PasteReference { text }
-                                } else {
-                                    Event::UndoReference { text }
-                                });
+                            if !this.history_reference_replayed {
+                                let value = this.input.read(cx).value();
+                                if redo {
+                                    if this
+                                        .undone_references
+                                        .last()
+                                        .is_some_and(|paste| paste.removed == value.as_ref())
+                                    {
+                                        let paste = this.undone_references.pop().unwrap();
+                                        let id = paste.id;
+                                        let text = paste.text.clone();
+                                        this.pasted_references.push(paste);
+                                        this.history_reference_replayed = true;
+                                        cx.emit(Event::PasteReference { id, text });
+                                    }
+                                } else if let Some(index) = this
+                                    .pasted_references
+                                    .iter()
+                                    .rposition(|paste| paste.restored == value.as_ref())
+                                {
+                                    let paste = this.pasted_references.remove(index);
+                                    let id = paste.id;
+                                    this.undone_references.push(paste);
+                                    this.history_reference_replayed = true;
+                                    cx.emit(Event::UndoReference { id });
+                                }
                             }
                         } else {
-                            this.pasted_references.retain(|paste| !paste.undone);
+                            this.undone_references.clear();
                         }
                         this.update_menu(cx);
                         cx.emit(Event::Change);
@@ -222,6 +237,8 @@ impl TaskComposer {
             read_only: false,
             dropping: None,
             pasted_references: vec![],
+            undone_references: vec![],
+            history_reference_replayed: false,
             history_redo: None,
             _subscription: subscription,
         }
@@ -229,31 +246,32 @@ impl TaskComposer {
 
     fn begin_history(&mut self, redo: bool, window: &Window, cx: &mut Context<Self>) {
         self.history_redo = Some(redo);
+        self.history_reference_replayed = false;
         // Wait past the textarea's queued changes; no-op history emits none.
         cx.defer_in(window, |_, window, cx| {
             cx.defer_in(window, |this, _, _| this.history_redo = None);
         });
     }
 
-    pub(crate) fn take_failed_reference(&mut self, text: &str) -> Option<(String, InputContent)> {
+    pub(crate) fn take_failed_reference(&mut self, id: u64) -> Option<(String, InputContent)> {
         let index = self
             .pasted_references
             .iter()
-            .rposition(|paste| paste.text == text)?;
+            .rposition(|paste| paste.id == id)?;
         let paste = self.pasted_references.remove(index);
         Some((paste.removed, paste.restored_content))
     }
 
     pub(crate) fn restore_failed_reference(
         &mut self,
-        text: &str,
+        id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self
             .pasted_references
             .iter()
-            .rposition(|paste| paste.text == text)
+            .rposition(|paste| paste.id == id)
         else {
             return;
         };
@@ -686,15 +704,16 @@ impl TaskComposer {
                     input.replace("", window, cx);
                     (restored, restored_content)
                 });
+                let id = NEXT_PASTE_ID.fetch_add(1, Ordering::Relaxed);
                 self.pasted_references.push(PastedReference {
+                    id,
                     restored,
                     restored_content,
                     removed: self.input.read(cx).value().to_string(),
                     text: text.clone(),
                     start,
-                    undone: false,
                 });
-                cx.emit(Event::PasteReference { text });
+                cx.emit(Event::PasteReference { id, text });
                 return true;
             }
             cx.emit(Event::SearchIssues(text));
@@ -1307,6 +1326,102 @@ mod tests {
         assert!(!cx.update(|cx| composer.read(cx).has_menu()));
     }
     #[gpui_kit::test]
+    fn redo_references_follow_conversion_undo_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let (window, composer) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| TaskComposer::new(window, cx))
+                })
+            })
+            .unwrap();
+        let pasted = Rc::new(RefCell::new(Vec::new()));
+        let seen = pasted.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&composer, move |_, event: &Event, _| {
+                if let Event::PasteReference { text, .. } = event {
+                    seen.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        let a = "https://github.com/org/shark/pull/93";
+        let b = "https://github.com/org/shark/pull/94";
+        for url in [a, b] {
+            cx.update_window(window, |_, window, cx| {
+                composer.update(cx, |this, cx| {
+                    assert!(this.paste(&ClipboardItem::new_string(url.into()), window, cx));
+                    this.input.update(cx, |input, cx| input.focus(window, cx));
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        for key in ["cmd-z", "cmd-z", "cmd-z", "cmd-shift-z"] {
+            cx.update_window(window, |_, window, cx| window.press(key, cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            &*pasted.borrow(),
+            &[a.to_string(), b.to_string(), a.to_string()]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn failed_paste_recovery_keeps_original_identity(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let (window, composer) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| TaskComposer::new(window, cx))
+                })
+            })
+            .unwrap();
+        let undone = Rc::new(RefCell::new(Vec::new()));
+        let seen = undone.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&composer, move |_, event: &Event, _| {
+                if let Event::UndoReference { id, .. } = event {
+                    seen.borrow_mut().push(*id);
+                }
+            })
+        });
+        let b_id = cx
+            .update_window(window, |_, window, cx| {
+                composer.update(cx, |this, cx| {
+                    let url = "https://github.com/org/shark/pull/93";
+                    assert!(this.paste(&ClipboardItem::new_string(url.into()), window, cx));
+                    let id = this.pasted_references.last().unwrap().id;
+                    this.input.update(cx, |input, cx| {
+                        input.set_value("draft B\n", window, cx);
+                        input.set_selected_range(8..8, cx);
+                    });
+                    assert!(this.paste(&ClipboardItem::new_string(url.into()), window, cx));
+                    let (removed, _) = this.take_failed_reference(id).unwrap();
+                    assert_eq!(removed, "", "draft A failure must recover A's paste record");
+                    assert_eq!(this.pasted_references.len(), 1);
+                    assert_eq!(this.pasted_references[0].removed, "draft B\n");
+                    let b_id = this.pasted_references[0].id;
+                    assert_ne!(id, b_id);
+                    this.input.update(cx, |input, cx| input.focus(window, cx));
+                    b_id
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.press("cmd-z", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(&*undone.borrow(), &[b_id]);
+    }
+
+    #[gpui_kit::test]
     fn no_op_history_clears_pending_direction(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1349,7 +1464,8 @@ mod tests {
                 assert!(this.paste(&ClipboardItem::new_string(url.into()), window, cx));
                 this.input
                     .update(cx, |input, cx| input.insert("new text", window, cx));
-                this.restore_failed_reference(url, window, cx);
+                let id = this.pasted_references.last().unwrap().id;
+                this.restore_failed_reference(id, window, cx);
                 assert_eq!(
                     this.input.read(cx).value().as_ref(),
                     format!("new text\n{url}")

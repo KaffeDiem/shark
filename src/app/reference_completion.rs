@@ -20,6 +20,17 @@ pub(super) struct ReferenceCompletion {
 }
 
 impl ReferenceCompletion {
+    fn sync_epoch(&mut self, epoch: Option<u64>) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.hits.clear();
+            self.searched.clear();
+            self.sends.clear();
+            self.retry_at = 0;
+            self.generation += 1;
+        }
+    }
+
     fn allow_search(&mut self, now: u64) -> bool {
         self.sends.retain(|sent| now.saturating_sub(*sent) < 60);
         if now < self.retry_at || self.sends.len() >= 25 {
@@ -44,8 +55,16 @@ fn search_now() -> u64 {
         .as_secs()
 }
 
+fn selected_issue_target(hit: Hit) -> Target {
+    Target {
+        id: hit.id,
+        org: None,
+    }
+}
+
 struct PastedReference {
     id: u64,
+    composer_id: u64,
     destination: Destination,
     text: String,
     repos: Vec<DraftRepo>,
@@ -82,15 +101,8 @@ impl Shark {
     }
 
     pub(super) fn sync_reference_completion(&mut self, agent: bool, cx: &mut Context<Self>) {
-        let epoch = self.linear_connection_epoch();
-        if self.reference_completion.epoch != epoch {
-            self.reference_completion.epoch = epoch;
-            self.reference_completion.hits.clear();
-            self.reference_completion.searched.clear();
-            self.reference_completion.sends.clear();
-            self.reference_completion.retry_at = 0;
-            self.reference_completion.generation += 1;
-        }
+        self.reference_completion
+            .sync_epoch(self.linear_connection_epoch());
         let hits = self.reference_hits();
         let composer = if agent {
             &self.home.agent_composer
@@ -100,6 +112,23 @@ impl Shark {
         composer.update(cx, |c, cx| c.set_issues(hits.clone(), cx));
         for chat in self.chats.values() {
             chat.update(cx, |chat, cx| chat.set_completion_issues(hits.clone(), cx));
+        }
+    }
+
+    pub(super) fn allow_reference_search(&mut self) -> bool {
+        self.reference_completion
+            .sync_epoch(self.linear_connection_epoch());
+        self.linear_in_use()
+            && self.linear_connection_epoch().is_some()
+            && self.linear_org_id().is_some()
+            && self.linear_needs_attention().is_none()
+            && self.reference_completion.allow_search(search_now())
+    }
+
+    pub(super) fn reference_search_failed(&mut self, epoch: Option<u64>, error: &linear::Error) {
+        if self.linear_connection_epoch() == epoch {
+            self.reference_completion.sync_epoch(epoch);
+            self.reference_completion.search_failed(error, search_now());
         }
     }
 
@@ -127,9 +156,7 @@ impl Shark {
                 .update(cx, |s, cx| {
                     if s.reference_completion.generation != generation
                         || s.linear_connection_epoch() != epoch
-                        || !s.linear_in_use()
-                        || s.linear_needs_attention().is_some()
-                        || !s.reference_completion.allow_search(search_now())
+                        || !s.allow_reference_search()
                     {
                         return None;
                     }
@@ -161,7 +188,7 @@ impl Shark {
                     return;
                 }
                 if let Err(error) = &result {
-                    s.reference_completion.search_failed(error, search_now());
+                    s.reference_search_failed(epoch, error);
                 }
                 if let Ok(hits) = result {
                     s.reference_completion.searched.insert(cache_key);
@@ -230,10 +257,7 @@ impl Shark {
                 self.draft_mut(agent).staging += 1;
                 let org = self.linear_org_id().map(str::to_string);
                 let epoch = self.linear_connection_epoch();
-                let target = linear::parse_issue(&hit.url).unwrap_or(Target {
-                    id: hit.identifier,
-                    org: None,
-                });
+                let target = selected_issue_target(hit);
                 let task = self.linear_request(
                     move |http, credential| linear::get_issue(http, credential, &target),
                     cx,
@@ -271,6 +295,7 @@ impl Shark {
     pub(super) fn paste_draft_reference(
         &mut self,
         agent: bool,
+        composer_id: u64,
         text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -291,6 +316,7 @@ impl Shark {
         let draft = self.draft(agent);
         let undo = PastedReference {
             id,
+            composer_id,
             destination: destination.clone(),
             text: text.clone(),
             repos: draft.repos.clone(),
@@ -501,11 +527,11 @@ impl Shark {
         };
         if let Some(composer) = current_input {
             composer.update(cx, |composer, cx| {
-                composer.restore_failed_reference(&paste.text, window, cx)
+                composer.restore_failed_reference(paste.composer_id, window, cx)
             });
         } else {
             let recovery = self.home.agent_composer.update(cx, |composer, _| {
-                composer.take_failed_reference(&paste.text)
+                composer.take_failed_reference(paste.composer_id)
             });
             if let Some(draft) = self.draft_at_mut(&paste.destination) {
                 let content = draft
@@ -567,7 +593,7 @@ impl Shark {
     pub(super) fn undo_draft_reference(
         &mut self,
         agent: bool,
-        text: String,
+        composer_id: u64,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -579,12 +605,9 @@ impl Shark {
         } else {
             Destination::Home
         };
-        let Some(index) = self
-            .reference_completion
-            .pastes
-            .iter()
-            .rposition(|paste| paste.destination == destination && paste.text == text)
-        else {
+        let Some(index) = self.reference_completion.pastes.iter().rposition(|paste| {
+            paste.destination == destination && paste.composer_id == composer_id
+        }) else {
             return;
         };
         let before = self.reference_completion.pastes.remove(index);
@@ -647,10 +670,7 @@ impl Shark {
     ) {
         let org = self.linear_org_id().map(str::to_string);
         let epoch = self.linear_connection_epoch();
-        let target = linear::parse_issue(&hit.url).unwrap_or(Target {
-            id: hit.identifier,
-            org: None,
-        });
+        let target = selected_issue_target(hit);
         let task = self.linear_request(
             move |http, credential| linear::get_issue(http, credential, &target),
             cx,
@@ -681,7 +701,7 @@ impl Shark {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReferenceCompletion, linear};
+    use super::{ReferenceCompletion, linear, selected_issue_target};
 
     #[test]
     fn reference_search_budget_is_rolling_and_shared_between_queries() {
@@ -702,5 +722,96 @@ mod tests {
         completion.search_failed(&linear::Error::Http(503), 200);
         assert!(!completion.allow_search(204));
         assert!(completion.allow_search(205));
+    }
+    #[test]
+    fn selected_reference_uses_immutable_issue_id() {
+        let hit = linear::Hit {
+            id: "immutable-issue-id".into(),
+            identifier: "ENG-123".into(),
+            url: "https://linear.app/renamed-workspace/issue/ENG-123/old-slug".into(),
+            title: String::new(),
+            status: String::new(),
+            state_type: String::new(),
+            priority: 0,
+            team: String::new(),
+            assignee: None,
+            updated_at: String::new(),
+        };
+        let target = selected_issue_target(hit);
+        assert_eq!(target.id, "immutable-issue-id");
+        assert_eq!(target.org, None);
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod ui_tests {
+    use super::*;
+    use crate::app::ui_tests::{UI_LOCK, boot};
+    use crate::state::Agent;
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn same_url_failures_restore_their_original_agent_drafts(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let (window, shark) = boot(
+            cx,
+            State {
+                agents: vec![
+                    Agent {
+                        slug: "first".into(),
+                        name: "First".into(),
+                        ..Default::default()
+                    },
+                    Agent {
+                        slug: "second".into(),
+                        name: "Second".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        let url = "https://linear.app/acme/issue/SHA-42/test";
+        let mut attempts = Vec::new();
+        for (slug, body) in [("first", "first body\n"), ("second", "second body\n")] {
+            cx.update_window(window, |_, window, cx| {
+                shark.update(cx, |s, cx| s.prefill_agent_task(slug, window, cx));
+                window.input(body, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(url.into()));
+                window.press("cmd-v", cx);
+            })
+            .unwrap();
+            attempts.push(cx.read(|cx| {
+                shark
+                    .read(cx)
+                    .reference_completion
+                    .pastes
+                    .last()
+                    .unwrap()
+                    .id
+            }));
+        }
+        cx.update_window(window, |_, window, cx| {
+            shark.update(cx, |s, cx| {
+                for id in attempts {
+                    s.fail_pasted_reference(id, "offline failure".into(), window, cx);
+                }
+                assert_eq!(
+                    s.home.agent_drafts["first"].text,
+                    format!("first body\n{url}")
+                );
+                assert_eq!(
+                    s.home.agent_prompt.read(cx).value().as_ref(),
+                    format!("second body\n{url}")
+                );
+                assert!(s.reference_completion.pastes.is_empty());
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
     }
 }
