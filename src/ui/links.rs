@@ -204,7 +204,7 @@ mod tests {
                 let bounds = w.find("md-mermaid").bounds();
                 assert_eq!(
                     w.find("md-mermaid").label(),
-                    Some("Mermaid diagram flowchart")
+                    Some("Mermaid diagram flowchart TD\n A --> B")
                 );
                 assert_eq!(w.find("md-mermaid").role(), Some(Role::Image));
                 assert!(bounds.size.height > px(20.) && bounds.size.height <= px(560.));
@@ -300,12 +300,27 @@ mod tests {
                 .await;
             }
             window
-                .update(cx, |_, w, _| {
+                .update(cx, |_, w, cx| {
                     assert_eq!(w.try_find("md-mermaid").is_some(), rendered, "{md}");
                     assert_eq!(w.try_find("md-mermaid-error").is_some(), failed, "{md}");
                     if rendered {
                         let bounds = w.find("md-mermaid").bounds();
                         assert!(bounds.size.height <= px(560.) && bounds.size.width <= px(340.));
+                    }
+                    if failed {
+                        let error = w.find("md-mermaid-error").bounds();
+                        let start = point(error.left() + px(18.), error.bottom() + px(40.));
+                        let end = point(error.left() + px(200.), start.y);
+                        w.pointer_down(start, MouseButton::Left, cx);
+                        w.pointer_move(end, Some(MouseButton::Left), cx);
+                        w.pointer_up(end, MouseButton::Left, cx);
+                        w.render_frame(cx);
+                        let selected = gpui_kit::base::TextSelection::selected_text(w, cx);
+                        assert_eq!(
+                            selected.trim(),
+                            "flowchart TD",
+                            "fallback supports selecting one source line"
+                        );
                     }
                 })
                 .unwrap();

@@ -94,10 +94,7 @@ impl MarkdownPlugin for MermaidPlugin {
             MarkdownNode::new("mermaid", fallback)
                 .text(code.value.clone())
                 .markdown(source.to_string())
-                .accessibility_label(format!(
-                    "Mermaid diagram {}",
-                    code.value.split_whitespace().next().unwrap_or_default()
-                )),
+                .accessibility_label(format!("Mermaid diagram {}", code.value)),
         )
     }
 
