@@ -115,7 +115,8 @@ pub(crate) fn markdown(
     group: &'static str,
     roots: Vec<PathBuf>,
 ) -> TextView {
-    TextView::new(md)
+    code_blocks(TextView::new(md), group)
+        .plugin(crate::mermaid::MermaidPlugin { group })
         .selectable(true)
         .on_link_click(move |url, event, _, cx| {
             if !event.standard_click() && !event.is_middle_click() {
@@ -125,7 +126,11 @@ pub(crate) fn markdown(
                 cx.open_url(&target);
             }
         })
-        .style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
+}
+
+/// Shared by ordinary Markdown and the Mermaid source fallback, without recursive plugins.
+pub(crate) fn code_blocks(view: TextView, group: &'static str) -> TextView {
+    view.style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
         .code_block_actions(move |block, _, cx| {
             h_flex()
                 .h(px(20.))
@@ -142,6 +147,170 @@ pub(crate) fn markdown(
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    async fn markdown_mermaid_streams_then_renders(cx: &mut TestAppContext) {
+        use gpui_kit::test::{TestAppContextExt as _, TestEventExt as _, TestWindowExt as _};
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        struct Markdown(Entity<TextViewState>);
+        impl Render for Markdown {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(340.)).group("mermaid-test").child(markdown(
+                    &self.0,
+                    "mermaid-test",
+                    vec![],
+                ))
+            }
+        }
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(
+                &crate::state::Appearance {
+                    mode: crate::state::Mode::Light,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let source = "```mermaid\nflowchart TD\n A --> B\n";
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                    cx.new(|cx| Markdown(cx.new(|cx| TextViewState::markdown(source, cx))))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |_, w, _| assert!(w.try_find("md-mermaid").is_none()))
+            .unwrap();
+        cx.update(|cx| {
+            view.read(cx)
+                .0
+                .clone()
+                .update(cx, |md, cx| md.push_str("```\n", cx))
+        });
+        cx.wait_for(window.into(), std::time::Duration::from_secs(10), |w, _| {
+            w.try_find("md-mermaid").is_some()
+        })
+        .await;
+        window
+            .update(cx, |_, w, cx| {
+                let bounds = w.find("md-mermaid").bounds();
+                assert_eq!(
+                    w.find("md-mermaid").label(),
+                    Some("Mermaid diagram flowchart")
+                );
+                assert_eq!(w.find("md-mermaid").role(), Some(Role::Image));
+                assert!(bounds.size.height > px(20.) && bounds.size.height <= px(560.));
+                assert!(bounds.size.width <= px(340.));
+                w.pointer_move(bounds.center(), None, cx);
+                w.render_frame(cx);
+                w.click("copy", cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+                    Some("flowchart TD\n A --> B")
+                );
+                w.click("open-mermaid", cx);
+            })
+            .unwrap();
+        let light_url = cx.opened_url().unwrap();
+        assert!(light_url.starts_with("file://") && light_url.ends_with(".png"));
+        cx.update(|cx| {
+            crate::theme::apply(
+                &crate::state::Appearance {
+                    mode: crate::state::Mode::Dark,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.wait_for(
+            window.into(),
+            std::time::Duration::from_secs(10),
+            |w, cx| {
+                if w.try_find("md-mermaid").is_none() {
+                    return false;
+                }
+                w.click("open-mermaid", cx);
+                true
+            },
+        )
+        .await;
+        assert_ne!(
+            cx.opened_url(),
+            Some(light_url),
+            "theme changes the rendered image"
+        );
+
+        for (md, rendered, failed) in [
+            (
+                "```Mermaid\nflowchart TD\n A --> B\n```".to_string(),
+                true,
+                false,
+            ),
+            (
+                "> ~~~mermaid\n> flowchart TD\n>  A --> B\n> ~~~".into(),
+                true,
+                false,
+            ),
+            (
+                "- Diagram\n\n  ```mermaid\n  flowchart TD\n   A --> B\n  ```".into(),
+                true,
+                false,
+            ),
+            ("```rust\nflowchart TD\n A --> B\n```".into(), false, false),
+            (
+                "````mermaid\nflowchart TD\n A --> B\n```".into(),
+                false,
+                false,
+            ),
+            ("```mermaid\nflowchart TD\n A -->\n```".into(), false, true),
+            (
+                format!(
+                    "```mermaid\nsequenceDiagram\n{}\n```",
+                    "Alice->>Bob: Message\n".repeat(30)
+                ),
+                true,
+                false,
+            ),
+        ] {
+            cx.update(|cx| {
+                view.read(cx)
+                    .0
+                    .clone()
+                    .update(cx, |state, cx| state.set_text(&md, cx))
+            });
+            cx.run_until_parked();
+            window.update(cx, |_, w, cx| w.render_frame(cx)).unwrap();
+            if rendered || failed {
+                cx.wait_for(window.into(), std::time::Duration::from_secs(10), |w, _| {
+                    w.try_find(if failed {
+                        "md-mermaid-error"
+                    } else {
+                        "md-mermaid"
+                    })
+                    .is_some()
+                })
+                .await;
+            }
+            window
+                .update(cx, |_, w, _| {
+                    assert_eq!(w.try_find("md-mermaid").is_some(), rendered, "{md}");
+                    assert_eq!(w.try_find("md-mermaid-error").is_some(), failed, "{md}");
+                    if rendered {
+                        let bounds = w.find("md-mermaid").bounds();
+                        assert!(bounds.size.height <= px(560.) && bounds.size.width <= px(340.));
+                    }
+                })
+                .unwrap();
+        }
+    }
 
     /// A task dir holding `repo/src/lib.rs`, `repo/README.md`, and `repo/a b å.txt`.
     fn link_fixture(tag: &str) -> (PathBuf, Vec<PathBuf>) {
