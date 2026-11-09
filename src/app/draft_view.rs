@@ -4,7 +4,41 @@ use super::task_draft::{BranchSpec, DraftRepo, TaskDraft};
 use super::*;
 use crate::models::{effort_label, efforts, model_label};
 use crate::task_composer::{Event as ComposerEvent, Source};
-use gpui_kit::component::Disableable as _;
+use gpui_kit::component::{Disableable as _, Selectable as _};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DraftStop {
+    Agent,
+    Repo(String),
+    Issue(String, String),
+    File(PathBuf),
+    More,
+    Attach,
+    Edited,
+}
+
+impl DraftStop {
+    fn anchor(&self) -> String {
+        match self {
+            Self::Agent => "home-agent-picker".into(),
+            Self::Repo(name) => format!("branch-{name}"),
+            Self::Issue(org, id) => format!("issue-{org}-{id}"),
+            Self::File(path) => format!("file-{}", path.display()),
+            Self::More => "draft-more".into(),
+            Self::Attach => "draft-add".into(),
+            Self::Edited => "draft-edited".into(),
+        }
+    }
+}
+
+fn draft_chip(id: impl Into<ElementId>, icon: impl Into<Icon>, label: String) -> Button {
+    Shark::chip(id, icon, label)
+        .h(px(26.))
+        .min_w(px(26.))
+        .rounded(px(13.))
+        .px(px(9.))
+        .max_w(px(200.))
+}
 
 impl Shark {
     fn anchor_draft_control(&self, key: String, control: impl IntoElement) -> AnyElement {
@@ -239,7 +273,7 @@ impl Shark {
             ComposerEvent::AgentMove(by) => self.move_mention(*by, cx),
             ComposerEvent::Tray => {
                 if agent || !self.home.asking {
-                    self.home.tray_index = 0;
+                    self.home.tray_stop = self.draft_stops().first().cloned();
                     self.home.tray_focus.focus(window, cx);
                     cx.notify();
                 }
@@ -400,6 +434,20 @@ impl Shark {
                 .checked(checked)
             })
             .collect();
+        let branch = self.draft_branch_label(current);
+        let selected = name.clone();
+        entries.insert(
+            0,
+            menu::item(
+                IconName::GitBranch,
+                "Branch or pull request…",
+                on_shark(cx, move |s, w, cx| {
+                    s.pick_draft_branch(Some((selected.clone(), false)), w, cx);
+                }),
+            )
+            .hint(format!("{branch} · ⌘⇧B")),
+        );
+        entries.insert(1, Entry::Sep);
         entries.push(Entry::Sep);
         entries.push(menu::item(
             IconName::X,
@@ -413,7 +461,12 @@ impl Shark {
                 s.focus_draft(agent, w, cx);
             }),
         ));
-        self.show_menu(window.mouse_position(), entries, window, cx);
+        self.show_menu(
+            self.draft_control_position(&DraftStop::Repo(name).anchor(), window),
+            entries,
+            window,
+            cx,
+        );
     }
 
     pub(super) fn draft_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -442,10 +495,13 @@ impl Shark {
             return;
         }
         let draft = self.draft(self.draft_target());
-        let index = if self.home.tray_focus.is_focused(window) {
-            self.home.tray_index.saturating_sub(draft.issues.len()) / 2
-        } else {
-            0
+        let index = match &self.home.tray_stop {
+            Some(DraftStop::Repo(name)) if self.home.tray_focus.is_focused(window) => draft
+                .repos
+                .iter()
+                .position(|r| &r.repo.name == name)
+                .unwrap_or(0),
+            _ => 0,
         };
         if let Some(repo) = draft.repos.get(index).or_else(|| draft.repos.first()) {
             self.pick_draft_branch(Some((repo.repo.name.clone(), false)), window, cx);
@@ -654,6 +710,25 @@ impl Shark {
                 }),
             ));
         }
+        if self.home.footer_density >= 2 {
+            entries.push(Entry::Sep);
+            if self.draft(agent).repos.is_empty() {
+                entries.push(Entry::Heading(
+                    "Plan only".into(),
+                    self.draft_plan_tooltip(agent).into(),
+                ));
+            } else {
+                entries.push(
+                    menu::item(
+                        IconName::ListTodo,
+                        "Plan before implementing",
+                        on_shark(cx, |s, _, cx| s.toggle_draft_plan(cx)),
+                    )
+                    .checked(self.draft(agent).plan)
+                    .hint("⇧Tab"),
+                );
+            }
+        }
         entries[0] =
             std::mem::replace(&mut entries[0], Entry::Sep).hint(self.draft_settings_source(agent));
         self.show_menu(window.mouse_position(), entries, window, cx);
@@ -798,21 +873,333 @@ impl Shark {
     }
 
     fn draft_file_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        let Some(path) = self.draft(agent).files.get(index) else {
+        let Some(path) = self.draft(self.draft_target()).files.get(index).cloned() else {
             return;
         };
-        let Ok(url) = url::Url::from_file_path(path) else {
+        let Ok(url) = url::Url::from_file_path(&path) else {
             return;
         };
+        let stop = DraftStop::File(path);
+        let remove = stop.clone();
         self.show_menu(
-            window.mouse_position(),
-            vec![menu::item(IconName::File, "Open file", move |_, cx| {
-                cx.open_url(url.as_str())
-            })],
+            self.draft_control_position(&stop.anchor(), window),
+            vec![
+                menu::item(IconName::File, "Open file", move |_, cx| {
+                    cx.open_url(url.as_str())
+                }),
+                Entry::Sep,
+                menu::item(
+                    IconName::X,
+                    "Remove file",
+                    on_shark(cx, move |s, w, cx| s.remove_draft_stop(&remove, w, cx)),
+                ),
+            ],
             window,
             cx,
         );
+    }
+
+    fn draft_issue_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(issue) = self.draft(self.draft_target()).issues.get(index) else {
+            return;
+        };
+        let stop = DraftStop::Issue(issue.org.clone(), issue.id.clone());
+        let remove = stop.clone();
+        let url = issue.url.clone();
+        self.show_menu(
+            self.draft_control_position(&stop.anchor(), window),
+            vec![
+                menu::item(IconName::ExternalLink, "Open in Linear", move |_, cx| {
+                    cx.open_url(&url)
+                }),
+                Entry::Sep,
+                menu::item(
+                    IconName::X,
+                    "Remove issue",
+                    on_shark(cx, move |s, w, cx| s.remove_draft_stop(&remove, w, cx)),
+                ),
+            ],
+            window,
+            cx,
+        );
+    }
+
+    fn draft_branch_label(&self, repo: &DraftRepo) -> String {
+        match &repo.branch {
+            BranchSpec::New { base } => format!(
+                "New branch from {}",
+                if base.is_empty() {
+                    self.draft_bases
+                        .get(&repo.repo.path)
+                        .map(String::as_str)
+                        .unwrap_or("default branch")
+                } else {
+                    base
+                }
+            ),
+            BranchSpec::Existing(branch) => branch.clone(),
+            BranchSpec::Pr(pr) => repo
+                .pr_label
+                .clone()
+                .unwrap_or_else(|| format!("Pull request #{}", pr.number)),
+        }
+    }
+
+    fn draft_repo_label(&self, repo: &DraftRepo, changed: bool) -> String {
+        let suffix = match &repo.branch {
+            BranchSpec::New { base }
+                if base.is_empty() || self.draft_bases.get(&repo.repo.path) == Some(base) =>
+            {
+                String::new()
+            }
+            BranchSpec::New { base } | BranchSpec::Existing(base) => format!(" · {base}"),
+            BranchSpec::Pr(pr) => format!(" · #{}", pr.number),
+        };
+        format!(
+            "{}{}{suffix}",
+            if changed { "● " } else { "" },
+            repo.repo.name
+        )
+    }
+
+    fn draft_plan_tooltip(&self, agent: bool) -> String {
+        if self.draft(agent).repos.is_empty() {
+            format!(
+                "Attach a repository to let {} implement",
+                self.draft_slug(agent)
+                    .and_then(|slug| self.agent(slug))
+                    .map_or("Shark", |a| a.name.as_str())
+            )
+        } else {
+            "Plan before implementing (⇧Tab)".into()
+        }
+    }
+
+    fn draft_edited_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let agent = self.draft_target();
+        let draft = self.draft(agent);
+        let Some(default) = self.draft_slug(agent).and_then(|slug| self.agent(slug)) else {
+            return;
+        };
+        if draft.starting {
+            return;
+        }
+        let mut changes: Vec<_> = default
+            .repos
+            .iter()
+            .filter(|name| !draft.repos.iter().any(|r| &r.repo.name == *name))
+            .map(|name| format!("Removed {name}"))
+            .collect();
+        changes.extend(
+            draft
+                .repos
+                .iter()
+                .filter(|r| !default.repos.contains(&r.repo.name))
+                .map(|r| format!("Added {}", r.repo.name)),
+        );
+        if draft.saved_settings(default) != (default.model.clone(), default.effort.clone()) {
+            let (model, effort) = draft.defaults(&self.state, self.draft_slug(agent));
+            changes.push(format!(
+                "Model {} · {}",
+                model_label(&model),
+                effort_label(effort.as_deref().unwrap_or(crate::models::EFFORT))
+            ));
+        }
+        let name = default.name.clone();
+        let entries = vec![
+            Entry::Heading(
+                format!("Differs from {name}'s defaults").into(),
+                changes.join(" · ").into(),
+            ),
+            menu::item(
+                IconName::RotateCcw,
+                format!("Reset to {name}'s defaults"),
+                on_shark(cx, |s, w, cx| s.reset_draft_defaults(w, cx)),
+            ),
+            menu::item(
+                IconName::Save,
+                format!("Save as {name}'s defaults"),
+                on_shark(cx, |s, w, cx| s.save_draft_defaults(w, cx)),
+            ),
+        ];
+        self.show_menu(
+            self.draft_control_position("draft-edited", window),
+            entries,
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn draft_chip_stops(&self, agent: bool) -> Vec<DraftStop> {
+        let draft = self.draft(agent);
+        std::iter::once(DraftStop::Agent)
+            .filter(|_| !agent)
+            .chain(
+                draft
+                    .repos
+                    .iter()
+                    .map(|r| DraftStop::Repo(r.repo.name.clone())),
+            )
+            .chain(
+                draft
+                    .issues
+                    .iter()
+                    .map(|i| DraftStop::Issue(i.org.clone(), i.id.clone())),
+            )
+            .chain(draft.files.iter().cloned().map(DraftStop::File))
+            .collect()
+    }
+
+    pub(super) fn draft_stops(&self) -> Vec<DraftStop> {
+        let agent = self.draft_target();
+        let chips = self.draft_chip_stops(agent);
+        let mut visible: Vec<_> = chips.iter().take(self.home.tray_shown).cloned().collect();
+        if visible.len() < chips.len() {
+            visible.push(DraftStop::More);
+        }
+        visible.push(DraftStop::Attach);
+        if self
+            .draft(agent)
+            .settings_edited(&self.state, self.draft_slug(agent))
+        {
+            visible.push(DraftStop::Edited);
+        }
+        visible
+    }
+
+    fn fit_draft_stops(&mut self, shown: usize, cx: &mut Context<Self>) {
+        self.home.tray_shown = shown;
+        let visible = self.draft_stops();
+        if self
+            .home
+            .tray_stop
+            .as_ref()
+            .is_some_and(|stop| !visible.contains(stop))
+        {
+            self.home.tray_stop = if self
+                .draft_chip_stops(self.draft_target())
+                .iter()
+                .any(|stop| Some(stop) == self.home.tray_stop.as_ref())
+            {
+                Some(DraftStop::More)
+            } else {
+                visible.first().cloned()
+            };
+        }
+        cx.notify();
+    }
+
+    fn open_draft_stop(&mut self, stop: &DraftStop, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.draft(self.draft_target());
+        match stop {
+            DraftStop::Agent => self.pick_home_agent(window, cx),
+            DraftStop::Repo(name) => {
+                if let Some(i) = draft.repos.iter().position(|r| &r.repo.name == name) {
+                    self.draft_repo_menu(i, window, cx);
+                }
+            }
+            DraftStop::Issue(org, id) => {
+                if let Some(i) = draft
+                    .issues
+                    .iter()
+                    .position(|r| &r.org == org && &r.id == id)
+                {
+                    self.draft_issue_menu(i, window, cx);
+                }
+            }
+            DraftStop::File(path) => {
+                if let Some(i) = draft.files.iter().position(|p| p == path) {
+                    self.draft_file_menu(i, window, cx);
+                }
+            }
+            DraftStop::Attach => self.draft_add_menu(window, cx),
+            DraftStop::Edited => self.draft_edited_menu(window, cx),
+            DraftStop::More => self.draft_overflow_menu(window, cx),
+        }
+    }
+
+    fn draft_overflow_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.draft(self.draft_target());
+        let entries = self
+            .draft_chip_stops(self.draft_target())
+            .into_iter()
+            .skip(self.home.tray_shown)
+            .filter_map(|stop| {
+                let (icon, label) = match &stop {
+                    DraftStop::Agent => (
+                        IconName::AtSign,
+                        self.draft_slug(false)
+                            .and_then(|slug| self.agent(slug))
+                            .map_or("Agent", |a| a.name.as_str())
+                            .to_string(),
+                    ),
+                    DraftStop::Repo(name) => (IconName::FolderGit2, name.clone()),
+                    DraftStop::Issue(org, id) => (
+                        IconName::Tag,
+                        draft
+                            .issues
+                            .iter()
+                            .find(|i| &i.org == org && &i.id == id)?
+                            .identifier
+                            .clone(),
+                    ),
+                    DraftStop::File(path) => (
+                        IconName::File,
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    _ => return None,
+                };
+                Some(menu::item(
+                    icon,
+                    label,
+                    on_shark(cx, move |s, w, cx| {
+                        let bounds = s.draft_anchors.borrow().get("draft-more").copied();
+                        if let Some(bounds) = bounds {
+                            s.draft_anchors.borrow_mut().insert(stop.anchor(), bounds);
+                        }
+                        s.open_draft_stop(&stop, w, cx);
+                    }),
+                ))
+            })
+            .collect();
+        self.show_menu(
+            self.draft_control_position("draft-more", window),
+            entries,
+            window,
+            cx,
+        );
+    }
+
+    fn remove_draft_stop(&mut self, stop: &DraftStop, window: &mut Window, cx: &mut Context<Self>) {
+        let agent = self.draft_target();
+        if self.draft(agent).starting {
+            return;
+        }
+        if matches!(stop, DraftStop::Agent) {
+            self.set_home_agent(None, window, cx);
+            return;
+        }
+        let draft = self.draft_mut(agent);
+        match stop {
+            DraftStop::Repo(name) => {
+                draft.repos.retain(|r| &r.repo.name != name);
+                draft.repos_edited = true;
+            }
+            DraftStop::Issue(org, id) => draft.issues.retain(|i| &i.org != org || &i.id != id),
+            DraftStop::File(path) => {
+                draft.files.retain(|p| p != path);
+                super::task_draft::discard_staged_files(std::slice::from_ref(path));
+            }
+            _ => return,
+        }
+        self.refresh_draft_sources(agent, cx);
+        self.fit_draft_stops(self.home.tray_shown, cx);
+        if self.draft_chip_stops(agent).is_empty() {
+            self.focus_draft(agent, window, cx);
+        }
     }
 
     fn draft_tray_key(
@@ -821,75 +1208,26 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let agent = self.draft_target();
-        let draft = self.draft(agent);
-        if draft.starting {
+        if !self.home.tray_focus.is_focused(window)
+            || self.draft(self.draft_target()).starting
+            || (!self.draft_target() && self.home.asking)
+        {
             return;
         }
-        let (issues, repos, files) = (draft.issues.len(), draft.repos.len(), draft.files.len());
-        let empty = usize::from(repos == 0);
-        let add = issues + repos * 2 + files + empty;
-        let edited = draft.settings_edited(&self.state, self.draft_slug(agent));
-        let count = add + 1 + if edited { 2 } else { 0 };
-        let index = self.home.tray_index.min(count - 1);
+        self.fit_draft_stops(self.home.tray_shown, cx);
+        let stops = self.draft_stops();
+        let index = self
+            .home
+            .tray_stop
+            .as_ref()
+            .and_then(|s| stops.iter().position(|stop| stop == s))
+            .unwrap_or(0);
         match event.keystroke.key.as_str() {
-            "left" => self.home.tray_index = index.saturating_sub(1),
-            "right" => self.home.tray_index = (index + 1).min(count - 1),
-            "backspace" | "delete" if index < add - empty => {
-                let draft = self.draft_mut(agent);
-                if index < issues {
-                    draft.issues.remove(index);
-                } else if index < issues + repos * 2 {
-                    draft.repos.remove((index - issues) / 2);
-                    draft.repos_edited = true;
-                } else {
-                    let removed = draft.files.remove(index - issues - repos * 2);
-                    super::task_draft::discard_staged_files(&[removed]);
-                }
-                self.home.tray_index = index.min(count.saturating_sub(2));
-                self.refresh_draft_sources(agent, cx);
-                if self.draft(agent).issues.len()
-                    + self.draft(agent).repos.len()
-                    + self.draft(agent).files.len()
-                    == 0
-                {
-                    self.focus_draft(agent, window, cx);
-                }
-            }
-            "enter" | "space" => {
-                if index < issues {
-                    let issue = &draft.issues[index];
-                    let url = issue.url.clone();
-                    let entries = vec![
-                        menu::item(
-                            None,
-                            format!("{} · {}", issue.identifier, issue.title),
-                            move |_, cx| cx.open_url(&url),
-                        ),
-                        menu::item(None, issue.status.clone(), |_, _| {}),
-                    ];
-                    self.show_menu(window.mouse_position(), entries, window, cx);
-                } else if index < issues + repos * 2 {
-                    let repo = (index - issues) / 2;
-                    if (index - issues) % 2 == 0 {
-                        self.draft_repo_menu(repo, window, cx);
-                    } else {
-                        let name = draft.repos[repo].repo.name.clone();
-                        self.pick_draft_branch(Some((name, false)), window, cx);
-                    }
-                } else if index < issues + repos * 2 + files {
-                    self.draft_file_menu(index - issues - repos * 2, window, cx);
-                } else if empty == 1 && index == add - 1 {
-                    self.draft_repository_menu(window, cx);
-                } else if index == add {
-                    self.draft_add_menu(window, cx);
-                } else if index == add + 1 {
-                    self.reset_draft_defaults(window, cx);
-                } else if index == add + 2 {
-                    self.save_draft_defaults(window, cx);
-                }
-            }
-            "escape" | "down" | "tab" => self.focus_draft(agent, window, cx),
+            "left" => self.home.tray_stop = stops.get(index.saturating_sub(1)).cloned(),
+            "right" => self.home.tray_stop = stops.get((index + 1).min(stops.len() - 1)).cloned(),
+            "backspace" | "delete" => self.remove_draft_stop(&stops[index], window, cx),
+            "enter" | "space" => self.open_draft_stop(&stops[index], window, cx),
+            "escape" | "down" | "tab" => self.focus_draft(self.draft_target(), window, cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -902,6 +1240,26 @@ impl Shark {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Chip identities can change without changing any measured widths.
+        if self.home.tray_focus.is_focused(window)
+            && self
+                .home
+                .tray_stop
+                .as_ref()
+                .is_some_and(|stop| !self.draft_stops().contains(stop))
+        {
+            let target = cx.entity().downgrade();
+            let destination = self.home.destination.clone();
+            cx.defer(move |cx| {
+                target
+                    .update(cx, |s, cx| {
+                        if s.home.destination == destination {
+                            s.fit_draft_stops(s.home.tray_shown, cx);
+                        }
+                    })
+                    .ok();
+            });
+        }
         let theme = cx.theme();
         let draft = self.draft(agent);
         let asking = !agent && self.home.asking;
@@ -916,28 +1274,100 @@ impl Shark {
             self.home.composer.clone()
         };
         let focused = input.read(cx).focus_handle(cx).is_focused(window);
-        let mut pills: Vec<AnyElement> = vec![];
+        let empty = input.read(cx).value().is_empty();
         let default_agent = self.draft_slug(agent).and_then(|slug| self.agent(slug));
         let edited = draft.settings_edited(&self.state, self.draft_slug(agent));
-        let tray_focused = self.home.tray_focus.is_focused(window);
-        let tray_index = self.home.tray_index;
-        let add_index = draft.issues.len()
-            + draft.repos.len() * 2
-            + draft.files.len()
-            + usize::from(draft.repos.is_empty());
+        let selected = |stop: &DraftStop| {
+            self.home.tray_focus.is_focused(window) && self.home.tray_stop.as_ref() == Some(stop)
+        };
+        let quiet = self.menu.is_some() || self.draft_picker.is_some();
+        let mut chips = Vec::new();
+        let mut first_chip = None;
+        if !agent && !asking {
+            let picked = self.draft_slug(false).and_then(|slug| self.agent(slug));
+            let label = picked.map_or("Agent", |a| a.name.as_str()).to_string();
+            first_chip = Some((IconName::AtSign, label.clone()));
+            let button = match picked {
+                Some(a) => Button::new("home-agent-picker")
+                    .ghost()
+                    .flex_none()
+                    .h(px(26.))
+                    .min_w(px(26.))
+                    .rounded(px(13.))
+                    .px(px(9.))
+                    .max_w(px(200.))
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(super::agent_icon_view::agent_icon(&a.icon))
+                            .child(div().min_w_0().truncate().child(label.clone())),
+                    ),
+                None => draft_chip("home-agent-picker", IconName::AtSign, label.clone())
+                    .text_color(theme.muted_foreground),
+            };
+            let button = button
+                .accessibility_label(label)
+                .tooltip("Pick an agent, or type @")
+                .disabled(draft.starting)
+                .selected(selected(&DraftStop::Agent))
+                .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx)));
+            chips.push(self.anchor_draft_control(
+                DraftStop::Agent.anchor(),
+                crate::ui::toolbar("home-agent-picker", button),
+            ));
+        }
         if !asking {
+            for (i, repo) in draft.repos.iter().enumerate() {
+                let stop = DraftStop::Repo(repo.repo.name.clone());
+                let changed = default_agent.is_some_and(|a| !a.repos.contains(&repo.repo.name));
+                let label = self.draft_repo_label(repo, changed);
+                first_chip.get_or_insert((IconName::FolderGit2, label.clone()));
+                let branch = self.draft_branch_label(repo);
+                let base = match &repo.branch {
+                    BranchSpec::New { base } if !base.is_empty() => base.clone(),
+                    BranchSpec::Pr(pr) => pr.base.clone(),
+                    _ => self
+                        .draft_bases
+                        .get(&repo.repo.path)
+                        .cloned()
+                        .unwrap_or_else(|| "Default branch".into()),
+                };
+                let card = super::attach::ChipCard {
+                    mark: Icon::new(IconName::FolderGit2),
+                    title: repo.repo.name.clone(),
+                    rows: vec![
+                        ("Repository", repo.repo.path.display().to_string()),
+                        ("Branch", branch.clone()),
+                        ("Base", base),
+                    ],
+                };
+                let action = stop.clone();
+                let button = draft_chip(("draft-repo", i), IconName::FolderGit2, label)
+                    .accessibility_label(format!(
+                        "{} · {branch}{}",
+                        repo.repo.name,
+                        if changed {
+                            ", changed from agent default"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .disabled(draft.starting)
+                    .selected(selected(&stop))
+                    .on_click(cx.listener(move |s, _, w, cx| s.open_draft_stop(&action, w, cx)));
+                chips.push(card.around(
+                    &format!("draft-repo-{i}"),
+                    self.anchor_draft_control(
+                        stop.anchor(),
+                        crate::ui::toolbar(("draft-repo", i), button),
+                    ),
+                    quiet,
+                ));
+            }
             for (i, issue) in draft.issues.iter().enumerate() {
+                let stop = DraftStop::Issue(issue.org.clone(), issue.id.clone());
+                first_chip.get_or_insert((IconName::Tag, issue.identifier.clone()));
                 let disconnected = self.linear_org_id() != Some(issue.org.as_str());
-                let label = format!(
-                    "{} {}{}",
-                    issue.identifier,
-                    issue.title,
-                    if disconnected {
-                        " · Linear disconnected"
-                    } else {
-                        ""
-                    }
-                );
                 let mut rows = vec![
                     ("Issue", issue.identifier.clone()),
                     ("Status", issue.status.clone()),
@@ -951,250 +1381,103 @@ impl Shark {
                 if disconnected {
                     rows.push(("Linear", "Disconnected".into()));
                 }
+                let icon = super::linear_issues::status_icon(&issue.state_type, theme)
+                    .text_color(theme.muted_foreground);
                 let card = super::attach::ChipCard {
-                    mark: Icon::new(IconName::Tag),
+                    mark: icon.clone(),
                     title: issue.title.clone(),
                     rows,
                 };
-                pills.push(
-                    h_flex()
-                        .gap_1()
-                        .max_w(px(400.))
-                        .child(
-                            card.around(
-                                &format!("draft-issue-{i}"),
-                                Button::new(("draft-issue", i))
-                                    .xsmall()
-                                    .ghost()
-                                    .icon(IconName::Tag)
-                                    .label(label)
-                                    .disabled(draft.starting),
-                                self.menu.is_some(),
-                            ),
-                        )
-                        .child(
-                            Button::new(("remove-draft-issue", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::X)
-                                .accessibility_label("Remove issue from this task")
-                                .disabled(draft.starting)
-                                .on_click(cx.listener(move |s, _, w, cx| {
-                                    s.draft_mut(agent).issues.remove(i);
-                                    s.focus_draft(agent, w, cx);
-                                })),
-                        )
-                        .into_any_element(),
-                );
-            }
-            for (i, repo) in draft.repos.iter().enumerate() {
-                let branch = match &repo.branch {
-                    BranchSpec::New { base } => format!(
-                        "New branch from {}",
-                        if base.is_empty() {
-                            self.draft_bases
-                                .get(&repo.repo.path)
-                                .map(String::as_str)
-                                .unwrap_or("default branch")
+                let action = stop.clone();
+                let button = draft_chip(("draft-issue", i), icon, issue.identifier.clone())
+                    .accessibility_label(format!(
+                        "{} · {}{}",
+                        issue.identifier,
+                        issue.title,
+                        if disconnected {
+                            " · Linear disconnected"
                         } else {
-                            base
+                            ""
                         }
+                    ))
+                    .disabled(draft.starting)
+                    .selected(selected(&stop))
+                    .on_click(cx.listener(move |s, _, w, cx| s.open_draft_stop(&action, w, cx)));
+                chips.push(card.around(
+                    &format!("draft-issue-{i}"),
+                    self.anchor_draft_control(
+                        stop.anchor(),
+                        crate::ui::toolbar(("draft-issue", i), button),
                     ),
-                    BranchSpec::Existing(b) => b.clone(),
-                    BranchSpec::Pr(pr) => repo
-                        .pr_label
-                        .clone()
-                        .unwrap_or_else(|| format!("Pull request #{}", pr.number)),
-                };
-                let changed = default_agent.is_some_and(|a| !a.repos.contains(&repo.repo.name));
-                let stop = draft.issues.len() + i * 2;
-                let name = repo.repo.name.clone();
-                let tooltip = format!(
-                    "{}, {}{} · Branch or pull request (⌘⇧B)",
-                    name,
-                    branch,
-                    if changed {
-                        ", changed from agent default"
-                    } else {
-                        ""
-                    }
-                );
-                pills.push(
-                    h_flex()
-                        .child(
-                            Button::new(("draft-repo", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::FolderGit2)
-                                .label(format!(
-                                    "{}{}",
-                                    if changed { "● " } else { "" },
-                                    repo.repo.name
-                                ))
-                                .accessibility_label(format!(
-                                    "{}{}",
-                                    repo.repo.name,
-                                    if changed {
-                                        ", changed from agent default"
-                                    } else {
-                                        ""
-                                    }
-                                ))
-                                .tooltip("Switch or remove repository (⌘I)")
-                                .when(tray_focused && tray_index == stop, |b| {
-                                    b.bg(theme.list_hover)
-                                })
-                                .disabled(draft.starting)
-                                .on_click(
-                                    cx.listener(move |s, _, w, cx| s.draft_repo_menu(i, w, cx)),
-                                ),
-                        )
-                        .child(div().h(px(16.)).border_l_1().border_color(theme.border))
-                        .child(
-                            Button::new(("draft-branch", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(if matches!(repo.branch, BranchSpec::Pr(_)) {
-                                    IconName::GitPullRequest
-                                } else {
-                                    IconName::GitBranch
-                                })
-                                .label(branch)
-                                .accessibility_label(tooltip.clone())
-                                .tooltip(tooltip)
-                                .when(tray_focused && tray_index == stop + 1, |b| {
-                                    b.bg(theme.list_hover)
-                                })
-                                .disabled(draft.starting)
-                                .on_click(cx.listener(move |s, _, w, cx| {
-                                    s.pick_draft_branch(Some((name.clone(), false)), w, cx)
-                                }))
-                                .map(|b| {
-                                    self.anchor_draft_control(
-                                        format!("branch-{}", repo.repo.name),
-                                        b,
-                                    )
-                                }),
-                        )
-                        .child(
-                            Button::new(("remove-draft-repo", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::X)
-                                .accessibility_label("Remove repository from this task")
-                                .disabled(draft.starting)
-                                .on_click(cx.listener(move |s, _, w, cx| {
-                                    s.draft_mut(agent).repos.remove(i);
-                                    s.draft_mut(agent).repos_edited = true;
-                                    s.focus_draft(agent, w, cx);
-                                })),
-                        )
-                        .into_any_element(),
-                );
+                    quiet,
+                ));
             }
             for (i, path) in draft.files.iter().enumerate() {
-                pills.push(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new(("draft-file", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::File)
-                                .label(
-                                    path.file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                )
-                                .tooltip("Open file (Enter or Space)")
-                                .disabled(draft.starting)
-                                .on_click(
-                                    cx.listener(move |s, _, w, cx| s.draft_file_menu(i, w, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new(("remove-draft-file", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::X)
-                                .accessibility_label("Remove file from this task")
-                                .disabled(draft.starting)
-                                .on_click(cx.listener(move |s, _, w, cx| {
-                                    let removed = s.draft_mut(agent).files.remove(i);
-                                    super::task_draft::discard_staged_files(&[removed]);
-                                    s.focus_draft(agent, w, cx);
-                                })),
-                        )
-                        .into_any_element(),
-                );
+                let stop = DraftStop::File(path.clone());
+                let label = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                first_chip.get_or_insert((IconName::File, label.clone()));
+                let action = stop.clone();
+                let button = draft_chip(("draft-file", i), IconName::File, label)
+                    .tooltip(path.display().to_string())
+                    .disabled(draft.starting)
+                    .selected(selected(&stop))
+                    .on_click(cx.listener(move |s, _, w, cx| s.open_draft_stop(&action, w, cx)));
+                chips.push(self.anchor_draft_control(
+                    stop.anchor(),
+                    crate::ui::toolbar(("draft-file", i), button),
+                ));
             }
         }
-        let mut footer = h_flex().gap_2().flex_wrap();
-        if !agent && !asking {
-            let selected = self.draft_slug(false).and_then(|slug| self.agent(slug));
-            footer = footer.child(
-                Button::new("home-agent-picker")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::AtSign)
-                    .label(selected.map_or_else(|| "No agent".into(), |a| a.name.clone()))
-                    .disabled(draft.starting)
-                    .tooltip("Pick an agent, or type @")
-                    .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
-            );
-        }
-        if !asking {
-            let (model, effort) = draft.defaults(&self.state, self.draft_slug(agent));
-            let overridden = default_agent
-                .is_some_and(|a| draft.saved_settings(a) != (a.model.clone(), a.effort.clone()));
-            let source = self.draft_settings_source(agent);
-            let label = format!(
-                "{}{} · {}",
-                if overridden { "● " } else { "" },
-                model_label(&model),
-                effort_label(effort.as_deref().unwrap_or(crate::models::EFFORT))
-            );
-            footer = footer
-                .child(
-                    Button::new("draft-model")
-                        .xsmall()
-                        .label(label.clone())
-                        .disabled(draft.starting)
-                        .accessibility_label(format!(
-                            "{label}, {source}{}",
-                            if overridden {
-                                ", changed from agent default"
-                            } else {
-                                ""
-                            }
-                        ))
-                        .tooltip(format!("{source} · Model and thinking for this task (⌘/)"))
-                        .on_click(cx.listener(|s, _, w, cx| s.draft_model_menu(w, cx))),
-                )
-                .child(
-                    Button::new("draft-plan")
-                        .xsmall()
-                        .ghost()
-                        .label(if draft.plan || draft.repos.is_empty() {
-                            "✓ Plan"
-                        } else {
-                            "Plan"
-                        })
-                        .disabled(draft.starting || draft.repos.is_empty())
-                        .tooltip(if draft.repos.is_empty() {
-                            "Tasks without a repository start in Plan mode."
-                        } else {
-                            "Plan before implementing (⇧Tab)"
-                        })
-                        .on_click(cx.listener(|s, _, _, cx| s.toggle_draft_plan(cx))),
-                );
-        }
-        footer = footer.child(div().flex_1()).child(
-            Button::new("draft-start")
-                .loading(draft.starting || draft.staging > 0)
+        let (model, effort) = draft.defaults(&self.state, self.draft_slug(agent));
+        let overridden = default_agent
+            .is_some_and(|a| draft.saved_settings(a) != (a.model.clone(), a.effort.clone()));
+        let short_model = format!(
+            "{}{}",
+            if overridden { "● " } else { "" },
+            model_label(&model)
+        );
+        let full_model = format!(
+            "{short_model} · {}",
+            effort_label(effort.as_deref().unwrap_or(crate::models::EFFORT))
+        );
+        let model_button = |id: &'static str, label: String| {
+            Button::new(id)
+                .flex_none()
+                .h(px(26.))
+                .rounded(px(13.))
+                .px(px(9.))
+                .dropdown_caret(true)
+                .label(label)
+        };
+        let plan_button = |id: &'static str| {
+            Button::new(id)
+                .xsmall()
+                .ghost()
+                .flex_none()
+                .h(px(26.))
+                .px(px(8.))
+                .label(if draft.repos.is_empty() {
+                    "Plan only"
+                } else {
+                    "Plan"
+                })
+                .when(draft.plan || draft.repos.is_empty(), |b| {
+                    b.icon(IconName::Check)
+                })
+        };
+        let start_button = |id: &'static str| {
+            Button::new(id)
                 .primary()
                 .small()
+                .loading(draft.starting || draft.staging > 0)
+                .flex_none()
+                .h(px(28.))
+                .rounded(px(14.))
+                .px(px(12.))
                 .label(if asking {
                     "Ask ↵"
                 } else if draft.staging > 0 {
@@ -1204,12 +1487,223 @@ impl Shark {
                 } else {
                     "Start ↵"
                 })
+        };
+        let edited_button = |id: &'static str| {
+            Button::new(id)
+                .ghost()
+                .flex_none()
+                .h(px(26.))
+                .rounded(px(13.))
+                .px(px(9.))
+                .label("● Edited")
+                .dropdown_caret(true)
+        };
+        let density = self.home.footer_density;
+        let mut footer = h_flex()
+            .id("draft-tray")
+            .test_support()
+            .relative()
+            .w_full()
+            .gap_1()
+            .track_focus(&self.home.tray_focus)
+            .on_key_down(cx.listener(|s, e, w, cx| s.draft_tray_key(e, w, cx)));
+        if !asking {
+            let disconnected = draft
+                .issues
+                .iter()
+                .filter(|i| self.linear_org_id() != Some(i.org.as_str()))
+                .count();
+            let indicator = (disconnected > 0).then(|| {
+                let tip = format!("{disconnected} disconnected Linear issues. Opens Settings.");
+                let button = Button::new("draft-disconnected")
+                    .h(px(26.))
+                    .min_w(px(26.))
+                    .rounded(px(13.))
+                    .icon(IconName::CircleDashed)
+                    .accessibility_label(tip.clone())
+                    .tooltip(tip)
+                    .on_click(
+                        cx.listener(|s, _, w, cx| crate::settings::open_linear(&s.state, w, cx)),
+                    );
+                crate::ui::toolbar("draft-disconnected", button).into_any_element()
+            });
+            let target = cx.entity().downgrade();
+            let add_target = target.clone();
+            let more_target = target.clone();
+            let destination = self.home.destination.clone();
+            let ids = self.draft_chip_stops(agent);
+            let count = ids.len();
+            let row = super::attach::AttachRow {
+                key: format!("draft-{:?}", destination).into(),
+                attach_id: "draft-add".into(),
+                more_id: "draft-more".into(),
+                height: px(26.),
+                chips,
+                failed: 0,
+                disconnected: indicator,
+                linear: true,
+                disabled: draft.starting,
+                attach_focused: selected(&DraftStop::Attach),
+                more_focused: selected(&DraftStop::More),
+                attach_tooltip: "Attach (⌘I)".into(),
+                on_attach: Rc::new(move |bounds, w, cx| {
+                    add_target
+                        .update(cx, |s, cx| {
+                            s.draft_anchors
+                                .borrow_mut()
+                                .insert("draft-add".into(), bounds);
+                            s.draft_add_menu(w, cx);
+                        })
+                        .ok();
+                }),
+                on_more: Rc::new(move |shown, bounds, w, cx| {
+                    more_target
+                        .update(cx, |s, cx| {
+                            s.home.tray_shown = shown;
+                            s.draft_anchors
+                                .borrow_mut()
+                                .insert("draft-more".into(), bounds);
+                            s.draft_overflow_menu(w, cx);
+                        })
+                        .ok();
+                }),
+                on_bounds: Some({
+                    let anchors = self.draft_anchors.clone();
+                    Rc::new(move |id, bounds, _| {
+                        anchors.borrow_mut().insert(id.to_string(), bounds);
+                    })
+                }),
+                on_fit: Some(Rc::new(move |shown, _, cx| {
+                    target
+                        .update(cx, |s, cx| {
+                            if s.home.destination == destination && s.draft_chip_stops(agent) == ids
+                            {
+                                s.fit_draft_stops(shown, cx);
+                            }
+                        })
+                        .ok();
+                })),
+            };
+            footer = footer.child(row);
+            if edited {
+                let button = edited_button("draft-edited")
+                    .disabled(draft.starting)
+                    .selected(selected(&DraftStop::Edited))
+                    .tooltip("Changes from agent defaults")
+                    .on_click(cx.listener(|s, _, w, cx| s.draft_edited_menu(w, cx)));
+                footer = footer.child(self.anchor_draft_control(
+                    "draft-edited".into(),
+                    crate::ui::toolbar("draft-edited", button),
+                ));
+            }
+            let source = self.draft_settings_source(agent);
+            footer = footer.child(div().flex_1().min_w_0()).child(
+                model_button(
+                    "draft-model",
+                    if density == 0 {
+                        full_model.clone()
+                    } else {
+                        short_model.clone()
+                    },
+                )
+                .when(density >= 2, |b| b.flex_shrink_1().min_w(px(48.)))
+                .disabled(draft.starting)
+                .accessibility_label(format!("{full_model}, {source}"))
+                .tooltip(format!("{source} · Model and thinking for this task (⌘/)"))
+                .on_click(cx.listener(|s, _, w, cx| s.draft_model_menu(w, cx))),
+            );
+            if density < 2 {
+                footer = footer.child(
+                    plan_button("draft-plan")
+                        .disabled(draft.starting || draft.repos.is_empty())
+                        .tooltip(self.draft_plan_tooltip(agent))
+                        .on_click(cx.listener(|s, _, _, cx| s.toggle_draft_plan(cx))),
+                );
+            }
+            // Measure canonical controls even when shortened, so resizing back cannot oscillate.
+            let target = cx.entity().downgrade();
+            let destination = self.home.destination.clone();
+            let attach_bounds = self.draft_anchors.clone();
+            let probe = h_flex()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w_full()
+                .invisible()
+                .gap_1()
+                .child(canvas(|_, _, _| {}, |_, _, _, _| {}).absolute().size_full())
+                .child(match first_chip {
+                    Some((icon, label)) => {
+                        draft_chip("draft-probe-first", icon, label).into_any_element()
+                    }
+                    None => div().w_0().into_any_element(),
+                })
+                .child(model_button("draft-probe-full", full_model))
+                .child(model_button("draft-probe-short", short_model))
+                .child(plan_button("draft-probe-plan"))
+                .child(start_button("draft-probe-start"))
+                .child(if edited {
+                    edited_button("draft-probe-edited").into_any_element()
+                } else {
+                    div().w_0().into_any_element()
+                })
+                .on_children_prepainted(move |b, _, cx| {
+                    if b.len() != 7 {
+                        return;
+                    }
+                    let left = if count == 0 {
+                        attach_bounds
+                            .borrow()
+                            .get("draft-add")
+                            .map_or(px(32.), |b| b.size.width)
+                            + px(4.)
+                    } else {
+                        px(32.)
+                            + b[1].size.width
+                            + px(4.)
+                            + if count > 1 { px(72.) } else { px(0.) }
+                            + if disconnected > 0 { px(36.) } else { px(0.) }
+                    };
+                    let fixed = left
+                        + b[5].size.width
+                        + b[6].size.width
+                        + px(if edited { 20. } else { 16. });
+                    let next = if fixed + b[2].size.width + b[4].size.width <= b[0].size.width {
+                        0
+                    } else if fixed + b[3].size.width + b[4].size.width <= b[0].size.width {
+                        1
+                    } else {
+                        2
+                    };
+                    if next != density {
+                        let target = target.clone();
+                        let destination = destination.clone();
+                        cx.defer(move |cx| {
+                            target
+                                .update(cx, |s, cx| {
+                                    if s.home.destination == destination
+                                        && s.home.footer_density != next
+                                    {
+                                        s.home.footer_density = next;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                        });
+                    }
+                });
+            footer = footer.child(probe);
+        } else {
+            footer = footer.child(div().flex_1());
+        }
+        footer = footer.child(
+            start_button("draft-start")
                 .disabled(draft.starting || draft.staging > 0)
                 .on_click(cx.listener(move |s, _, w, cx| {
                     if agent {
-                        s.submit_task_draft(w, cx);
+                        s.submit_task_draft(w, cx)
                     } else {
-                        s.submit_prompt(w, cx);
+                        s.submit_prompt(w, cx)
                     }
                 })),
         );
@@ -1252,7 +1746,9 @@ impl Shark {
                     .key_context("HomePrompt")
                     .on_action(cx.listener(|s, _: &PickModel, w, cx| s.draft_model_menu(w, cx)))
                     .on_action(cx.listener(|s, _: &AddToDraft, w, cx| s.draft_add_menu(w, cx)))
-                    .on_action(cx.listener(|s, _: &ChangeDraftBranch, w, cx| s.change_draft_branch(w, cx)))
+                    .on_action(
+                        cx.listener(|s, _: &ChangeDraftBranch, w, cx| s.change_draft_branch(w, cx)),
+                    )
                     .on_action(cx.listener(|s, _: &TogglePlanMode, _, cx| s.toggle_draft_plan(cx)))
                     .px_3()
                     .py_2()
@@ -1264,84 +1760,33 @@ impl Shark {
                     .text_size(px(14.))
                     .child(composer)
                     .children(suggestions)
-                    .when(!asking, |d| {
-                        d.child(
-                            h_flex()
-                                .id("draft-tray")
-                                .track_focus(&self.home.tray_focus)
-                                .on_key_down(cx.listener(|s, e, w, cx| s.draft_tray_key(e, w, cx)))
-                                .gap_2()
-                                .flex_wrap()
-                                .children(pills.into_iter().enumerate().map(|(i, pill)| {
-                                    let stop = if i < draft.issues.len() { i }
-                                        else if i < draft.issues.len() + draft.repos.len() { draft.issues.len() + (i - draft.issues.len()) * 2 }
-                                        else { i + draft.repos.len() };
-                                    div()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(
-                                            if self.home.tray_focus.is_focused(window)
-                                                && (self.home.tray_index == stop || (i >= draft.issues.len() && i < draft.issues.len() + draft.repos.len() && self.home.tray_index == stop + 1))
-                                            {
-                                                theme.primary
-                                            } else {
-                                                theme.border
-                                            },
-                                        )
-                                        .child(pill)
-                                }))
-                                .when(draft.repos.is_empty(), |row| row.child(
-                                    Button::new("draft-empty-repo").xsmall().ghost().icon(IconName::FolderGit2)
-                                        .label("Add repository").text_color(theme.muted_foreground)
-                                        .border_1().border_dashed().border_color(theme.border)
-                                        .when(tray_focused && tray_index == add_index - 1, |b| b.bg(theme.list_hover))
-                                        .tooltip("Add repository (⌘I)").disabled(draft.starting)
-                                        .on_click(cx.listener(|s, _, w, cx| s.draft_repository_menu(w, cx)))
-                                ))
-                                .child(Button::new("draft-add").xsmall().ghost().icon(IconName::Plus)
-                                    .when(draft.issues.is_empty() && draft.repos.is_empty() && draft.files.is_empty(), |b| b.label("Issue, PR or repository"))
-                                    .accessibility_label("Add issue, PR or repository")
-                                    .tooltip("Add issue, PR or repository (⌘I)").disabled(draft.starting)
-                                    .when(tray_focused && tray_index == add_index, |b| b.bg(theme.list_hover))
-                                    .on_click(cx.listener(|s, _, w, cx| s.draft_add_menu(w, cx)))
-                                    .map(|b| self.anchor_draft_control("draft-add".into(), b)))
-                                .when(draft.repos.is_empty(), |row| row.child(div().text_xs().text_color(theme.muted_foreground).child("Plans only without a repository")))
-                                .when(edited, |row| row.child(
-                                    h_flex().gap_1().child(div().text_xs().text_color(theme.muted_foreground).child("Edited"))
-                                        .child(Button::new("draft-reset").xsmall().ghost().label("Reset").disabled(draft.starting)
-                                            .when(tray_focused && tray_index == add_index + 1, |b| b.bg(theme.list_hover))
-                                            .on_click(cx.listener(|s, _, w, cx| s.reset_draft_defaults(w, cx))))
-                                        .child(Button::new("draft-save-default").xsmall().ghost().label("Save as default").disabled(draft.starting)
-                                            .tooltip(format!("Saves repositories, model and thinking for {}", default_agent.map_or("agent", |a| a.name.as_str())))
-                                            .when(tray_focused && tray_index == add_index + 2, |b| b.bg(theme.list_hover))
-                                            .on_click(cx.listener(|s, _, w, cx| s.save_draft_defaults(w, cx))))
-                                )),
-                        )
-                    })
                     .child(footer),
             )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(crate::ui::hint("shift-enter", "new line"))
-                    .when(!asking, |d| {
-                        d.child(crate::ui::hint(
-                            "@",
-                            if agent { "file" } else { "agent / file" },
-                        ))
-                        .child(crate::ui::hint("#", "issue or PR"))
-                        .child(crate::ui::hint("/", "skill"))
-                        .child(crate::ui::hint("cmd-i", "add"))
-                    })
-                    .when(!agent, |d| {
-                        d.child(crate::ui::hint(
-                            "tab",
-                            if asking { "new task" } else { "ask Shark" },
-                        ))
-                    }),
-            )
+            .when(focused && empty, |d| {
+                d.child(
+                    h_flex()
+                        .id("draft-hints")
+                        .test_support()
+                        .gap_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(crate::ui::hint("shift-enter", "new line"))
+                        .when(!asking, |d| {
+                            d.child(crate::ui::hint(
+                                "@",
+                                if agent { "file" } else { "agent / file" },
+                            ))
+                            .child(crate::ui::hint("#", "issue or PR"))
+                            .child(crate::ui::hint("/", "skill"))
+                        })
+                        .when(!agent, |d| {
+                            d.child(crate::ui::hint(
+                                "tab",
+                                if asking { "new task" } else { "ask Shark" },
+                            ))
+                        }),
+                )
+            })
             .into_any_element()
     }
 }

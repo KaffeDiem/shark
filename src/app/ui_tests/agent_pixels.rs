@@ -215,6 +215,27 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 p.set_value("Tighten the onboarding spacing", w, cx)
             });
         }),
+        ("draft-composer-narrow", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_draft.issues.push(draft_issue());
+            s.home.agent_draft.files = vec![
+                PathBuf::from("/tmp/design-review-notes.md"),
+                PathBuf::from("/tmp/long-composer-layout-reference.png"),
+            ];
+            s.home.agent_prompt.update(cx, |p, cx| {
+                p.set_value("Keep every attachment reachable in a narrow window", w, cx)
+            });
+        }),
+        ("draft-composer-narrow-edited", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_draft.model = Some("long-custom-model-name".into());
+            s.home.agent_draft.issues.push(draft_issue());
+        }),
+        ("draft-removed-default", |s, w, cx| {
+            s.prefill_agent_task("designer", w, cx);
+            s.home.agent_draft.repos.clear();
+            s.home.agent_draft.repos_edited = true;
+        }),
         ("draft-starting", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
             s.home.agent_prompt.update(cx, |p, cx| {
@@ -365,11 +386,18 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                                 point(px(0.), px(0.)),
                                 size(
-                                    px(if case == "task-agent-chip-narrow" {
-                                        800.
-                                    } else {
-                                        1280.
-                                    }),
+                                    px(
+                                        if matches!(
+                                            case,
+                                            "task-agent-chip-narrow"
+                                                | "draft-composer-narrow"
+                                                | "draft-composer-narrow-edited"
+                                        ) {
+                                            800.
+                                        } else {
+                                            1280.
+                                        },
+                                    ),
                                     px(800.),
                                 ),
                             ))),

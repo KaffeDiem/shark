@@ -24,7 +24,7 @@ const ROW_H: f32 = 25.;
 
 /// A Linear state's icon and color. `state.type`, so a custom state like "Merged" gets one too;
 /// an unknown type or a snapshot from before it was kept reads as unstarted.
-fn status_icon(kind: &str, theme: &Theme) -> Icon {
+pub(super) fn status_icon(kind: &str, theme: &Theme) -> Icon {
     let (icon, color) = match kind {
         "triage" => (IconName::Inbox, theme.warning_foreground),
         "backlog" => (IconName::CircleDashed, theme.muted_foreground),

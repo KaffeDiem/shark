@@ -36,6 +36,7 @@ pub(crate) enum Entry {
         hint: Option<SharedString>,
         entries: Vec<Entry>,
     },
+    Heading(SharedString, SharedString),
     Sep,
 }
 
@@ -197,13 +198,13 @@ pub(crate) struct Menu {
 
 impl EventEmitter<DismissEvent> for Menu {}
 
-/// Next row up or down from `from`, wrapping and skipping separators.
+/// Next actionable row up or down from `from`, wrapping.
 fn step(entries: &[Entry], from: Option<usize>, down: bool) -> Option<usize> {
     let n = entries.len();
     let mut ix = from.unwrap_or(if down { n.wrapping_sub(1) } else { 0 });
     for _ in 0..n {
         ix = if down { (ix + 1) % n } else { (ix + n - 1) % n };
-        if !matches!(entries[ix], Entry::Sep) {
+        if matches!(entries[ix], Entry::Item { .. } | Entry::Sub { .. }) {
             return Some(ix);
         }
     }
@@ -219,13 +220,19 @@ fn find(entries: &[Entry], typed: &str, from: usize) -> Option<usize> {
             Entry::Item { label, .. } | Entry::Sub { label, .. } => {
                 label.to_lowercase().starts_with(typed)
             }
-            Entry::Sep => false,
+            Entry::Sep | Entry::Heading(..) => false,
         })
 }
 
 impl Menu {
     /// Starts the highlight on `ix`, e.g. the current choice of a picker.
     pub(crate) fn select(&mut self, ix: usize) {
+        if !matches!(
+            self.entries.get(ix),
+            Some(Entry::Item { .. } | Entry::Sub { .. })
+        ) {
+            return;
+        }
         self.sel = Some(ix);
         self.scroll.scroll_to_item(ix);
     }
@@ -414,6 +421,30 @@ impl Menu {
         let (icons, controls) = columns(entries);
         let rows = entries.iter().enumerate().map(|(ix, e)| {
             let (icon, image, agent_icon, label, hint, checked, submenu) = match e {
+                Entry::Heading(title, detail) => {
+                    return v_flex()
+                        .id(ix)
+                        .test_support()
+                        .h(HEADING_H)
+                        .px(px(10.))
+                        .justify_center()
+                        .gap_1()
+                        .aria_label(format!("{title}. {detail}"))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(detail.clone()),
+                        )
+                        .into_any_element();
+                }
                 Entry::Sep => {
                     return div()
                         .h(px(1.))
@@ -710,6 +741,13 @@ fn panel_width(entries: &[Entry], window: &Window, cx: &App) -> Pixels {
     let mut preferred = px(0.);
     let mut longest_label = px(0.);
     for entry in entries {
+        if let Entry::Heading(title, detail) = entry {
+            preferred = preferred.max(
+                (text_width(title, window, cx.theme()).max(text_width(detail, window, cx.theme()))
+                    + px(32.))
+                .min(px(440.)),
+            );
+        }
         if let Entry::Item { label, hint, .. } | Entry::Sub { label, hint, .. } = entry {
             let label = text_width(label, window, cx.theme());
             // Keep the column gap even when metadata has yielded all of its width.
@@ -766,6 +804,7 @@ pub(crate) fn chrome(theme: &Theme) -> Div {
 
 /// Shared tap target height for action menus and composer completions.
 pub(crate) const ROW_H: Pixels = px(36.);
+const HEADING_H: Pixels = px(56.);
 
 /// The highlighted row uses a translucent fill, leaving the text colour unchanged.
 pub(crate) fn highlight(theme: &Theme) -> Hsla {
@@ -805,12 +844,10 @@ fn child_placement(
 fn panel_height(entries: &[Entry], back: bool, viewport: Pixels) -> Pixels {
     let rows = entries
         .iter()
-        .map(|e| {
-            if matches!(e, Entry::Sep) {
-                px(13.)
-            } else {
-                ROW_H
-            }
+        .map(|e| match e {
+            Entry::Sep => px(13.),
+            Entry::Heading(..) => HEADING_H,
+            _ => ROW_H,
         })
         .sum::<Pixels>();
     (rows + px(12.) + if back { ROW_H } else { px(0.) }).min((viewport - px(16.)).max(px(0.)))
@@ -1011,6 +1048,33 @@ mod tests {
         assert_eq!(step(&entries, Some(2), true), Some(0));
         assert_eq!(step(&entries, None, false), Some(2));
         assert_eq!(step(&[], None, true), None);
+    }
+
+    #[test]
+    fn heading_is_not_an_action_or_type_select_target() {
+        let entries = [
+            Entry::Heading("Reset defaults".into(), "Removed calor".into()),
+            item(None, "Reset", |_, _| {}),
+            Entry::Sep,
+            item(None, "Save", |_, _| {}),
+        ];
+        assert_eq!(step(&entries, None, true), Some(1));
+        assert_eq!(step(&entries, Some(3), true), Some(1));
+        assert_eq!(step(&entries, Some(1), false), Some(3));
+        assert_eq!(find(&entries, "reset", 0), Some(1));
+        assert_eq!(find(&entries, "removed", 0), None);
+        assert_eq!(
+            panel_height(&entries, false, px(1000.)),
+            HEADING_H + ROW_H * 2. + px(25.)
+        );
+        assert_eq!(
+            step(
+                &[Entry::Heading("Only heading".into(), "Details".into())],
+                None,
+                true
+            ),
+            None
+        );
     }
 
     #[test]

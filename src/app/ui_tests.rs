@@ -2698,6 +2698,7 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
                 .map(|e| match e {
                     Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
                     Entry::Sep => "-".into(),
+                    Entry::Heading(title, detail) => format!("{title}. {detail}"),
                 })
                 .collect::<Vec<_>>()
         })
@@ -3589,6 +3590,7 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
             .map(|e| match e {
                 Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
                 Entry::Sep => "-".into(),
+                Entry::Heading(title, detail) => format!("{title}. {detail}"),
             })
             .collect::<Vec<_>>()
     };

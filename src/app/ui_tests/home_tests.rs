@@ -831,7 +831,9 @@ async fn staged_files_stay_with_their_draft_and_block_early_start(cx: &mut TestA
     on_app(window, shark.clone())(cx, &|s, w, cx| s.enter_home(w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click(("remove-draft-file", 0usize), cx);
+        w.click(("draft-file", 0usize), cx);
+        w.render_frame(cx);
+        w.within("menu-parent").click(2usize, cx);
     })
     .unwrap();
     assert!(!staged.exists());
@@ -862,7 +864,8 @@ async fn draft_tray_keyboard_opens_branch_choices_and_removes_repo(cx: &mut Test
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
     press_in(window)(cx, &["up"]);
-    press_in(window)(cx, &["right", "enter"]);
+    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["down", "enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).draft_picker.is_some()
     })
@@ -990,4 +993,54 @@ fn ui_review_regression_claude_guards_are_inside_ui_lock() {
             );
         }
     }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_agent_chip_backspace_preserves_prompt_body_and_tokens(cx: &mut TestAppContext) {
+    use gpui_kit::component::input::{InlineToken, InputContent};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        let content = InputContent::new("@designer Keep notes.txt")
+            .with_token(15..24, InlineToken::new("notes.txt", "notes.txt"))
+            .unwrap();
+        s.home.prompt.update(cx, |prompt, cx| {
+            prompt.set_value(content, w, cx);
+            prompt.set_selected_range(0..0, cx);
+            prompt.focus(w, cx);
+        });
+    });
+    for _ in 0..4 {
+        cx.update_window(window, |_, w, cx| w.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.home.tray_stop = Some(super::super::draft_view::DraftStop::Agent);
+        s.home.tray_focus.focus(w, cx);
+    });
+    press_in(window)(cx, &["backspace"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        let content = s.home.prompt.read(cx).content();
+        assert_eq!(content.text().as_ref(), "Keep notes.txt");
+        assert_eq!(content.tokens().len(), 1);
+        assert_eq!(content.tokens()[0].range(), 5..14);
+        assert!(s.home.draft_agent.is_none());
+        assert!(s.state.tasks.is_empty());
+    });
 }

@@ -9,6 +9,7 @@ use crate::state::{AttachStage, Attachment};
 use crate::ui::{menu_dialog, open_grouped};
 use git::Found;
 use gpui_kit::base::HoverCard;
+use gpui_kit::component::{Disableable as _, Selectable as _};
 use std::cell::Cell;
 use std::time::Duration;
 
@@ -301,96 +302,131 @@ impl Fit {
     }
 }
 
-/// The header's chips and Attach. Lays every chip out, hiding what doesn't fit, so that what is
-/// measured doesn't depend on what is shown; `render_attachments` built them.
-// ponytail: `+N` sits by the last chip shown, so up to a chip's width stays empty before the
-// button; closing that means laying chips out by measured widths instead.
+/// Shared measured chip row. The caller owns what Attach and overflow open.
+// shortcut: overflow sits after the last whole chip, measure individual widths to fill the remaining gap.
 #[derive(IntoElement)]
-struct AttachRow {
-    name: String,
-    chips: Vec<AnyElement>,
-    /// The first this many chips are failures.
-    failed: usize,
-    /// Outside the chips: it says something about several, so it never goes under `+N`.
-    disconnected: Option<AnyElement>,
-    linear: bool,
-    shark: WeakEntity<Shark>,
+pub(super) struct AttachRow {
+    pub(super) key: SharedString,
+    pub(super) attach_id: SharedString,
+    pub(super) more_id: SharedString,
+    pub(super) height: Pixels,
+    pub(super) chips: Vec<AnyElement>,
+    /// The first this many chips are failures; overflow keeps their warning mark.
+    pub(super) failed: usize,
+    pub(super) disconnected: Option<AnyElement>,
+    /// Full Attach offers several kinds and shows a caret.
+    pub(super) linear: bool,
+    pub(super) disabled: bool,
+    pub(super) attach_focused: bool,
+    pub(super) more_focused: bool,
+    pub(super) attach_tooltip: SharedString,
+    pub(super) on_attach: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>,
+    pub(super) on_more: Rc<dyn Fn(usize, Bounds<Pixels>, &mut Window, &mut App)>,
+    pub(super) on_fit: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
+    pub(super) on_bounds: Option<Rc<dyn Fn(&str, Bounds<Pixels>, &mut App)>>,
 }
 
 impl RenderOnce for AttachRow {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let key = SharedString::from(format!("attach-fit-{}", self.name));
+        let key = SharedString::from(format!("attach-fit-{}", self.key));
         let fit = window.use_keyed_state(key, cx, |_, _| Fit::default());
+        let key = SharedString::from(format!("attach-reported-{}", self.key));
+        let reported = window.use_keyed_state(key, cx, |_, _| None::<(usize, Fit)>);
         let was = *fit.read(cx);
         let count = self.chips.len();
         let shown = count - was.hidden.min(count);
         let compact = was.tight.is_some();
-        let key = SharedString::from(format!("attach-at-{}", self.name));
+        let key = SharedString::from(format!("attach-at-{}", self.key));
         let at = window.use_keyed_state(key, cx, |_, _| Rc::<Cell<Bounds<Pixels>>>::default());
         let at = at.read(cx).clone();
+        let key = SharedString::from(format!("attach-more-at-{}", self.key));
+        let more_at = window.use_keyed_state(key, cx, |_, _| Rc::<Cell<Bounds<Pixels>>>::default());
+        let more_at = more_at.read(cx).clone();
+        let attach_id = self.attach_id.clone();
+        let more_id = self.more_id.clone();
+        let attach_bounds = self.on_bounds.clone();
+        let more_bounds = self.on_bounds.clone();
         let attach = {
-            let (shark, name, linear, at) = (
-                self.shark.clone(),
-                self.name.clone(),
-                self.linear,
-                at.clone(),
-            );
-            Button::new("header-attach")
+            let (on_attach, at) = (self.on_attach, at.clone());
+            Button::new(self.attach_id.clone())
                 .icon(IconName::Paperclip)
                 .ghost()
                 .xsmall()
-                .dropdown_caret(linear && !compact)
+                .h(self.height)
+                .min_w(self.height)
+                .rounded(self.height / 2.)
+                .disabled(self.disabled)
+                .selected(self.attach_focused)
+                .dropdown_caret(self.linear && !compact)
                 .accessibility_label("Attach")
-                .map(|b| match compact {
-                    true => b.tooltip("Attach"),
-                    false => b.label("Attach"),
-                })
-                .on_click(move |_, w, cx| {
-                    let name = name.clone();
-                    shark
-                        .update(cx, |s, cx| match linear {
-                            true => s.attach_menu(name, at.get(), w, cx),
-                            false => s.attach_repository(name, w, cx),
-                        })
-                        .ok();
-                })
-                .map(|b| crate::ui::toolbar("header-attach", b))
+                .tooltip(self.attach_tooltip)
+                .when(!compact, |b| b.label("Attach"))
+                .on_click(move |_, w, cx| on_attach(at.get(), w, cx))
+                .map(|b| crate::ui::toolbar(self.attach_id, b))
         };
         let more = (shown < count).then(|| {
-            let (shark, name) = (self.shark.clone(), self.name.clone());
             let icon = match shown < self.failed {
                 true => Standing::Failed.mark(cx.theme()),
                 false => Icon::new(IconName::Ellipsis),
             };
             let hidden = count - shown;
-            Shark::chip("attach-more", icon, format!("+{hidden}"))
+            let (on_more, click_at) = (self.on_more, more_at.clone());
+            let button = Shark::chip(self.more_id.clone(), icon, format!("+{hidden}"))
                 .w(MORE - px(4.))
+                .h(self.height)
+                .min_w(self.height)
+                .rounded(self.height / 2.)
                 .px(px(6.))
-                .absolute()
-                .left(was.more_at)
+                .disabled(self.disabled)
+                .selected(self.more_focused)
                 .cursor_pointer()
                 .accessibility_label(format!("Show {hidden} more"))
                 .tooltip(format!("Show {hidden} more"))
-                .on_click(move |_, w, cx| {
-                    let name = name.clone();
-                    shark
-                        .update(cx, |s, cx| s.attachment_list(name, shown, w, cx))
-                        .ok();
-                })
-                .map(|b| crate::ui::toolbar("attach-more", b))
-        });
-        h_flex()
-            .flex_shrink_1()
-            // Reserve the status indicator too, so it cannot squeeze out the overflow button.
-            .min_w(
-                (if count > 0 { MORE + px(36.) } else { px(32.) })
-                    + if self.disconnected.is_some() {
-                        px(36.)
-                    } else {
-                        px(0.)
+                .on_click(move |_, w, cx| on_more(shown, click_at.get(), w, cx))
+                .map(|b| crate::ui::toolbar(self.more_id, b));
+            div().absolute().left(was.more_at).child(button).child(
+                canvas(
+                    move |b, _, cx| {
+                        more_at.set(b);
+                        if let Some(on_bounds) = &more_bounds {
+                            on_bounds(&more_id, b, cx);
+                        }
                     },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+        });
+        let available = Rc::new(Cell::new(px(0.)));
+        let measure_available = available.clone();
+        h_flex()
+            .relative()
+            .flex_shrink_1()
+            .when(count == 0, |row| row.flex_shrink_0())
+            // Reserve the status indicator too, so it cannot squeeze out overflow.
+            .min_w(
+                (if count > 0 {
+                    MORE + self.height + px(4.)
+                } else {
+                    self.height
+                }) + if self.disconnected.is_some() {
+                    px(36.)
+                } else {
+                    px(0.)
+                },
             )
             .gap_1()
+            .child(
+                canvas(
+                    move |bounds, _, _| measure_available.set(bounds.size.width),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(
                 h_flex()
                     .relative()
@@ -398,7 +434,7 @@ impl RenderOnce for AttachRow {
                     .min_w_0()
                     .overflow_hidden()
                     .gap_1()
-                    // The first child, so the measuring below gets the row's own bounds.
+                    // First child gives the measuring callback the row's own bounds.
                     .child(canvas(|_, _, _| {}, |_, _, _, _| {}).absolute().size_full())
                     .children(self.chips.into_iter().enumerate().map(|(i, chip)| {
                         div()
@@ -419,16 +455,27 @@ impl RenderOnce for AttachRow {
                         let last = chips[..count - clipped].last();
                         let next = Fit {
                             more_at: last.map_or(px(0.), |c| c.right() - row.left() + px(4.)),
-                            ..was.next(clipped, count, window.viewport_size().width)
+                            ..was.next(clipped, count, available.get())
                         };
-                        if next != was {
-                            // Too late for this frame: the next one is drawn with it.
-                            let fit = fit.clone();
-                            cx.defer(move |cx| {
-                                fit.update(cx, |f, cx| {
-                                    *f = next;
-                                    cx.notify();
-                                })
+                        let changed = next != was;
+                        let report = (count, next);
+                        let notify = self.on_fit.is_some() && *reported.read(cx) != Some(report);
+                        if changed || notify {
+                            let (fit, reported, on_fit) =
+                                (fit.clone(), reported.clone(), self.on_fit.clone());
+                            window.defer(cx, move |window, cx| {
+                                if changed {
+                                    fit.update(cx, |f, cx| {
+                                        *f = next;
+                                        cx.notify();
+                                    });
+                                }
+                                if notify {
+                                    reported.update(cx, |r, _| *r = Some(report));
+                                    if let Some(on_fit) = on_fit {
+                                        on_fit(count - next.hidden.min(count), window, cx);
+                                    }
+                                }
                             });
                         }
                     }),
@@ -436,11 +483,19 @@ impl RenderOnce for AttachRow {
             .children(self.disconnected)
             .child(
                 div().relative().flex_none().child(attach).child(
-                    canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full(),
+                    canvas(
+                        move |b, _, cx| {
+                            at.set(b);
+                            if let Some(on_bounds) = &attach_bounds {
+                                on_bounds(&attach_id, b, cx);
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
                 ),
             )
     }
@@ -1637,14 +1692,179 @@ impl Shark {
             })
             .collect();
         chips.extend(self.issue_chips(ws, quiet, cx));
+        let attach_target = cx.entity().downgrade();
+        let overflow_target = attach_target.clone();
+        let attach_name = name.clone();
+        let linear = self.linear_in_use();
         AttachRow {
-            name,
+            key: name.clone().into(),
+            attach_id: "header-attach".into(),
+            more_id: "attach-more".into(),
+            height: px(32.),
             chips,
             failed,
             disconnected: self.disconnected_chip(ws, cx),
-            linear: self.linear_in_use(),
-            shark: cx.entity().downgrade(),
+            linear,
+            disabled: false,
+            attach_focused: false,
+            more_focused: false,
+            attach_tooltip: "Attach".into(),
+            on_attach: Rc::new(move |bounds, w, cx| {
+                attach_target
+                    .update(cx, |s, cx| {
+                        if linear {
+                            s.attach_menu(attach_name.clone(), bounds, w, cx);
+                        } else {
+                            s.attach_repository(attach_name.clone(), w, cx);
+                        }
+                    })
+                    .ok();
+            }),
+            on_more: Rc::new(move |shown, _, w, cx| {
+                overflow_target
+                    .update(cx, |s, cx| s.attachment_list(name.clone(), shown, w, cx))
+                    .ok();
+            }),
+            on_fit: None,
+            on_bounds: None,
         }
         .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod row_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt;
+
+    struct Fixture {
+        width: Pixels,
+        count: usize,
+        seen: Rc<RefCell<Vec<usize>>>,
+        overflow: Rc<Cell<Option<(usize, Bounds<Pixels>)>>>,
+    }
+
+    impl Render for Fixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (seen, overflow) = (self.seen.clone(), self.overflow.clone());
+            div().w(self.width).child(AttachRow {
+                key: "row-fixture".into(),
+                attach_id: "row-attach".into(),
+                more_id: "row-more".into(),
+                height: px(26.),
+                chips: (0..self.count)
+                    .map(|_| div().w(px(100.)).h(px(26.)).into_any_element())
+                    .collect(),
+                failed: 0,
+                disconnected: None,
+                linear: true,
+                disabled: false,
+                attach_focused: false,
+                more_focused: true,
+                attach_tooltip: "Attach (cmd-i)".into(),
+                on_attach: Rc::new(|_, _, _| {}),
+                on_more: Rc::new(move |shown, bounds, _, _| overflow.set(Some((shown, bounds)))),
+                on_fit: Some(Rc::new(move |shown, _, _| seen.borrow_mut().push(shown))),
+                on_bounds: None,
+            })
+        }
+    }
+
+    /// The draft-sized row uses the same measurement and callback contract as the header.
+    #[gpui_kit::test]
+    fn shared_row_reports_settled_fit_and_preserves_overflow_geometry(cx: &mut TestAppContext) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let overflow = Rc::new(Cell::new(None));
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|_| Fixture {
+                    width: px(240.),
+                    count: 8,
+                    seen: seen.clone(),
+                    overflow: overflow.clone(),
+                })
+            })
+            .unwrap()
+        });
+        let window: AnyWindowHandle = window.into();
+        for _ in 0..8 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let shown = *seen
+            .borrow()
+            .last()
+            .expect("first measured fit is reported");
+        assert!(shown < 8);
+        let callbacks = seen.borrow().len();
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            seen.borrow().len(),
+            callbacks,
+            "unchanged layout does not report again"
+        );
+        cx.update_window(window, |_, w, cx| {
+            assert_eq!(w.find("row-attach").bounds().size.height, px(26.));
+            let bounds = w.find("row-more").bounds();
+            assert_eq!(bounds.size.height, px(26.));
+            w.click("row-more", cx);
+            assert_eq!(overflow.get(), Some((shown, bounds)));
+            view.update(cx, |v, cx| {
+                v.width = px(1000.);
+                cx.notify();
+            });
+        })
+        .unwrap();
+        for _ in 0..8 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            seen.borrow().last().copied(),
+            Some(8),
+            "allocated row width restores the full layout"
+        );
+        cx.update_window(window, |_, w, _| assert!(w.try_find("row-more").is_none()))
+            .unwrap();
+        view.update(cx, |v, cx| {
+            v.count = 2;
+            v.width = px(240.);
+            cx.notify();
+        });
+        for _ in 0..8 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let compact_width = cx
+            .update_window(window, |_, w, _| w.find("row-attach").bounds().size.width)
+            .unwrap();
+        view.update(cx, |v, cx| {
+            v.width = px(1000.);
+            cx.notify();
+        });
+        for _ in 0..8 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.update_window(window, |_, w, _| {
+            assert!(
+                w.find("row-attach").bounds().size.width > compact_width,
+                "Attach's label returns when all compact chips already fit before widening"
+            )
+        })
+        .unwrap();
     }
 }
