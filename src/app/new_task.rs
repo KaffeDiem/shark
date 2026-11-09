@@ -480,7 +480,11 @@ impl NewTaskForm {
                     return;
                 };
                 // A base needn't be on GitHub, a parent to stack on must.
-                if !b.origin && self.attach.is_none() && !matches!(self.mode, Mode::Bases(_)) {
+                if !b.origin
+                    && !self.anchored
+                    && self.attach.is_none()
+                    && !matches!(self.mode, Mode::Bases(_))
+                {
                     let msg = format!("`{}` isn't on GitHub yet; push it first", b.name);
                     return notify_err(window, cx, msg);
                 }

@@ -13,8 +13,35 @@ pub(super) struct ReferenceCompletion {
     hits: Vec<Hit>,
     searched: HashSet<String>,
     generation: u64,
+    sends: Vec<u64>,
+    retry_at: u64,
     next_paste: u64,
     pastes: Vec<PastedReference>,
+}
+
+impl ReferenceCompletion {
+    fn allow_search(&mut self, now: u64) -> bool {
+        self.sends.retain(|sent| now.saturating_sub(*sent) < 60);
+        if now < self.retry_at || self.sends.len() >= 25 {
+            return false;
+        }
+        self.sends.push(now);
+        true
+    }
+
+    fn search_failed(&mut self, error: &linear::Error, now: u64) {
+        self.retry_at = self.retry_at.max(match error {
+            linear::Error::RateLimited { retry_at } => *retry_at,
+            _ => now.saturating_add(5),
+        });
+    }
+}
+
+fn search_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 struct PastedReference {
@@ -60,6 +87,8 @@ impl Shark {
             self.reference_completion.epoch = epoch;
             self.reference_completion.hits.clear();
             self.reference_completion.searched.clear();
+            self.reference_completion.sends.clear();
+            self.reference_completion.retry_at = 0;
             self.reference_completion.generation += 1;
         }
         let hits = self.reference_hits();
@@ -98,6 +127,9 @@ impl Shark {
                 .update(cx, |s, cx| {
                     if s.reference_completion.generation != generation
                         || s.linear_connection_epoch() != epoch
+                        || !s.linear_in_use()
+                        || s.linear_needs_attention().is_some()
+                        || !s.reference_completion.allow_search(search_now())
                     {
                         return None;
                     }
@@ -127,6 +159,9 @@ impl Shark {
             this.update(cx, |s, cx| {
                 if s.linear_connection_epoch() != epoch {
                     return;
+                }
+                if let Err(error) = &result {
+                    s.reference_completion.search_failed(error, search_now());
                 }
                 if let Ok(hits) = result {
                     s.reference_completion.searched.insert(cache_key);
@@ -641,5 +676,31 @@ impl Shark {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReferenceCompletion, linear};
+
+    #[test]
+    fn reference_search_budget_is_rolling_and_shared_between_queries() {
+        let mut completion = ReferenceCompletion::default();
+        for _ in 0..25 {
+            assert!(completion.allow_search(100));
+        }
+        assert!(!completion.allow_search(159));
+        assert!(completion.allow_search(160));
+    }
+
+    #[test]
+    fn reference_search_respects_server_and_transient_backoff() {
+        let mut completion = ReferenceCompletion::default();
+        completion.search_failed(&linear::Error::RateLimited { retry_at: 200 }, 100);
+        assert!(!completion.allow_search(199));
+        assert!(completion.allow_search(200));
+        completion.search_failed(&linear::Error::Http(503), 200);
+        assert!(!completion.allow_search(204));
+        assert!(completion.allow_search(205));
     }
 }

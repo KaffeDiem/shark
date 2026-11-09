@@ -317,6 +317,16 @@ enum Pick {
     Files,
 }
 impl Pick {
+    fn issue_target(&self) -> Option<linear::Target> {
+        match self {
+            Self::Issue(issue) => Some(linear::Target {
+                id: issue.id.clone(),
+                org: None,
+            }),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> String {
         match self {
             Self::Repo(r) => format!("repo:{}", r.name),
@@ -597,16 +607,7 @@ impl AddPicker {
                 .collect()
         };
         let destination = self.destination.clone();
-        let targets: Vec<_> = picks
-            .iter()
-            .filter_map(|p| match p {
-                Pick::Issue(i) => Some(linear::Target {
-                    id: i.identifier.clone(),
-                    org: None,
-                }),
-                _ => None,
-            })
-            .collect();
+        let targets: Vec<_> = picks.iter().filter_map(Pick::issue_target).collect();
         let request = (!targets.is_empty()).then(|| {
             self.shark.update(cx, |s, cx| {
                 s.linear_request(
@@ -699,6 +700,9 @@ impl AddPicker {
                             for issue in issues {
                                 linear::keep(&mut draft.issues, &issue);
                             }
+                        }
+                        if s.home.destination == destination {
+                            s.refresh_draft_sources(s.draft_target(), cx);
                         }
                         s.close_draft_picker(w, cx);
                         cx.notify();
@@ -860,8 +864,10 @@ impl Render for AddPicker {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+    #[cfg(feature = "test-support")]
     use gpui_kit::test::TestWindowExt;
 
+    #[cfg(feature = "test-support")]
     fn picker(shark: &Entity<Shark>, w: &mut Window, cx: &mut App) -> Entity<AddPicker> {
         shark.update(cx, |s, cx| {
             s.draft_add_picker(point(px(100.), px(100.)), w, cx);
@@ -876,6 +882,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "test-support")]
     fn pr(number: u64) -> Pick {
         Pick::Pr(serde_json::from_value(serde_json::json!({
             "repo": "web", "number": number, "title": format!("Web fix {number}"),
@@ -883,6 +890,7 @@ mod tests {
         })).unwrap())
     }
 
+    #[cfg(feature = "test-support")]
     fn selected_key(p: &AddPicker, cx: &App) -> Option<String> {
         p.state
             .read(cx)
@@ -891,6 +899,7 @@ mod tests {
             .map(|r| r.key())
     }
 
+    #[cfg(feature = "test-support")]
     fn repositories(home: &std::path::Path) -> Vec<Repo> {
         ["api", "web"]
             .map(|name| Repo {
@@ -900,6 +909,7 @@ mod tests {
             .to_vec()
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn attachment_tabs_are_visible_even_without_results(cx: &mut gpui_kit::TestAppContext) {
@@ -928,6 +938,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn draft_picker_stays_inside_bottom_edge(cx: &mut gpui_kit::TestAppContext) {
@@ -965,6 +976,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn category_tabs_include_suggestions_once_and_keep_special_actions(
@@ -1026,6 +1038,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn tabs_click_cycle_wrap_and_reopen_with_search_focus(cx: &mut gpui_kit::TestAppContext) {
@@ -1100,6 +1113,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn marked_attachments_survive_category_and_query_changes(
@@ -1149,6 +1163,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn category_actions_open_existing_path_prompts_without_attaching_marks(
@@ -1195,6 +1210,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn refresh_keeps_tab_query_and_identity_when_rows_reorder_or_disappear(
@@ -1253,6 +1269,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn background_suggestions_do_not_move_the_highlighted_repository(
@@ -1350,6 +1367,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn refreshed_suggestions_apply_on_reopen_and_expire_with_the_connection(
@@ -1423,6 +1441,82 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attaching_repository_and_pr_refreshes_composer_sources(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let _turn = super::super::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = super::super::ui_tests::test_home();
+        let (window, shark) = super::super::ui_tests::boot(
+            cx,
+            State {
+                repos: repositories(&home),
+                ..Default::default()
+            },
+            WindowOptions::default(),
+        );
+        for pull_request in [false, true] {
+            window
+                .update(cx, |_, w, cx| {
+                    shark.update(cx, |s, cx| s.enter_home(w, cx));
+                    let picker = picker(&shark, w, cx);
+                    picker.update(cx, |p, cx| {
+                        if pull_request {
+                            p.rows.push(pr(42));
+                            p.change_tab(AttachmentTab::PullRequests, w, cx);
+                        } else {
+                            p.change_tab(AttachmentTab::Repositories, w, cx);
+                        }
+                    });
+                    w.render_frame(cx);
+                    let p = picker.read(cx);
+                    let at = if pull_request {
+                        p.state.read(cx).selected_index().unwrap()
+                    } else {
+                        IndexPath::new(1)
+                    };
+                    picker.update(cx, |p, cx| p.attach(at, w, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let sources = shark.read(cx).home.composer.read(cx).sources_for_test();
+                assert_eq!(sources.len(), 1);
+                if pull_request {
+                    let source = sources.iter().find(|s| s.name == "web").unwrap();
+                    assert_eq!(source.start_ref, "refs/pull/42/head");
+                    assert_eq!(source.pr.as_ref().unwrap().number, 42);
+                } else {
+                    assert_eq!(sources[0].name, "web");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn issue_attachment_keeps_identity_when_workspace_identifiers_overlap() {
+        let issue = Pick::Issue(Hit {
+            id: "6d43a2b1-8042-4a16-9c7a-41f31b566103".into(),
+            identifier: "ENG-123".into(),
+            url: "https://linear.app/original-workspace/issue/ENG-123/fix".into(),
+            title: String::new(),
+            status: String::new(),
+            state_type: String::new(),
+            priority: 0,
+            team: String::new(),
+            assignee: None,
+            updated_at: String::new(),
+        });
+        assert_eq!(
+            issue.issue_target().unwrap().id,
+            "6d43a2b1-8042-4a16-9c7a-41f31b566103"
+        );
     }
 
     #[test]

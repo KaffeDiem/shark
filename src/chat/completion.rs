@@ -122,12 +122,30 @@ impl Chat {
         issues: Vec<crate::linear::Hit>,
         cx: &mut Context<Self>,
     ) {
+        let selection = self
+            .menu
+            .as_ref()
+            .filter(|menu| menu.src == '#')
+            .and_then(|menu| Some((self.menu_item(menu.sel)?.insert.clone(), menu.armed)));
         self.pr_items.retain(|item| item.kind != Kind::Issue);
         let mut items = complete::issue_items(&issues);
         items.append(&mut self.pr_items);
         self.pr_items = items;
         if self.menu.is_some() {
             self.update_menu(cx);
+        }
+        if let Some((insert, armed)) = selection
+            && let Some(menu) = self.menu.as_mut().filter(|menu| menu.src == '#')
+        {
+            let selected = menu
+                .matches
+                .iter()
+                .position(|&i| self.pr_items[i].insert == insert);
+            menu.armed = selected.is_some() && armed;
+            if let Some(selected) = selected {
+                menu.sel = selected;
+                self.menu_scroll.scroll_to_item(selected);
+            }
         }
     }
 
@@ -638,5 +656,72 @@ impl Chat {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn issue_refresh_preserves_reference_highlight(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Chat::new(Task::default(), ChatMeta::default(), false, window, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            chat.update(cx, |chat, cx| {
+                let prs = serde_json::from_str::<Vec<complete::Pr>>(
+                    r#"[{"repo":"api","number":12,"title":"Login page","author":null,
+                     "url":"https://github.com/o/api/pull/12","state":"OPEN","updatedAt":"1"},
+                    {"repo":"web","number":7,"title":"Fix endpoint","author":null,
+                     "url":"https://github.com/o/web/pull/7","state":"OPEN","updatedAt":"2"}]"#,
+                )
+                .unwrap();
+                chat.pr_items = complete::pr_items(&prs);
+                chat.composer.update(cx, |input, cx| {
+                    input.set_value("#", window, cx);
+                    input.set_selected_range(1..1, cx);
+                });
+                chat.update_menu(cx);
+                let menu = chat.menu.as_mut().unwrap();
+                menu.sel = 1;
+                menu.armed = true;
+                let selected = chat.menu_item(1).unwrap().insert.clone();
+                let issue = crate::linear::Hit {
+                    id: "issue".into(),
+                    identifier: "ENG-1".into(),
+                    url: "https://linear.app/acme/issue/ENG-1".into(),
+                    title: "Issue".into(),
+                    status: "Todo".into(),
+                    state_type: "unstarted".into(),
+                    priority: 0,
+                    team: "ENG".into(),
+                    assignee: None,
+                    updated_at: "3".into(),
+                };
+                chat.set_completion_issues(vec![issue], cx);
+                let menu = chat.menu.as_ref().unwrap();
+                assert!(
+                    menu.armed,
+                    "an issue response must preserve the keyboard selection"
+                );
+                assert_eq!(chat.menu_item(menu.sel).unwrap().insert, selected);
+                chat.menu.as_mut().unwrap().armed = false;
+                chat.set_completion_issues(vec![], cx);
+                let menu = chat.menu.as_ref().unwrap();
+                assert!(!menu.armed, "a source refresh must not arm a reference");
+                assert_eq!(chat.menu_item(menu.sel).unwrap().insert, selected);
+            })
+        })
+        .unwrap();
     }
 }

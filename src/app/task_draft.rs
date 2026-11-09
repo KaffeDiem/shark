@@ -128,10 +128,11 @@ impl TaskDraft {
         let Some(agent) = slug.and_then(|slug| state.agents.iter().find(|a| a.slug == slug)) else {
             return false;
         };
-        let repos: std::collections::BTreeSet<_> =
-            self.repos.iter().map(|r| &r.repo.name).collect();
-        let defaults: std::collections::BTreeSet<_> = agent.repos.iter().collect();
-        repos != defaults
+        !self
+            .repos
+            .iter()
+            .map(|r| &r.repo.name)
+            .eq(agent.repos.iter())
             || self.saved_settings(agent) != (agent.model.clone(), agent.effort.clone())
     }
 
@@ -482,6 +483,30 @@ mod tests {
         discard_staged_files(&[source.clone()]);
         assert!(source.exists());
         std::fs::remove_file(source).unwrap();
+    }
+
+    #[core::prelude::v1::test]
+    fn repository_order_changes_are_saveable_settings() {
+        let state = State {
+            agents: vec![crate::state::Agent {
+                slug: "worker".into(),
+                repos: vec!["api".into(), "web".into()],
+                ..Default::default()
+            }],
+            repos: ["api", "web"]
+                .map(|name| Repo {
+                    name: name.into(),
+                    path: "/unused".into(),
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        let mut draft = TaskDraft::for_agent(&state, Some("worker"));
+        assert!(!draft.settings_edited(&state, Some("worker")));
+        draft.repos.swap(0, 1);
+        assert!(draft.settings_edited(&state, Some("worker")));
+        draft.repos.swap(0, 1);
+        assert!(!draft.settings_edited(&state, Some("worker")));
     }
 
     #[core::prelude::v1::test]

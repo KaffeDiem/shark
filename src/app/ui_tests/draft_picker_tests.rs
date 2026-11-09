@@ -42,6 +42,47 @@ async fn add_picker_space_marks_multiple_repositories_and_enter_only_attaches(
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn anchored_branch_from_accepts_a_local_only_base(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let registered = repos(&home, &["api"]);
+    git::git(&registered[0].path, &["branch", "local-base"]).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: registered,
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                repos: vec!["api".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
+    press_in(window)(cx, &["up"]);
+    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["down", "enter"]);
+    until(cx, window, |w, cx| {
+        w.render_frame(cx);
+        w.try_find(("source-branch", 1usize)).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| w.input("local-base", cx))
+        .unwrap();
+    press_in(window)(cx, &["alt-enter"]);
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.draft_picker.is_none(), "local bases do not require a pushed stacking parent");
+        assert!(matches!(&s.home.agent_draft.repos[0].branch, BranchSpec::New { base } if base == "local-base"));
+        assert!(s.state.tasks.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn grouped_branch_picker_enter_checks_out_and_alt_enter_uses_base(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
