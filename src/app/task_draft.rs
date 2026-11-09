@@ -283,6 +283,8 @@ impl Shark {
             .insert(name.clone(), agent.as_ref().map(|a| a.slug.clone()));
         let pending = name.clone();
         let staged_files = draft.files.clone();
+        // An issue's title is already a good one.
+        let titling = draft.issues.is_empty().then(|| draft.text.clone());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -340,6 +342,9 @@ impl Shark {
                     s.refresh_agent_files(&agent.slug, cx);
                 }
                 s.record_interaction(&ws.name, cx);
+                if let Some(text) = &titling {
+                    s.auto_title(&ws.name, text, cx);
+                }
                 let ws = s.task(&ws.name).cloned().unwrap_or(ws);
                 let chat = s.ensure_chat(&ws, &ws.chats[0], window, cx);
                 let then = prompt.map(|p| (p, chat));
