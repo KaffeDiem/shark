@@ -1,8 +1,8 @@
 //! Persistent agents. An agent's page is its settings: the header holds its identity,
-//! instructions and defaults, edited in place; below sit its composer, tasks and history.
+//! instructions, skills and handoff, edited in place; below sit its composer, tasks and history.
 use super::menus::on_shark;
 use super::*;
-use crate::models::{effort_label, efforts, model_label};
+use crate::models::efforts;
 use crate::state::Agent;
 use gpui_kit::component::input::{Textarea, TextareaState};
 use std::cell::Cell;
@@ -446,7 +446,37 @@ impl Shark {
         self.sync_agent(slug, true, cx)
     }
 
-    /// What an agent offers, from its sidebar row's right-click and its header's `…`.
+    /// Identity controls used by the header and the sidebar's richer agent menu.
+    pub(super) fn agent_identity_menu(&self, slug: &str, cx: &Context<Self>) -> Vec<Entry> {
+        let s = slug.to_string();
+        let act = |f: fn(&mut Shark, &str, &mut Window, &mut Context<Shark>)| {
+            let s = s.clone();
+            on_shark(cx, move |shark, w, cx| f(shark, &s, w, cx))
+        };
+        vec![
+            menu::item(IconName::Pencil, "Rename", act(Shark::rename_agent)),
+            menu::item(
+                IconName::Shapes,
+                "Change icon…",
+                act(Shark::pick_agent_icon),
+            ),
+            menu::item(
+                IconName::Image,
+                "Paste Image as Icon",
+                act(Shark::paste_agent_icon),
+            )
+            .hint("⌘D"),
+            menu::item(
+                IconName::FileText,
+                "Edit instructions",
+                act(Shark::edit_agent),
+            ),
+            Entry::Sep,
+            menu::item(IconName::Trash, "Delete agent…", act(Shark::delete_agent)),
+        ]
+    }
+
+    /// Task, skills and identity actions offered by the sidebar row's right-click.
     pub(super) fn agent_menu(&self, slug: &str, cx: &Context<Self>) -> Vec<Entry> {
         let s = slug.to_string();
         let act = |f: fn(&mut Shark, &str, &mut Window, &mut Context<Shark>)| {
@@ -467,23 +497,6 @@ impl Shark {
                 act(Shark::prefill_agent_task),
             ),
             Entry::Sep,
-            menu::item(IconName::Pencil, "Rename", act(Shark::rename_agent)),
-            menu::item(
-                IconName::Shapes,
-                "Change icon…",
-                act(Shark::pick_agent_icon),
-            ),
-            menu::item(
-                IconName::Image,
-                "Paste Image as Icon",
-                act(Shark::paste_agent_icon),
-            )
-            .hint("⌘D"),
-            menu::item(
-                IconName::FileText,
-                "Edit instructions",
-                act(Shark::edit_agent),
-            ),
             Entry::Sep,
             menu::item(IconName::BookOpen, "Add skills…", {
                 let s = s.clone();
@@ -501,6 +514,9 @@ impl Shark {
                 act(Shark::refresh_agent_skills),
             ),
         ];
+        let mut identity = self.agent_identity_menu(slug, cx);
+        identity.truncate(identity.len() - 2);
+        entries.splice(2..2, identity);
         entries.extend(open_in);
         entries.extend([
             Entry::Sep,
@@ -541,71 +557,6 @@ impl Shark {
                         .checked(current == Some(a.slug.as_str()))
                 }),
         );
-        self.show_menu(pos, entries, window, cx);
-    }
-
-    fn agent_model_menu(
-        &mut self,
-        slug: &str,
-        pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agent(slug) else {
-            return;
-        };
-        let inherited = model_label(&repo_defaults(&self.state, agent).0);
-        let current = agent.model.clone();
-        let pick = |model: Option<&'static str>| {
-            let s = slug.to_string();
-            on_shark(cx, move |shark, _, cx| {
-                shark.update_agent(&s, |a| a.model = model.map(Into::into), cx)
-            })
-        };
-        let mut entries = vec![
-            menu::item(None, "Inherit", pick(None))
-                .hint(inherited)
-                .checked(current.is_none()),
-            Entry::Sep,
-        ];
-        entries.extend(MODELS.iter().map(|m| {
-            menu::item(None, model_label(m), pick(Some(m))).checked(current.as_deref() == Some(*m))
-        }));
-        self.show_menu(pos, entries, window, cx);
-    }
-
-    fn agent_effort_menu(
-        &mut self,
-        slug: &str,
-        pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agent(slug) else {
-            return;
-        };
-        let model = (agent.model.clone()).unwrap_or_else(|| repo_defaults(&self.state, agent).0);
-        let inherited = crate::models::effort_of(&ChatMeta {
-            model: Some(model.clone()),
-            effort: repo_defaults(&self.state, agent).1,
-            ..Default::default()
-        });
-        let current = agent.effort.clone();
-        let pick = |effort: Option<&'static str>| {
-            let s = slug.to_string();
-            on_shark(cx, move |shark, _, cx| {
-                shark.update_agent(&s, |a| a.effort = effort.map(Into::into), cx)
-            })
-        };
-        let mut entries = vec![
-            menu::item(None, "Inherit", pick(None))
-                .hint(effort_label(inherited))
-                .checked(current.is_none()),
-            Entry::Sep,
-        ];
-        entries.extend(efforts(&model).iter().map(|l| {
-            menu::item(None, effort_label(l), pick(Some(l))).checked(current.as_deref() == Some(*l))
-        }));
         self.show_menu(pos, entries, window, cx);
     }
 
@@ -656,55 +607,7 @@ impl Shark {
         self.show_menu(pos, entries, window, cx);
     }
 
-    fn agent_repos_menu(
-        &mut self,
-        slug: &str,
-        pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agent(slug) else {
-            return;
-        };
-        let mut entries: Vec<Entry> = self
-            .state
-            .repos
-            .iter()
-            .map(|r| {
-                let on = agent.repos.contains(&r.name);
-                let (slug, repo) = (slug.to_string(), r.name.clone());
-                menu::item(
-                    IconName::FolderGit2,
-                    r.name.clone(),
-                    on_shark(cx, move |s, _, cx| {
-                        s.update_agent(
-                            &slug,
-                            |a| {
-                                if on {
-                                    a.repos.retain(|r| r != &repo);
-                                } else {
-                                    a.repos.push(repo.clone());
-                                }
-                            },
-                            cx,
-                        )
-                    }),
-                )
-                .checked(on)
-            })
-            .collect();
-        if !entries.is_empty() {
-            entries.push(Entry::Sep);
-        }
-        entries.push(menu::item(
-            IconName::FolderPlus,
-            "Add repository…",
-            on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
-        ));
-        self.show_menu(pos, entries, window, cx);
-    }
-
-    /// Icon, name, @handle and `…`; instructions; then quiet, explicitly labelled defaults.
+    /// Identity and instructions, followed by skills and handoff.
     fn render_agent_header(
         &self,
         agent: &Agent,
@@ -738,10 +641,10 @@ impl Shark {
                 .into_any_element()
         } else {
             let (header, current) = (header.clone(), agent.name.clone());
-            h_flex()
+            v_flex()
                 .flex_1()
                 .min_w_0()
-                .gap_2()
+                .items_start()
                 .child(
                     div()
                         .id("agent-name")
@@ -749,6 +652,7 @@ impl Shark {
                         .aria_label(format!("Rename {}", agent.name))
                         .test_support()
                         .min_w_0()
+                        .max_w_full()
                         .px_1()
                         .ml(px(-4.))
                         .rounded(theme.radius)
@@ -764,7 +668,8 @@ impl Shark {
                 )
                 .child(
                     div()
-                        .flex_none()
+                        .max_w_full()
+                        .truncate()
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(format!("@{}", agent.slug)),
@@ -782,7 +687,7 @@ impl Shark {
                     .accessibility_label(format!("{} actions", agent.name))
                     .tooltip("Agent actions"),
                 move |s, pos, w, cx| {
-                    let entries = s.agent_menu(&slug, cx);
+                    let entries = s.agent_identity_menu(&slug, cx);
                     s.show_menu(pos, entries, w, cx)
                 },
                 cx,
@@ -791,12 +696,12 @@ impl Shark {
         let identity = h_flex()
             .gap_2()
             .child(
-                // Outdented by the ghost padding so the glyph lines up with the composer's edge.
                 Button::new("agent-page-icon")
                     .accessibility_label("Change agent icon")
                     .ghost()
-                    .ml(px(-6.))
-                    .child(super::agent_icon_view::agent_icon(&agent.icon))
+                    .p_0()
+                    .size(px(40.))
+                    .child(super::agent_icon_view::agent_icon(&agent.icon).size(px(40.)))
                     .tooltip("Change icon")
                     .on_click(cx.listener(move |s, _, w, cx| s.pick_agent_icon(&icon_slug, w, cx))),
             )
@@ -831,24 +736,18 @@ impl Shark {
                         "Every task of this agent reads these through CLAUDE.md and AGENTS.md.",
                     ))
                 });
-        let repos = agent
-            .repos
-            .iter()
-            .filter(|r| self.state.repos.iter().any(|x| &x.name == *r))
-            .cloned()
-            .collect::<Vec<_>>();
-        let chip = |id: &'static str, key: &'static str, value: String, tip: &'static str, open: fn(&mut Shark, &str, Point<Pixels>, &mut Window, &mut Context<Shark>)| {
+        let chip = |id: &'static str, value: String, icon: Option<IconName>, tip: &'static str, open: fn(&mut Shark, &str, Point<Pixels>, &mut Window, &mut Context<Shark>)| {
             let s = slug.clone();
             anchored_button(
                 id.into(),
                 true,
                 Button::new(id)
                     .ghost()
-                    .accessibility_label(format!("{key} {value}"))
+                    .accessibility_label(value.clone())
                     .tooltip(tip)
                     .child(h_flex().gap_1()
-                        .child(div().text_color(theme.muted_foreground).child(key))
-                        .child(div().max_w(px(180.)).truncate().text_color(theme.foreground).child(value))
+                        .children(icon.map(|icon| Icon::new(icon).with_size(px(14.))))
+                        .child(div().max_w(px(240.)).truncate().child(value))
                         .child(Icon::new(IconName::ChevronDown).with_size(px(12.)))),
                 move |sh, pos, w, cx| open(sh, &s, pos, w, cx),
                 cx,
@@ -856,54 +755,32 @@ impl Shark {
         };
         let chips = vec![
             chip(
-                "agent-repos",
-                "Repos",
-                if repos.is_empty() {
-                    "None".into()
-                } else {
-                    repos.join(", ")
-                },
-                "Repositories for new tasks",
-                Shark::agent_repos_menu,
-            ),
-            chip(
-                "agent-model",
-                "Model",
-                agent
-                    .model
-                    .as_deref()
-                    .map(model_label)
-                    .unwrap_or_else(|| "Inherit".into()),
-                "Model for new tasks",
-                Shark::agent_model_menu,
-            ),
-            chip(
-                "agent-effort",
-                "Thinking",
-                agent
-                    .effort
-                    .as_deref()
-                    .map(effort_label)
-                    .unwrap_or_else(|| "Inherit".into()),
-                "Thinking level for new tasks",
-                Shark::agent_effort_menu,
-            ),
-            chip(
                 "agent-skills",
-                "Skills",
-                h.skills.len().to_string(),
+                format!(
+                    "{} {}",
+                    h.skills.len(),
+                    if h.skills.len() == 1 {
+                        "skill"
+                    } else {
+                        "skills"
+                    }
+                ),
+                Some(IconName::BookOpen),
                 "This agent's skills",
                 Shark::agent_skills_menu,
             ),
             chip(
                 "agent-next",
-                "Then",
-                agent
-                    .next
-                    .as_deref()
-                    .and_then(|s| self.agent(s))
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| "None".into()),
+                format!(
+                    "Hands off to {}",
+                    agent
+                        .next
+                        .as_deref()
+                        .and_then(|s| self.agent(s))
+                        .map(|a| a.name.as_str())
+                        .unwrap_or("nobody")
+                ),
+                None,
                 "Hand off finished work to",
                 Shark::agent_next_menu,
             ),
@@ -914,23 +791,7 @@ impl Shark {
             .gap_2()
             .child(identity)
             .child(instructions)
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("agent-defaults-label")
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Defaults")
-                            .tooltip(|w, cx| {
-                                Tooltip::new("Used when a task starts. Saved for this agent.")
-                                    .build(w, cx)
-                            }),
-                    )
-                    .children(chips),
-            )
+            .child(h_flex().flex_wrap().gap_1().children(chips))
             .into_any_element()
     }
 

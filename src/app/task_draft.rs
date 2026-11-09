@@ -2,7 +2,7 @@
 use super::*;
 use crate::state::{AgentLink, TaskRepo};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum BranchSpec {
     New { base: String },
     Existing(String),
@@ -13,6 +13,7 @@ pub(super) enum BranchSpec {
 pub(super) struct DraftRepo {
     pub repo: Repo,
     pub branch: BranchSpec,
+    pub pr_label: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -24,6 +25,8 @@ pub(super) struct TaskDraft {
     pub files: Vec<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Bypass agent defaults so saving can restore repository/app inheritance.
+    pub follow_app: bool,
     pub plan: bool,
     pub repos_edited: bool,
     pub starting: bool,
@@ -51,6 +54,7 @@ impl TaskDraft {
                         .cloned()
                         .map(|repo| DraftRepo {
                             repo,
+                            pr_label: None,
                             branch: BranchSpec::New {
                                 base: String::new(),
                             },
@@ -80,10 +84,12 @@ impl TaskDraft {
         overrides: bool,
     ) -> (String, Option<String>) {
         let task = Task {
-            agent: slug.map(|slug| AgentLink {
-                slug: slug.into(),
-                ..Default::default()
-            }),
+            agent: slug
+                .filter(|_| !(overrides && self.follow_app))
+                .map(|slug| AgentLink {
+                    slug: slug.into(),
+                    ..Default::default()
+                }),
             repos: self
                 .repos
                 .iter()
@@ -105,6 +111,29 @@ impl TaskDraft {
             ..Default::default()
         });
         (model, Some(resolved.to_string()))
+    }
+
+    pub fn saved_settings(&self, agent: &crate::state::Agent) -> (Option<String>, Option<String>) {
+        if self.follow_app {
+            (self.model.clone(), self.effort.clone())
+        } else {
+            (
+                self.model.clone().or_else(|| agent.model.clone()),
+                self.effort.clone().or_else(|| agent.effort.clone()),
+            )
+        }
+    }
+
+    pub fn settings_edited(&self, state: &State, slug: Option<&str>) -> bool {
+        let Some(agent) = slug.and_then(|slug| state.agents.iter().find(|a| a.slug == slug)) else {
+            return false;
+        };
+        !self
+            .repos
+            .iter()
+            .map(|r| &r.repo.name)
+            .eq(agent.repos.iter())
+            || self.saved_settings(agent) != (agent.model.clone(), agent.effort.clone())
     }
 
     /// Header edits apply to future drafts; keep the current task's effective choices.
@@ -457,6 +486,65 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn repository_order_changes_are_saveable_settings() {
+        let state = State {
+            agents: vec![crate::state::Agent {
+                slug: "worker".into(),
+                repos: vec!["api".into(), "web".into()],
+                ..Default::default()
+            }],
+            repos: ["api", "web"]
+                .map(|name| Repo {
+                    name: name.into(),
+                    path: "/unused".into(),
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        let mut draft = TaskDraft::for_agent(&state, Some("worker"));
+        assert!(!draft.settings_edited(&state, Some("worker")));
+        draft.repos.swap(0, 1);
+        assert!(draft.settings_edited(&state, Some("worker")));
+        draft.repos.swap(0, 1);
+        assert!(!draft.settings_edited(&state, Some("worker")));
+    }
+
+    #[core::prelude::v1::test]
+    fn saveable_settings_exclude_task_context_and_preserve_inheritance() {
+        let mut state = State {
+            last_model: Some("sonnet".into()),
+            agents: vec![crate::state::Agent {
+                slug: "worker".into(),
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                repos: vec!["api".into()],
+                ..Default::default()
+            }],
+            repos: vec![Repo {
+                name: "api".into(),
+                path: "/unused".into(),
+            }],
+            ..Default::default()
+        };
+        let mut draft = TaskDraft::for_agent(&state, Some("worker"));
+        draft.repos[0].branch = BranchSpec::Existing("fix".into());
+        draft.files.push("notes.txt".into());
+        draft.issues.push(Snapshot::default());
+        draft.plan = true;
+        assert!(!draft.settings_edited(&state, Some("worker")));
+        draft.follow_app = true;
+        assert_eq!(draft.defaults(&state, Some("worker")).0, "sonnet");
+        assert_eq!(draft.saved_settings(&state.agents[0]), (None, None));
+        assert!(draft.settings_edited(&state, Some("worker")));
+        state.agents[0].model = None;
+        state.agents[0].effort = None;
+        assert!(!draft.settings_edited(&state, Some("worker")));
+        draft.repos.clear();
+        assert!(draft.settings_edited(&state, Some("worker")));
+        assert!(!draft.settings_edited(&state, None));
+    }
+
+    #[core::prelude::v1::test]
     fn overrides_resolve_without_changing_agent_defaults() {
         let state = State {
             agents: vec![crate::state::Agent {
@@ -554,6 +642,7 @@ mod tests {
         let mut draft = TaskDraft {
             text: "Implement this carefully".into(),
             repos: vec![DraftRepo {
+                pr_label: None,
                 repo: Repo {
                     name: "api".into(),
                     path,

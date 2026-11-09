@@ -58,6 +58,8 @@ pub(super) struct NewTaskForm {
     errors: Vec<[Option<String>; 2]>,
     mode: Mode,
     pending_selection: Option<Option<IndexPath>>,
+    anchored: bool,
+    viewer: Option<String>,
     shark: WeakEntity<Shark>,
     _sub: Subscription,
 }
@@ -79,6 +81,25 @@ impl Mode {
             Mode::Branches(ix) | Mode::Bases(ix) => Some((ix, 0)),
             Mode::Prs(ix) => Some((ix, 1)),
         }
+    }
+}
+
+fn sort_prs(prs: &mut [complete::Pr], viewer: Option<&str>) {
+    let own = |pr: &complete::Pr| {
+        viewer.is_some_and(|viewer| pr.author.as_ref().is_some_and(|a| a.login == viewer))
+    };
+    prs.sort_by(|a, b| {
+        own(b)
+            .cmp(&own(a))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+}
+
+fn anchored_branch_choice(at: IndexPath) -> (bool, usize) {
+    match at.section {
+        1 => (true, at.row),
+        2 => (false, at.row + 1),
+        _ => (false, 0),
     }
 }
 
@@ -156,6 +177,8 @@ impl NewTaskForm {
             errors: vec![[None, None]; n],
             mode: Mode::Repos,
             pending_selection: None,
+            anchored: false,
+            viewer: None,
             shark,
             _sub,
         };
@@ -202,7 +225,7 @@ impl NewTaskForm {
     /// aimed here, against the current list with its filter cleared.
     fn show(&mut self, mode: Mode, row: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
-        self.pending_selection = None;
+        self.pending_selection = self.anchored.then_some(Some(IndexPath::new(row)));
         self.picker.update(cx, |p, cx| {
             p.set_query("", window, cx);
             let row = if row < p.matched_count() { row } else { 0 };
@@ -223,6 +246,17 @@ impl NewTaskForm {
     }
 
     fn pick_branch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.anchored {
+            if self.prs[ix].is_none() {
+                self.prs[ix] = Some(complete::cached_repo_prs(
+                    &self.repos[ix].name,
+                    &self.repos[ix].path,
+                    true,
+                ));
+            }
+            self.mode = Mode::Prs(ix);
+            self.refresh(false, window, cx);
+        }
         self.show(Mode::Branches(ix), 0, window, cx);
         self.refresh(false, window, cx);
         if self.attach.is_some() && self.names_own(ix, cx) {
@@ -266,7 +300,9 @@ impl NewTaskForm {
         }
         if self.prs[ix].is_none() {
             let repo = &self.repos[ix];
-            self.prs[ix] = Some(complete::cached_repo_prs(&repo.name, &repo.path, true));
+            let mut prs = complete::cached_repo_prs(&repo.name, &repo.path, true);
+            sort_prs(&mut prs, self.viewer.as_deref());
+            self.prs[ix] = Some(prs);
         }
         self.show(Mode::Prs(ix), 0, window, cx);
         self.refresh(false, window, cx);
@@ -319,8 +355,16 @@ impl NewTaskForm {
                 }
                 if let Some(result) = prs {
                     match result {
-                        Ok(list) => {
-                            if f.mode == Mode::Prs(ix) {
+                        Ok(mut list) => {
+                            sort_prs(&mut list, f.viewer.as_deref());
+                            if f.mode == Mode::Prs(ix)
+                                || (f.anchored
+                                    && f.mode == Mode::Branches(ix)
+                                    && f.picker
+                                        .read(cx)
+                                        .selected_index()
+                                        .is_some_and(|at| at.section == 1))
+                            {
                                 let was = f
                                     .picker
                                     .read(cx)
@@ -328,10 +372,16 @@ impl NewTaskForm {
                                     .and_then(|i| f.prs[ix].as_ref()?.get(i.row))
                                     .map(|p| p.number);
                                 if let Some(number) = was {
-                                    let at = list
-                                        .iter()
-                                        .position(|p| p.number == number)
-                                        .map(IndexPath::new);
+                                    let at =
+                                        list.iter().position(|p| p.number == number).map(|row| {
+                                            IndexPath::new(row).section(
+                                                if matches!(f.mode, Mode::Branches(_)) {
+                                                    1
+                                                } else {
+                                                    0
+                                                },
+                                            )
+                                        });
                                     f.select_after_refresh(at, window, cx);
                                 }
                             }
@@ -370,7 +420,13 @@ impl NewTaskForm {
         cx: &mut Context<Self>,
     ) {
         let Some(list) = list else { return };
-        let row = self.picker.read(cx).selected_index().map(|i| i.row);
+        let row = self.picker.read(cx).selected_index().and_then(|i| {
+            if self.anchored && matches!(self.mode, Mode::Branches(_)) {
+                (i.section == 2).then_some(i.row + 1)
+            } else {
+                Some(i.row)
+            }
+        });
         let was = row.and_then(|r| self.listed(ix, r)).map(|b| b.name.clone());
         if let (Mode::Branches(shown) | Mode::Bases(shown), Some(was)) = (self.mode, was)
             && shown == ix
@@ -378,7 +434,13 @@ impl NewTaskForm {
             // Resolved against the list shown now; a row it filters out highlights nothing.
             let at = list.iter().position(|b| b.name == was);
             let first = matches!(self.mode, Mode::Branches(_)) as usize;
-            let at = at.map(|i| IndexPath::new(i + first));
+            let at = at.map(|i| {
+                if self.anchored && matches!(self.mode, Mode::Branches(_)) {
+                    IndexPath::new(i).section(2)
+                } else {
+                    IndexPath::new(i + first)
+                }
+            });
             self.select_after_refresh(at, window, cx);
         }
         self.branches[ix] = Some(list);
@@ -392,8 +454,21 @@ impl NewTaskForm {
         if self.attach.is_some() {
             return;
         }
-        if let Some(row) = self.picker.read(cx).selected_index().map(|i| i.row) {
-            self.branch_from_row(row, window, cx);
+        if let Some(at) = self.picker.read(cx).selected_index() {
+            if self.anchored
+                && let Mode::Branches(repo) = self.mode
+            {
+                let (pr, row) = anchored_branch_choice(at);
+                if pr {
+                    self.mode = Mode::Prs(repo);
+                }
+                self.branch_from_row(row, window, cx);
+                if pr {
+                    self.mode = Mode::Branches(repo);
+                }
+            } else {
+                self.branch_from_row(at.row, window, cx);
+            }
         }
     }
 
@@ -405,7 +480,11 @@ impl NewTaskForm {
                     return;
                 };
                 // A base needn't be on GitHub, a parent to stack on must.
-                if !b.origin && self.attach.is_none() {
+                if !b.origin
+                    && !self.anchored
+                    && self.attach.is_none()
+                    && !matches!(self.mode, Mode::Bases(_))
+                {
                     let msg = format!("`{}` isn't on GitHub yet; push it first", b.name);
                     return notify_err(window, cx, msg);
                 }
@@ -429,10 +508,18 @@ impl NewTaskForm {
         self.own[ix] = None;
         self.chosen_pr[ix] = None;
         self.picked[ix] = true;
-        self.back(window, cx);
+        self.finish_choice(window, cx);
         // Stacking needs a new branch; the name field is where it goes.
         if self.selection.is_none() && self.branch.read(cx).value().trim().is_empty() {
             self.branch.update(cx, |i, cx| i.focus(window, cx));
+        }
+    }
+
+    fn finish_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.anchored {
+            self.submit(window, cx);
+        } else {
+            self.back(window, cx);
         }
     }
 
@@ -457,6 +544,7 @@ impl NewTaskForm {
         // A new branch keeps the base picked for it in Attach repository.
         if let Mode::Branches(ix) | Mode::Prs(ix) = self.mode
             && (self.attach.is_none() || row > 0)
+            && !(self.anchored && row == 0 && matches!(self.mode, Mode::Branches(_)))
         {
             self.from[ix] = None;
         }
@@ -483,7 +571,7 @@ impl NewTaskForm {
                 self.own[ix] = Some(format!("pr/{}", pr.number));
                 self.chosen_pr[ix] = Some(pr);
                 self.picked[ix] = true;
-                return self.back(window, cx);
+                return self.finish_choice(window, cx);
             }
             Mode::Branches(ix) | Mode::Bases(ix) => ix,
         };
@@ -504,7 +592,7 @@ impl NewTaskForm {
         self.chosen_pr[ix] = None;
         self.own[ix] = b.map(|b| b.name);
         self.picked[ix] = true;
-        self.back(window, cx);
+        self.finish_choice(window, cx);
     }
 
     /// The task's name and branch: the typed one, else the first picked existing branch
@@ -751,6 +839,9 @@ impl NewTaskForm {
                     DraftRepo {
                         repo: repo.clone(),
                         branch,
+                        pr_label: self.chosen_pr[i].as_ref().map(|pr| {
+                            format!("#{} {} · {}", pr.number, pr.title, pr.status().label())
+                        }),
                     }
                 })
                 .collect();
@@ -759,7 +850,12 @@ impl NewTaskForm {
                 return false;
             }
             self.shark
-                .update(cx, |s, cx| done(s, repos, window, cx))
+                .update(cx, |s, cx| {
+                    done(s, repos, window, cx);
+                    if self.anchored {
+                        s.close_draft_picker(window, cx);
+                    }
+                })
                 .ok();
             return true;
         }
@@ -899,13 +995,45 @@ impl Render for NewTaskForm {
                 .collect(),
             Mode::Branches(ix) | Mode::Bases(ix) => {
                 let list = self.branches[ix].clone().unwrap_or_default();
-                let new = CommandItem::new().label("New branch (task name)");
+                let new = CommandItem::new().label(if self.anchored {
+                    format!(
+                        "New branch from {}",
+                        self.from[ix]
+                            .as_deref()
+                            .or(self.defaults[ix].as_deref())
+                            .unwrap_or("default branch")
+                            .trim_start_matches("origin/")
+                    )
+                } else {
+                    "New branch (task name)".into()
+                });
                 (matches!(self.mode, Mode::Branches(_))
                     .then_some(new)
                     .into_iter())
                 .chain(list.into_iter().enumerate().map(|(i, b)| {
+                    let used = b.checked_out.is_some();
+                    let tag_color = if used {
+                        cx.theme().warning_foreground
+                    } else {
+                        muted
+                    };
                     let tag = match &b.checked_out {
-                        Some(at) => format!("checked out at {}", tilde(Path::new(at))),
+                        Some(at) => self
+                            .shark
+                            .upgrade()
+                            .and_then(|s| {
+                                let s = s.read(cx);
+                                s.state
+                                    .tasks
+                                    .iter()
+                                    .find(|task| {
+                                        task.dir().join(&self.repos[ix].name) == Path::new(at)
+                                    })
+                                    .map(|task| {
+                                        format!("In use by \"{}\"", s.task_title(&task.name))
+                                    })
+                            })
+                            .unwrap_or_else(|| format!("Checked out at {}", tilde(Path::new(at)))),
                         None => (b.local.then_some("local").into_iter())
                             .chain(b.origin.then_some("origin"))
                             .collect::<Vec<_>>()
@@ -916,6 +1044,7 @@ impl Render for NewTaskForm {
                         let tip = format!("{name}\n{tag}");
                         v_flex()
                             .id(("source-branch", i))
+                            .test_support()
                             .flex_1()
                             .min_w_0()
                             .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -925,7 +1054,7 @@ impl Render for NewTaskForm {
                                     .w_full()
                                     .truncate()
                                     .text_xs()
-                                    .text_color(muted)
+                                    .text_color(tag_color)
                                     .child(tag.clone()),
                             )
                     })
@@ -1016,13 +1145,71 @@ impl Render for NewTaskForm {
                 "Filter pull requests…".into(),
             ),
         };
-        let picker = crate::ui::command(&self.picker, window)
-            .items(items)
+        let picker = crate::ui::command(&self.picker, window);
+        let picker = if self.anchored
+            && let Mode::Branches(ix) = self.mode
+        {
+            let mut items = items.into_iter();
+            let fresh = items.next().into_iter();
+            let prs = self.prs[ix].iter().flatten().map(|pr| {
+                let status = pr.status();
+                let label = format!("#{} {}", pr.number, pr.title);
+                let hint = format!(
+                    "{} · {}",
+                    status.label(),
+                    pr.author
+                        .as_ref()
+                        .map(|a| a.login.as_str())
+                        .unwrap_or("unknown author")
+                );
+                CommandItem::new()
+                    .label(label.clone())
+                    .keywords([pr.head_ref_name.clone(), hint.clone()])
+                    .child(move |_, cx| {
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .child(status.icon(cx.theme()).size_4())
+                            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(hint.clone()),
+                            )
+                    })
+            });
+            picker
+                .group(CommandGroup::new().label("Start fresh").items(fresh))
+                .group(CommandGroup::new().label("Pull requests").items(prs))
+                .group(CommandGroup::new().label("Branches").items(items))
+        } else {
+            picker.items(items)
+        };
+        let picker = picker
             .placeholder(placeholder)
             .bordered(!attaching)
             .max_h(px(if attaching { 380. } else { 240. }))
             .on_confirm(move |ix, window, cx| {
-                entity.update(cx, |f, cx| f.choose(ix.row, window, cx)).ok();
+                entity
+                    .update(cx, |f, cx| {
+                        if f.anchored
+                            && let Mode::Branches(repo) = f.mode
+                        {
+                            let (pr, row) = anchored_branch_choice(ix);
+                            if pr {
+                                f.mode = Mode::Prs(repo);
+                            }
+                            f.choose(row, window, cx);
+                            if pr {
+                                f.mode = Mode::Branches(repo);
+                            }
+                        } else {
+                            f.choose(ix.row, window, cx);
+                        }
+                    })
+                    .ok();
             })
             // The summary row and the count follow the highlight.
             .when(attaching, |c| {
@@ -1106,11 +1293,64 @@ impl Render for NewTaskForm {
             }))
             .on_action(cx.listener(|this, e: &Enter, window, cx| this.attach_enter(e, window, cx)))
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                if this.anchored {
+                    this.shark
+                        .update(cx, |s, cx| s.close_draft_picker(window, cx))
+                        .ok();
+                    return;
+                }
                 match this.attach.is_some() && this.mode != Mode::Repos {
                     true => this.back(window, cx),
                     false => cx.propagate(),
                 }
             }));
+        if self.anchored {
+            let ix = self.mode.slot().map(|(ix, _)| ix).unwrap_or(0);
+            return form
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .px_1()
+                        .py_1()
+                        .child(
+                            Button::new("draft-source-branches")
+                                .ghost()
+                                .xsmall()
+                                .label("Branches")
+                                .selected(matches!(self.mode, Mode::Branches(_)))
+                                .on_click(cx.listener(move |f, _, w, cx| f.pick_branch(ix, w, cx))),
+                        )
+                        .child(
+                            Button::new("draft-source-prs")
+                                .ghost()
+                                .xsmall()
+                                .label("Pull requests")
+                                .selected(matches!(self.mode, Mode::Prs(_)))
+                                .on_click(cx.listener(move |f, _, w, cx| f.pick_pr(ix, w, cx))),
+                        )
+                        .child(
+                            Button::new("draft-source-base")
+                                .ghost()
+                                .xsmall()
+                                .label("Change base")
+                                .selected(matches!(self.mode, Mode::Bases(_)))
+                                .on_click(cx.listener(move |f, _, w, cx| f.pick_base(ix, w, cx))),
+                        ),
+                )
+                .child(picker)
+                .children(self.source_status(cx).map(|s| div().px_3().child(s)))
+                .child(crate::ui::key_footer(
+                    &[
+                        ("enter", "Pick"),
+                        ("alt-enter", "Branch from it"),
+                        ("cmd-b", "Branches"),
+                        ("cmd-p", "PRs"),
+                        ("escape", "Close"),
+                    ],
+                    None,
+                ))
+                .into_any_element();
+        }
         if attaching {
             return form
                 .child(self.attach_body(picker, in_branch, cx))
@@ -1697,11 +1937,12 @@ impl NewTaskForm {
 }
 
 impl Shark {
-    pub(super) fn pick_draft_repos(
+    pub(super) fn pick_draft_repos_at(
         &mut self,
         current: Vec<super::task_draft::DraftRepo>,
         only: Option<(String, bool)>,
         done: super::task_draft::PickRepos,
+        position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1754,6 +1995,7 @@ impl Shark {
                 cx,
             );
             f.selection = Some(done);
+            f.anchored = true;
             for (i, repo) in f.repos.iter().enumerate() {
                 if let Some(current) = current.iter().find(|r| r.repo.name == repo.name) {
                     match &current.branch {
@@ -1781,7 +2023,51 @@ impl Shark {
             }
             f
         });
+        let source = form.read(cx).repos[0].path.clone();
+        form.update(cx, |_, cx| {
+            cx.spawn_in(window, async move |this, cx| {
+                let viewer = cx
+                    .background_executor()
+                    .spawn(async move {
+                        git::cmd_bounded(&source, "gh", &["api", "user", "--jq", ".login"], 10).ok()
+                    })
+                    .await;
+                this.update_in(cx, |f, w, cx| {
+                    f.viewer = viewer.map(|name| name.trim().to_string());
+                    let selected = f.picker.read(cx).selected_index();
+                    let selected_pr = f.mode.slot().and_then(|(ix, _)| {
+                        let at = selected?;
+                        ((f.mode == Mode::Prs(ix))
+                            || (f.mode == Mode::Branches(ix) && at.section == 1))
+                            .then(|| f.prs[ix].as_ref()?.get(at.row).map(|pr| (ix, pr.number)))
+                            .flatten()
+                    });
+                    for prs in f.prs.iter_mut().flatten() {
+                        sort_prs(prs, f.viewer.as_deref());
+                    }
+                    if let Some((ix, number)) = selected_pr {
+                        let at = f.prs[ix]
+                            .as_ref()
+                            .and_then(|prs| prs.iter().position(|pr| pr.number == number))
+                            .map(|row| {
+                                IndexPath::new(row).section(
+                                    if matches!(f.mode, Mode::Branches(_)) {
+                                        1
+                                    } else {
+                                        0
+                                    },
+                                )
+                            });
+                        f.select_after_refresh(at, w, cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        });
         let input = form.read(cx).picker.clone();
+        self.hold_draft_picker(form.clone().into(), position, window, cx);
         if let Some((_, pr)) = only {
             form.update(cx, |f, cx| {
                 if pr {
@@ -1791,14 +2077,50 @@ impl Shark {
                 }
             });
         }
-        window.open_dialog(cx, move |d, _, _| {
-            let f = form.clone();
-            crate::ui::dialog(d)
-                .title("Add branch or pull request")
-                .w(px(640.))
-                .child(form.clone())
-                .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
-        });
         input.update(cx, |i, cx| i.focus(window, cx));
+    }
+}
+
+#[cfg(test)]
+mod anchored_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn own_pull_requests_sort_before_newer_requests_by_others() {
+        let pr = |number, author: &str, updated: &str| {
+            serde_json::from_value::<complete::Pr>(serde_json::json!({
+            "number": number, "title": "test", "author": {"login": author},
+            "url": format!("https://github.com/o/r/pull/{number}"), "state": "OPEN", "updatedAt": updated
+        })).unwrap()
+        };
+        let mut prs = vec![
+            pr(1, "other", "2026-11-08"),
+            pr(2, "you", "2026-10-01"),
+            pr(3, "you", "2026-11-01"),
+        ];
+        sort_prs(&mut prs, Some("you"));
+        assert_eq!(
+            prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        sort_prs(&mut prs, None);
+        assert_eq!(
+            prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn grouped_sources_keep_pr_and_branch_rows_distinct() {
+        assert_eq!(anchored_branch_choice(IndexPath::new(0)), (false, 0));
+        assert_eq!(
+            anchored_branch_choice(IndexPath::new(2).section(1)),
+            (true, 2)
+        );
+        assert_eq!(
+            anchored_branch_choice(IndexPath::new(2).section(2)),
+            (false, 3)
+        );
     }
 }

@@ -91,6 +91,8 @@ actions!(
         ToggleDiffMode,
         RefreshDiff,
         PickModel,
+        AddToDraft,
+        ChangeDraftBranch,
         ToggleSidebar,
         PasteAgentIcon,
         ToggleFileTree,
@@ -382,6 +384,13 @@ fn bind_keys(cx: &mut App) {
         // rejected key's message.
         KeyBinding::new("enter", NoAction, Some("LinearPage")),
         KeyBinding::new("cmd-/", PickModel, None),
+        KeyBinding::new("cmd-i", AddToDraft, Some("HomePrompt")),
+        KeyBinding::new("cmd-shift-b", ChangeDraftBranch, Some("HomePrompt")),
+        KeyBinding::new(
+            "alt-enter",
+            BranchFromSource,
+            Some("TaskComposer || Composer"),
+        ),
         KeyBinding::new("cmd-shift-f", ToggleFastMode, None),
         KeyBinding::new("cmd-shift-.", RaiseEffort, None),
         KeyBinding::new("cmd-shift-,", LowerEffort, None),

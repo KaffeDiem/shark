@@ -140,12 +140,18 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
         s.open_agent("designer", w, cx);
         s.new_task_default(w, cx);
     });
-    press_in(window)(cx, &["cmd-b"]);
+    press_in(window)(cx, &["enter"]);
+    until(cx, window, |_, cx| shark.read(cx).draft_picker.is_none()).await;
+    on(cx, &|s, w, cx| s.focus_draft(true, w, cx));
+    press_in(window)(cx, &["cmd-shift-b"]);
+    until(cx, window, |w, cx| {
+        w.render_frame(cx);
+        w.try_find(("source-branch", 1usize)).is_some()
+    })
+    .await;
     cx.update_window(window, |_, w, cx| w.input("from-agent", cx))
         .unwrap();
     press_in(window)(cx, &["enter"]);
-    cx.update_window(window, |_, w, cx| w.click("create", cx))
-        .unwrap();
     cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);
@@ -218,11 +224,14 @@ async fn branch_task_captures_selected_agent_and_repository_defaults(cx: &mut Te
             p.set_value("@designer Fix onboarding spacing", w, cx)
         });
     });
-    cx.update_window(window, |_, w, cx| w.click("create", cx))
-        .unwrap();
+    press_in(window)(cx, &["enter"]);
     cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);
+        assert!(
+            s.draft_picker.is_none(),
+            "Enter should close branch picker before Start"
+        );
         assert!(
             s.state.tasks.is_empty(),
             "picker does not create a task or send hidden notes"

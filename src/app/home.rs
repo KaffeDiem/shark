@@ -145,7 +145,9 @@ pub(crate) struct Home {
     pub(super) draft: TaskDraft,
     pub(super) draft_agent: Option<String>,
     pub(super) tray_focus: FocusHandle,
-    pub(super) tray_index: usize,
+    pub(super) tray_stop: Option<super::draft_view::DraftStop>,
+    pub(super) tray_shown: usize,
+    pub(super) footer_density: u8,
     /// The agent page's task composer, holding `agent_prompt_for`'s draft; other agents'
     /// drafts wait in `agent_drafts`.
     pub(super) agent_prompt: Entity<TextareaState>,
@@ -203,7 +205,9 @@ impl Home {
             draft: TaskDraft::default(),
             draft_agent: None,
             tray_focus: cx.focus_handle(),
-            tray_index: 0,
+            tray_stop: None,
+            tray_shown: usize::MAX,
+            footer_density: 0,
             agent_prompt,
             agent_composer,
             agent_draft: TaskDraft::default(),
@@ -260,7 +264,7 @@ impl Shark {
             if self.home.destination == Destination::Home && self.home.asking {
                 self.toggle_ask_mode(window, cx);
             }
-            self.pick_draft_branch(None, window, cx);
+            self.change_draft_branch(window, cx);
         } else {
             self.new_task_from_repos(self.state.last_repos.clone(), None, window, cx);
         }
@@ -306,6 +310,7 @@ impl Shark {
     }
 
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_picker = None;
         self.home.on = true;
         self.home.destination = Destination::Home;
         self.zen = false;
@@ -579,6 +584,42 @@ impl Shark {
         }
     }
 
+    pub(super) fn set_home_agent(
+        &mut self,
+        slug: Option<&str>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.home.prompt.read(cx).value();
+        let (_, body) = agent_prompt(text.trim(), &self.state.agents);
+        let value = match slug {
+            Some(slug) => format!("@{slug} {body}"),
+            None => body.to_string(),
+        };
+        let old_start = text.trim_end().len() - body.len();
+        let new_start = value.len() - body.len();
+        let mut content = gpui_kit::component::input::InputContent::new(value);
+        for span in self.home.prompt.read(cx).tokens() {
+            let range = span.range();
+            if range.start >= old_start && range.end <= old_start + body.len() {
+                content = content
+                    .with_token(
+                        range.start - old_start + new_start..range.end - old_start + new_start,
+                        span.token().clone(),
+                    )
+                    .expect("unchanged token text in the task body");
+            }
+        }
+        self.home.prompt.update(cx, |p, cx| {
+            p.set_value(content, w, cx);
+            let end = p.value().len();
+            p.set_selected_range(end..end, cx);
+            p.focus(w, cx);
+        });
+        self.draft_composer_event(false, &ComposerEvent::Change, w, cx);
+        cx.notify();
+    }
+
     pub(super) fn pick_home_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agents = self.state.agents.clone();
         let text = self.home.prompt.read(cx).value();
@@ -598,36 +639,7 @@ impl Shark {
             rows,
             selected,
             move |s, i, w, cx| {
-                let text = s.home.prompt.read(cx).value();
-                let (_, body) = agent_prompt(text.trim(), &s.state.agents);
-                let value = if i == 0 {
-                    body.to_string()
-                } else {
-                    format!("@{} {body}", agents[i - 1].slug)
-                };
-                let old_start = text.trim_end().len() - body.len();
-                let new_start = value.len() - body.len();
-                let mut content = gpui_kit::component::input::InputContent::new(value);
-                for span in s.home.prompt.read(cx).tokens() {
-                    let range = span.range();
-                    if range.start >= old_start && range.end <= old_start + body.len() {
-                        content = content
-                            .with_token(
-                                range.start - old_start + new_start
-                                    ..range.end - old_start + new_start,
-                                span.token().clone(),
-                            )
-                            .expect("unchanged token text in the task body");
-                    }
-                }
-                s.home.prompt.update(cx, |p, cx| {
-                    p.set_value(content, w, cx);
-                    let end = p.value().len();
-                    p.set_selected_range(end..end, cx);
-                    p.focus(w, cx);
-                });
-                s.draft_composer_event(false, &ComposerEvent::Change, w, cx);
-                cx.notify();
+                s.set_home_agent(i.checked_sub(1).map(|i| agents[i].slug.as_str()), w, cx);
             },
             window,
             cx,

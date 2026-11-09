@@ -21,11 +21,23 @@ pub enum Kind {
     Dir,
     Command,
     Pr(PrStatus),
+    Issue,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Reference {
+    Issue(crate::linear::Hit),
+    Pr {
+        repo: String,
+        label: String,
+        pr: crate::git::PullRequest,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct Item {
     pub kind: Kind,
+    pub(crate) reference: Option<Reference>,
     /// Text that goes into the prompt, e.g. `@api/README.md`, `/review` or a PR's URL.
     pub insert: String,
     pub label: String,
@@ -211,6 +223,7 @@ fn item(kind: Kind, repo: &str, path: &str) -> Item {
     let key = full.to_lowercase();
     Item {
         kind,
+        reference: None,
         label: full[at..].to_string(),
         detail: full[..at].trim_end_matches('/').to_string(),
         badge: repo.to_string(),
@@ -411,6 +424,7 @@ fn commands(cmds: Vec<Cmd>) -> Vec<Item> {
             let key = c.name.to_lowercase();
             Item {
                 kind: Kind::Command,
+                reference: None,
                 insert: format!("/{}", c.name),
                 label: format!("/{}", c.name),
                 detail: c.description.lines().next().unwrap_or_default().to_string(),
@@ -502,6 +516,15 @@ pub fn pr_items(prs: &[Pr]) -> Vec<Item> {
             .to_lowercase();
             Item {
                 kind: Kind::Pr(status),
+                reference: Some(Reference::Pr {
+                    repo: p.repo.clone(),
+                    label: format!("#{} {}{}", p.number, p.title, state),
+                    pr: crate::git::PullRequest {
+                        number: p.number,
+                        url: p.url.clone(),
+                        base: p.base_ref_name.clone(),
+                    },
+                }),
                 insert: p.url.clone(),
                 label: format!("#{}", p.number),
                 detail: format!("{} · {author}{state}", p.title),
@@ -513,12 +536,69 @@ pub fn pr_items(prs: &[Pr]) -> Vec<Item> {
         .collect()
 }
 
+/// Issues precede PRs in the shared reference menu.
+pub(crate) fn issue_items(issues: &[crate::linear::Hit]) -> Vec<Item> {
+    issues
+        .iter()
+        .map(|issue| Item {
+            kind: Kind::Issue,
+            reference: Some(Reference::Issue(issue.clone())),
+            insert: format!("{} {}", issue.identifier, issue.url),
+            label: issue.identifier.clone(),
+            detail: issue.title.clone(),
+            badge: issue.team.clone(),
+            key: format!(
+                "{} {} {}",
+                issue.identifier,
+                issue.title,
+                issue.assignee.as_deref().unwrap_or_default()
+            )
+            .to_lowercase(),
+            name_at: 0,
+        })
+        .collect()
+}
+
+/// An issue identifier or URL pasted alone on a line can become a reference without swallowing prose.
+pub(crate) fn pasted_reference(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.contains(char::is_whitespace) {
+        return None;
+    }
+    if let Some(issue) = crate::linear::parse_issue(text) {
+        return Some(issue.id);
+    }
+    let url = url::Url::parse(text).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    let parts: Vec<_> = url.path_segments()?.collect();
+    if parts.len() != 4
+        || parts[0].is_empty()
+        || parts[1].is_empty()
+        || parts[2] != "pull"
+        || parts[3].is_empty()
+        || !parts[3].bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("{} #{}", parts[1], parts[3]))
+}
+
 /// Like `rank`, but an all-digit query puts that exact number first, so `#12` beats `#120`.
 pub fn rank_prs(items: &[Item], query: &str, limit: usize) -> Vec<usize> {
-    let mut ix = rank(items, query, limit);
-    if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) {
-        ix.sort_by_key(|&i| items[i].label[1..] != *query); // stable: ties keep their rank
+    let mut ix = rank(items, query, items.len());
+    ix.sort_by_key(|&i| items[i].kind != Kind::Issue);
+    let number = query.rsplit('/').next().unwrap_or(query);
+    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+        ix.sort_by_key(|&i| items[i].label.strip_prefix('#') != Some(number));
     }
+    ix.truncate(limit);
     ix
 }
 
@@ -529,6 +609,15 @@ pub fn names_pr(item: &Item, query: &str) -> bool {
     let q = query.to_lowercase();
     let (scope, q) = q.split_once('/').unwrap_or(("", &q));
     let name = &item.key[item.name_at..];
+    if item.kind == Kind::Issue
+        && q.strip_suffix('-').is_some_and(|scope| {
+            item.label
+                .rsplit_once('-')
+                .is_some_and(|(team, _)| team.eq_ignore_ascii_case(scope))
+        })
+    {
+        return false;
+    }
     if q.is_empty() || !item.key[..item.name_at].starts_with(scope) {
         return false;
     }
@@ -1001,5 +1090,45 @@ mod tests {
             "{} commands",
             cmds.len()
         );
+    }
+    #[test]
+    fn issue_references_share_pr_arming() {
+        let issue = Item {
+            kind: Kind::Issue,
+            reference: None,
+            insert: "SHA-42 https://linear.app/acme/issue/SHA-42/test".into(),
+            label: "SHA-42".into(),
+            detail: "Fix tray".into(),
+            badge: "SHA".into(),
+            key: "sha-42 fix tray alice".into(),
+            name_at: 0,
+        };
+        assert!(names_pr(&issue, "SHA-42"));
+        assert!(names_pr(&issue, "SHA-4"));
+        assert!(!names_pr(&issue, "SHA-"));
+        assert!(names_pr(&issue, "tray"));
+        assert!(!names_pr(&issue, "endif"));
+    }
+    #[test]
+    fn pasted_reference_accepts_issue_identifiers_and_reference_urls() {
+        assert_eq!(
+            pasted_reference("https://github.com/org/shark/pull/93"),
+            Some("shark #93".into())
+        );
+        assert_eq!(
+            pasted_reference("https://linear.app/org/issue/SHA-42/fix"),
+            Some("SHA-42".into())
+        );
+        assert_eq!(pasted_reference("SHA-42"), Some("SHA-42".into()));
+        for text in [
+            "see SHA-42",
+            "SHA-no",
+            "see https://github.com/org/shark/pull/93",
+            "https://github.com/org/shark/issues/93",
+            "https://github.com.evil/org/shark/pull/93",
+            "https://github.com/org/shark/pull/93/files",
+        ] {
+            assert!(pasted_reference(text).is_none(), "{text}");
+        }
     }
 }

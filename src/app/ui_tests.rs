@@ -23,6 +23,8 @@ mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;
 mod differ_review_fixes_tests;
+mod draft_picker_tests;
+mod draft_settings_tests;
 mod drag_tests;
 mod editor_pane_tests;
 mod file_changes_tests;
@@ -2696,6 +2698,7 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
                 .map(|e| match e {
                     Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
                     Entry::Sep => "-".into(),
+                    Entry::Heading(title, detail) => format!("{title}. {detail}"),
                 })
                 .collect::<Vec<_>>()
         })
@@ -3587,6 +3590,7 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
             .map(|e| match e {
                 Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
                 Entry::Sep => "-".into(),
+                Entry::Heading(title, detail) => format!("{title}. {detail}"),
             })
             .collect::<Vec<_>>()
     };

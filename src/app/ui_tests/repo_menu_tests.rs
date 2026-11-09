@@ -19,7 +19,7 @@ fn invoke(entries: Vec<Entry>, label: &str, window: &mut Window, cx: &mut App) {
 fn has(entries: &[Entry], text: &str) -> bool {
     entries.iter().any(|e| match e {
         Entry::Item { label, .. } | Entry::Sub { label, .. } => label == text,
-        Entry::Sep => false,
+        Entry::Sep | Entry::Heading(..) => false,
     })
 }
 

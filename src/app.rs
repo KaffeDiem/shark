@@ -40,6 +40,7 @@ mod ask;
 mod attach;
 mod chats;
 mod differ_host;
+mod draft_picker;
 mod draft_view;
 mod editor_pane;
 mod features;
@@ -58,6 +59,7 @@ pub(crate) mod menus;
 mod new_task;
 mod palette;
 mod picker;
+mod reference_completion;
 mod reorder;
 pub(crate) mod repo_settings;
 mod run;
@@ -157,7 +159,12 @@ pub struct Shark {
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
     icon_picker: Option<icon_picker_host::Panel>,
+    draft_picker: Option<draft_picker::DraftPickerHost>,
+    draft_suggestions: Option<draft_picker::SuggestionCache>,
+    reference_completion: reference_completion::ReferenceCompletion,
     icon_anchors: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    draft_anchors: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    draft_bases: HashMap<PathBuf, String>,
     agent_icon_drop: Option<(String, PathBuf)>,
     usage: Vec<crate::usage::Snapshot>,
     #[cfg(test)]
@@ -328,7 +335,12 @@ impl Shark {
             app_switcher: None,
             usage_panel: None,
             icon_picker: None,
+            draft_picker: None,
+            draft_suggestions: None,
+            reference_completion: Default::default(),
             icon_anchors: Rc::default(),
+            draft_anchors: Rc::default(),
+            draft_bases: HashMap::new(),
             agent_icon_drop: None,
             usage: vec![Default::default(); crate::usage::Provider::ALL.len()],
             #[cfg(test)]
@@ -434,6 +446,7 @@ impl Shark {
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_picker = None;
         if let Tab::Feature(feature) = tab {
             if self.active_task().is_none() {
                 return notify_err(window, cx, "Open a task first");
@@ -1110,6 +1123,7 @@ impl Render for Shark {
             .children(self.render_app_switcher(window, cx))
             .children(self.render_usage(window, cx))
             .children(self.render_icon_picker(window, cx))
+            .children(self.render_draft_picker(window, cx))
             .when(self.zen_shown(), |d| d.bg(cx.theme().background))
             .child(match self.zen_shown() {
                 true => self.render_zen(cx),
