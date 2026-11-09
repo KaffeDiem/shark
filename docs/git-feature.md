@@ -144,7 +144,7 @@ Markdown renderer, which does not load remote or repository-relative images.
 - Mermaid uses `merman` (version and features pinned in `Cargo.toml`) with its
   resvg-safe pipeline, rasterized by resvg with system fonts. Diagrams follow the
   theme, render off the UI thread under a deadline and a source size bound
-  (`src/features/git/mermaid.rs`), and are cached as PNGs in the media cache keyed by
+  (`src/mermaid.rs`), and are cached as PNGs in the media cache keyed by
   source and theme. The image size is read from the PNG header. Failures show the error
   and the source.
 - Relative images resolve against the document's captured revision: the commit being

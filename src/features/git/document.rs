@@ -3,8 +3,8 @@
 //! never the working tree. A document is a list of blocks, so long ones are virtualized.
 //! GitHub's extensions are handled here: HTML comments are dropped, `<details>` folds,
 //! `> [!NOTE]` alerts, `suggestion` fences, `:emoji:` and `@user`/`#123`/SHA links.
-use super::mermaid::{self, Diagram};
 use crate::media::{self, Kind, Lru, MediaFile, MediaView, Playing, Side, Source};
+use crate::mermaid::{self, Diagram};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::spinner::Spinner;

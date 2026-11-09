@@ -23,7 +23,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-pub(crate) use links::{copy_button, link_roots, markdown};
+pub(crate) use links::{code_blocks, copy_button, link_roots, markdown};
 use std::{rc::Rc, sync::Arc};
 pub(crate) use toolbar::{quiet_toolbar, toolbar};
 

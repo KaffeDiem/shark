@@ -108,6 +108,8 @@ Scripts receive `SHARK_TASK` and `SHARK_TASK_PATH`. Existing `SHARK_WORKSPACE` a
 
 ## Chats and plans
 
+Mermaid diagrams render in Markdown replies and panes once their code fence closes; use Copy for the source or Open for the full-size image.
+
 A task can have several chat tabs, each with its own session, model, transcript and queue. Chats within the same task share its worktrees; tasks of the same agent do not. `cmd-t` starts another chat. Closing a running chat asks before stopping it. **Reopen closed chat…** or `cmd-shift-t` restores a recent session; Shark keeps the latest 20 closed chats. **Start a new conversation** resets the shown chat's model session.
 
 Choose a model and thinking level with the composer button or `cmd-/`. Defaults apply to new chats; changing one chat does not replace the others. Changes take effect with the next message, restarting and resuming a Claude process where necessary. Codex's **Fast** mode (`cmd-shift-f`) selects its priority service tier and uses more of your plan's allowance.

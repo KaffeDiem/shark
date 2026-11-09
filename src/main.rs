@@ -21,6 +21,7 @@ mod lsp;
 mod media;
 mod menu;
 mod menubar;
+mod mermaid;
 mod models;
 mod overflow_fade;
 mod plan;

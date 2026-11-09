@@ -2,8 +2,6 @@
 pub(crate) mod commits;
 pub(crate) mod document;
 mod drafts;
-pub(crate) use drafts::store_path as drafts_path;
-mod mermaid;
 use crate::media::{Lru, Playing};
 use crate::pr::git_feature as api;
 use crate::state::Task;
@@ -14,6 +12,7 @@ use crate::{
 };
 use commits::{Commits, RepoContext};
 use document::{DocContext, RichDoc};
+pub(crate) use drafts::store_path as drafts_path;
 use drafts::{DescriptionDraft, DraftStore, Editing};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};

@@ -3546,6 +3546,56 @@ exec cat >>"$0.stdin"
         assert_eq!(clip(cx).as_deref(), Some("hi"));
     }
 
+    #[gpui_kit::test]
+    fn streaming_mermaid_reply_renders_after_fence_closes(cx: &mut TestAppContext) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let chat = open_chat("mermaid-stream", cx);
+        let window = cx.windows()[0];
+        let open = "```mermaid\nflowchart TD\n  A[Start] --> B[Done]\n";
+        let closed = format!("{open}```");
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| c.apply(Ev::TextDelta(open.into()), cx));
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            assert!(
+                w.try_find("md-mermaid").is_none(),
+                "open fence stays source"
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| c.apply(Ev::Text(closed.clone()), cx));
+        });
+        cx.update_window(window, |_, w, cx| w.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let bounds = w.find("md-mermaid").bounds();
+            assert!(
+                bounds.size.height > px(20.) && bounds.size.height <= px(560.),
+                "{bounds:?}"
+            );
+            chat.update(cx, |c, cx| {
+                assert_eq!(c.blocks.len(), 1, "streaming updates keep one reply");
+                assert!(matches!(&c.blocks[0], Block::Text { src, .. } if src == &closed));
+                c.sel = 0;
+                c.copy_selected(w, cx);
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(closed),
+            "copy preserves the Mermaid source"
+        );
+    }
+
     /// A codex model starts a new conversation (claude's session can't carry over) and keeps
     /// plan mode; another codex model keeps the thread.
     #[gpui_kit::test]

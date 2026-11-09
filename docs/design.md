@@ -164,6 +164,8 @@ Dialogs use `ui::dialog` / `ui::alert_dialog`: 14px corners, 20px form padding a
 
 ### Chat, plans and questions
 
+Closed Mermaid fences render inside the code-block surface across Markdown views, scaled down to the column and capped at 560px tall (900px in Git); Copy keeps the source and Open opens the full-size image in the system viewer. Streaming or failed diagrams keep their source; failures add one muted error line.
+
 Transcript prose is primary; tool calls are evidence. Group consecutive ordinary calls between prose into one summary row counted by verb. Show the running call and failures on the collapsed summary so collapse never hides a failure. Expand to compact 28px rows and individual outputs. Skills and subagent invocations remain standalone intent rows (`BookOpen` / `Bot`). Paths are task-relative. End turns with duration and done/interrupted state, including interruptions recovered on replay.
 
 Keep prose in the 680px reading column and composer in its 712px card. Code and output explicitly use the mono font; do not inherit UI typography. User messages, tools and rendered markdown use the shared copy controls. Reserve their space so hover or the copied check neither shifts nor covers text. Keyboard copy and palette actions must remain available.
