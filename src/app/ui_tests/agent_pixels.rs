@@ -190,6 +190,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         ("draft-issue-pr", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
             s.home.agent_draft.issues.push(draft_issue());
+            s.home.agent_draft.repos[0].pr_label =
+                Some("#89 Preserve selected skills · Open".into());
             s.home.agent_draft.repos[0].branch =
                 super::super::task_draft::BranchSpec::Pr(git::PullRequest {
                     number: 89,

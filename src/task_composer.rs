@@ -2,8 +2,8 @@
 use crate::complete::{self, Item, Kind};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveUp, OutdentInline,
-    Textarea, TextareaState,
+    Enter, Escape, IndentInline, InlineToken, InputContent, InputEvent, MoveDown, MoveUp,
+    OutdentInline, Textarea, TextareaState, Undo,
 };
 use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -21,6 +21,14 @@ pub(crate) struct Source {
 
 pub(crate) enum Event {
     Submit,
+    AttachReference(complete::Reference),
+    SearchIssues(String),
+    PasteReference {
+        text: String,
+    },
+    UndoReference {
+        text: String,
+    },
     Change,
     Escape,
     TogglePlan,
@@ -34,7 +42,16 @@ pub(crate) enum Event {
     },
 }
 
+struct PastedReference {
+    restored: String,
+    restored_content: InputContent,
+    removed: String,
+    text: String,
+    start: usize,
+}
+
 struct Menu {
+    query: String,
     range: std::ops::Range<usize>,
     source: char,
     matches: Vec<usize>,
@@ -53,6 +70,7 @@ pub(crate) struct TaskComposer {
     asking: bool,
     files: Vec<Item>,
     prs: Vec<Item>,
+    issues: Vec<crate::linear::Hit>,
     commands: Vec<Item>,
     menu: Option<Menu>,
     scroll: ScrollHandle,
@@ -63,6 +81,8 @@ pub(crate) struct TaskComposer {
     generation: u64,
     read_only: bool,
     dropping: Option<Vec<PathBuf>>,
+    pasted_references: Vec<PastedReference>,
+    undoing: bool,
     _subscription: Subscription,
 }
 
@@ -96,6 +116,47 @@ pub(crate) fn insert_token(
     });
 }
 
+/// Record plain paste first; token conversion is a separate native undo transaction.
+pub(crate) fn paste_reference(
+    input: &Entity<TextareaState>,
+    item: &ClipboardItem,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let Some(text) = item.text() else {
+        return false;
+    };
+    let Some(label) = complete::pasted_reference(&text) else {
+        return false;
+    };
+    let state = input.read(cx);
+    let range = state.selected_range();
+    let value = state.value();
+    if !value[..range.start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        || !value[range.end..]
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        return false;
+    }
+    input.update(cx, |input, cx| {
+        input.replace(text.clone(), window, cx);
+        let url = text.trim();
+        let start = range.start + text.len() - text.trim_start().len();
+        let token = InlineToken::new(url.to_string(), url.to_string()).with_label(label);
+        let _ = input.replace_range_with_token(start..start + url.len(), token, window, cx);
+    });
+    true
+}
+
 impl TaskComposer {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| textarea(window, cx, 2));
@@ -108,6 +169,17 @@ impl TaskComposer {
                         cx.emit(Event::Submit)
                     }
                     InputEvent::Change => {
+                        if std::mem::take(&mut this.undoing) {
+                            let value = this.input.read(cx).value().to_string();
+                            if let Some(index) = this
+                                .pasted_references
+                                .iter()
+                                .rposition(|paste| paste.restored == value)
+                            {
+                                let text = this.pasted_references.remove(index).text;
+                                cx.emit(Event::UndoReference { text });
+                            }
+                        }
                         this.update_menu(cx);
                         cx.emit(Event::Change);
                     }
@@ -126,6 +198,7 @@ impl TaskComposer {
             asking: false,
             files: vec![],
             prs: vec![],
+            issues: vec![],
             commands: vec![],
             menu: None,
             scroll: ScrollHandle::new(),
@@ -136,7 +209,40 @@ impl TaskComposer {
             generation: 0,
             read_only: false,
             dropping: None,
+            pasted_references: vec![],
+            undoing: false,
             _subscription: subscription,
+        }
+    }
+
+    pub(crate) fn take_failed_reference(&mut self, text: &str) -> Option<(String, InputContent)> {
+        let index = self
+            .pasted_references
+            .iter()
+            .rposition(|paste| paste.text == text)?;
+        let paste = self.pasted_references.remove(index);
+        Some((paste.removed, paste.restored_content))
+    }
+
+    pub(crate) fn restore_failed_reference(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .pasted_references
+            .iter()
+            .rposition(|paste| paste.text == text)
+        else {
+            return;
+        };
+        let paste = self.pasted_references.remove(index);
+        if self.input.read(cx).value().as_ref() == paste.removed {
+            self.input.update(cx, |input, cx| {
+                input.set_selected_range(paste.start..paste.start, cx);
+                input.replace(paste.text, window, cx);
+            });
         }
     }
 
@@ -182,6 +288,9 @@ impl TaskComposer {
                 .flat_map(|s| complete::cached_repo_prs(&s.name, &s.path, false))
                 .collect::<Vec<_>>(),
         );
+        let mut references = complete::issue_items(&self.issues);
+        references.append(&mut self.prs);
+        self.prs = references;
         self.commands = complete::skill_items(self.skills.clone());
         self.close_menu(cx);
         self.generation += 1;
@@ -279,7 +388,38 @@ impl TaskComposer {
         }
     }
 
-    fn refresh_prs(&mut self, prs: Vec<Item>, cx: &mut Context<Self>) {
+    pub(crate) fn set_issues(&mut self, issues: Vec<crate::linear::Hit>, cx: &mut Context<Self>) {
+        self.issues = issues;
+        let prs = self
+            .prs
+            .iter()
+            .filter(|item| item.kind != Kind::Issue)
+            .cloned()
+            .collect();
+        self.refresh_prs(prs, cx);
+    }
+
+    fn attach_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.menu.as_ref().filter(|m| m.source == '#' && m.armed) else {
+            return false;
+        };
+        let Some(reference) = menu
+            .matches
+            .get(menu.selected)
+            .and_then(|i| self.prs[*i].reference.clone())
+        else {
+            return false;
+        };
+        let range = self.menu.take().unwrap().range;
+        self.input.update(cx, |input, cx| {
+            input.set_selected_range(range, cx);
+            input.replace("", window, cx);
+        });
+        cx.emit(Event::AttachReference(reference));
+        true
+    }
+
+    fn refresh_prs(&mut self, mut prs: Vec<Item>, cx: &mut Context<Self>) {
         let selection = self
             .menu
             .as_ref()
@@ -288,7 +428,9 @@ impl TaskComposer {
                 let item = self.prs.get(*menu.matches.get(menu.selected)?)?;
                 Some((item.insert.clone(), menu.armed))
             });
-        self.prs = prs;
+        let mut issues = complete::issue_items(&self.issues);
+        issues.append(&mut prs);
+        self.prs = issues;
         if !self.has_menu() {
             return;
         }
@@ -387,6 +529,14 @@ impl TaskComposer {
             return self.close_menu(cx);
         };
         let query = &text[range.start + 1..range.end];
+        if source == '#'
+            && self
+                .menu
+                .as_ref()
+                .is_none_or(|menu| menu.range != range || menu.query != query)
+        {
+            cx.emit(Event::SearchIssues(query.to_string()));
+        }
         let items = self.source(source);
         let matches = if source == '#' {
             complete::rank_prs(items, query, 50)
@@ -404,6 +554,7 @@ impl TaskComposer {
                 .first()
                 .is_some_and(|i| complete::names_pr(&items[*i], query));
         self.menu = Some(Menu {
+            query: query.to_string(),
             range,
             source,
             matches,
@@ -455,7 +606,7 @@ impl TaskComposer {
         true
     }
 
-    fn paste(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+    fn paste(&mut self, item: &ClipboardItem, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.read_only {
             return true;
         }
@@ -468,6 +619,47 @@ impl TaskComposer {
         }) {
             cx.emit(Event::Attach { paths, image: None });
             return true;
+        }
+        if let Some(text) = item
+            .text()
+            .filter(|text| complete::pasted_reference(text).is_some())
+        {
+            let input = self.input.read(cx);
+            let range = input.selected_range();
+            let value = input.value();
+            let own_line = value[..range.start]
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+                && value[range.end..]
+                    .split('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty();
+            if own_line {
+                let start = range.start;
+                let (restored, restored_content) = self.input.update(cx, |input, cx| {
+                    input.replace(text.clone(), window, cx);
+                    let restored = input.value().to_string();
+                    let restored_content = input.content();
+                    input.set_selected_range(start..start + text.len(), cx);
+                    input.replace("", window, cx);
+                    (restored, restored_content)
+                });
+                self.pasted_references.push(PastedReference {
+                    restored,
+                    restored_content,
+                    removed: self.input.read(cx).value().to_string(),
+                    text: text.clone(),
+                    start,
+                });
+                cx.emit(Event::PasteReference { text });
+                return true;
+            }
+            cx.emit(Event::SearchIssues(text));
         }
         if item
             .entries()
@@ -503,8 +695,9 @@ impl TaskComposer {
                     Kind::Dir => IconName::Folder,
                     Kind::Command => IconName::Slash,
                     Kind::Pr(_) => IconName::GitPullRequest,
+                    Kind::Issue => IconName::Tag,
                 };
-                h_flex()
+                let row = h_flex()
                     .id(selected)
                     .h(crate::menu::ROW_H)
                     .px_2()
@@ -538,7 +731,30 @@ impl TaskComposer {
                                 .text_color(theme.muted_foreground)
                                 .child(item.badge.clone()),
                         )
-                    })
+                    });
+                v_flex()
+                    .when(
+                        menu.source == '#'
+                            && (selected == 0
+                                || (self.source(menu.source)[menu.matches[selected - 1]].kind
+                                    == Kind::Issue)
+                                    != (item.kind == Kind::Issue)),
+                        |d| {
+                            d.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if item.kind == Kind::Issue {
+                                        "Issues"
+                                    } else {
+                                        "Pull requests"
+                                    }),
+                            )
+                        },
+                    )
+                    .child(row)
             })
             .collect::<Vec<_>>();
         let error = match menu.source {
@@ -551,7 +767,7 @@ impl TaskComposer {
         } else {
             self.loading
         };
-        let empty = if self.sources.is_empty() && menu.source != '/' {
+        let empty = if self.sources.is_empty() && menu.source == '@' {
             "Add a repository to reference files"
         } else if loading {
             "Loading…"
@@ -560,7 +776,7 @@ impl TaskComposer {
         } else {
             match menu.source {
                 '/' => "No matching skills",
-                '#' => "No matching pull requests",
+                '#' => "No matching references",
                 _ => "No matching files",
             }
         };
@@ -590,6 +806,15 @@ impl TaskComposer {
                         })
                         .children(rows),
                 )
+                .when(menu.source == '#', |d| {
+                    d.child(
+                        div()
+                            .px_2()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("↵ mention · ⌥↵ attach · Esc close"),
+                    )
+                })
                 .when_some(error.clone(), |d, error| {
                     d.child(
                         div()
@@ -610,6 +835,7 @@ impl Render for TaskComposer {
         let dropped = this.clone();
         v_flex()
             .id("task-composer-input")
+            .key_context("TaskComposer")
             .test_support()
             .relative()
             .w_full()
@@ -653,9 +879,37 @@ impl Render for TaskComposer {
                     cx.stop_propagation();
                 }
             }))
+            .capture_action(cx.listener(|this, _: &Undo, _, _| {
+                this.undoing = true;
+            }))
+            .capture_action(
+                cx.listener(|this, _: &crate::BranchFromSource, window, cx| {
+                    if this.attach_reference(window, cx) {
+                        cx.stop_propagation();
+                    } else if this
+                        .menu
+                        .as_ref()
+                        .is_some_and(|menu| menu.source == '#' && !menu.armed)
+                    {
+                        this.input
+                            .update(cx, |input, cx| input.replace("\n", window, cx));
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .capture_action(cx.listener(|this, event: &Enter, window, cx| {
-                if !event.shift && this.pick(None, window, cx) {
-                    cx.stop_propagation();
+                if !event.shift {
+                    if this.pick(None, window, cx) {
+                        cx.stop_propagation();
+                    } else if this
+                        .menu
+                        .as_ref()
+                        .is_some_and(|menu| menu.source == '#' && !menu.armed)
+                    {
+                        this.input
+                            .update(cx, |input, cx| input.replace("\n", window, cx));
+                        cx.stop_propagation();
+                    }
                 }
             }))
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
@@ -716,8 +970,8 @@ impl Render for TaskComposer {
                 Textarea::new(&self.input)
                     .appearance(false)
                     .readonly(self.read_only)
-                    .on_paste(move |item, _, cx| {
-                        this.update(cx, |this, cx| this.paste(item, cx))
+                    .on_paste(move |item, window, cx| {
+                        this.update(cx, |this, cx| this.paste(item, window, cx))
                             .unwrap_or(false)
                     }),
             )
@@ -731,12 +985,13 @@ impl Render for TaskComposer {
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::{Event, TaskComposer};
+    use crate::complete;
     use core::prelude::v1::test;
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
-        AppContext as _, Context, ExternalPaths, FileDropEvent, Keystroke, TestAppContext, Window,
-        WindowOptions,
+        AppContext as _, ClipboardItem, Context, ExternalPaths, FileDropEvent, Keystroke,
+        TestAppContext, Window, WindowOptions,
     };
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -765,6 +1020,9 @@ mod tests {
                     Event::Escape => "escape",
                     Event::TogglePlan => "plan",
                     Event::AgentMove(_) => "agent",
+                    Event::PasteReference { .. } => "paste-reference",
+                    Event::UndoReference { .. } => "undo-reference",
+                    Event::AttachReference(_) => "attach-reference",
                     _ => "other",
                 });
             })
@@ -879,6 +1137,81 @@ mod tests {
                 assert_eq!(input.tokens().len(), 1);
             });
         }
+        for key in ["enter", "alt-enter"] {
+            act(cx, &|this, window, cx| {
+                this.input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.insert("#endif", window, cx);
+                });
+            });
+            let submitted = events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "submit")
+                .count();
+            press(cx, key);
+            cx.run_until_parked();
+            cx.update(|cx| {
+                assert_eq!(
+                    composer.read(cx).input.read(cx).value().as_ref(),
+                    "#endif\n"
+                )
+            });
+            assert_eq!(
+                events
+                    .borrow()
+                    .iter()
+                    .filter(|event| **event == "submit")
+                    .count(),
+                submitted
+            );
+        }
+        act(cx, &|this, window, cx| {
+            let prs: Vec<complete::Pr> = serde_json::from_str(r#"[{"repo":"shark","number":93,"title":"Redesign agent page","url":"https://github.com/org/shark/pull/93","state":"OPEN","baseRefName":"master"}]"#).unwrap();
+            this.refresh_prs(complete::pr_items(&prs), cx);
+            this.input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.insert("#93", window, cx);
+            });
+        });
+        let submitted = events
+            .borrow()
+            .iter()
+            .filter(|event| **event == "submit")
+            .count();
+        press(cx, "alt-enter");
+        cx.run_until_parked();
+        assert!(events.borrow().contains(&"attach-reference"));
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "submit")
+                .count(),
+            submitted
+        );
+        cx.update(|cx| assert_eq!(composer.read(cx).input.read(cx).value().as_ref(), ""));
+        act(cx, &|this, window, cx| {
+            this.input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            assert!(this.paste(
+                &ClipboardItem::new_string("https://github.com/org/shark/pull/93".into()),
+                window,
+                cx
+            ));
+        });
+        cx.run_until_parked();
+        assert!(events.borrow().contains(&"paste-reference"));
+        cx.update(|cx| assert_eq!(composer.read(cx).input.read(cx).value().as_ref(), ""));
+        press(cx, "cmd-z");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                composer.read(cx).input.read(cx).value().as_ref(),
+                "https://github.com/org/shark/pull/93"
+            )
+        });
+        assert!(events.borrow().contains(&"undo-reference"));
         act(cx, &|this, window, cx| {
             this.set_asking(true, cx);
             this.input.update(cx, |input, cx| {

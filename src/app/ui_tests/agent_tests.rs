@@ -637,8 +637,10 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update_window(window, |_, w, cx| w.has_active_dialog(cx))
-            .unwrap()
+        cx.update_window(window, |_, w, cx| {
+            w.has_active_dialog(cx) || shark.read(cx).draft_picker.is_some()
+        })
+        .unwrap()
     };
     assert!(
         run(cx),
@@ -649,8 +651,7 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
     let repos = repos(&home, &["api"]);
     on_app(window, shark.clone())(cx, &|s, _, _| s.state.repos = repos.clone());
     assert!(run(cx));
-    cx.update_window(window, |_, w, cx| w.click("create", cx))
-        .unwrap();
+    press_in(window)(cx, &["enter"]);
     cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);

@@ -40,6 +40,34 @@ impl Row {
 pub(super) const COMMANDS: &[Row] = &[
     Row::key("New task", IconName::Plus, &NewTask, "create start chat"),
     Row(
+        "Add to task…",
+        IconName::Plus,
+        Some(&AddToDraft),
+        "issue pull request repository file",
+        Some(|s, w, cx| s.draft_add_menu(w, cx)),
+    ),
+    Row(
+        "Change branch or pull request…",
+        IconName::GitBranch,
+        Some(&ChangeDraftBranch),
+        "draft repository",
+        Some(|s, w, cx| s.change_draft_branch(w, cx)),
+    ),
+    Row(
+        "Reset task to agent defaults",
+        IconName::RotateCcw,
+        None,
+        "draft repository model thinking",
+        Some(|s, w, cx| s.reset_draft_defaults(w, cx)),
+    ),
+    Row(
+        "Save task settings as agent default",
+        IconName::Save,
+        None,
+        "draft repository model thinking",
+        Some(|s, w, cx| s.save_draft_defaults(w, cx)),
+    ),
+    Row(
         "New task for agent…",
         IconName::Bot,
         None,
@@ -958,6 +986,20 @@ impl Shark {
                     && NEED_TASK.contains(label)
                     && !(*label == "Attach Linear issue…" && self.home_shown()))
                 || (no_linear && NEED_LINEAR.contains(label))
+                || ([
+                    "Add to task…",
+                    "Change branch or pull request…",
+                    "Reset task to agent defaults",
+                    "Save task settings as agent default",
+                ]
+                .contains(label)
+                    && (!self.home_shown() || (self.home.asking && !self.draft_target())))
+                || ([
+                    "Reset task to agent defaults",
+                    "Save task settings as agent default",
+                ]
+                .contains(label)
+                    && self.draft_slug(self.draft_target()).is_none())
                 || (*label == "Show or hide diff files"
                     && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
             {

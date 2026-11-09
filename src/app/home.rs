@@ -260,7 +260,7 @@ impl Shark {
             if self.home.destination == Destination::Home && self.home.asking {
                 self.toggle_ask_mode(window, cx);
             }
-            self.pick_draft_branch(None, window, cx);
+            self.change_draft_branch(window, cx);
         } else {
             self.new_task_from_repos(self.state.last_repos.clone(), None, window, cx);
         }
@@ -306,6 +306,7 @@ impl Shark {
     }
 
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_picker = None;
         self.home.on = true;
         self.home.destination = Destination::Home;
         self.zen = false;

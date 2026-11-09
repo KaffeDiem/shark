@@ -92,6 +92,8 @@ impl Block {
 type Row = (usize, Option<usize>);
 
 pub enum ChatEvent {
+    AttachCompletionIssue(crate::linear::Hit),
+    SearchCompletionIssues(String),
     /// `meta` changed (session, model or title); the app saves it.
     Meta,
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
@@ -588,6 +590,15 @@ impl Chat {
         }) {
             self.attach(p, None, window, cx);
             return true;
+        }
+        if crate::task_composer::paste_reference(&self.composer, item, window, cx) {
+            return true;
+        }
+        if let Some(text) = item
+            .text()
+            .filter(|text| complete::pasted_reference(text).is_some())
+        {
+            cx.emit(ChatEvent::SearchCompletionIssues(text));
         }
         // Text wins over a rendered image of it, as copied from a word processor.
         if entries
@@ -1832,10 +1843,18 @@ impl Chat {
                             cx.stop_propagation();
                         }
                     }))
+                    .capture_action(cx.listener(|this, _: &crate::BranchFromSource, window, cx| {
+                        if this.attach_completion_issue(window, cx) { cx.stop_propagation(); }
+                        else if this.unarmed_reference() { this.composer.update(cx, |input, cx| input.replace("\n", window, cx)); cx.stop_propagation(); }
+                    }))
                     .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-                        // With no match, Enter sends what was typed.
-                        if !a.shift && this.pick_selected(window, cx) {
-                            cx.stop_propagation();
+                        // Unarmed reference queries stay text; other Enter presses send.
+                        if !a.shift {
+                            if this.pick_selected(window, cx) { cx.stop_propagation(); }
+                            else if this.unarmed_reference() {
+                                this.composer.update(cx, |input, cx| input.replace("\n", window, cx));
+                                cx.stop_propagation();
+                            }
                         }
                     }))
                     .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
@@ -5001,6 +5020,18 @@ done
             let c = chat.read(cx).composer.read(cx);
             assert_eq!(c.tokens().last().unwrap().token().label(), "api#12");
         });
+        for key in ["enter", "alt-enter"] {
+            act(cx, &|w, cx| w.input(" #endif", cx));
+            assert_eq!(armed(cx), Some(false));
+            act(cx, &|w, cx| w.press(key, cx));
+            assert!(value(cx).ends_with(" #endif\n"), "{key}: {}", value(cx));
+            cx.update(|cx| {
+                assert!(
+                    chat.read(cx).queue.is_empty(),
+                    "unarmed references never submit"
+                )
+            });
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -130,6 +130,12 @@ impl Shark {
             window,
             move |this, chat, ev: &ChatEvent, window, cx| {
                 match ev {
+                    ChatEvent::SearchCompletionIssues(query) => {
+                        this.search_reference_issues(query.clone(), cx)
+                    }
+                    ChatEvent::AttachCompletionIssue(hit) => {
+                        this.attach_chat_reference_issue(name.clone(), hit.clone(), window, cx)
+                    }
                     ChatEvent::Meta => this.save_meta(chat, cx),
                     ChatEvent::HandOff { to } => match to {
                         Some(to) => this.hand_off(&name, to, Some(id.clone()), window, cx),
@@ -201,6 +207,7 @@ impl Shark {
             sync.update(cx, |g, cx| g.add_chat(chat.clone(), cx));
         }
         self.chats.insert(meta.id.clone(), chat.clone());
+        self.sync_reference_completion(self.draft_target(), cx);
         self.save_meta(&chat, cx); // replay may have found a title
         chat
     }

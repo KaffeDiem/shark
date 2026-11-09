@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::AgentLink;
+use crate::state::{Agent, AgentLink};
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -34,16 +34,14 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         assert!(w.try_find("agent-settings").is_some());
         w.click("agent-instructions", cx);
         w.input("Always use Mobbin to ground your research", cx);
-        // Defaults › Repos › api makes it a default repository.
-        w.click("agent-repos", cx);
+        assert!(w.try_find("agent-repos").is_none());
     })
     .unwrap();
-    press_in(window)(cx, &["a", "enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         let a = &s.state.agents[0];
         assert_eq!(a.slug, "designer");
-        assert_eq!(a.repos, ["api"]);
+        assert!(a.repos.is_empty());
         assert_eq!(a.instructions, "Always use Mobbin to ground your research");
         assert_eq!(
             s.state.sections.len(),
@@ -77,19 +75,18 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
             "settings are edited on the agent's page"
         );
         assert!(w.try_find("agent-skills").is_some());
+        assert_eq!(
+            w.find("agent-page-icon").bounds().size,
+            size(px(40.), px(40.))
+        );
         assert!(w.try_find("agent-attach").is_none());
+        assert!(w.try_find("agent-model").is_none());
+        assert!(w.try_find("agent-effort").is_none());
+        assert!(w.try_find("agent-defaults-label").is_none());
+        assert_eq!(w.find("agent-skills").label().as_deref(), Some("0 skills"));
         assert_eq!(
-            w.find("agent-model").label().as_deref(),
-            Some("Model Inherit")
-        );
-        assert_eq!(
-            w.find("agent-effort").label().as_deref(),
-            Some("Thinking Inherit")
-        );
-        assert_eq!(w.find("agent-next").label().as_deref(), Some("Then None"));
-        assert!(
-            w.try_find("agent-repos").is_some(),
-            "the default shows as a chip"
+            w.find("agent-next").label().as_deref(),
+            Some("Hands off to nobody")
         );
         assert!(w.try_find("agent-empty-tasks").is_some());
         assert!(w.try_find("agent-composer").is_some());
@@ -99,6 +96,26 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         );
     })
     .unwrap();
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let labels = s
+            .agent_identity_menu("designer", cx)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Item { label, .. } => Some(label.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "Rename",
+                "Change icon…",
+                "Paste Image as Icon",
+                "Edit instructions",
+                "Delete agent…"
+            ]
+        );
+    });
     let saved = State::load();
     assert_eq!(
         saved.agents[0].instructions,
@@ -297,6 +314,7 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
         let header = shark.read(cx).home.agent_header.clone().unwrap();
         assert_eq!(header.read(cx).skills, ["research"]);
         w.render_frame(cx);
+        assert_eq!(w.find("agent-skills").label().as_deref(), Some("1 skill"));
         for (i, status) in ["Merged", "Not merged", "PR state unknown"]
             .into_iter()
             .enumerate()
@@ -615,4 +633,154 @@ async fn ui_review_regression_skill_refresh_reaches_both_drafts(cx: &mut TestApp
         });
     }
     fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn reference_attachment_changes_only_the_draft_and_paste_undo_cancels_pending_reads(
+    cx: &mut TestAppContext,
+) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.attach_draft_reference(
+            false,
+            crate::complete::Reference::Pr {
+                repo: "api".into(),
+                label: "#93 Review".into(),
+                pr: git::PullRequest {
+                    number: 93,
+                    url: "https://github.com/org/api/pull/93".into(),
+                    base: "main".into(),
+                },
+            },
+            w,
+            cx,
+        );
+        assert_eq!(s.home.draft.repos.len(), 1);
+        assert_eq!(
+            s.home.draft.repos[0].pr_label.as_deref(),
+            Some("#93 Review")
+        );
+        assert!(
+            matches!(&s.home.draft.repos[0].branch, super::super::task_draft::BranchSpec::Pr(pr) if pr.number == 93)
+        );
+        assert!(s.state.tasks.is_empty(), "attaching never starts a task");
+        let url = "https://linear.app/acme/issue/SHA-42/test".to_string();
+        s.paste_draft_reference(false, url.clone(), w, cx);
+        assert_eq!(
+            s.home.draft.staging, 1,
+            "a pending full snapshot blocks submit"
+        );
+        s.home.draft.issues.push(Snapshot {
+            id: "unrelated".into(),
+            ..Default::default()
+        });
+        s.undo_draft_reference(false, url, w, cx);
+        assert_eq!(s.home.draft.staging, 0);
+        assert_eq!(
+            s.home.draft.issues[0].id, "unrelated",
+            "undo keeps newer attachments"
+        );
+        assert!(
+            matches!(&s.home.draft.repos[0].branch, super::super::task_draft::BranchSpec::Pr(pr) if pr.number == 93)
+        );
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.home.draft.issues.len() == 1,
+            "cancelled reads cannot reattach after undo"
+        );
+        assert_eq!(s.home.draft.staging, 0);
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn failed_paste_restores_original_agent_draft_after_navigation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![
+                Agent {
+                    slug: "first".into(),
+                    name: "First".into(),
+                    ..Default::default()
+                },
+                Agent {
+                    slug: "second".into(),
+                    name: "Second".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("first", w, cx));
+    let url = "https://linear.app/acme/issue/SHA-42/test";
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(url.into())));
+    cx.update_window(window, |_, w, cx| w.press("cmd-v", cx))
+        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.open_agent("second", w, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.home.agent_drafts["first"].text, url,
+            "failed paste remains in its original draft"
+        );
+        assert_eq!(s.home.agent_drafts["first"].staging, 0);
+        assert_eq!(
+            s.home.agent_prompt.read(cx).value().as_ref(),
+            "",
+            "recovery leaves the second agent's input alone"
+        );
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn reference_suggestions_exclude_other_linear_workspaces(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            linear: Some(crate::linear::Connection {
+                org_id: "current".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark)(cx, &|s, _, _| {
+        s.home.draft.issues.push(Snapshot {
+            org: "prior".into(),
+            id: "prior-id".into(),
+            identifier: "SHA-42".into(),
+            ..Default::default()
+        });
+        assert_eq!(s.home.draft.issues.len(), 1);
+        assert!(
+            s.reference_hits().is_empty(),
+            "a matching identifier from a prior workspace is not a current suggestion"
+        );
+    });
 }

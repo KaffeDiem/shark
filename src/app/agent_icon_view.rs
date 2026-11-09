@@ -3,17 +3,33 @@ use super::*;
 use crate::state::{Agent, AgentIcon};
 
 #[derive(IntoElement)]
-pub(crate) struct AgentIconView(AgentIcon);
+pub(crate) struct AgentIconView {
+    icon: AgentIcon,
+    size: Pixels,
+}
 
 pub(crate) fn agent_icon(icon: &AgentIcon) -> AgentIconView {
-    AgentIconView(icon.clone())
+    AgentIconView {
+        icon: icon.clone(),
+        size: px(16.),
+    }
+}
+
+impl AgentIconView {
+    pub(crate) fn size(mut self, size: Pixels) -> Self {
+        self.size = size;
+        self
+    }
 }
 
 impl RenderOnce for AgentIconView {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let content = match self.0 {
+        let large = self.size > px(16.);
+        let symbol = matches!(&self.icon, AgentIcon::Symbol { .. });
+        let glyph_size = if large { self.size * 0.55 } else { self.size };
+        let content = match self.icon {
             AgentIcon::Symbol { name, tint } => Icon::new(super::icon_picker::symbol(&name))
-                .with_size(px(16.))
+                .with_size(glyph_size)
                 .when_some(
                     tint.as_deref()
                         .and_then(|t| super::icon_picker::tint(t, cx.theme())),
@@ -22,30 +38,33 @@ impl RenderOnce for AgentIconView {
                 .into_any_element(),
             AgentIcon::Emoji { value } => div()
                 .font_family("Apple Color Emoji")
-                .text_size(px(14.))
-                .line_height(px(16.))
+                .text_size(if large { self.size * 0.65 } else { px(14.) })
+                .line_height(self.size)
                 .child(value)
                 .into_any_element(),
             AgentIcon::Image { file } => match crate::agent_icon::path(&file) {
                 Some(path) => img(path)
-                    .size(px(16.))
+                    .size(self.size)
                     .object_fit(ObjectFit::Cover)
                     .rounded_full()
                     .border(px(0.5))
                     .border_color(white().opacity(0.1))
-                    .with_fallback(|| {
+                    .with_fallback(move || {
                         Icon::new(IconName::Bot)
-                            .with_size(px(16.))
+                            .with_size(glyph_size)
                             .into_any_element()
                     })
                     .into_any_element(),
                 None => Icon::new(IconName::Bot)
-                    .with_size(px(16.))
+                    .with_size(glyph_size)
                     .into_any_element(),
             },
         };
         div()
-            .size(px(16.))
+            .size(self.size)
+            .when(large && symbol, |d| {
+                d.rounded_full().bg(cx.theme().secondary)
+            })
             .flex_none()
             .flex()
             .items_center()

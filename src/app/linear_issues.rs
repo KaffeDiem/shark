@@ -1279,7 +1279,7 @@ impl Shark {
     }
 
     /// Adds `snapshots` to `name`, but not what's already there: only Refresh replaces a snapshot.
-    fn attach_issues(
+    pub(super) fn attach_issues(
         &mut self,
         name: String,
         snapshots: Vec<Snapshot>,
