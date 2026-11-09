@@ -455,39 +455,9 @@ impl Shark {
                 }
                 match result {
                     Ok((repo, label, pr)) => {
-                        let applied_name = repo.name.clone();
-                        let Some(draft) =
-                            s.draft_at_mut(&destination).filter(|draft| !draft.starting)
-                        else {
+                        if !s.apply_pasted_pr(id, repo, label, pr) {
+                            s.fail_pasted_reference(id, "The repository selection changed while looking up this pull request".into(), window, cx);
                             return;
-                        };
-                        if let Some(existing) = draft
-                            .repos
-                            .iter_mut()
-                            .find(|existing| existing.repo.name == repo.name)
-                        {
-                            existing.branch = BranchSpec::Pr(pr.clone());
-                            existing.pr_label = Some(label.clone());
-                        } else {
-                            draft.repos.push(DraftRepo {
-                                repo,
-                                branch: BranchSpec::Pr(pr.clone()),
-                                pr_label: Some(label.clone()),
-                            });
-                        }
-                        draft.repos_edited = true;
-                        let applied = draft
-                            .repos
-                            .iter()
-                            .find(|existing| existing.repo.name == applied_name)
-                            .cloned();
-                        if let Some(paste) = s
-                            .reference_completion
-                            .pastes
-                            .iter_mut()
-                            .find(|paste| paste.id == id)
-                        {
-                            paste.applied = applied.map(PastedMutation::Repo);
                         }
                         if s.home.destination == destination {
                             s.focus_draft(agent, window, cx);
@@ -500,6 +470,93 @@ impl Shark {
             .ok();
         })
         .detach();
+    }
+
+    fn apply_pasted_pr(
+        &mut self,
+        id: u64,
+        repo: Repo,
+        label: String,
+        pr: git::PullRequest,
+    ) -> bool {
+        let Some(paste) = self
+            .reference_completion
+            .pastes
+            .iter()
+            .find(|paste| paste.id == id)
+        else {
+            return false;
+        };
+        let destination = paste.destination.clone();
+        let baseline = paste.repos.clone();
+        let Some(draft) = self
+            .draft_at_mut(&destination)
+            .filter(|draft| !draft.starting)
+        else {
+            return false;
+        };
+        let (repos, repos_edited) = (draft.repos.clone(), draft.repos_edited);
+        let current = repos.iter().find(|item| item.repo.name == repo.name);
+        let unchanged = |left: Option<&DraftRepo>, right: Option<&DraftRepo>| match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.repo.name == right.repo.name
+                    && left.repo.path == right.repo.path
+                    && left.branch == right.branch
+                    && left.pr_label == right.pr_label
+            }
+            _ => false,
+        };
+        let mut earlier_applied = false;
+        for paste in self
+            .reference_completion
+            .pastes
+            .iter()
+            .filter(|paste| paste.destination == destination)
+        {
+            if let Some(PastedMutation::Repo(applied)) = &paste.applied {
+                if applied.repo.name != repo.name {
+                    continue;
+                }
+                if paste.id > id {
+                    return false;
+                }
+                earlier_applied |= paste.id < id && unchanged(current, Some(applied));
+            }
+        }
+        if !unchanged(
+            current,
+            baseline.iter().find(|item| item.repo.name == repo.name),
+        ) && !earlier_applied
+        {
+            return false;
+        }
+        let applied = DraftRepo {
+            repo,
+            branch: BranchSpec::Pr(pr),
+            pr_label: Some(label),
+        };
+        let draft = self.draft_at_mut(&destination).unwrap();
+        if let Some(existing) = draft
+            .repos
+            .iter_mut()
+            .find(|item| item.repo.name == applied.repo.name)
+        {
+            *existing = applied.clone();
+        } else {
+            draft.repos.push(applied.clone());
+        }
+        draft.repos_edited = true;
+        let paste = self
+            .reference_completion
+            .pastes
+            .iter_mut()
+            .find(|paste| paste.id == id)
+            .unwrap();
+        paste.repos = repos;
+        paste.repos_edited = repos_edited;
+        paste.applied = Some(PastedMutation::Repo(applied));
+        true
     }
 
     fn fail_pasted_reference(
@@ -813,5 +870,62 @@ mod ui_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+    fn pr_completion_race(cx: &mut TestAppContext, case: u8) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, window, cx| shark.update(cx, |s, cx| {
+            let repo = Repo { name: "api".into(), path: "/unused/api".into() };
+            s.home.draft.repos = vec![DraftRepo { repo: repo.clone(), branch: BranchSpec::Existing("main".into()), pr_label: None }];
+            for id in 1..=2 {
+                s.reference_completion.pastes.push(PastedReference {
+                    id, composer_id: id, destination: Destination::Home,
+                    text: format!("https://github.com/o/api/pull/{id}"),
+                    repos: s.home.draft.repos.clone(), repos_edited: false,
+                    pending: false, applied: None,
+                });
+            }
+            let apply = |s: &mut Shark, number| s.apply_pasted_pr(number, repo.clone(), format!("#{number}"), git::PullRequest {
+                number, url: format!("https://github.com/o/api/pull/{number}"), base: "main".into(),
+            });
+            match case {
+                0 => {
+                    s.home.draft.repos[0].branch = BranchSpec::Existing("newer-choice".into());
+                    assert!(!apply(s, 1));
+                    assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::Existing(branch) if branch == "newer-choice"), "lookup must preserve newer manual choice");
+                }
+                1 => {
+                    assert!(apply(s, 2));
+                    assert!(!apply(s, 1));
+                    assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::Pr(pr) if pr.number == 2), "older lookup must preserve newer pasted PR");
+                }
+                _ => {
+                    assert!(apply(s, 1));
+                    assert!(apply(s, 2));
+                    s.undo_draft_reference(false, 2, window, cx);
+                    assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::Pr(pr) if pr.number == 1), "undo B must restore A at apply time");
+                    s.undo_draft_reference(false, 1, window, cx);
+                    assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::Existing(branch) if branch == "main"));
+                    assert!(!s.home.draft.repos_edited);
+                }
+            }
+        })).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pr_completion_preserves_manual_branch(cx: &mut TestAppContext) {
+        pr_completion_race(cx, 0);
+    }
+
+    #[gpui_kit::test]
+    fn pr_completion_preserves_newer_paste(cx: &mut TestAppContext) {
+        pr_completion_race(cx, 1);
+    }
+
+    #[gpui_kit::test]
+    fn pr_completion_undo_restores_apply_time_branch(cx: &mut TestAppContext) {
+        pr_completion_race(cx, 2);
     }
 }
