@@ -296,8 +296,13 @@ fn svg(source: &str, dark: bool) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use core::prelude::v1::test;
+    use super::render;
+    #[cfg(feature = "test-support")]
+    use {
+        super::{DIAGRAMS, Diagram, State, diagram, key},
+        core::prelude::v1::test,
+        gpui_kit::TestAppContext,
+    };
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]

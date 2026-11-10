@@ -118,6 +118,10 @@ impl Shark {
         self._subs
             .push(cx.observe_in(&chat, window, move |this, chat, window, cx| {
                 this.update_awake(cx);
+                if this.task(&task).is_some_and(|t| t.backlog) && this.running_chats(&task, cx) > 0
+                {
+                    this.set_backlog(&task, false, None, cx);
+                }
                 // Home's "Approve a plan": approving notifies the chat.
                 if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
                     this.state.mark(|s| &mut s.approved_plan);

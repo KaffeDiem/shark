@@ -329,6 +329,9 @@ pub struct Task {
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
     pub last_interacted_at: Option<u64>,
+    /// Parked until the user resumes it or an agent starts working.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backlog: bool,
     /// Immutable identity: the directory, the first chat's id, every per-task key.
     pub name: String,
     /// What the user sees and edits; empty or `NEW_TASK` shows `name` (`display_title`).
@@ -416,6 +419,7 @@ impl Default for Task {
             agent: None,
             instance_id: task_instance_id(),
             last_interacted_at: None,
+            backlog: false,
             name: String::new(),
             title: String::new(),
             branch: String::new(),
@@ -1366,6 +1370,22 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backlog_defaults_false_and_roundtrips() {
+        let mut task: Task =
+            serde_json::from_str(r#"{"name":"old","branch":"main","repos":[]}"#).unwrap();
+        assert!(!task.backlog);
+        assert!(
+            serde_json::to_value(&task)
+                .unwrap()
+                .get("backlog")
+                .is_none()
+        );
+        task.backlog = true;
+        let saved = serde_json::to_string(&task).unwrap();
+        assert!(serde_json::from_str::<Task>(&saved).unwrap().backlog);
+    }
 
     #[test]
     fn legacy_agent_icons_and_variants_roundtrip() {

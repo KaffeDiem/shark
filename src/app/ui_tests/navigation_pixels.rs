@@ -70,7 +70,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             });
         }).unwrap();
 
-        for rail in [false, true] {
+        let home_only = std::env::var_os("SHARK_RENDER_HOME_ONLY").is_some();
+        for rail in [false, true].into_iter().filter(|_| !home_only) {
             for case in [
                 "workspace",
                 "home",
@@ -233,11 +234,78 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 }
             }
         }
+        for case in [
+            "backlog-closed",
+            "backlog-open",
+            "repo-filter",
+            "repo-empty",
+            "repo-picker",
+            "sidebar-filter",
+            "sidebar-repo-menu",
+        ] {
+            cx.update_window(window, |_, w, cx| {
+                w.close_all_dialogs(cx);
+                shark.update(cx, |s, cx| {
+                    s.rail = false;
+                    s.home.on = true;
+                    s.state.home_checklist_dismissed = true;
+                    s.home.destination = home::Destination::Home;
+                    s.state.tasks[2].backlog = true;
+                    s.state.tasks[1].repos.clear();
+                    s.home.waiting.insert("Inactive".into(), "Plan to approve");
+                    s.home.backlog_open = case != "backlog-closed";
+                    s.home.repo_filter = match case {
+                        "repo-filter" | "repo-picker" => Some(home::RepoFilter::Repo("api".into())),
+                        "repo-empty" => Some(home::RepoFilter::Repo("web".into())),
+                        _ => None,
+                    };
+                    s.sidebar_repo_filter = matches!(case, "sidebar-filter" | "sidebar-repo-menu")
+                        .then(|| home::RepoFilter::Repo("api".into()));
+                    s.fix_home_sel(cx);
+                    if case == "repo-picker" {
+                        s.pick_repo_filter(w, cx);
+                    }
+                    cx.notify();
+                });
+                w.render_frame(cx);
+                shark.update(cx, |s, _| {
+                    s.home.page.set_offset(point(
+                        px(0.),
+                        if case == "repo-empty" {
+                            px(0.)
+                        } else {
+                            px(-140.)
+                        },
+                    ));
+                });
+                w.render_frame(cx);
+                assert!(w.try_find("repo-filter").is_some());
+                if case == "repo-empty" {
+                    assert!(w.try_find("repo-empty-tasks").is_some());
+                } else if case != "repo-picker" {
+                    assert!(w.try_find("backlog-heading").is_some());
+                }
+                if case == "sidebar-repo-menu" {
+                    w.click("sidebar-repo-filter", cx);
+                    w.render_frame(cx);
+                    assert!(w.try_find("menu-parent").is_some());
+                }
+            })
+            .unwrap();
+            let screenshot = cx
+                .capture_screenshot(window)
+                .expect("repository and backlog renderer");
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                screenshot
+                    .save(dir.join(format!("navigation-{mode_name}-{case}.png")))
+                    .unwrap();
+            }
+        }
         cx.update_window(window, |_, w, _| w.remove_window())
             .unwrap();
     }
     fs::remove_dir_all(&home).ok();
-    println!(
-        "navigation pixels: dark/light, expanded/rail, Home/workspace/focus, statuses, folding and naming passed"
-    );
+    println!("navigation pixels: selected dark/light cases passed");
 }

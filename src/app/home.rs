@@ -60,6 +60,31 @@ pub(super) enum Destination {
     Agent(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RepoFilter {
+    Repo(String),
+    NoRepo,
+}
+
+impl RepoFilter {
+    pub(super) fn label(&self) -> &str {
+        match self {
+            Self::Repo(name) => name,
+            Self::NoRepo => "No repository",
+        }
+    }
+}
+
+pub(super) fn repo_matches(task: &Task, filter: &RepoFilter) -> bool {
+    match filter {
+        RepoFilter::Repo(name) => {
+            task.repos.iter().any(|r| &r.name == name)
+                || task.attaching.iter().any(|r| &r.repo == name)
+        }
+        RepoFilter::NoRepo => task.repos.is_empty() && task.attaching.is_empty(),
+    }
+}
+
 /// Home's task groups, in the order they're shown.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Bucket {
@@ -67,6 +92,7 @@ pub(super) enum Bucket {
     Running,
     Unread,
     Idle,
+    Backlog,
 }
 
 impl Bucket {
@@ -76,6 +102,7 @@ impl Bucket {
             Bucket::Running => "Running",
             Bucket::Unread => "Unread",
             Bucket::Idle => "Idle",
+            Bucket::Backlog => "Backlog",
         }
     }
 }
@@ -135,7 +162,9 @@ pub(crate) struct Home {
     /// Shown over the open task. With none open, Home shows anyway.
     pub(super) on: bool,
     pub(super) destination: Destination,
-    group_tasks: bool,
+    pub(super) group_tasks: bool,
+    pub(super) backlog_open: bool,
+    pub(super) repo_filter: Option<RepoFilter>,
     /// The task list, which takes j/k/enter.
     pub(super) focus: FocusHandle,
     /// The task under the list cursor.
@@ -198,6 +227,8 @@ impl Home {
             on: false,
             destination: Destination::Home,
             group_tasks: false,
+            backlog_open: false,
+            repo_filter: None,
             focus: cx.focus_handle(),
             sel: None,
             prompt,
@@ -241,7 +272,7 @@ impl Home {
 /// A Home task row, in display order.
 pub(super) struct HomeRow {
     pub(super) ix: usize,
-    bucket: Bucket,
+    pub(super) bucket: Bucket,
     label: Option<String>,
     running: usize,
 }
@@ -317,12 +348,9 @@ impl Shark {
         self.remember_open();
         self.refresh_home(None, cx);
         self.scan_approved(cx);
-        let rows = self.home_rows(cx);
         // The cursor starts on the task just left.
         self.home.sel = self.active.clone().or(self.home.sel.take());
-        if self.home_at(&rows).is_none() {
-            self.home.sel = (rows.first()).map(|r| self.state.tasks[r.ix].name.clone());
-        }
+        self.fix_home_sel(cx);
         self.focus_fallback(window, cx);
         cx.notify();
     }
@@ -424,20 +452,197 @@ impl Shark {
         .detach();
     }
 
+    pub(super) fn fix_home_sel(&mut self, cx: &App) {
+        let rows = self.home_rows(cx);
+        if self.home_at(&rows).is_none() {
+            self.home.sel = rows.first().map(|r| self.state.tasks[r.ix].name.clone());
+        }
+    }
+
+    pub(super) fn home_hidden(&self, cx: &App) -> (usize, usize) {
+        let Some(filter) = self
+            .home
+            .repo_filter
+            .as_ref()
+            .filter(|_| self.home.destination == Destination::Home)
+        else {
+            return (0, 0);
+        };
+        self.state
+            .tasks
+            .iter()
+            .filter(|t| !repo_matches(t, filter))
+            .fold((0, 0), |(n, needs), t| {
+                (
+                    n + 1,
+                    needs + usize::from(matches!(self.attention_of(&t.name, cx), Attn::Needs(_))),
+                )
+            })
+    }
+
+    pub(super) fn clear_repo_filter(&mut self, cx: &mut Context<Self>) {
+        self.home.repo_filter = None;
+        self.fix_home_sel(cx);
+        cx.notify();
+    }
+
+    pub(super) fn pick_repo_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut filters = vec![None];
+        filters.extend(self.state.repos.iter().filter_map(|repo| {
+            let filter = RepoFilter::Repo(repo.name.clone());
+            self.state
+                .tasks
+                .iter()
+                .any(|t| repo_matches(t, &filter))
+                .then_some(Some(filter))
+        }));
+        if self
+            .state
+            .tasks
+            .iter()
+            .any(|t| repo_matches(t, &RepoFilter::NoRepo))
+        {
+            filters.push(Some(RepoFilter::NoRepo));
+        }
+        let items = filters
+            .iter()
+            .map(|filter| {
+                let label: SharedString = filter
+                    .as_ref()
+                    .map_or("All repositories", RepoFilter::label)
+                    .to_string()
+                    .into();
+                let checked = filter == &self.home.repo_filter;
+                let (n, needs) = self
+                    .state
+                    .tasks
+                    .iter()
+                    .filter(|t| filter.as_ref().is_none_or(|f| repo_matches(t, f)))
+                    .fold((0, 0), |(n, needs), t| {
+                        (
+                            n + 1,
+                            needs
+                                + usize::from(matches!(
+                                    self.attention_of(&t.name, cx),
+                                    Attn::Needs(_)
+                                )),
+                        )
+                    });
+                CommandItem::new()
+                    .label(label.clone())
+                    .checked(checked)
+                    .child(move |_, cx| {
+                        let muted = cx.theme().muted_foreground;
+                        h_flex()
+                            .flex_1()
+                            .gap_2()
+                            .child(Icon::new(IconName::FolderGit2).size_4().text_color(muted))
+                            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{n} tasks")),
+                            )
+                            .when(needs > 0, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("{needs} need you")),
+                                )
+                            })
+                    })
+            })
+            .collect();
+        let selected = filters
+            .iter()
+            .position(|f| f == &self.home.repo_filter)
+            .unwrap_or(0);
+        open_menu(
+            cx.entity().downgrade(),
+            "Show tasks in…",
+            items,
+            selected,
+            move |s, i, _, cx| {
+                s.home.repo_filter = filters[i].clone();
+                s.fix_home_sel(cx);
+                cx.notify();
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn home_task_matches(&self, task: &Task) -> bool {
+        match &self.home.destination {
+            Destination::Agent(slug) if self.home_shown() => {
+                task.agent.as_ref().is_some_and(|a| &a.slug == slug)
+            }
+            Destination::Home => self
+                .home
+                .repo_filter
+                .as_ref()
+                .is_none_or(|f| repo_matches(task, f)),
+            _ => true,
+        }
+    }
+
+    pub(super) fn toggle_backlog_open(&mut self, cx: &mut Context<Self>) {
+        self.home.backlog_open = !self.home.backlog_open;
+        self.fix_home_sel(cx);
+        cx.notify();
+    }
+
+    fn backlog_heading(&self, n: usize, cx: &Context<Self>) -> impl IntoElement + ParentElement {
+        h_flex()
+            .id("backlog-heading")
+            .test_support()
+            .aria_label(format!("Backlog: {n} tasks"))
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .mt_3()
+            .h(px(36.))
+            .px_3()
+            .gap_2()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                Button::new("toggle-backlog")
+                    .ghost()
+                    .xsmall()
+                    .icon(if self.home.backlog_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .accessibility_label(if self.home.backlog_open {
+                        "Collapse Backlog"
+                    } else {
+                        "Expand Backlog"
+                    })
+                    .on_click(cx.listener(|s, _, _, cx| s.toggle_backlog_open(cx))),
+            )
+            .child(div().font_weight(FontWeight::MEDIUM).child("Backlog"))
+            .child(n.to_string())
+            .child(div().flex_1())
+    }
+
     pub(super) fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
         let mut rows: Vec<HomeRow> = (0..self.state.tasks.len())
-            .filter(|&ix| match &self.home.destination {
-                Destination::Agent(slug) if self.home_shown() => self.state.tasks[ix]
-                    .agent
-                    .as_ref()
-                    .is_some_and(|a| &a.slug == slug),
-                _ => true,
+            .filter(|&ix| {
+                let task = &self.state.tasks[ix];
+                self.home_task_matches(task) && (!task.backlog || self.home.backlog_open)
             })
             .map(|ix| {
                 let name = &self.state.tasks[ix].name;
                 let running = self.running_chats(name, cx);
                 let waiting = self.home.waiting.get(name).copied();
-                let (bucket, label) = bucket(running, &self.attention_of(name, cx), waiting);
+                let (bucket, label) = if self.state.tasks[ix].backlog {
+                    (Bucket::Backlog, waiting.map(str::to_string))
+                } else {
+                    bucket(running, &self.attention_of(name, cx), waiting)
+                };
                 HomeRow {
                     ix,
                     bucket,
@@ -449,8 +654,11 @@ impl Shark {
         rows.sort_by_key(|r| r.bucket);
         if self.home.destination == Destination::Home && self.home.group_tasks {
             rows.sort_by_key(|r| {
-                self.plain_task_group(r)
-                    .unwrap_or(self.state.sections.len())
+                (
+                    r.bucket == Bucket::Backlog,
+                    self.plain_task_group(r)
+                        .unwrap_or(self.state.sections.len()),
+                )
             });
         }
         rows
@@ -463,7 +671,9 @@ impl Shark {
     }
 
     fn home_group_key(&self, row: &HomeRow) -> (Option<usize>, Option<Bucket>) {
-        if self.home.destination == Destination::Home && self.home.group_tasks {
+        if row.bucket == Bucket::Backlog {
+            (None, Some(Bucket::Backlog))
+        } else if self.home.destination == Destination::Home && self.home.group_tasks {
             (self.plain_task_group(row), None)
         } else {
             (None, Some(row.bucket))
@@ -471,6 +681,9 @@ impl Shark {
     }
 
     fn home_row_group(&self, row: &HomeRow) -> String {
+        if row.bucket == Bucket::Backlog {
+            return Bucket::Backlog.title().into();
+        }
         if self.home.destination == Destination::Home && self.home.group_tasks {
             self.plain_task_group(row)
                 .map(|i| self.state.sections[i].name.clone())
@@ -1105,6 +1318,12 @@ impl Shark {
     /// The task list, grouped by what each task needs; Home can group by task group instead.
     pub(super) fn render_ws_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.home_rows(cx);
+        let backlog = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.backlog && self.home_task_matches(t))
+            .count();
         let theme = cx.theme();
         let focused = self.home.focus.is_focused(window);
         let on_home = self.home.destination == Destination::Home;
@@ -1124,20 +1343,6 @@ impl Shark {
                     }
                 }
             }));
-        if rows.is_empty() {
-            return match on_home {
-                true => self.render_empty(list, cx),
-                false => list
-                    .child(super::agent_settings::empty_state(
-                        theme,
-                        "agent-empty-tasks",
-                        IconName::Inbox,
-                        "No tasks yet",
-                        "Describe the work above and press enter. Each task gets its own branch and chat.",
-                    ))
-                    .into_any_element(),
-            };
-        }
         let now = SystemTime::now();
         let mut items: Vec<AnyElement> = vec![];
         let grouping = on_home.then(|| {
@@ -1179,8 +1384,81 @@ impl Shark {
                     );
                 }))
         });
-        let mut grouping = grouping;
+        let mut grouping = grouping.map(|b| {
+            h_flex().gap_2().child(b).child(
+                Button::new("repo-filter")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::FolderGit2)
+                    .label(
+                        self.home
+                            .repo_filter
+                            .as_ref()
+                            .map_or("All repositories", RepoFilter::label)
+                            .to_string(),
+                    )
+                    .tooltip("Show tasks in a repository")
+                    .accessibility_label(format!(
+                        "Showing tasks in {}, {} hidden",
+                        self.home
+                            .repo_filter
+                            .as_ref()
+                            .map_or("All repositories", RepoFilter::label),
+                        self.home_hidden(cx).0
+                    ))
+                    .when(self.home.repo_filter.is_some(), |b| {
+                        b.bg(theme.secondary).border_1().border_color(theme.border)
+                    })
+                    .on_click(cx.listener(|s, _, w, cx| s.pick_repo_filter(w, cx))),
+            )
+        });
+        if rows.is_empty()
+            && backlog == 0
+            && on_home
+            && let Some(filter) = &self.home.repo_filter
+        {
+            return list
+                .child(h_flex().justify_end().children(grouping.take()))
+                .child(super::agent_settings::empty_state(
+                    theme,
+                    "repo-empty-tasks",
+                    IconName::FolderGit2,
+                    format!("No tasks in {}", filter.label()),
+                    format!("{} tasks in other repositories", self.home_hidden(cx).0),
+                ))
+                .child(
+                    Button::new("show-all-repositories")
+                        .ghost()
+                        .label("Show all repositories")
+                        .on_click(cx.listener(|s, _, _, cx| s.clear_repo_filter(cx))),
+                )
+                .into_any_element();
+        }
+        if rows.is_empty() && backlog == 0 {
+            return match on_home {
+                true => self.render_empty(list, cx),
+                false => list
+                    .child(super::agent_settings::empty_state(
+                        theme,
+                        "agent-empty-tasks",
+                        IconName::Inbox,
+                        "No tasks yet",
+                        "Describe the work above and press enter. Each task gets its own branch and chat.",
+                    ))
+                    .into_any_element(),
+            };
+        }
+
         for group in rows.chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b)) {
+            if group[0].bucket == Bucket::Backlog {
+                items.push(
+                    self.backlog_heading(backlog, cx)
+                        .children(grouping.take())
+                        .into_any_element(),
+                );
+                items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+                continue;
+            }
             items.push(
                 h_flex()
                     .id(("home-group", items.len()))
@@ -1226,7 +1504,40 @@ impl Shark {
             );
             items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
         }
+        if !self.home.backlog_open && backlog > 0 {
+            items.push(
+                self.backlog_heading(backlog, cx)
+                    .children(grouping.take())
+                    .into_any_element(),
+            );
+        }
+        let (hidden, needs) = self.home_hidden(cx);
         list.children(items)
+            .when(hidden > 0, |d| {
+                d.child(
+                    h_flex()
+                        .px_3()
+                        .pt_3()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "{hidden} tasks in other repositories{}",
+                            if needs > 0 {
+                                format!(", {needs} need you")
+                            } else {
+                                String::new()
+                            }
+                        ))
+                        .child(
+                            Button::new("show-all-repositories")
+                                .ghost()
+                                .xsmall()
+                                .label("Show all")
+                                .on_click(cx.listener(|s, _, _, cx| s.clear_repo_filter(cx))),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .pt_3()
@@ -1388,7 +1699,7 @@ impl Shark {
                     .max_w(px(260.))
                     .truncate()
                     .text_xs()
-                    .text_color(match r.label.is_some() {
+                    .text_color(match r.label.is_some() && r.bucket != Bucket::Backlog {
                         true => theme.warning_foreground,
                         false => theme.muted_foreground,
                     })

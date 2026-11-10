@@ -1,6 +1,7 @@
 use super::*;
 use crate::attention::Attn;
 use crate::state::TaskRepo;
+use gpui_kit::test::TestQueryExt;
 
 /// A task `one` made from a repo `api`; the app has it open.
 async fn one_task(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, Entity<Shark>) {
@@ -1042,5 +1043,663 @@ async fn home_agent_chip_backspace_preserves_prompt_body_and_tokens(cx: &mut Tes
         assert_eq!(content.tokens()[0].range(), 5..14);
         assert!(s.home.draft_agent.is_none());
         assert!(s.state.tasks.is_empty());
+    });
+}
+
+/// Repository scope belongs to Home; other navigation still sees every task.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn repo_filter_narrows_home(cx: &mut TestAppContext) {
+    use super::super::home::{Destination, RepoFilter};
+    use crate::state::{AgentLink, AttachStage, Attachment};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.state.repos = repos(&home, &["api", "web"]);
+        let repo = |name: &str| TaskRepo {
+            name: name.into(),
+            src: home.join(name),
+            base: "main".into(),
+            branch: None,
+        };
+        s.state.tasks = vec![
+            Task {
+                repos: vec![repo("api")],
+                ..fake("api-only")
+            },
+            Task {
+                repos: vec![repo("api"), repo("web")],
+                ..fake("both")
+            },
+            Task {
+                agent: Some(AgentLink {
+                    slug: "designer".into(),
+                    ..Default::default()
+                }),
+                ..fake("none")
+            },
+        ];
+        s.enter_home(w, cx);
+        s.home.sel = Some("none".into());
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.fix_home_sel(cx);
+        assert_eq!(s.home_rows(cx).len(), 2);
+        assert_eq!(s.home_hidden(cx), (1, 0));
+        assert_eq!(s.home.sel.as_deref(), Some("api-only"));
+        assert_eq!(
+            s.ws_order(true).len(),
+            3,
+            "the filter never changes sidebar order"
+        );
+        s.home.repo_filter = Some(RepoFilter::NoRepo);
+        s.fix_home_sel(cx);
+        assert_eq!(s.home_rows(cx).len(), 1);
+        assert_eq!(s.home.sel.as_deref(), Some("none"));
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.home.destination = Destination::Agent("designer".into());
+        assert_eq!(
+            s.home_rows(cx).len(),
+            1,
+            "agent pages ignore the Home filter"
+        );
+        s.home.destination = Destination::Home;
+        let mut attachment = Attachment::fresh(&s.state.repos[1], "none", "main");
+        attachment.stage = AttachStage::SetupFailed;
+        s.state.tasks[2].attaching.push(attachment);
+        assert_eq!(
+            s.home_hidden(cx),
+            (1, 1),
+            "hidden tasks retain their attention"
+        );
+        s.home.repo_filter = Some(RepoFilter::Repo("web".into()));
+        assert_eq!(s.home_rows(cx).len(), 2, "pending attachments match too");
+        s.home.repo_filter = Some(RepoFilter::NoRepo);
+        assert!(s.home_rows(cx).is_empty(), "attaching is not No repository");
+        s.state.tasks[2].attaching.clear();
+        s.home.repo_filter = None;
+        s.fix_home_sel(cx);
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("repo-filter", cx);
+        w.input("api", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.repo_filter, Some(RepoFilter::Repo("api".into())));
+        assert_eq!(s.home_rows(cx).len(), 2);
+        assert_eq!(s.home_hidden(cx), (1, 0));
+    });
+    on(cx, &|s, _, cx| {
+        s.home.repo_filter = Some(RepoFilter::Repo("removed-repo".into()));
+        s.fix_home_sel(cx);
+        assert!(s.home.sel.is_none());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("repo-filter").is_some(),
+            "the empty state keeps its controls"
+        );
+        w.click("show-all-repositories", cx);
+    })
+    .unwrap();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.repo_filter, None);
+        assert_eq!(s.home_rows(cx).len(), 3);
+        assert!(s.home.sel.is_some());
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+/// A stale Home cursor must never target a task hidden by a repository filter.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn repo_filter_rejects_hidden_target(cx: &mut TestAppContext) {
+    use super::super::home::RepoFilter;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![fake("hidden")];
+        s.enter_home(w, cx);
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.home.sel = Some("hidden".into());
+        s.home.focus.focus(w, cx);
+        assert!(
+            s.target(w).is_none(),
+            "a stale cursor cannot act on a filtered-out task"
+        );
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_folds_last_and_mutes_attention(cx: &mut TestAppContext) {
+    use super::super::home::{Bucket, Destination, RepoFilter};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let parked = Task {
+        backlog: true,
+        agent: Some(crate::state::AgentLink {
+            slug: "designer".into(),
+            ..Default::default()
+        }),
+        repos: vec![TaskRepo {
+            name: "api".into(),
+            src: home.join("api"),
+            base: "main".into(),
+            branch: None,
+        }],
+        ..fake("parked")
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![fake("active"), parked],
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            sections: vec![Section {
+                name: "First".into(),
+                icon: "folder".into(),
+                tasks: vec!["parked".into()],
+                collapsed: false,
+                agent: None,
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        assert!(!s.home.backlog_open);
+        assert_eq!(s.home_rows(cx).len(), 1);
+        s.home.waiting.insert("parked".into(), "Plan to approve");
+        s.turn_done("parked", "parked", cx);
+        assert_eq!(s.attention_of("parked", cx), Attn::None);
+        assert_eq!(
+            crate::attention::BADGE.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        s.active = Some("parked".into());
+        assert!(
+            !s.ws_order(false).contains(&1),
+            "even the open backlog task has no cmd-N"
+        );
+        assert!(
+            s.ws_order(true).contains(&1),
+            "full task navigation includes Backlog"
+        );
+        assert!(
+            s.side_rows(false).contains(&SideRow::Task(1)),
+            "the open task stays in the sidebar"
+        );
+        s.home.backlog_open = true;
+        for grouped in [false, true] {
+            s.home.group_tasks = grouped;
+            let rows = s.home_rows(cx);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.last().unwrap().bucket, Bucket::Backlog);
+            assert_eq!(s.state.tasks[rows.last().unwrap().ix].name, "parked");
+        }
+        s.home.destination = Destination::Agent("designer".into());
+        assert_eq!(
+            s.home_rows(cx).len(),
+            1,
+            "agent pages show their Backlog when expanded"
+        );
+        assert_eq!(s.home_rows(cx)[0].bucket, Bucket::Backlog);
+        s.home.backlog_open = false;
+        assert!(s.home_rows(cx).is_empty(), "agent pages fold Backlog too");
+        s.home.backlog_open = true;
+        s.home.destination = Destination::Home;
+        s.home.sel = Some("parked".into());
+        s.home.focus.focus(w, cx);
+        cx.notify();
+    });
+    assert!(
+        cx.shown_system_notifications().is_empty(),
+        "Backlog stays quiet"
+    );
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("toggle-backlog", cx);
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        assert!(!s.home.backlog_open);
+        assert_ne!(s.target(w).map(|t| t.name).as_deref(), Some("parked"));
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.fix_home_sel(cx);
+        assert!(s.home_rows(cx).is_empty());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("toggle-backlog").is_some(),
+            "a filtered, folded Backlog remains reachable"
+        );
+        assert!(
+            w.try_find("repo-empty-tasks").is_none(),
+            "folding is not an empty repository"
+        );
+        w.click("toggle-backlog", cx);
+    })
+    .unwrap();
+    cx.read(|cx| assert_eq!(shark.read(cx).home_rows(cx).len(), 1));
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_key_and_cursor(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: ["a", "b", "c"].map(fake).to_vec(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.open_task(0, w, cx);
+        s.enter_home(w, cx);
+        s.home.sel = Some("a".into());
+        s.home.focus.focus(w, cx);
+    });
+    press(cx, &["b"]);
+    on(cx, &|s, w, cx| {
+        assert!(s.task("a").unwrap().backlog);
+        assert_eq!(
+            s.home.sel.as_deref(),
+            Some("b"),
+            "the cursor keeps the vacated row's height"
+        );
+        s.leave_home(w, cx);
+        s.sel = SideRow::Task(0);
+        s.sidebar_focus.focus(w, cx);
+    });
+    press(cx, &["b"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(!s.task("a").unwrap().backlog);
+        assert_eq!(s.active.as_deref(), Some("a"));
+        assert!(s.ws_order(false).contains(&0));
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_preserves_notification_baseline(cx: &mut TestAppContext) {
+    use crate::state::{AttachStage, Attachment};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![fake("parked")],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks[0].attaching.push(Attachment {
+            repo: "api".into(),
+            src: home.join("api"),
+            branch: "parked".into(),
+            base: "main".into(),
+            fresh: true,
+            stage: AttachStage::SetupFailed,
+            error: None,
+        });
+        s.attn.set_checked("parked", vec![]);
+        s.refresh_attention(cx);
+        assert!(matches!(s.attention_of("parked", cx), Attn::Needs(_)));
+        s.set_backlog("parked", true, Some(w), cx);
+        assert_eq!(s.attention_of("parked", cx), Attn::None);
+        s.set_backlog("parked", false, None, cx);
+        assert!(matches!(s.attention_of("parked", cx), Attn::Needs(_)));
+    });
+    assert!(
+        cx.shown_system_notifications().is_empty(),
+        "reactivating an unchanged needs-you label must not notify"
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_picker_and_turn_start(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![Task {
+                backlog: true,
+                ..fake("parked")
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| s.enter_home(w, cx));
+    press(cx, &["cmd-shift-o"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.find("workspace-result-parked")
+                .label()
+                .is_some_and(|l| l.contains("Backlog"))
+        );
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    let chat = cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.task("parked").unwrap().backlog,
+            "opening does not reactivate"
+        );
+        s.active_chat().unwrap().clone()
+    });
+    cx.update(|cx| {
+        chat.update(cx, |c, cx| {
+            c.busy = true;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert!(
+            !shark.read(cx).task("parked").unwrap().backlog,
+            "a turn starts without needing a sent event"
+        )
+    });
+    cx.update(|cx| {
+        chat.update(cx, |c, cx| {
+            c.busy = false;
+            cx.notify();
+        })
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_cannot_hide_an_open_question(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![fake("question"), fake("idle")],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| s.open_task(0, w, cx));
+    let chat = cx.read(|cx| shark.read(cx).active_chat().unwrap().clone());
+    cx.update(|cx| chat.update(cx, |c, cx| {
+        c.busy = true;
+        crate::chat::ui_tests::play(c, &[r#"{"type":"control_request","request_id":"backlog-question","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"backlog-tool","input":{"questions":[{"header":"Color","question":"Which color?","options":[{"label":"Blue","description":"Blue"},{"label":"Red","description":"Red"}]}]}}}"#], cx);
+        cx.notify();
+    }));
+    cx.run_until_parked();
+    on(cx, &|s, w, cx| {
+        assert!(s.asking_chat("question", cx));
+        assert_eq!(s.running_chats("question", cx), 0);
+        assert!(!s.can_backlog("question", cx));
+        assert!(
+            !ws_menu(s, s.task("question").unwrap(), cx)
+                .iter()
+                .any(|e| matches!(e, Entry::Item { label, .. } if label == "Move to backlog"))
+        );
+        s.enter_home(w, cx);
+        s.home.sel = Some("question".into());
+        s.home.focus.focus(w, cx);
+    });
+    press(cx, &["b"]);
+    cx.read(|cx| assert!(!shark.read(cx).task("question").unwrap().backlog));
+    for (task, count) in [("question", 0), ("idle", 1)] {
+        on(cx, &|s, w, cx| {
+            s.home.sel = Some(task.into());
+            s.home.focus.focus(w, cx);
+        });
+        press(cx, &["cmd-k"]);
+        cx.update_window(window, |_, w, cx| w.input("Move task to backlog", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            assert_eq!(
+                w.find_all_by_role(Role::ListBoxOption).len(),
+                count,
+                "palette gate for {task}"
+            );
+        })
+        .unwrap();
+        press(cx, &["escape", "escape"]);
+        cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+            .unwrap();
+    }
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn sidebar_repository_filter_menu(cx: &mut TestAppContext) {
+    use crate::state::{Agent, AgentLink, Attachment};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.state.repos = repos(&home, &["api", "web"]);
+        s.state.agents = vec![Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            ..Default::default()
+        }];
+        let repo = |name: &str| TaskRepo {
+            name: name.into(),
+            src: home.join(name),
+            base: "main".into(),
+            branch: None,
+        };
+        s.state.tasks = vec![
+            Task {
+                repos: vec![repo("web")],
+                agent: Some(AgentLink {
+                    slug: "designer".into(),
+                    ..Default::default()
+                }),
+                ..fake("web-task")
+            },
+            Task {
+                repos: vec![repo("api"), repo("web")],
+                agent: Some(AgentLink {
+                    slug: "designer".into(),
+                    ..Default::default()
+                }),
+                ..fake("both")
+            },
+            Task {
+                attaching: vec![Attachment::fresh(&s.state.repos[0], "pending", "main")],
+                ..fake("pending")
+            },
+            fake("no-repo"),
+        ];
+        s.enter_home(w, cx);
+        s.sel = SideRow::Task(0);
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("sidebar-repo-filter", cx);
+        w.render_frame(cx);
+        assert!(
+            w.try_find("menu-parent").is_some(),
+            "uses the task context menu"
+        );
+        assert!(!w.has_active_dialog(cx));
+    })
+    .unwrap();
+    press_in(window)(cx, &["a", "p", "i", "enter"]);
+    on(cx, &|s, _, cx| {
+        assert_eq!(s.ws_order(false), [1, 2]);
+        assert_eq!(
+            s.sel,
+            SideRow::Agent(0),
+            "hidden cursor returns to its agent"
+        );
+        assert_eq!(
+            s.ws_order(true),
+            [0, 1, 2, 3],
+            "global task picker retains every task"
+        );
+        assert_eq!(s.home_rows(cx).len(), 4, "Home filter stays independent");
+    });
+    on(cx, &|s, w, cx| {
+        s.sel = SideRow::Task(0);
+        s.sidebar_focus.focus(w, cx);
+        assert!(
+            s.target(w).is_none(),
+            "stale hidden cursor cannot target a task"
+        );
+        s.fix_sel();
+        s.set_agent_collapsed(0, true, cx);
+        assert_eq!(s.ws_order(false), [2], "collapsed agents stay collapsed");
+        s.set_agent_collapsed(0, false, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("sidebar-repo-filter", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["n", "o", "enter"]);
+    on(cx, &|s, _, _| {
+        assert_eq!(s.ws_order(false), [3]);
+    });
+    on(cx, &|s, _, cx| {
+        s.sidebar_repo_filter = Some(super::super::home::RepoFilter::Repo("removed".into()));
+        s.fix_sel();
+        assert!(s.ws_order(false).is_empty());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("sidebar-repo-filter", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["a", "l", "l", "enter"]);
+    on(cx, &|s, _, _| {
+        assert_eq!(s.ws_order(false), [0, 1, 2, 3]);
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn empty_filtered_sidebar_does_not_open_hidden_task(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![fake("hidden"), fake("visible")];
+        s.state.tasks[0].repos.push(TaskRepo {
+            name: "api".into(),
+            src: PathBuf::from("/unused/api"),
+            base: "main".into(),
+            branch: None,
+        });
+        s.sidebar_repo_filter = Some(super::super::home::RepoFilter::NoRepo);
+        s.sel = SideRow::Task(1);
+        s.archived("visible", Ok(vec![]), w, cx);
+        assert!(s.side_rows(false).is_empty());
+        s.sidebar_focus.focus(w, cx);
+    });
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        assert!(
+            shark.read(cx).active.is_none(),
+            "Enter must ignore an invisible row"
+        )
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn empty_sidebar_does_not_target_backlog(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![
+            Task {
+                backlog: true,
+                ..fake("parked")
+            },
+            fake("visible"),
+        ];
+        s.sel = SideRow::Task(1);
+        s.archived("visible", Ok(vec![]), w, cx);
+        assert!(s.side_rows(false).is_empty());
+        s.sidebar_focus.focus(w, cx);
+        assert!(
+            s.target(w).is_none(),
+            "hidden backlog cannot receive task actions"
+        );
+    });
+    press_in(window)(cx, &["b", "cmd-backspace"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.task("parked").unwrap().backlog);
+        assert!(s.archiving.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn automatic_backlog_resume_preserves_recency(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![Task {
+            backlog: true,
+            last_interacted_at: Some(123),
+            ..fake("parked")
+        }];
+        s.set_backlog("parked", false, None, cx);
+        assert!(!s.task("parked").unwrap().backlog);
+        assert_eq!(s.task("parked").unwrap().last_interacted_at, Some(123));
+        s.set_backlog("parked", true, Some(w), cx);
+        assert!(s.task("parked").unwrap().last_interacted_at > Some(123));
+        s.state.tasks[0].last_interacted_at = Some(123);
+        s.set_backlog("parked", false, Some(w), cx);
+        assert!(s.task("parked").unwrap().last_interacted_at > Some(123));
     });
 }

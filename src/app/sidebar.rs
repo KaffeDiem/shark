@@ -1,5 +1,6 @@
 //! Agent navigation, task rows, manual task groups, and the sidebar cursor.
 use super::*;
+use gpui_kit::component::Selectable as _;
 
 /// A task's status icon: a spinner while an agent runs, else by what it needs from you.
 /// `idle` colours the dashed circle of a task that needs nothing.
@@ -20,6 +21,7 @@ pub(super) fn indicator(
         home::Bucket::Needs => (IconName::CircleAlert, theme.warning_foreground),
         home::Bucket::Unread => (IconName::CircleCheck, theme.success_foreground),
         home::Bucket::Idle => (IconName::CircleDashed, idle),
+        home::Bucket::Backlog => (IconName::CirclePause, idle),
     };
     Icon::new(icon)
         .with_size(size)
@@ -28,6 +30,7 @@ pub(super) fn indicator(
 }
 
 pub(super) fn task_indicator(
+    backlog: bool,
     running: usize,
     attention: &Attn,
     foreground: Hsla,
@@ -35,7 +38,11 @@ pub(super) fn task_indicator(
     theme: &Theme,
 ) -> AnyElement {
     indicator(
-        home::bucket(running, attention, None).0,
+        if backlog {
+            home::Bucket::Backlog
+        } else {
+            home::bucket(running, attention, None).0
+        },
         foreground,
         size,
         theme,
@@ -202,6 +209,58 @@ pub(super) fn rail_button<E: Styled>(e: E) -> E {
 }
 
 impl Shark {
+    pub(super) fn sidebar_task_matches(&self, task: &Task) -> bool {
+        self.sidebar_repo_filter
+            .as_ref()
+            .is_none_or(|filter| home::repo_matches(task, filter))
+    }
+
+    fn sidebar_repo_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+        let names: std::collections::BTreeSet<_> = self
+            .state
+            .tasks
+            .iter()
+            .flat_map(|t| {
+                t.repos
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .chain(t.attaching.iter().map(|r| r.repo.clone()))
+            })
+            .collect();
+        let filters = std::iter::once(None)
+            .chain(
+                names
+                    .into_iter()
+                    .map(|name| Some(home::RepoFilter::Repo(name))),
+            )
+            .chain(
+                self.state
+                    .tasks
+                    .iter()
+                    .any(|t| home::repo_matches(t, &home::RepoFilter::NoRepo))
+                    .then_some(Some(home::RepoFilter::NoRepo)),
+            );
+        filters
+            .map(|filter| {
+                let label = filter
+                    .as_ref()
+                    .map_or("All repositories", home::RepoFilter::label)
+                    .to_string();
+                let checked = filter == self.sidebar_repo_filter;
+                menu::item(
+                    IconName::FolderGit2,
+                    label,
+                    on_shark(cx, move |s, _, cx| {
+                        s.sidebar_repo_filter = filter.clone();
+                        s.fix_sel();
+                        cx.notify();
+                    }),
+                )
+                .checked(checked)
+            })
+            .collect()
+    }
+
     pub(super) fn section_of(&self, ws: &str) -> Option<usize> {
         self.state
             .sections
@@ -240,6 +299,16 @@ impl Shark {
                 })
                 .map(|(i, _)| SideRow::Task(i)),
         );
+        rows.retain(|row| match row {
+            SideRow::Task(ix) => {
+                let task = &self.state.tasks[*ix];
+                // Global task search uses unfolded rows and keeps every repository reachable.
+                unfold
+                    || (self.sidebar_task_matches(task)
+                        && (!task.backlog || self.active.as_deref() == Some(&task.name)))
+            }
+            SideRow::Agent(_) => true,
+        });
         rows
     }
 
@@ -310,14 +379,15 @@ impl Shark {
         self.side_rows(unfold)
             .into_iter()
             .filter_map(|r| match r {
-                SideRow::Task(ix) => Some(ix),
+                SideRow::Task(ix) if unfold || !self.state.tasks[ix].backlog => Some(ix),
+                SideRow::Task(_) => None,
                 SideRow::Agent(_) => None,
             })
             .collect()
     }
 
     /// Keeps the cursor on a visible row; a task hidden by collapsing hands it to its header.
-    fn fix_sel(&mut self) {
+    pub(super) fn fix_sel(&mut self) {
         let rows = self.side_rows(false);
         if rows.contains(&self.sel) {
             return;
@@ -713,7 +783,7 @@ impl Shark {
             })
             .child(match nth {
                 Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                _ => task_indicator(running, &attn, foreground, ISZ, theme),
+                _ => task_indicator(w.backlog, running, &attn, foreground, ISZ, theme),
             })
             .when(!rail, |d| {
                 d.child(
@@ -779,7 +849,8 @@ impl Shark {
             .state
             .tasks
             .iter()
-            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == agent.slug))
+            .filter(|t| !t.backlog && t.agent.as_ref().is_some_and(|a| a.slug == agent.slug))
+            .filter(|t| self.sidebar_task_matches(t))
             .collect();
         let needs = tasks
             .iter()
@@ -1127,11 +1198,16 @@ impl Shark {
             .h_full()
             .flex_none()
             .map(|d| nav_actions(d, false, cx, Shark::move_sel))
-            .on_action(cx.listener(|this, _: &Confirm, window, cx| match this.sel {
-                SideRow::Task(ix) => this.open_task(ix, window, cx),
-                SideRow::Agent(i) => {
-                    if let Some(slug) = this.state.agents.get(i).map(|a| a.slug.clone()) {
-                        this.open_agent(&slug, window, cx);
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                if !this.side_rows(false).contains(&this.sel) {
+                    return;
+                }
+                match this.sel {
+                    SideRow::Task(ix) => this.open_task(ix, window, cx),
+                    SideRow::Agent(i) => {
+                        if let Some(slug) = this.state.agents.get(i).map(|a| a.slug.clone()) {
+                            this.open_agent(&slug, window, cx);
+                        }
                     }
                 }
             }))
@@ -1178,6 +1254,19 @@ impl Shark {
                                 .flex_none()
                                 .gap(px(4.))
                                 .mr(px(8.))
+                                .child(
+                                    side_toggle(
+                                        "sidebar-repo-filter",
+                                        IconName::ListFilter,
+                                        "Filter sidebar by repository",
+                                    )
+                                    .selected(self.sidebar_repo_filter.is_some())
+                                    .on_click(cx.listener(|this, e: &ClickEvent, w, cx| {
+                                        let entries = this.sidebar_repo_menu(cx);
+                                        this.show_menu(e.position(), entries, w, cx);
+                                    }))
+                                    .map(|b| quiet_toolbar("sidebar-repo-filter", b)),
+                                )
                                 .child(self.render_commands(cx))
                                 .child(self.render_new_task(cx)),
                         )

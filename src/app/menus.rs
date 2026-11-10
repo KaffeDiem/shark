@@ -99,6 +99,49 @@ pub(super) fn path_submenu(
     menu::sub(icon, label, entries)
 }
 
+fn show_in_entry(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Option<Entry> {
+    let mut names: Vec<_> = ws
+        .repos
+        .iter()
+        .map(|r| r.name.clone())
+        .chain(ws.attaching.iter().map(|r| r.repo.clone()))
+        .collect();
+    let mut seen = HashSet::new();
+    names.retain(|n| seen.insert(n.clone()));
+    let single = names.len() == 1;
+    let entries: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            let filter = home::RepoFilter::Repo(name.clone());
+            let n = this
+                .state
+                .tasks
+                .iter()
+                .filter(|t| home::repo_matches(t, &filter))
+                .count();
+            menu::item(
+                IconName::FolderGit2,
+                if single {
+                    format!("Show tasks in {name}")
+                } else {
+                    name
+                },
+                on_shark(cx, move |s, w, cx| {
+                    s.home.repo_filter = Some(filter.clone());
+                    s.enter_home(w, cx);
+                    cx.notify();
+                }),
+            )
+            .hint(format!("{n} tasks"))
+        })
+        .collect();
+    match entries.len() {
+        0 => None,
+        1 => entries.into_iter().next(),
+        _ => Some(menu::sub(IconName::FolderGit2, "Show tasks in", entries)),
+    }
+}
+
 /// Right-click menu of a sidebar task. Shows where everything lives on disk,
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
 pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry> {
@@ -114,12 +157,32 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
             on_task(cx, &ws.name, |s, n, w, cx| s.open_task_named(&n, w, cx)),
         ));
     }
+    entries.extend(show_in_entry(this, ws, cx));
     entries.push(menu::item(
         IconName::Pencil,
         "Rename task…",
         on_task(cx, &ws.name, |s, n, w, cx| s.rename_task(n, w, cx)),
     ));
     entries.push(move_submenu(this, &ws.name, cx));
+    if ws.backlog || this.can_backlog(&ws.name, cx) {
+        let on = !ws.backlog;
+        entries.push(menu::item(
+            if on {
+                IconName::CirclePause
+            } else {
+                IconName::Play
+            },
+            if on {
+                "Move to backlog"
+            } else {
+                "Move to active"
+            },
+            on_task(cx, &ws.name, move |s, n, w, cx| {
+                s.set_backlog(&n, on, Some(w), cx)
+            }),
+        ));
+    }
+
     entries.extend(handoff_submenu(this, ws, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
         .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))

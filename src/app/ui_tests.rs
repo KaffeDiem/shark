@@ -3202,6 +3202,136 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     );
     fs::remove_dir_all(&home).ok();
 }
+/// Parking and resuming are task actions shared by Home and sidebar menus.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn task_menu_backlog_actions(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![Task {
+                name: "one".into(),
+                branch: "one".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    for (parked, shown, hidden) in [
+        (false, "Move to backlog", "Move to active"),
+        (true, "Move to active", "Move to backlog"),
+    ] {
+        on(cx, &|s, _, cx| {
+            s.state.tasks[0].backlog = parked;
+            let entries = ws_menu(s, &s.state.tasks[0], cx);
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == shown))
+            );
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == hidden))
+            );
+        });
+        let click = shark.update(cx, |s, cx| {
+            ws_menu(s, &s.state.tasks[0], cx)
+                .into_iter()
+                .find_map(|e| match e {
+                    Entry::Item {
+                        label, on_click, ..
+                    } if label == shown => Some(on_click),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        cx.update_window(window, |_, w, cx| click(w, cx)).unwrap();
+        cx.read(|cx| assert_eq!(shark.read(cx).state.tasks[0].backlog, !parked));
+    }
+    fs::remove_dir_all(home).ok();
+}
+
+/// Task menus offer the one repository directly or a submenu for several.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn task_menu_repository_filters(cx: &mut TestAppContext) {
+    use super::home::{Destination, RepoFilter};
+    use crate::state::TaskRepo;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, _, cx| {
+        let repo = |name: &str| TaskRepo {
+            name: name.into(),
+            src: home.join(name),
+            base: "main".into(),
+            branch: None,
+        };
+        s.state.tasks = [vec![], vec![repo("api")], vec![repo("api"), repo("web")]]
+            .into_iter()
+            .enumerate()
+            .map(|(i, repos)| Task {
+                name: format!("task-{i}"),
+                branch: format!("task-{i}"),
+                repos,
+                ..Default::default()
+            })
+            .collect();
+        let entries = ws_menu(s, &s.state.tasks[0], cx);
+        assert!(!entries.iter().any(|e| matches!(e,
+            Entry::Item { label, .. } | Entry::Sub { label, .. } if label.starts_with("Show tasks in")
+        )));
+        let entries = ws_menu(s, &s.state.tasks[1], cx);
+        assert!(entries.iter().any(|e| matches!(e,
+            Entry::Item { label, .. } if label == "Show tasks in api"
+        )));
+        let entries = ws_menu(s, &s.state.tasks[2], cx);
+        let children = entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Sub { label, entries, .. } if label == "Show tasks in" => Some(entries),
+                _ => None,
+            })
+            .expect("multi-repository filter submenu");
+        let rows: Vec<_> = children
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, hint, .. } => {
+                    Some((label.as_ref(), hint.as_ref().map(|h| h.as_ref())))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, [("api", Some("2 tasks")), ("web", Some("1 tasks"))]);
+    });
+    let click = shark.update(cx, |s, cx| {
+        ws_menu(s, &s.state.tasks[1], cx)
+            .into_iter()
+            .find_map(|e| match e {
+                Entry::Item {
+                    label, on_click, ..
+                } if label == "Show tasks in api" => Some(on_click),
+                _ => None,
+            })
+            .unwrap()
+    });
+    cx.update_window(window, |_, w, cx| click(w, cx)).unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.destination, Destination::Home);
+        assert_eq!(s.home.repo_filter, Some(RepoFilter::Repo("api".into())));
+        assert_eq!(s.home_rows(cx).len(), 2);
+    });
+    fs::remove_dir_all(home).ok();
+}
+
 /// Open in an app: terminals take the task folder, Fork asks which repo, Xcode shows
 /// only where a repo has a project and opens it. Through cmd-k and the right-click menu.
 #[gpui_kit::test]

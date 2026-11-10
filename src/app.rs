@@ -106,6 +106,7 @@ pub struct Shark {
     sel: SideRow,
     /// Agent navigation folds independently of optional task groups.
     collapsed_agents: HashSet<String>,
+    sidebar_repo_filter: Option<home::RepoFilter>,
     pub(crate) active: Option<String>,
     /// By chat id; created when a chat is first shown.
     chats: HashMap<String, Entity<Chat>>,
@@ -299,6 +300,7 @@ impl Shark {
             state,
             sel: SideRow::Task(0),
             collapsed_agents: HashSet::new(),
+            sidebar_repo_filter: None,
             active: None,
             chats: HashMap::new(),
             awake: None,
@@ -406,7 +408,7 @@ impl Shark {
         menu::hold(self, m, |s| &mut s.menu, cx);
     }
 
-    fn task(&self, name: &str) -> Option<&Task> {
+    pub(crate) fn task(&self, name: &str) -> Option<&Task> {
         self.state.tasks.iter().find(|w| w.name == name)
     }
 
@@ -1051,6 +1053,15 @@ impl Render for Shark {
                 cx.listener(|this, _: &NewSection, w, cx| this.start_naming(None, None, w, cx)),
             )
             .on_action(cx.listener(|this, _: &MoveToSection, w, cx| this.pick_section(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleBacklog, w, cx| {
+                this.with_target(w, cx, |s, ws, w, cx| {
+                    if !s.can_backlog(&ws.name, cx) {
+                        notify_err(w, cx, "Stop the running chat first");
+                    } else {
+                        s.set_backlog(&ws.name, !ws.backlog, Some(w), cx);
+                    }
+                });
+            }))
             .on_action(cx.listener(|this, _: &RenameSection, w, cx| {
                 this.with_section(w, cx, |s, i, w, cx| s.start_naming(Some(i), None, w, cx))
             }))

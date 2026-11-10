@@ -343,7 +343,7 @@ async fn task_interaction_excludes_background_and_flushes(cx: &mut TestAppContex
         s.state.tasks[0].last_interacted_at = Some(31);
         s.enter_home(w, cx);
     });
-    press_in(window)(cx, &["b"]);
+    press_in(window)(cx, &["q"]); // An unbound Home key is not a task interaction.
     on(cx, &|s, w, cx| {
         assert_eq!(s.state.tasks[0].last_interacted_at, Some(31));
         s.toggle_home(w, cx);
