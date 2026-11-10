@@ -43,7 +43,10 @@ fn open_page(state: &State, tab: usize, window: &mut Window, cx: &mut Context<Sh
     let focus = view.read(cx).focus.clone();
     window.open_dialog(cx, move |d, _, _| {
         // No dialog title: the page list and the page title say where you are.
-        dialog(d).w(px(800.)).child(view.clone())
+        dialog(d)
+            .w(px(800.))
+            .on_ok(|_, _, _| false)
+            .child(view.clone())
     });
     focus.focus(window, cx);
 }
@@ -569,7 +572,7 @@ impl Settings {
                 v_flex()
                     .w_full()
                     .gap_1()
-                    .child(Input::new(&self.openrouter).small())
+                    .child(Input::new(&self.openrouter).small().id("openrouter-key"))
                     .when(!note.is_empty(), |c| {
                         c.child(
                             div()

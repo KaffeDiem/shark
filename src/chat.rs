@@ -94,8 +94,10 @@ type Row = (usize, Option<usize>);
 pub enum ChatEvent {
     AttachCompletionIssue(crate::linear::Hit),
     SearchCompletionIssues(String),
-    /// `meta` changed (session, model or title); the app saves it.
+    /// Chat metadata changed; the app saves it.
     Meta,
+    /// The chat received its first title; only a live user send carries a prompt.
+    Title(Option<String>),
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
     Picked,
     TurnDone,
@@ -474,7 +476,7 @@ impl Chat {
             && let Some(t) = first
         {
             self.meta.title = t;
-            cx.emit(ChatEvent::Meta);
+            cx.emit(ChatEvent::Title(None));
         }
         cx.notify();
     }
@@ -888,7 +890,7 @@ impl Chat {
                 Some(r) => review_title(r),
                 None => title_of(&text),
             };
-            cx.emit(ChatEvent::Meta);
+            cx.emit(ChatEvent::Title(review.is_none().then(|| text.clone())));
         }
         // Jump to the end so push follows the new message and the reply.
         self.sel = self.rows.len().saturating_sub(1);

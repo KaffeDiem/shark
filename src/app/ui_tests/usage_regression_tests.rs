@@ -368,3 +368,27 @@ async fn about_dialog_shows_the_license(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn openrouter_enter_keeps_settings_open(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
+        w.render_frame(cx);
+        w.click("openrouter-key", cx);
+        w.input("invalid key", cx); // Invalid header character: no network request.
+        w.press("enter", cx);
+        assert!(w.has_active_dialog(cx), "Enter must not dismiss Settings");
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx), "failed validation stays visible");
+        w.press("escape", cx);
+        assert!(!w.has_active_dialog(cx), "Escape still dismisses Settings");
+    })
+    .unwrap();
+}

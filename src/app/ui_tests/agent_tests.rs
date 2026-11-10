@@ -21,6 +21,38 @@ fn toasts(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
         .unwrap()
 }
 
+struct TitleCurlPath(std::ffi::OsString);
+
+impl TitleCurlPath {
+    fn set(home: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let curl = bin.join("curl");
+        fs::write(
+            &curl,
+            "#!/bin/sh\nprintf 'called\\n' >> \"$0.calls\"\ngrep -q SecondLineSentinel body || exit 1\nprintf '%s' '{\"choices\":[{\"message\":{\"content\":\"Generated task title\"}}]}' > response\nprintf 200\n",
+        )
+        .unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        let mut path = bin.into_os_string();
+        path.push(":");
+        path.push(&old);
+        // SAFETY: tests using this guard hold UI_LOCK until it drops.
+        unsafe { std::env::set_var("PATH", path) };
+        Self(old)
+    }
+}
+
+impl Drop for TitleCurlPath {
+    fn drop(&mut self) {
+        // SAFETY: tests using this guard hold UI_LOCK until it drops.
+        unsafe { std::env::set_var("PATH", &self.0) };
+    }
+}
+
 /// Duplicate folders and names in one picker result are checked against earlier additions.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -162,6 +194,118 @@ async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     chat.update(cx, |_, cx| cx.emit(crate::chat::ChatEvent::Meta));
     cx.run_until_parked();
     assert_eq!(active_task(cx, &shark).title, shown);
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn first_prompt_after_cmd_n_gets_generated_title(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    shark.update(cx, |s, _| s.openrouter_key = Some(Some("test-key".into())));
+    press_in(window)(cx, &["cmd-n"]);
+    let chat = active_chat(cx, &shark);
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| {
+            c.ask(
+                "Please implement a reusable task naming flow\nSecondLineSentinel",
+                w,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        shark.read(cx).active_task().unwrap().title == "Generated task title"
+    })
+    .await;
+    assert_eq!(active_task(cx, &shark).title, "Generated task title");
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn first_prompt_after_empty_branch_task_gets_generated_title(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    let selected = cx.update(|cx| shark.read(cx).state.repos.clone());
+    shark.update(cx, |s, _| s.openrouter_key = Some(Some("test-key".into())));
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.create_task_for_test(
+            "first-title".into(),
+            git::on_branch(&selected, "first-title"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    until(cx, window, |_, cx| shark.read(cx).active.is_some()).await;
+    assert!(active_task(cx, &shark).title.is_empty());
+    let chat = active_chat(cx, &shark);
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| {
+            assert!(c.ask(
+                "Please implement a reusable task naming flow\nSecondLineSentinel",
+                w,
+                cx,
+            ));
+        });
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        shark.read(cx).active_task().unwrap().title == "Generated task title"
+    })
+    .await;
+    assert_eq!(active_task(cx, &shark).title, "Generated task title");
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn sentinel_first_line_requests_one_generated_title(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    shark.update(cx, |s, _| s.openrouter_key = Some(Some("test-key".into())));
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.new_task(
+            Some(
+                "New agent\nPlease implement a reusable task naming flow SecondLineSentinel".into(),
+            ),
+            None,
+            None,
+            w,
+            cx,
+        );
+    });
+    until(cx, window, |_, cx| {
+        shark.read(cx).active_task().unwrap().title == "Generated task title"
+    })
+    .await;
+    cx.run_until_parked();
+    assert_eq!(
+        fs::read_to_string(home.join("bin/curl.calls")).unwrap(),
+        "called\n"
+    );
 }
 
 /// An agent saved with the old name and the literal placeholder is still titled by a message.

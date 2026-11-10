@@ -136,7 +136,17 @@ impl Shark {
                     ChatEvent::AttachCompletionIssue(hit) => {
                         this.attach_chat_reference_issue(name.clone(), hit.clone(), window, cx)
                     }
-                    ChatEvent::Meta => this.save_meta(chat, cx),
+                    ChatEvent::Meta => this.save_meta(chat, false, cx),
+                    ChatEvent::Title(prompt) => {
+                        let untitled = this.task(&name).is_some_and(|w| {
+                            (w.title.is_empty() || w.title == crate::state::NEW_TASK)
+                                && w.primary_issue().is_none()
+                        });
+                        this.save_meta(chat, true, cx);
+                        if let Some(prompt) = prompt.as_deref().filter(|_| untitled) {
+                            this.auto_title(&name, prompt, cx);
+                        }
+                    }
                     ChatEvent::HandOff { to } => match to {
                         Some(to) => this.hand_off(&name, to, Some(id.clone()), window, cx),
                         None => this.hand_off_picker(&name, Some(id.clone()), window, cx),
@@ -208,16 +218,19 @@ impl Shark {
         }
         self.chats.insert(meta.id.clone(), chat.clone());
         self.sync_reference_completion(self.draft_target(), cx);
-        self.save_meta(&chat, cx); // replay may have found a title
+        self.save_meta(&chat, true, cx); // a persisted chat may already have a title
         chat
     }
 
-    /// The first message of a still untitled agent titles it too.
-    fn save_meta(&mut self, chat: &Entity<Chat>, cx: &mut Context<Self>) {
+    /// A chat's first title fills a still untitled task.
+    fn save_meta(&mut self, chat: &Entity<Chat>, title: bool, cx: &mut Context<Self>) {
         let meta = chat.read(cx).meta.clone();
         let ws = (self.state.tasks.iter_mut()).find(|w| w.chats.iter().any(|c| c.id == meta.id));
         let Some(ws) = ws else { return };
-        let untitled = ws.title == crate::state::NEW_TASK && !meta.title.is_empty();
+        let untitled = title
+            && (ws.title.is_empty() || ws.title == crate::state::NEW_TASK)
+            && ws.primary_issue().is_none()
+            && !meta.title.is_empty();
         if untitled {
             ws.title = meta.title.clone();
         }

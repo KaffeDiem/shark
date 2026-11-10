@@ -465,9 +465,14 @@ impl Shark {
     /// With an OpenRouter key (Settings > General), a prompt of more than four words gets a 3-4
     /// word title. A rename made meanwhile wins; any failure keeps the prompt's first line.
     pub(super) fn auto_title(&mut self, name: &str, prompt: &str, cx: &mut Context<Self>) {
-        let Some(before) = self.task(name).map(|t| t.title.clone()) else {
+        let Some(task) = self.task(name) else {
             return;
         };
+        let before = task.title.clone();
+        // A creation hook precedes the first send; its Title event will request this once.
+        if before == crate::state::NEW_TASK && task.chats.iter().all(|c| c.title.is_empty()) {
+            return;
+        }
         if !crate::title::wanted(prompt) || self.openrouter_key == Some(None) {
             return;
         }
