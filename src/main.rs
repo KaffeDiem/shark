@@ -38,6 +38,7 @@ mod state;
 mod sync;
 mod task_composer;
 mod theme;
+mod title;
 mod transcript;
 mod ui;
 mod usage;

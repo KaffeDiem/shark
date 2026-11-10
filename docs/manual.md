@@ -198,7 +198,7 @@ Every chat receives changed issue text with its next normal message. It is marke
 
 ## Settings, shortcuts and local data
 
-Settings (`cmd-,`) applies changes immediately. General includes stay awake, Vim mode and repository skills. Appearance chooses light/dark/system mode, themes and installed fonts. Prompts edits the git requests sent to chats; `{repos}` and `{branch}` are filled in, and **Reset to default** removes an override. Repositories and Linear have their own pages.
+Settings (`cmd-,`) applies changes immediately. General includes stay awake, Vim mode, repository skills and **Task titles from OpenRouter**. With an OpenRouter API key, a new task whose first prompt is longer than four words gets a 3-4 word title from DeepSeek V4.1 Flash, so OpenRouter receives that prompt. The key is checked with one request and then saved in macOS Keychain. A rename made before the title arrives wins, and any failure keeps the prompt's first line. To remove the key, press Enter on an empty field. Appearance chooses light/dark/system mode, themes and installed fonts. Prompts edits the git requests sent to chats; `{repos}` and `{branch}` are filled in, and **Reset to default** removes an override. Repositories and Linear have their own pages.
 
 The footer's **Usage** panel shows Claude and Codex allowance and reset times. Green, amber and red dots compare remaining allowance with an even burn through the window; unknown or stale readings are muted. It uses signed-in CLI accounts without sending an inference prompt. Refresh is available in the panel.
 

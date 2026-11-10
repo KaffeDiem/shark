@@ -130,6 +130,8 @@ pub struct Shark {
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashMap<String, Option<String>>,
+    /// The OpenRouter key for task titles: `None` until the Keychain is first read.
+    pub(crate) openrouter_key: Option<Option<String>>,
     /// Agents with a repository being created right now (`Task::attaching` has the rest).
     adding_repos: HashSet<String>,
     /// Per agent, how the attachment operation has gone.
@@ -314,6 +316,7 @@ impl Shark {
             chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
             creating: HashMap::new(),
+            openrouter_key: None,
             adding_repos: HashSet::new(),
             attach_results: HashMap::new(),
             setting_up: vec![],
@@ -788,7 +791,7 @@ impl Shark {
                 h_flex()
                     .h(px(44.))
                     .flex_none()
-                    .px(px(16.))
+                    .px(px(6.))
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(theme.border)

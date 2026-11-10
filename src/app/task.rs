@@ -363,6 +363,7 @@ impl Shark {
                 || tasks_dir().join(n).exists()
                 || crate::transcript::transcript_path(n).exists()
         });
+        let from_issue = issue.is_some();
         let title = match (&issue, first.as_deref()) {
             (Some((title, _)), _) => title.clone(),
             (None, Some(first)) => crate::chat::title_of(first),
@@ -404,6 +405,9 @@ impl Shark {
             cx,
         );
         let Some(first) = first else { return };
+        if !from_issue {
+            self.auto_title(&name, &first, cx);
+        }
         if let Some(chat) = self.active_chat().cloned() {
             chat.update(cx, |c, cx| c.ask(&first, window, cx));
         }
@@ -456,6 +460,57 @@ impl Shark {
             let _ = self.state.save();
             cx.notify();
         }
+    }
+
+    /// With an OpenRouter key (Settings > General), a prompt of more than four words gets a 3-4
+    /// word title. A rename made meanwhile wins; any failure keeps the prompt's first line.
+    pub(super) fn auto_title(&mut self, name: &str, prompt: &str, cx: &mut Context<Self>) {
+        let Some(task) = self.task(name) else {
+            return;
+        };
+        let before = task.title.clone();
+        let instance = task.instance_id.clone();
+        // A creation hook precedes the first send; its Title event will request this once.
+        if before == crate::state::NEW_TASK && task.chats.iter().all(|c| c.title.is_empty()) {
+            return;
+        }
+        if !crate::title::wanted(prompt) || self.openrouter_key == Some(None) {
+            return;
+        }
+        let cached = self.openrouter_key.clone();
+        let read = cached
+            .is_none()
+            .then(|| cx.read_credentials(crate::title::KEYCHAIN));
+        let (name, prompt) = (name.to_string(), prompt.to_string());
+        cx.spawn(async move |this, cx| {
+            let key = match (cached, read) {
+                (Some(key), _) => key,
+                (None, Some(read)) => {
+                    // ponytail: a declined Keychain prompt reads as "no key" until relaunch.
+                    let key = crate::title::key_from(read.await);
+                    // A key saved or removed in Settings meanwhile wins.
+                    this.update(cx, |s, _| s.openrouter_key.get_or_insert(key).clone())
+                        .ok()
+                        .flatten()
+                }
+                (None, None) => None,
+            };
+            let Some(key) = key else { return };
+            let title = cx
+                .background_executor()
+                .spawn(async move { crate::title::generate(&key, &prompt) })
+                .await;
+            let Ok(title) = title else { return };
+            this.update(cx, |s, cx| {
+                if s.task(&name)
+                    .is_some_and(|t| t.instance_id == instance && t.title == before)
+                {
+                    s.set_title(&name, title, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// `picked` repos start ticked: the last-used ones, or the repo clicked in the sidebar.
@@ -661,6 +716,9 @@ impl Shark {
                             ws = current;
                         }
                         let _ = s.state.save();
+                        if let Some(p) = &prompt {
+                            s.auto_title(&name, p, cx);
+                        }
                         // A dirty file tab in the task left behind asks first: send once opened.
                         let deferred = Rc::new(std::cell::Cell::new(false));
                         let (later, setup_ws, key) = (deferred.clone(), ws.clone(), name.clone());
