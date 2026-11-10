@@ -1243,6 +1243,9 @@ impl Shark {
             _ => self.active.clone()?,
         };
         let task = self.task(&name)?;
+        if self.sidebar_focus.is_focused(window) && !self.sidebar_task_matches(task) {
+            return None;
+        }
         if !self.sidebar_focus.is_focused(window)
             && self.home_shown()
             && (!self.home_task_matches(task) || (task.backlog && !self.home.backlog_open))

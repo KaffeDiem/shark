@@ -74,6 +74,8 @@ Use **Move to backlog** in a task menu, the palette, or `b` in a task list to pa
 
 The **All repositories** control on the first group heading filters Home to one repository or **No repository**, including repositories being attached. The picker shows task and needs-you counts; the footer counts tasks elsewhere and **Show all** clears the filter. The filter resets on restart and does not affect agent pages, the sidebar, Dock badge, cmd-j or task picker. Right-click a task and choose **Show tasks in…** to open its repository on Home.
 
+The filter icon beside Home in the expanded sidebar opens a repository menu with **All repositories** and **No repository**. This independent filter narrows agent and unassigned task rows, agent counts and `cmd-1…9` shortcuts. Global task search still finds every task. The sidebar filter resets on restart.
+
 The **Status** control switches grouping between status and task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
 
 `cmd-0` opens Home; from Home it returns to the active task. `esc` leaves an overview for the active task, or returns to Home if none is active. The task picker (`cmd-shift-o`) searches task titles and repositories. With no query it selects the most recent task from Home, or the most recent other task while a task is open. The app switcher (`cmd-o`, held) cycles tasks until you release Command.

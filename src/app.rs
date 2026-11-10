@@ -106,6 +106,7 @@ pub struct Shark {
     sel: SideRow,
     /// Agent navigation folds independently of optional task groups.
     collapsed_agents: HashSet<String>,
+    sidebar_repo_filter: Option<home::RepoFilter>,
     pub(crate) active: Option<String>,
     /// By chat id; created when a chat is first shown.
     chats: HashMap<String, Entity<Chat>>,
@@ -299,6 +300,7 @@ impl Shark {
             state,
             sel: SideRow::Task(0),
             collapsed_agents: HashSet::new(),
+            sidebar_repo_filter: None,
             active: None,
             chats: HashMap::new(),
             awake: None,

@@ -67,7 +67,7 @@ pub(super) enum RepoFilter {
 }
 
 impl RepoFilter {
-    fn label(&self) -> &str {
+    pub(super) fn label(&self) -> &str {
         match self {
             Self::Repo(name) => name,
             Self::NoRepo => "No repository",

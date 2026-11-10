@@ -240,8 +240,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             "repo-filter",
             "repo-empty",
             "repo-picker",
+            "sidebar-filter",
+            "sidebar-repo-menu",
         ] {
             cx.update_window(window, |_, w, cx| {
+                w.close_all_dialogs(cx);
                 shark.update(cx, |s, cx| {
                     s.rail = false;
                     s.home.on = true;
@@ -256,6 +259,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         "repo-empty" => Some(home::RepoFilter::Repo("web".into())),
                         _ => None,
                     };
+                    s.sidebar_repo_filter = matches!(case, "sidebar-filter" | "sidebar-repo-menu")
+                        .then(|| home::RepoFilter::Repo("api".into()));
                     s.fix_home_sel(cx);
                     if case == "repo-picker" {
                         s.pick_repo_filter(w, cx);
@@ -279,6 +284,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     assert!(w.try_find("repo-empty-tasks").is_some());
                 } else if case != "repo-picker" {
                     assert!(w.try_find("backlog-heading").is_some());
+                }
+                if case == "sidebar-repo-menu" {
+                    w.click("sidebar-repo-filter", cx);
+                    w.render_frame(cx);
+                    assert!(w.try_find("menu-parent").is_some());
                 }
             })
             .unwrap();

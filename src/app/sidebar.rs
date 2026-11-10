@@ -1,5 +1,6 @@
 //! Agent navigation, task rows, manual task groups, and the sidebar cursor.
 use super::*;
+use gpui_kit::component::Selectable as _;
 
 /// A task's status icon: a spinner while an agent runs, else by what it needs from you.
 /// `idle` colours the dashed circle of a task that needs nothing.
@@ -208,6 +209,58 @@ pub(super) fn rail_button<E: Styled>(e: E) -> E {
 }
 
 impl Shark {
+    pub(super) fn sidebar_task_matches(&self, task: &Task) -> bool {
+        self.sidebar_repo_filter
+            .as_ref()
+            .is_none_or(|filter| home::repo_matches(task, filter))
+    }
+
+    fn sidebar_repo_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+        let names: std::collections::BTreeSet<_> = self
+            .state
+            .tasks
+            .iter()
+            .flat_map(|t| {
+                t.repos
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .chain(t.attaching.iter().map(|r| r.repo.clone()))
+            })
+            .collect();
+        let filters = std::iter::once(None)
+            .chain(
+                names
+                    .into_iter()
+                    .map(|name| Some(home::RepoFilter::Repo(name))),
+            )
+            .chain(
+                self.state
+                    .tasks
+                    .iter()
+                    .any(|t| home::repo_matches(t, &home::RepoFilter::NoRepo))
+                    .then_some(Some(home::RepoFilter::NoRepo)),
+            );
+        filters
+            .map(|filter| {
+                let label = filter
+                    .as_ref()
+                    .map_or("All repositories", home::RepoFilter::label)
+                    .to_string();
+                let checked = filter == self.sidebar_repo_filter;
+                menu::item(
+                    IconName::FolderGit2,
+                    label,
+                    on_shark(cx, move |s, _, cx| {
+                        s.sidebar_repo_filter = filter.clone();
+                        s.fix_sel();
+                        cx.notify();
+                    }),
+                )
+                .checked(checked)
+            })
+            .collect()
+    }
+
     pub(super) fn section_of(&self, ws: &str) -> Option<usize> {
         self.state
             .sections
@@ -249,7 +302,10 @@ impl Shark {
         rows.retain(|row| match row {
             SideRow::Task(ix) => {
                 let task = &self.state.tasks[*ix];
-                unfold || !task.backlog || self.active.as_deref() == Some(&task.name)
+                // Global task search uses unfolded rows and keeps every repository reachable.
+                unfold
+                    || (self.sidebar_task_matches(task)
+                        && (!task.backlog || self.active.as_deref() == Some(&task.name)))
             }
             SideRow::Agent(_) => true,
         });
@@ -794,6 +850,7 @@ impl Shark {
             .tasks
             .iter()
             .filter(|t| !t.backlog && t.agent.as_ref().is_some_and(|a| a.slug == agent.slug))
+            .filter(|t| self.sidebar_task_matches(t))
             .collect();
         let needs = tasks
             .iter()
@@ -1192,6 +1249,19 @@ impl Shark {
                                 .flex_none()
                                 .gap(px(4.))
                                 .mr(px(8.))
+                                .child(
+                                    side_toggle(
+                                        "sidebar-repo-filter",
+                                        IconName::ListFilter,
+                                        "Filter sidebar by repository",
+                                    )
+                                    .selected(self.sidebar_repo_filter.is_some())
+                                    .on_click(cx.listener(|this, e: &ClickEvent, w, cx| {
+                                        let entries = this.sidebar_repo_menu(cx);
+                                        this.show_menu(e.position(), entries, w, cx);
+                                    }))
+                                    .map(|b| quiet_toolbar("sidebar-repo-filter", b)),
+                                )
                                 .child(self.render_commands(cx))
                                 .child(self.render_new_task(cx)),
                         )

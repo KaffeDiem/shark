@@ -1507,3 +1507,116 @@ async fn backlog_cannot_hide_an_open_question(cx: &mut TestAppContext) {
     }
     fs::remove_dir_all(home).ok();
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn sidebar_repository_filter_menu(cx: &mut TestAppContext) {
+    use crate::state::{Agent, AgentLink, Attachment};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.state.repos = repos(&home, &["api", "web"]);
+        s.state.agents = vec![Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            ..Default::default()
+        }];
+        let repo = |name: &str| TaskRepo {
+            name: name.into(),
+            src: home.join(name),
+            base: "main".into(),
+            branch: None,
+        };
+        s.state.tasks = vec![
+            Task {
+                repos: vec![repo("web")],
+                agent: Some(AgentLink {
+                    slug: "designer".into(),
+                    ..Default::default()
+                }),
+                ..fake("web-task")
+            },
+            Task {
+                repos: vec![repo("api"), repo("web")],
+                agent: Some(AgentLink {
+                    slug: "designer".into(),
+                    ..Default::default()
+                }),
+                ..fake("both")
+            },
+            Task {
+                attaching: vec![Attachment::fresh(&s.state.repos[0], "pending", "main")],
+                ..fake("pending")
+            },
+            fake("no-repo"),
+        ];
+        s.enter_home(w, cx);
+        s.sel = SideRow::Task(0);
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("sidebar-repo-filter", cx);
+        w.render_frame(cx);
+        assert!(
+            w.try_find("menu-parent").is_some(),
+            "uses the task context menu"
+        );
+        assert!(!w.has_active_dialog(cx));
+    })
+    .unwrap();
+    press_in(window)(cx, &["a", "p", "i", "enter"]);
+    on(cx, &|s, _, cx| {
+        assert_eq!(s.ws_order(false), [1, 2]);
+        assert_eq!(
+            s.sel,
+            SideRow::Agent(0),
+            "hidden cursor returns to its agent"
+        );
+        assert_eq!(
+            s.ws_order(true),
+            [0, 1, 2, 3],
+            "global task picker retains every task"
+        );
+        assert_eq!(s.home_rows(cx).len(), 4, "Home filter stays independent");
+    });
+    on(cx, &|s, w, cx| {
+        s.sel = SideRow::Task(0);
+        s.sidebar_focus.focus(w, cx);
+        assert!(
+            s.target(w).is_none(),
+            "stale hidden cursor cannot target a task"
+        );
+        s.fix_sel();
+        s.set_agent_collapsed(0, true, cx);
+        assert_eq!(s.ws_order(false), [2], "collapsed agents stay collapsed");
+        s.set_agent_collapsed(0, false, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("sidebar-repo-filter", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["n", "o", "enter"]);
+    on(cx, &|s, _, _| {
+        assert_eq!(s.ws_order(false), [3]);
+    });
+    on(cx, &|s, _, cx| {
+        s.sidebar_repo_filter = Some(super::super::home::RepoFilter::Repo("removed".into()));
+        s.fix_sel();
+        assert!(s.ws_order(false).is_empty());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("sidebar-repo-filter", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["a", "l", "l", "enter"]);
+    on(cx, &|s, _, _| {
+        assert_eq!(s.ws_order(false), [0, 1, 2, 3]);
+    });
+    fs::remove_dir_all(home).ok();
+}
