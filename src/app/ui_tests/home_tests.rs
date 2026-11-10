@@ -1,6 +1,7 @@
 use super::*;
 use crate::attention::Attn;
 use crate::state::TaskRepo;
+use gpui_kit::test::TestQueryExt;
 
 /// A task `one` made from a repo `api`; the app has it open.
 async fn one_task(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, Entity<Shark>) {
@@ -1177,5 +1178,332 @@ async fn repo_filter_rejects_hidden_target(cx: &mut TestAppContext) {
             "a stale cursor cannot act on a filtered-out task"
         );
     });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_folds_last_and_mutes_attention(cx: &mut TestAppContext) {
+    use super::super::home::{Bucket, Destination, RepoFilter};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let parked = Task {
+        backlog: true,
+        agent: Some(crate::state::AgentLink {
+            slug: "designer".into(),
+            ..Default::default()
+        }),
+        repos: vec![TaskRepo {
+            name: "api".into(),
+            src: home.join("api"),
+            base: "main".into(),
+            branch: None,
+        }],
+        ..fake("parked")
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![fake("active"), parked],
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            sections: vec![Section {
+                name: "First".into(),
+                icon: "folder".into(),
+                tasks: vec!["parked".into()],
+                collapsed: false,
+                agent: None,
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        assert!(!s.home.backlog_open);
+        assert_eq!(s.home_rows(cx).len(), 1);
+        s.home.waiting.insert("parked".into(), "Plan to approve");
+        s.turn_done("parked", "parked", cx);
+        assert_eq!(s.attention_of("parked", cx), Attn::None);
+        assert_eq!(
+            crate::attention::BADGE.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        s.active = Some("parked".into());
+        assert!(
+            !s.ws_order(false).contains(&1),
+            "even the open backlog task has no cmd-N"
+        );
+        assert!(
+            s.ws_order(true).contains(&1),
+            "full task navigation includes Backlog"
+        );
+        assert!(
+            s.side_rows(false).contains(&SideRow::Task(1)),
+            "the open task stays in the sidebar"
+        );
+        s.home.backlog_open = true;
+        for grouped in [false, true] {
+            s.home.group_tasks = grouped;
+            let rows = s.home_rows(cx);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.last().unwrap().bucket, Bucket::Backlog);
+            assert_eq!(s.state.tasks[rows.last().unwrap().ix].name, "parked");
+        }
+        s.home.destination = Destination::Agent("designer".into());
+        assert_eq!(
+            s.home_rows(cx).len(),
+            1,
+            "agent pages show their Backlog when expanded"
+        );
+        assert_eq!(s.home_rows(cx)[0].bucket, Bucket::Backlog);
+        s.home.backlog_open = false;
+        assert!(s.home_rows(cx).is_empty(), "agent pages fold Backlog too");
+        s.home.backlog_open = true;
+        s.home.destination = Destination::Home;
+        s.home.sel = Some("parked".into());
+        s.home.focus.focus(w, cx);
+        cx.notify();
+    });
+    assert!(
+        cx.shown_system_notifications().is_empty(),
+        "Backlog stays quiet"
+    );
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("toggle-backlog", cx);
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        assert!(!s.home.backlog_open);
+        assert_ne!(s.target(w).map(|t| t.name).as_deref(), Some("parked"));
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.fix_home_sel(cx);
+        assert!(s.home_rows(cx).is_empty());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("toggle-backlog").is_some(),
+            "a filtered, folded Backlog remains reachable"
+        );
+        assert!(
+            w.try_find("repo-empty-tasks").is_none(),
+            "folding is not an empty repository"
+        );
+        w.click("toggle-backlog", cx);
+    })
+    .unwrap();
+    cx.read(|cx| assert_eq!(shark.read(cx).home_rows(cx).len(), 1));
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_key_and_cursor(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: ["a", "b", "c"].map(fake).to_vec(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.open_task(0, w, cx);
+        s.enter_home(w, cx);
+        s.home.sel = Some("a".into());
+        s.home.focus.focus(w, cx);
+    });
+    press(cx, &["b"]);
+    on(cx, &|s, w, cx| {
+        assert!(s.task("a").unwrap().backlog);
+        assert_eq!(
+            s.home.sel.as_deref(),
+            Some("b"),
+            "the cursor keeps the vacated row's height"
+        );
+        s.leave_home(w, cx);
+        s.sel = SideRow::Task(0);
+        s.sidebar_focus.focus(w, cx);
+    });
+    press(cx, &["b"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(!s.task("a").unwrap().backlog);
+        assert_eq!(s.active.as_deref(), Some("a"));
+        assert!(s.ws_order(false).contains(&0));
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_preserves_notification_baseline(cx: &mut TestAppContext) {
+    use crate::state::{AttachStage, Attachment};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![fake("parked")],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks[0].attaching.push(Attachment {
+            repo: "api".into(),
+            src: home.join("api"),
+            branch: "parked".into(),
+            base: "main".into(),
+            fresh: true,
+            stage: AttachStage::SetupFailed,
+            error: None,
+        });
+        s.attn.set_checked("parked", vec![]);
+        s.refresh_attention(cx);
+        assert!(matches!(s.attention_of("parked", cx), Attn::Needs(_)));
+        s.set_backlog("parked", true, Some(w), cx);
+        assert_eq!(s.attention_of("parked", cx), Attn::None);
+        s.set_backlog("parked", false, None, cx);
+        assert!(matches!(s.attention_of("parked", cx), Attn::Needs(_)));
+    });
+    assert!(
+        cx.shown_system_notifications().is_empty(),
+        "reactivating an unchanged needs-you label must not notify"
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_picker_and_turn_start(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![Task {
+                backlog: true,
+                ..fake("parked")
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| s.enter_home(w, cx));
+    press(cx, &["cmd-shift-o"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.find("workspace-result-parked")
+                .label()
+                .is_some_and(|l| l.contains("Backlog"))
+        );
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    let chat = cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.task("parked").unwrap().backlog,
+            "opening does not reactivate"
+        );
+        s.active_chat().unwrap().clone()
+    });
+    cx.update(|cx| {
+        chat.update(cx, |c, cx| {
+            c.busy = true;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert!(
+            !shark.read(cx).task("parked").unwrap().backlog,
+            "a turn starts without needing a sent event"
+        )
+    });
+    cx.update(|cx| {
+        chat.update(cx, |c, cx| {
+            c.busy = false;
+            cx.notify();
+        })
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn backlog_cannot_hide_an_open_question(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![fake("question"), fake("idle")],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| s.open_task(0, w, cx));
+    let chat = cx.read(|cx| shark.read(cx).active_chat().unwrap().clone());
+    cx.update(|cx| chat.update(cx, |c, cx| {
+        c.busy = true;
+        crate::chat::ui_tests::play(c, &[r#"{"type":"control_request","request_id":"backlog-question","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"backlog-tool","input":{"questions":[{"header":"Color","question":"Which color?","options":[{"label":"Blue","description":"Blue"},{"label":"Red","description":"Red"}]}]}}}"#], cx);
+        cx.notify();
+    }));
+    cx.run_until_parked();
+    on(cx, &|s, w, cx| {
+        assert!(s.asking_chat("question", cx));
+        assert_eq!(s.running_chats("question", cx), 0);
+        assert!(!s.can_backlog("question", cx));
+        assert!(
+            !ws_menu(s, s.task("question").unwrap(), cx)
+                .iter()
+                .any(|e| matches!(e, Entry::Item { label, .. } if label == "Move to backlog"))
+        );
+        s.enter_home(w, cx);
+        s.home.sel = Some("question".into());
+        s.home.focus.focus(w, cx);
+    });
+    press(cx, &["b"]);
+    cx.read(|cx| assert!(!shark.read(cx).task("question").unwrap().backlog));
+    for (task, count) in [("question", 0), ("idle", 1)] {
+        on(cx, &|s, w, cx| {
+            s.home.sel = Some(task.into());
+            s.home.focus.focus(w, cx);
+        });
+        press(cx, &["cmd-k"]);
+        cx.update_window(window, |_, w, cx| w.input("Move task to backlog", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            assert_eq!(
+                w.find_all_by_role(Role::ListBoxOption).len(),
+                count,
+                "palette gate for {task}"
+            );
+        })
+        .unwrap();
+        press(cx, &["escape", "escape"]);
+        cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+            .unwrap();
+    }
     fs::remove_dir_all(home).ok();
 }

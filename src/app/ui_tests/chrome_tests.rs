@@ -317,6 +317,10 @@ pub(crate) fn render_pixels() {
         // Capture settled surfaces; motion behavior is covered by interaction tests.
         cx.set_reduce_motion(true);
     });
+    if std::env::var_os("SHARK_RENDER_HOME_ONLY").is_some() {
+        super::navigation_pixels::render_pixels(&mut cx);
+        return;
+    }
     if std::env::var_os("SHARK_RENDER_USAGE_ONLY").is_some() {
         super::super::usage::render_pixels(&mut cx);
         return;

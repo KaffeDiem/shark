@@ -194,6 +194,18 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
     Row::key("Copy task path", IconName::Copy, &CopyPath, "folder"),
     Row::key("Copy branch name", IconName::GitBranch, &CopyBranch, ""),
+    Row::key(
+        "Move task to backlog",
+        IconName::CirclePause,
+        &ToggleBacklog,
+        "backlog park later",
+    ),
+    Row::key(
+        "Move task to active",
+        IconName::Play,
+        &ToggleBacklog,
+        "backlog resume",
+    ),
     Row::key("Show chat", IconName::MessageSquare, &ShowChat, "tab"),
     Row::key("New chat", IconName::Plus, &NewChat, "tab"),
     Row(
@@ -812,6 +824,8 @@ pub(super) const COMMANDS: &[Row] = &[
 
 /// Rows that act on a task; left out while there's none to act on.
 const NEED_TASK: &[&str] = &[
+    "Move task to backlog",
+    "Move task to active",
     "Show Git",
     "Attach repository…",
     "Attach Linear issue…",
@@ -1003,6 +1017,11 @@ impl Shark {
                     && NEED_TASK.contains(label)
                     && !(*label == "Attach Linear issue…" && self.home_shown()))
                 || (*label == "Show all repositories" && self.home.repo_filter.is_none())
+                || (*label == "Move task to backlog"
+                    && target
+                        .as_ref()
+                        .is_none_or(|t| t.backlog || !self.can_backlog(&t.name, cx)))
+                || (*label == "Move task to active" && target.as_ref().is_none_or(|t| !t.backlog))
                 || (no_linear && NEED_LINEAR.contains(label))
                 || ([
                     "Add to task…",
@@ -1083,6 +1102,17 @@ mod tests {
         let gated = [CLAUDE_ONLY, CODEX_ONLY, NEED_TASK, NEED_LINEAR];
         for label in gated.into_iter().flatten() {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
+        }
+    }
+
+    #[test]
+    fn backlog_commands_belong_to_task_group() {
+        let end = COMMANDS.iter().position(|r| r.0 == "Show chat").unwrap();
+        for label in ["Move task to backlog", "Move task to active"] {
+            assert!(
+                COMMANDS[..end].iter().any(|r| r.0 == label),
+                "{label} belongs in Task"
+            );
         }
     }
 

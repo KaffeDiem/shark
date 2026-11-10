@@ -184,15 +184,21 @@ impl Shark {
 
     /// A turn finished off screen, in the task or any of its chat tabs.
     fn unread_ws(&self, name: &str) -> bool {
+        if self.task(name).is_some_and(|t| t.backlog) {
+            return false;
+        }
         self.attn.unread.contains(name) || self.chat_unread(name)
     }
 
     /// The agent is on it (mid-rebase looks like conflicts), or the task is going away.
-    fn busy(&self, name: &str, cx: &App) -> bool {
+    pub(crate) fn busy(&self, name: &str, cx: &App) -> bool {
         self.archiving.contains(name) || self.running_chats(name, cx) > 0
     }
 
     fn needs_you(&self, name: &str, cx: &App) -> Option<String> {
+        if self.task(name).is_some_and(|t| t.backlog) {
+            return None;
+        }
         if self.asking_chat(name, cx) {
             return Some(crate::transcript::QUESTION.into());
         }
@@ -344,6 +350,9 @@ impl Shark {
         for name in &names {
             let needs = self.needs_you(name, cx);
             count += usize::from(needs.is_some() || self.unread_ws(name));
+            if self.task(name).is_some_and(|t| t.backlog) {
+                continue;
+            }
             // Nothing known yet (never opened, not checked): no baseline to compare against.
             if !self.attn.checked.contains_key(name) && !self.syncs.contains_key(name) {
                 continue;
@@ -430,6 +439,9 @@ impl Shark {
         let Some(ws) = self.state.tasks.iter().find(|ws| ws.name == name) else {
             return;
         };
+        if ws.backlog {
+            return;
+        }
         cx.show_system_notification(SystemNotification {
             tag: serde_json::to_string(&(&ws.instance_id, name, chat))
                 .expect("notification identity")

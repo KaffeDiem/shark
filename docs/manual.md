@@ -70,6 +70,8 @@ Each skill has a `<skill>/SKILL.md` file. After manual changes, choose **Refresh
 
 Home starts tasks and lists every task, grouped by **Needs you**, **Running**, **Unread** and **Idle**. Needs you includes questions, plan approvals, attachment problems and actionable git status. The sidebar and Dock badge also mark work needing attention; notifications announce completed turns and tasks that need you.
 
+Use **Move to backlog** in a task menu, the palette, or `b` in a task list to park work. Home and agent pages keep it in the trailing **Backlog N** section, collapsed by default. Parked tasks leave the sidebar except for the open task and stop raising attention or notifications. Starting a turn returns a task to active; **Move to active** or `b` does the same explicitly. Running tasks, tasks being deleted and unanswered questions cannot be parked. Backlog survives restart; expansion does not. The task picker still finds parked tasks, while `cmd-1…9` skip them.
+
 The **All repositories** control on the first group heading filters Home to one repository or **No repository**, including repositories being attached. The picker shows task and needs-you counts; the footer counts tasks elsewhere and **Show all** clears the filter. The filter resets on restart and does not affect agent pages, the sidebar, Dock badge, cmd-j or task picker. Right-click a task and choose **Show tasks in…** to open its repository on Home.
 
 The **Status** control switches grouping between status and task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
@@ -216,9 +218,10 @@ The footer's **Usage** panel shows Claude and Codex allowance and reset times. G
 | Differ / Git / file picker | `cmd-shift-d` / `cmd-shift-g` / `cmd-p` |
 | Run repository scripts | `cmd-r` |
 | Next task needing attention | `cmd-j` |
+| Move task to Backlog / active (task lists) | `b` |
 | Sidebar rail / Zen mode | `cmd-b` / `cmd-.` |
 
-Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home and agent task lists use `i`/`a` to reach a prompt. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, artifact and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
+Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home and agent task lists use `i`/`a` to reach a prompt; `b` parks or resumes the selected task in these lists and the sidebar. Expand Backlog to navigate its rows with the same list keys. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, artifact and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
 
 Shark stores state, transcripts, plans, comments and Linear snapshots under `~/Library/Application Support/shark/`. Agent skills live there too. Worktrees remain under `~/shark/workspaces/`; the older directory name and serialized `workspaces` fields are retained for existing installations. Do not move worktrees manually: their git metadata refers to their locations.
 

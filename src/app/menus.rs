@@ -164,6 +164,25 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
         on_task(cx, &ws.name, |s, n, w, cx| s.rename_task(n, w, cx)),
     ));
     entries.push(move_submenu(this, &ws.name, cx));
+    if ws.backlog || this.can_backlog(&ws.name, cx) {
+        let on = !ws.backlog;
+        entries.push(menu::item(
+            if on {
+                IconName::CirclePause
+            } else {
+                IconName::Play
+            },
+            if on {
+                "Move to backlog"
+            } else {
+                "Move to active"
+            },
+            on_task(cx, &ws.name, move |s, n, w, cx| {
+                s.set_backlog(&n, on, Some(w), cx)
+            }),
+        ));
+    }
+
     entries.extend(handoff_submenu(this, ws, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
         .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))

@@ -27,6 +27,7 @@ pub(super) struct PickerTask {
     repos: Vec<(String, (String, IconName, Option<crate::prs::PrStatus>))>,
     last_interacted_at: Option<u64>,
     running: usize,
+    backlog: bool,
     attention: Attn,
 }
 
@@ -49,11 +50,15 @@ impl PickerTask {
                 .collect(),
             last_interacted_at: ws.last_interacted_at,
             running,
+            backlog: ws.backlog,
             attention,
         }
     }
 
     fn activity(&self) -> Option<String> {
+        if self.backlog {
+            return Some("Backlog".into());
+        }
         let running = match self.running {
             0 => None,
             1 => Some("1 chat running".to_string()),
@@ -268,6 +273,7 @@ impl TaskPicker {
                 let ws = by_name.get(name.as_str())?;
                 let rows = ws.repos.clone();
                 let running = ws.running;
+                let backlog = ws.backlog;
                 let attention = ws.attention.clone();
                 let activity = ws.activity();
                 let (time, exact) = interaction_time(ws.last_interacted_at, now);
@@ -314,6 +320,7 @@ impl TaskPicker {
                                         .size(px(16.))
                                         .flex_none()
                                         .child(sidebar::task_indicator(
+                                            backlog,
                                             running,
                                             &attention,
                                             muted,
@@ -510,6 +517,15 @@ mod tests {
             0,
             Attn::None,
         )
+    }
+
+    #[test]
+    fn backlog_stays_searchable_and_labels_activity() {
+        let mut parked = task("parked", "api", None);
+        parked.backlog = true;
+        parked.attention = Attn::Unread;
+        assert_eq!(parked.activity().as_deref(), Some("Backlog"));
+        assert_eq!(rank(&[parked], "parked"), vec!["parked"]);
     }
 
     #[test]

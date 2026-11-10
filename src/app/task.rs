@@ -4,6 +4,42 @@ use super::*;
 use crate::state::{AgentLink, AttachStage, Sibling};
 
 impl Shark {
+    pub(super) fn can_backlog(&self, name: &str, cx: &App) -> bool {
+        !self.busy(name, cx) && !self.asking_chat(name, cx)
+    }
+
+    pub(super) fn set_backlog(
+        &mut self,
+        name: &str,
+        on: bool,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if on && !self.can_backlog(name, cx) {
+            return;
+        }
+        let before = self.cursors(cx);
+        let Some(task) = self.state.tasks.iter_mut().find(|t| t.name == name) else {
+            return;
+        };
+        if task.backlog == on {
+            return;
+        }
+        task.backlog = on;
+        let title = task.display_title().to_string();
+        let _ = self.state.save();
+        self.record_interaction(name, cx);
+        if on {
+            self.restore_cursors(name, before, cx);
+            self.fix_sel();
+        }
+        self.refresh_attention(cx);
+        if on && let Some(window) = window {
+            window.push_notification(format!("Moved “{title}” to backlog"), cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn sync_agent(
         &mut self,
         slug: &str,
@@ -1209,16 +1245,7 @@ impl Shark {
         let task = self.task(&name)?;
         if !self.sidebar_focus.is_focused(window)
             && self.home_shown()
-            && match &self.home.destination {
-                home::Destination::Agent(slug) => {
-                    task.agent.as_ref().is_none_or(|a| &a.slug != slug)
-                }
-                home::Destination::Home => self
-                    .home
-                    .repo_filter
-                    .as_ref()
-                    .is_some_and(|filter| !home::repo_matches(task, filter)),
-            }
+            && (!self.home_task_matches(task) || (task.backlog && !self.home.backlog_open))
         {
             return None;
         }

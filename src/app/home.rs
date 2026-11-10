@@ -92,6 +92,7 @@ pub(super) enum Bucket {
     Running,
     Unread,
     Idle,
+    Backlog,
 }
 
 impl Bucket {
@@ -101,6 +102,7 @@ impl Bucket {
             Bucket::Running => "Running",
             Bucket::Unread => "Unread",
             Bucket::Idle => "Idle",
+            Bucket::Backlog => "Backlog",
         }
     }
 }
@@ -160,7 +162,8 @@ pub(crate) struct Home {
     /// Shown over the open task. With none open, Home shows anyway.
     pub(super) on: bool,
     pub(super) destination: Destination,
-    group_tasks: bool,
+    pub(super) group_tasks: bool,
+    pub(super) backlog_open: bool,
     pub(super) repo_filter: Option<RepoFilter>,
     /// The task list, which takes j/k/enter.
     pub(super) focus: FocusHandle,
@@ -224,6 +227,7 @@ impl Home {
             on: false,
             destination: Destination::Home,
             group_tasks: false,
+            backlog_open: false,
             repo_filter: None,
             focus: cx.focus_handle(),
             sel: None,
@@ -268,7 +272,7 @@ impl Home {
 /// A Home task row, in display order.
 pub(super) struct HomeRow {
     pub(super) ix: usize,
-    bucket: Bucket,
+    pub(super) bucket: Bucket,
     label: Option<String>,
     running: usize,
 }
@@ -570,25 +574,75 @@ impl Shark {
         );
     }
 
+    pub(super) fn home_task_matches(&self, task: &Task) -> bool {
+        match &self.home.destination {
+            Destination::Agent(slug) if self.home_shown() => {
+                task.agent.as_ref().is_some_and(|a| &a.slug == slug)
+            }
+            Destination::Home => self
+                .home
+                .repo_filter
+                .as_ref()
+                .is_none_or(|f| repo_matches(task, f)),
+            _ => true,
+        }
+    }
+
+    pub(super) fn toggle_backlog_open(&mut self, cx: &mut Context<Self>) {
+        self.home.backlog_open = !self.home.backlog_open;
+        self.fix_home_sel(cx);
+        cx.notify();
+    }
+
+    fn backlog_heading(&self, n: usize, cx: &Context<Self>) -> impl IntoElement + ParentElement {
+        h_flex()
+            .id("backlog-heading")
+            .test_support()
+            .aria_label(format!("Backlog: {n} tasks"))
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .mt_3()
+            .h(px(36.))
+            .px_3()
+            .gap_2()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                Button::new("toggle-backlog")
+                    .ghost()
+                    .xsmall()
+                    .icon(if self.home.backlog_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .accessibility_label(if self.home.backlog_open {
+                        "Collapse Backlog"
+                    } else {
+                        "Expand Backlog"
+                    })
+                    .on_click(cx.listener(|s, _, _, cx| s.toggle_backlog_open(cx))),
+            )
+            .child(div().font_weight(FontWeight::MEDIUM).child("Backlog"))
+            .child(n.to_string())
+            .child(div().flex_1())
+    }
+
     pub(super) fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
         let mut rows: Vec<HomeRow> = (0..self.state.tasks.len())
-            .filter(|&ix| match &self.home.destination {
-                Destination::Agent(slug) if self.home_shown() => self.state.tasks[ix]
-                    .agent
-                    .as_ref()
-                    .is_some_and(|a| &a.slug == slug),
-                Destination::Home => self
-                    .home
-                    .repo_filter
-                    .as_ref()
-                    .is_none_or(|f| repo_matches(&self.state.tasks[ix], f)),
-                _ => true,
+            .filter(|&ix| {
+                let task = &self.state.tasks[ix];
+                self.home_task_matches(task) && (!task.backlog || self.home.backlog_open)
             })
             .map(|ix| {
                 let name = &self.state.tasks[ix].name;
                 let running = self.running_chats(name, cx);
                 let waiting = self.home.waiting.get(name).copied();
-                let (bucket, label) = bucket(running, &self.attention_of(name, cx), waiting);
+                let (bucket, label) = if self.state.tasks[ix].backlog {
+                    (Bucket::Backlog, waiting.map(str::to_string))
+                } else {
+                    bucket(running, &self.attention_of(name, cx), waiting)
+                };
                 HomeRow {
                     ix,
                     bucket,
@@ -600,8 +654,11 @@ impl Shark {
         rows.sort_by_key(|r| r.bucket);
         if self.home.destination == Destination::Home && self.home.group_tasks {
             rows.sort_by_key(|r| {
-                self.plain_task_group(r)
-                    .unwrap_or(self.state.sections.len())
+                (
+                    r.bucket == Bucket::Backlog,
+                    self.plain_task_group(r)
+                        .unwrap_or(self.state.sections.len()),
+                )
             });
         }
         rows
@@ -614,7 +671,9 @@ impl Shark {
     }
 
     fn home_group_key(&self, row: &HomeRow) -> (Option<usize>, Option<Bucket>) {
-        if self.home.destination == Destination::Home && self.home.group_tasks {
+        if row.bucket == Bucket::Backlog {
+            (None, Some(Bucket::Backlog))
+        } else if self.home.destination == Destination::Home && self.home.group_tasks {
             (self.plain_task_group(row), None)
         } else {
             (None, Some(row.bucket))
@@ -622,6 +681,9 @@ impl Shark {
     }
 
     fn home_row_group(&self, row: &HomeRow) -> String {
+        if row.bucket == Bucket::Backlog {
+            return Bucket::Backlog.title().into();
+        }
         if self.home.destination == Destination::Home && self.home.group_tasks {
             self.plain_task_group(row)
                 .map(|i| self.state.sections[i].name.clone())
@@ -1256,6 +1318,12 @@ impl Shark {
     /// The task list, grouped by what each task needs; Home can group by task group instead.
     pub(super) fn render_ws_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.home_rows(cx);
+        let backlog = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.backlog && self.home_task_matches(t))
+            .count();
         let theme = cx.theme();
         let focused = self.home.focus.is_focused(window);
         let on_home = self.home.destination == Destination::Home;
@@ -1345,6 +1413,7 @@ impl Shark {
             )
         });
         if rows.is_empty()
+            && backlog == 0
             && on_home
             && let Some(filter) = &self.home.repo_filter
         {
@@ -1365,7 +1434,7 @@ impl Shark {
                 )
                 .into_any_element();
         }
-        if rows.is_empty() {
+        if rows.is_empty() && backlog == 0 {
             return match on_home {
                 true => self.render_empty(list, cx),
                 false => list
@@ -1381,6 +1450,15 @@ impl Shark {
         }
 
         for group in rows.chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b)) {
+            if group[0].bucket == Bucket::Backlog {
+                items.push(
+                    self.backlog_heading(backlog, cx)
+                        .children(grouping.take())
+                        .into_any_element(),
+                );
+                items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+                continue;
+            }
             items.push(
                 h_flex()
                     .id(("home-group", items.len()))
@@ -1425,6 +1503,13 @@ impl Shark {
                     .into_any_element(),
             );
             items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+        }
+        if !self.home.backlog_open && backlog > 0 {
+            items.push(
+                self.backlog_heading(backlog, cx)
+                    .children(grouping.take())
+                    .into_any_element(),
+            );
         }
         let (hidden, needs) = self.home_hidden(cx);
         list.children(items)
@@ -1614,7 +1699,7 @@ impl Shark {
                     .max_w(px(260.))
                     .truncate()
                     .text_xs()
-                    .text_color(match r.label.is_some() {
+                    .text_color(match r.label.is_some() && r.bucket != Bucket::Backlog {
                         true => theme.warning_foreground,
                         false => theme.muted_foreground,
                     })

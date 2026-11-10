@@ -3202,6 +3202,60 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     );
     fs::remove_dir_all(&home).ok();
 }
+/// Parking and resuming are task actions shared by Home and sidebar menus.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn task_menu_backlog_actions(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![Task {
+                name: "one".into(),
+                branch: "one".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    for (parked, shown, hidden) in [
+        (false, "Move to backlog", "Move to active"),
+        (true, "Move to active", "Move to backlog"),
+    ] {
+        on(cx, &|s, _, cx| {
+            s.state.tasks[0].backlog = parked;
+            let entries = ws_menu(s, &s.state.tasks[0], cx);
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == shown))
+            );
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == hidden))
+            );
+        });
+        let click = shark.update(cx, |s, cx| {
+            ws_menu(s, &s.state.tasks[0], cx)
+                .into_iter()
+                .find_map(|e| match e {
+                    Entry::Item {
+                        label, on_click, ..
+                    } if label == shown => Some(on_click),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        cx.update_window(window, |_, w, cx| click(w, cx)).unwrap();
+        cx.read(|cx| assert_eq!(shark.read(cx).state.tasks[0].backlog, !parked));
+    }
+    fs::remove_dir_all(home).ok();
+}
+
 /// Task menus offer the one repository directly or a submenu for several.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]

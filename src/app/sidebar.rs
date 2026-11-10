@@ -20,6 +20,7 @@ pub(super) fn indicator(
         home::Bucket::Needs => (IconName::CircleAlert, theme.warning_foreground),
         home::Bucket::Unread => (IconName::CircleCheck, theme.success_foreground),
         home::Bucket::Idle => (IconName::CircleDashed, idle),
+        home::Bucket::Backlog => (IconName::CirclePause, idle),
     };
     Icon::new(icon)
         .with_size(size)
@@ -28,6 +29,7 @@ pub(super) fn indicator(
 }
 
 pub(super) fn task_indicator(
+    backlog: bool,
     running: usize,
     attention: &Attn,
     foreground: Hsla,
@@ -35,7 +37,11 @@ pub(super) fn task_indicator(
     theme: &Theme,
 ) -> AnyElement {
     indicator(
-        home::bucket(running, attention, None).0,
+        if backlog {
+            home::Bucket::Backlog
+        } else {
+            home::bucket(running, attention, None).0
+        },
         foreground,
         size,
         theme,
@@ -240,6 +246,13 @@ impl Shark {
                 })
                 .map(|(i, _)| SideRow::Task(i)),
         );
+        rows.retain(|row| match row {
+            SideRow::Task(ix) => {
+                let task = &self.state.tasks[*ix];
+                unfold || !task.backlog || self.active.as_deref() == Some(&task.name)
+            }
+            SideRow::Agent(_) => true,
+        });
         rows
     }
 
@@ -310,14 +323,15 @@ impl Shark {
         self.side_rows(unfold)
             .into_iter()
             .filter_map(|r| match r {
-                SideRow::Task(ix) => Some(ix),
+                SideRow::Task(ix) if unfold || !self.state.tasks[ix].backlog => Some(ix),
+                SideRow::Task(_) => None,
                 SideRow::Agent(_) => None,
             })
             .collect()
     }
 
     /// Keeps the cursor on a visible row; a task hidden by collapsing hands it to its header.
-    fn fix_sel(&mut self) {
+    pub(super) fn fix_sel(&mut self) {
         let rows = self.side_rows(false);
         if rows.contains(&self.sel) {
             return;
@@ -713,7 +727,7 @@ impl Shark {
             })
             .child(match nth {
                 Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                _ => task_indicator(running, &attn, foreground, ISZ, theme),
+                _ => task_indicator(w.backlog, running, &attn, foreground, ISZ, theme),
             })
             .when(!rail, |d| {
                 d.child(
@@ -779,7 +793,7 @@ impl Shark {
             .state
             .tasks
             .iter()
-            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == agent.slug))
+            .filter(|t| !t.backlog && t.agent.as_ref().is_some_and(|a| a.slug == agent.slug))
             .collect();
         let needs = tasks
             .iter()
