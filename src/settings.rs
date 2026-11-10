@@ -350,25 +350,36 @@ impl Settings {
                 }
                 Err(e) => Err(e),
             };
-            this.update_in(cx, |this, window, cx| {
-                this.openrouter_note = match saved {
-                    Ok(()) => {
-                        shark
-                            .update(cx, |s, _| s.openrouter_key = Some(Some(key)))
-                            .ok();
-                        // A new input, not an emptied one: `set_value` leaves the key on the undo stack.
-                        (this.openrouter, this._openrouter_sub) =
-                            Self::openrouter_input(window, cx);
-                        SAVED.into()
-                    }
-                    Err(e) => format!("Not saved: {e}").into(),
-                };
-                this.openrouter_busy = false;
-                cx.notify();
-            })
-            .ok();
+            Self::finish_openrouter_save(this, shark, key, saved, cx);
         })
         .detach();
+    }
+
+    pub(crate) fn finish_openrouter_save(
+        this: WeakEntity<Self>,
+        shark: WeakEntity<Shark>,
+        key: String,
+        saved: Result<(), String>,
+        cx: &mut AsyncWindowContext,
+    ) {
+        if saved.is_ok() {
+            shark
+                .update(cx, |s, _| s.openrouter_key = Some(Some(key)))
+                .ok();
+        }
+        this.update_in(cx, |this, window, cx| {
+            this.openrouter_note = match saved {
+                Ok(()) => {
+                    // A new input, not an emptied one: `set_value` leaves the key on the undo stack.
+                    (this.openrouter, this._openrouter_sub) = Self::openrouter_input(window, cx);
+                    SAVED.into()
+                }
+                Err(e) => format!("Not saved: {e}").into(),
+            };
+            this.openrouter_busy = false;
+            cx.notify();
+        })
+        .ok();
     }
 
     fn with_state<R>(&self, cx: &mut App, f: impl FnOnce(&mut State) -> R) -> Option<R> {

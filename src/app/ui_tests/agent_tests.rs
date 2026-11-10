@@ -308,6 +308,44 @@ async fn sentinel_first_line_requests_one_generated_title(cx: &mut TestAppContex
     );
 }
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn old_title_result_does_not_rename_recreated_task(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let dir = home.join("shark/workspaces/stale-title");
+    let old = git::create_empty_task(&dir, "stale-title", "Original task title", None).unwrap();
+    let (_window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![old.clone()],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    shark.update(cx, |s, cx| {
+        s.openrouter_key = Some(Some("test-key".into()));
+        s.auto_title(
+            "stale-title",
+            "Please implement a reusable task naming flow SecondLineSentinel",
+            cx,
+        );
+        git::remove_task(&old, &dir, false).unwrap();
+        let replacement =
+            git::create_empty_task(&dir, "stale-title", "Original task title", None).unwrap();
+        assert_ne!(old.instance_id, replacement.instance_id);
+        s.state.tasks[0] = replacement;
+        s.state.save().unwrap();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| shark.read(cx).state.tasks[0].title.clone()),
+        "Original task title"
+    );
+}
+
 /// An agent saved with the old name and the literal placeholder is still titled by a message.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]

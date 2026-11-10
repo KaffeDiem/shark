@@ -469,6 +469,7 @@ impl Shark {
             return;
         };
         let before = task.title.clone();
+        let instance = task.instance_id.clone();
         // A creation hook precedes the first send; its Title event will request this once.
         if before == crate::state::NEW_TASK && task.chats.iter().all(|c| c.title.is_empty()) {
             return;
@@ -501,7 +502,9 @@ impl Shark {
                 .await;
             let Ok(title) = title else { return };
             this.update(cx, |s, cx| {
-                if s.task(&name).is_some_and(|t| t.title == before) {
+                if s.task(&name)
+                    .is_some_and(|t| t.instance_id == instance && t.title == before)
+                {
                     s.set_title(&name, title, cx);
                 }
             })

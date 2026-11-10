@@ -392,3 +392,35 @@ async fn openrouter_enter_keeps_settings_open(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn openrouter_save_updates_cache_after_settings_closes(cx: &mut TestAppContext) {
+    use crate::settings::Settings;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let view = cx
+        .update_window(window, |_, w, cx| {
+            let state = shark.read(cx).state.clone();
+            cx.new(|cx| Settings::new(shark.downgrade(), &state, w, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let weak = view.downgrade();
+    drop(view);
+    assert!(weak.upgrade().is_none());
+    let shark_weak = shark.downgrade();
+    cx.update_window(window, |_, w, cx| {
+        w.spawn(cx, async move |cx| {
+            Settings::finish_openrouter_save(weak, shark_weak, "test-key".into(), Ok(()), cx);
+        })
+        .detach();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| shark.read(cx).openrouter_key.clone()),
+        Some(Some("test-key".into()))
+    );
+}
