@@ -1198,11 +1198,16 @@ impl Shark {
             .h_full()
             .flex_none()
             .map(|d| nav_actions(d, false, cx, Shark::move_sel))
-            .on_action(cx.listener(|this, _: &Confirm, window, cx| match this.sel {
-                SideRow::Task(ix) => this.open_task(ix, window, cx),
-                SideRow::Agent(i) => {
-                    if let Some(slug) = this.state.agents.get(i).map(|a| a.slug.clone()) {
-                        this.open_agent(&slug, window, cx);
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                if !this.side_rows(false).contains(&this.sel) {
+                    return;
+                }
+                match this.sel {
+                    SideRow::Task(ix) => this.open_task(ix, window, cx),
+                    SideRow::Agent(i) => {
+                        if let Some(slug) = this.state.agents.get(i).map(|a| a.slug.clone()) {
+                            this.open_agent(&slug, window, cx);
+                        }
                     }
                 }
             }))

@@ -28,7 +28,9 @@ impl Shark {
         task.backlog = on;
         let title = task.display_title().to_string();
         let _ = self.state.save();
-        self.record_interaction(name, cx);
+        if window.is_some() {
+            self.record_interaction(name, cx);
+        }
         if on {
             self.restore_cursors(name, before, cx);
             self.fix_sel();
@@ -1243,7 +1245,7 @@ impl Shark {
             _ => self.active.clone()?,
         };
         let task = self.task(&name)?;
-        if self.sidebar_focus.is_focused(window) && !self.sidebar_task_matches(task) {
+        if self.sidebar_focus.is_focused(window) && !self.side_rows(false).contains(&self.sel) {
             return None;
         }
         if !self.sidebar_focus.is_focused(window)

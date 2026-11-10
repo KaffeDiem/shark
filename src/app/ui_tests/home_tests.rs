@@ -1620,3 +1620,86 @@ async fn sidebar_repository_filter_menu(cx: &mut TestAppContext) {
     });
     fs::remove_dir_all(home).ok();
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn empty_filtered_sidebar_does_not_open_hidden_task(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![fake("hidden"), fake("visible")];
+        s.state.tasks[0].repos.push(TaskRepo {
+            name: "api".into(),
+            src: PathBuf::from("/unused/api"),
+            base: "main".into(),
+            branch: None,
+        });
+        s.sidebar_repo_filter = Some(super::super::home::RepoFilter::NoRepo);
+        s.sel = SideRow::Task(1);
+        s.archived("visible", Ok(vec![]), w, cx);
+        assert!(s.side_rows(false).is_empty());
+        s.sidebar_focus.focus(w, cx);
+    });
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        assert!(
+            shark.read(cx).active.is_none(),
+            "Enter must ignore an invisible row"
+        )
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn empty_sidebar_does_not_target_backlog(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![
+            Task {
+                backlog: true,
+                ..fake("parked")
+            },
+            fake("visible"),
+        ];
+        s.sel = SideRow::Task(1);
+        s.archived("visible", Ok(vec![]), w, cx);
+        assert!(s.side_rows(false).is_empty());
+        s.sidebar_focus.focus(w, cx);
+        assert!(
+            s.target(w).is_none(),
+            "hidden backlog cannot receive task actions"
+        );
+    });
+    press_in(window)(cx, &["b", "cmd-backspace"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.task("parked").unwrap().backlog);
+        assert!(s.archiving.is_empty());
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn automatic_backlog_resume_preserves_recency(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![Task {
+            backlog: true,
+            last_interacted_at: Some(123),
+            ..fake("parked")
+        }];
+        s.set_backlog("parked", false, None, cx);
+        assert!(!s.task("parked").unwrap().backlog);
+        assert_eq!(s.task("parked").unwrap().last_interacted_at, Some(123));
+        s.set_backlog("parked", true, Some(w), cx);
+        assert!(s.task("parked").unwrap().last_interacted_at > Some(123));
+        s.state.tasks[0].last_interacted_at = Some(123);
+        s.set_backlog("parked", false, Some(w), cx);
+        assert!(s.task("parked").unwrap().last_interacted_at > Some(123));
+    });
+}
