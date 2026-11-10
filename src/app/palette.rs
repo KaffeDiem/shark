@@ -668,6 +668,23 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.enter_home(w, cx)),
     ),
     Row(
+        "Show tasks in repository…",
+        IconName::FolderGit2,
+        None,
+        "filter repo",
+        Some(|s, w, cx| {
+            s.enter_home(w, cx);
+            s.pick_repo_filter(w, cx);
+        }),
+    ),
+    Row(
+        "Show all repositories",
+        IconName::FolderGit2,
+        None,
+        "filter repo",
+        Some(|s, _, cx| s.clear_repo_filter(cx)),
+    ),
+    Row(
         "Hide Get started",
         IconName::CircleCheck,
         None,
@@ -985,6 +1002,7 @@ impl Shark {
                 || (no_target
                     && NEED_TASK.contains(label)
                     && !(*label == "Attach Linear issue…" && self.home_shown()))
+                || (*label == "Show all repositories" && self.home.repo_filter.is_none())
                 || (no_linear && NEED_LINEAR.contains(label))
                 || ([
                     "Add to task…",

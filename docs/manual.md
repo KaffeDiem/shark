@@ -70,7 +70,9 @@ Each skill has a `<skill>/SKILL.md` file. After manual changes, choose **Refresh
 
 Home starts tasks and lists every task, grouped by **Needs you**, **Running**, **Unread** and **Idle**. Needs you includes questions, plan approvals, attachment problems and actionable git status. The sidebar and Dock badge also mark work needing attention; notifications announce completed turns and tasks that need you.
 
-The control on the first group heading switches grouping between status and task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
+The **All repositories** control on the first group heading filters Home to one repository or **No repository**, including repositories being attached. The picker shows task and needs-you counts; the footer counts tasks elsewhere and **Show all** clears the filter. The filter resets on restart and does not affect agent pages, the sidebar, Dock badge, cmd-j or task picker. Right-click a task and choose **Show tasks in…** to open its repository on Home.
+
+The **Status** control switches grouping between status and task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
 
 `cmd-0` opens Home; from Home it returns to the active task. `esc` leaves an overview for the active task, or returns to Home if none is active. The task picker (`cmd-shift-o`) searches task titles and repositories. With no query it selects the most recent task from Home, or the most recent other task while a task is open. The app switcher (`cmd-o`, held) cycles tasks until you release Command.
 

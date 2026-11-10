@@ -60,6 +60,31 @@ pub(super) enum Destination {
     Agent(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RepoFilter {
+    Repo(String),
+    NoRepo,
+}
+
+impl RepoFilter {
+    fn label(&self) -> &str {
+        match self {
+            Self::Repo(name) => name,
+            Self::NoRepo => "No repository",
+        }
+    }
+}
+
+pub(super) fn repo_matches(task: &Task, filter: &RepoFilter) -> bool {
+    match filter {
+        RepoFilter::Repo(name) => {
+            task.repos.iter().any(|r| &r.name == name)
+                || task.attaching.iter().any(|r| &r.repo == name)
+        }
+        RepoFilter::NoRepo => task.repos.is_empty() && task.attaching.is_empty(),
+    }
+}
+
 /// Home's task groups, in the order they're shown.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Bucket {
@@ -136,6 +161,7 @@ pub(crate) struct Home {
     pub(super) on: bool,
     pub(super) destination: Destination,
     group_tasks: bool,
+    pub(super) repo_filter: Option<RepoFilter>,
     /// The task list, which takes j/k/enter.
     pub(super) focus: FocusHandle,
     /// The task under the list cursor.
@@ -198,6 +224,7 @@ impl Home {
             on: false,
             destination: Destination::Home,
             group_tasks: false,
+            repo_filter: None,
             focus: cx.focus_handle(),
             sel: None,
             prompt,
@@ -317,12 +344,9 @@ impl Shark {
         self.remember_open();
         self.refresh_home(None, cx);
         self.scan_approved(cx);
-        let rows = self.home_rows(cx);
         // The cursor starts on the task just left.
         self.home.sel = self.active.clone().or(self.home.sel.take());
-        if self.home_at(&rows).is_none() {
-            self.home.sel = (rows.first()).map(|r| self.state.tasks[r.ix].name.clone());
-        }
+        self.fix_home_sel(cx);
         self.focus_fallback(window, cx);
         cx.notify();
     }
@@ -424,6 +448,128 @@ impl Shark {
         .detach();
     }
 
+    pub(super) fn fix_home_sel(&mut self, cx: &App) {
+        let rows = self.home_rows(cx);
+        if self.home_at(&rows).is_none() {
+            self.home.sel = rows.first().map(|r| self.state.tasks[r.ix].name.clone());
+        }
+    }
+
+    pub(super) fn home_hidden(&self, cx: &App) -> (usize, usize) {
+        let Some(filter) = self
+            .home
+            .repo_filter
+            .as_ref()
+            .filter(|_| self.home.destination == Destination::Home)
+        else {
+            return (0, 0);
+        };
+        self.state
+            .tasks
+            .iter()
+            .filter(|t| !repo_matches(t, filter))
+            .fold((0, 0), |(n, needs), t| {
+                (
+                    n + 1,
+                    needs + usize::from(matches!(self.attention_of(&t.name, cx), Attn::Needs(_))),
+                )
+            })
+    }
+
+    pub(super) fn clear_repo_filter(&mut self, cx: &mut Context<Self>) {
+        self.home.repo_filter = None;
+        self.fix_home_sel(cx);
+        cx.notify();
+    }
+
+    pub(super) fn pick_repo_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut filters = vec![None];
+        filters.extend(self.state.repos.iter().filter_map(|repo| {
+            let filter = RepoFilter::Repo(repo.name.clone());
+            self.state
+                .tasks
+                .iter()
+                .any(|t| repo_matches(t, &filter))
+                .then_some(Some(filter))
+        }));
+        if self
+            .state
+            .tasks
+            .iter()
+            .any(|t| repo_matches(t, &RepoFilter::NoRepo))
+        {
+            filters.push(Some(RepoFilter::NoRepo));
+        }
+        let items = filters
+            .iter()
+            .map(|filter| {
+                let label: SharedString = filter
+                    .as_ref()
+                    .map_or("All repositories", RepoFilter::label)
+                    .to_string()
+                    .into();
+                let checked = filter == &self.home.repo_filter;
+                let (n, needs) = self
+                    .state
+                    .tasks
+                    .iter()
+                    .filter(|t| filter.as_ref().is_none_or(|f| repo_matches(t, f)))
+                    .fold((0, 0), |(n, needs), t| {
+                        (
+                            n + 1,
+                            needs
+                                + usize::from(matches!(
+                                    self.attention_of(&t.name, cx),
+                                    Attn::Needs(_)
+                                )),
+                        )
+                    });
+                CommandItem::new()
+                    .label(label.clone())
+                    .checked(checked)
+                    .child(move |_, cx| {
+                        let muted = cx.theme().muted_foreground;
+                        h_flex()
+                            .flex_1()
+                            .gap_2()
+                            .child(Icon::new(IconName::FolderGit2).size_4().text_color(muted))
+                            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{n} tasks")),
+                            )
+                            .when(needs > 0, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("{needs} need you")),
+                                )
+                            })
+                    })
+            })
+            .collect();
+        let selected = filters
+            .iter()
+            .position(|f| f == &self.home.repo_filter)
+            .unwrap_or(0);
+        open_menu(
+            cx.entity().downgrade(),
+            "Show tasks in…",
+            items,
+            selected,
+            move |s, i, _, cx| {
+                s.home.repo_filter = filters[i].clone();
+                s.fix_home_sel(cx);
+                cx.notify();
+            },
+            window,
+            cx,
+        );
+    }
+
     pub(super) fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
         let mut rows: Vec<HomeRow> = (0..self.state.tasks.len())
             .filter(|&ix| match &self.home.destination {
@@ -431,6 +577,11 @@ impl Shark {
                     .agent
                     .as_ref()
                     .is_some_and(|a| &a.slug == slug),
+                Destination::Home => self
+                    .home
+                    .repo_filter
+                    .as_ref()
+                    .is_none_or(|f| repo_matches(&self.state.tasks[ix], f)),
                 _ => true,
             })
             .map(|ix| {
@@ -1124,20 +1275,6 @@ impl Shark {
                     }
                 }
             }));
-        if rows.is_empty() {
-            return match on_home {
-                true => self.render_empty(list, cx),
-                false => list
-                    .child(super::agent_settings::empty_state(
-                        theme,
-                        "agent-empty-tasks",
-                        IconName::Inbox,
-                        "No tasks yet",
-                        "Describe the work above and press enter. Each task gets its own branch and chat.",
-                    ))
-                    .into_any_element(),
-            };
-        }
         let now = SystemTime::now();
         let mut items: Vec<AnyElement> = vec![];
         let grouping = on_home.then(|| {
@@ -1179,7 +1316,70 @@ impl Shark {
                     );
                 }))
         });
-        let mut grouping = grouping;
+        let mut grouping = grouping.map(|b| {
+            h_flex().gap_2().child(b).child(
+                Button::new("repo-filter")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::FolderGit2)
+                    .label(
+                        self.home
+                            .repo_filter
+                            .as_ref()
+                            .map_or("All repositories", RepoFilter::label)
+                            .to_string(),
+                    )
+                    .tooltip("Show tasks in a repository")
+                    .accessibility_label(format!(
+                        "Showing tasks in {}, {} hidden",
+                        self.home
+                            .repo_filter
+                            .as_ref()
+                            .map_or("All repositories", RepoFilter::label),
+                        self.home_hidden(cx).0
+                    ))
+                    .when(self.home.repo_filter.is_some(), |b| {
+                        b.bg(theme.secondary).border_1().border_color(theme.border)
+                    })
+                    .on_click(cx.listener(|s, _, w, cx| s.pick_repo_filter(w, cx))),
+            )
+        });
+        if rows.is_empty()
+            && on_home
+            && let Some(filter) = &self.home.repo_filter
+        {
+            return list
+                .child(h_flex().justify_end().children(grouping.take()))
+                .child(super::agent_settings::empty_state(
+                    theme,
+                    "repo-empty-tasks",
+                    IconName::FolderGit2,
+                    format!("No tasks in {}", filter.label()),
+                    format!("{} tasks in other repositories", self.home_hidden(cx).0),
+                ))
+                .child(
+                    Button::new("show-all-repositories")
+                        .ghost()
+                        .label("Show all repositories")
+                        .on_click(cx.listener(|s, _, _, cx| s.clear_repo_filter(cx))),
+                )
+                .into_any_element();
+        }
+        if rows.is_empty() {
+            return match on_home {
+                true => self.render_empty(list, cx),
+                false => list
+                    .child(super::agent_settings::empty_state(
+                        theme,
+                        "agent-empty-tasks",
+                        IconName::Inbox,
+                        "No tasks yet",
+                        "Describe the work above and press enter. Each task gets its own branch and chat.",
+                    ))
+                    .into_any_element(),
+            };
+        }
+
         for group in rows.chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b)) {
             items.push(
                 h_flex()
@@ -1226,7 +1426,33 @@ impl Shark {
             );
             items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
         }
+        let (hidden, needs) = self.home_hidden(cx);
         list.children(items)
+            .when(hidden > 0, |d| {
+                d.child(
+                    h_flex()
+                        .px_3()
+                        .pt_3()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "{hidden} tasks in other repositories{}",
+                            if needs > 0 {
+                                format!(", {needs} need you")
+                            } else {
+                                String::new()
+                            }
+                        ))
+                        .child(
+                            Button::new("show-all-repositories")
+                                .ghost()
+                                .xsmall()
+                                .label("Show all")
+                                .on_click(cx.listener(|s, _, _, cx| s.clear_repo_filter(cx))),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .pt_3()

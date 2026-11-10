@@ -1044,3 +1044,138 @@ async fn home_agent_chip_backspace_preserves_prompt_body_and_tokens(cx: &mut Tes
         assert!(s.state.tasks.is_empty());
     });
 }
+
+/// Repository scope belongs to Home; other navigation still sees every task.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn repo_filter_narrows_home(cx: &mut TestAppContext) {
+    use super::super::home::{Destination, RepoFilter};
+    use crate::state::{AgentLink, AttachStage, Attachment};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.state.repos = repos(&home, &["api", "web"]);
+        let repo = |name: &str| TaskRepo {
+            name: name.into(),
+            src: home.join(name),
+            base: "main".into(),
+            branch: None,
+        };
+        s.state.tasks = vec![
+            Task {
+                repos: vec![repo("api")],
+                ..fake("api-only")
+            },
+            Task {
+                repos: vec![repo("api"), repo("web")],
+                ..fake("both")
+            },
+            Task {
+                agent: Some(AgentLink {
+                    slug: "designer".into(),
+                    ..Default::default()
+                }),
+                ..fake("none")
+            },
+        ];
+        s.enter_home(w, cx);
+        s.home.sel = Some("none".into());
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.fix_home_sel(cx);
+        assert_eq!(s.home_rows(cx).len(), 2);
+        assert_eq!(s.home_hidden(cx), (1, 0));
+        assert_eq!(s.home.sel.as_deref(), Some("api-only"));
+        assert_eq!(
+            s.ws_order(true).len(),
+            3,
+            "the filter never changes sidebar order"
+        );
+        s.home.repo_filter = Some(RepoFilter::NoRepo);
+        s.fix_home_sel(cx);
+        assert_eq!(s.home_rows(cx).len(), 1);
+        assert_eq!(s.home.sel.as_deref(), Some("none"));
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.home.destination = Destination::Agent("designer".into());
+        assert_eq!(
+            s.home_rows(cx).len(),
+            1,
+            "agent pages ignore the Home filter"
+        );
+        s.home.destination = Destination::Home;
+        let mut attachment = Attachment::fresh(&s.state.repos[1], "none", "main");
+        attachment.stage = AttachStage::SetupFailed;
+        s.state.tasks[2].attaching.push(attachment);
+        assert_eq!(
+            s.home_hidden(cx),
+            (1, 1),
+            "hidden tasks retain their attention"
+        );
+        s.home.repo_filter = Some(RepoFilter::Repo("web".into()));
+        assert_eq!(s.home_rows(cx).len(), 2, "pending attachments match too");
+        s.home.repo_filter = Some(RepoFilter::NoRepo);
+        assert!(s.home_rows(cx).is_empty(), "attaching is not No repository");
+        s.state.tasks[2].attaching.clear();
+        s.home.repo_filter = None;
+        s.fix_home_sel(cx);
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("repo-filter", cx);
+        w.input("api", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.repo_filter, Some(RepoFilter::Repo("api".into())));
+        assert_eq!(s.home_rows(cx).len(), 2);
+        assert_eq!(s.home_hidden(cx), (1, 0));
+    });
+    on(cx, &|s, _, cx| {
+        s.home.repo_filter = Some(RepoFilter::Repo("removed-repo".into()));
+        s.fix_home_sel(cx);
+        assert!(s.home.sel.is_none());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("repo-filter").is_some(),
+            "the empty state keeps its controls"
+        );
+        w.click("show-all-repositories", cx);
+    })
+    .unwrap();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.repo_filter, None);
+        assert_eq!(s.home_rows(cx).len(), 3);
+        assert!(s.home.sel.is_some());
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+/// A stale Home cursor must never target a task hidden by a repository filter.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn repo_filter_rejects_hidden_target(cx: &mut TestAppContext) {
+    use super::super::home::RepoFilter;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.tasks = vec![fake("hidden")];
+        s.enter_home(w, cx);
+        s.home.repo_filter = Some(RepoFilter::Repo("api".into()));
+        s.home.sel = Some("hidden".into());
+        s.home.focus.focus(w, cx);
+        assert!(
+            s.target(w).is_none(),
+            "a stale cursor cannot act on a filtered-out task"
+        );
+    });
+    fs::remove_dir_all(home).ok();
+}

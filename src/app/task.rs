@@ -1209,8 +1209,16 @@ impl Shark {
         let task = self.task(&name)?;
         if !self.sidebar_focus.is_focused(window)
             && self.home_shown()
-            && let home::Destination::Agent(slug) = &self.home.destination
-            && task.agent.as_ref().is_none_or(|a| &a.slug != slug)
+            && match &self.home.destination {
+                home::Destination::Agent(slug) => {
+                    task.agent.as_ref().is_none_or(|a| &a.slug != slug)
+                }
+                home::Destination::Home => self
+                    .home
+                    .repo_filter
+                    .as_ref()
+                    .is_some_and(|filter| !home::repo_matches(task, filter)),
+            }
         {
             return None;
         }
