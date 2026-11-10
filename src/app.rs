@@ -791,7 +791,7 @@ impl Shark {
                 h_flex()
                     .h(px(44.))
                     .flex_none()
-                    .px(px(16.))
+                    .px(px(6.))
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(theme.border)

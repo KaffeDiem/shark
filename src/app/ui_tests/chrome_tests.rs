@@ -1,6 +1,56 @@
 use super::*;
 use gpui_kit::test::{TestEventExt, TestQueryExt};
 
+#[gpui_kit::test]
+async fn chat_toolbar_has_even_edge_spacing(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.create_task_for_test(
+            "toolbar-spacing".into(),
+            git::on_branch(&repos, "toolbar-spacing"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    until(cx, window, |_, cx| {
+        shark.read(cx).active.as_deref() == Some("toolbar-spacing")
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let island = w.find("content-island").bounds();
+        let row = w.find("workspace-toolbar-empty").bounds();
+        let run = w.find("run").bounds();
+        let git = w.find("git-menu").bounds();
+        for (button, horizontal) in [
+            (run, run.left() - island.left()),
+            (git, island.right() - git.right()),
+        ] {
+            let top = button.top() - island.top();
+            let bottom = row.bottom() - button.bottom();
+            assert!((top - bottom).abs() <= px(1.), "vertically centered");
+            assert!(
+                (horizontal - top).abs() <= px(1.),
+                "equal horizontal and vertical edge spacing: {horizontal:?} vs {top:?}"
+            );
+        }
+    })
+    .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
 fn assert_command_spacing(w: &mut Window) {
     let rows = w.find_all_by_role(Role::ListBoxOption);
     assert!(rows.len() > 2, "the palette renders its command rows");
