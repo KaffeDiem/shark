@@ -6,7 +6,7 @@ pub(super) const NOTES_END: &str = "\n[/shark]\n\n";
 
 /// A message as it went on the wire, split into the `[shark]` context notes put before it
 /// (`pending_context`) and the text itself. Older messages end their notes with a blank line.
-pub(super) fn split_notes(wire: &str) -> (&str, &str) {
+pub(crate) fn split_notes(wire: &str) -> (&str, &str) {
     let split = wire.split_once(NOTES_END).or(wire.split_once("\n\n"));
     match split {
         Some((notes, text)) if notes.starts_with("[shark] ") => (notes, text),

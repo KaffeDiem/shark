@@ -33,6 +33,7 @@ mod issue_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
+mod peek_review_tests;
 mod repo_menu_tests;
 mod repo_settings_tests;
 mod sidebar_tests;

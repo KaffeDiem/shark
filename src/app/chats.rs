@@ -142,21 +142,16 @@ impl Shark {
                     }
                     ChatEvent::Meta => this.save_meta(chat, false, cx),
                     ChatEvent::Title(prompt) => {
-                        let untitled = this.task(&name).is_some_and(|w| {
-                            w.title.is_empty() || w.title == crate::state::NEW_TASK
-                        });
-                        this.save_meta(chat, true, cx);
                         if let Some(prompt) = prompt.as_deref() {
                             let first = this
                                 .task(&name)
                                 .and_then(|t| t.chats.first())
                                 .is_some_and(|m| m.id == id);
-                            if untitled && !this.titling.contains(&name) {
-                                this.auto_title(&name, prompt, cx);
-                            } else if !(first && this.titling.contains(&name)) {
+                            if !(first && this.titling.contains(&name)) {
                                 this.request_title(&name, Some(id.clone()), prompt, None, cx);
                             }
                         }
+                        this.save_meta(chat, true, cx);
                     }
                     ChatEvent::HandOff { to } => match to {
                         Some(to) => this.hand_off(&name, to, Some(id.clone()), window, cx),

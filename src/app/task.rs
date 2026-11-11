@@ -505,12 +505,7 @@ impl Shark {
         let prompt = task
             .primary_issue()
             .map(|i| format!("{}: {}", i.identifier, i.title))
-            .unwrap_or_else(|| {
-                task.chats
-                    .iter()
-                    .find(|c| !c.title.is_empty())
-                    .map_or_else(|| task.display_title().into_owned(), |c| c.title.clone())
-            });
+            .unwrap_or_else(|| task.display_title().into_owned());
         self.request_title(name, None, &prompt, Some(window.window_handle()), cx);
     }
 
@@ -530,21 +525,38 @@ impl Shark {
         };
         let before = task.title.clone();
         let instance = task.instance_id.clone();
+        let title_task = chat.is_none()
+            || ((before.is_empty() || before == crate::state::NEW_TASK)
+                && !self.titling.contains(name));
+        let original = (report.is_some() && task.primary_issue().is_none()).then(|| {
+            task.chats
+                .iter()
+                .chain(&task.closed)
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        });
         let revision = self.title_revisions.get(name).copied().unwrap_or(0);
-        let meta = chat
-            .as_ref()
-            .and_then(|id| task.chats.iter().find(|c| &c.id == id))
-            .or_else(|| task.chats.first());
-        let tab = meta.map(|c| (c.id.clone(), c.title.clone()));
-        if let Some(id) = &chat {
-            if !self.chat_titling.insert(id.clone()) {
-                return;
+        let meta = match &chat {
+            Some(id) => {
+                let Some(meta) = task.chats.iter().find(|c| &c.id == id) else {
+                    return;
+                };
+                Some(meta)
             }
-        } else {
+            None => task.chats.first(),
+        };
+        let tab = meta.map(|c| (c.id.clone(), c.title.clone()));
+        let first_line = crate::chat::title_of(prompt);
+        if title_task {
             if !self.titling.insert(name.into()) {
                 return;
             }
             self.title_errors.remove(name);
+        } else if let Some(id) = &chat {
+            if !self.chat_titling.insert(id.clone()) {
+                return;
+            }
+            self.chat_title_errors.remove(id);
         }
         let cached = self.openrouter_key.clone();
         let read = cached
@@ -566,28 +578,34 @@ impl Shark {
             let result = match key {
                 Some(key) => Some(
                     cx.background_executor()
-                        .spawn(async move { crate::title::generate(&key, &prompt) })
+                        .spawn(async move {
+                            let source = original.and_then(|ids| {
+                                ids.iter()
+                                    .find_map(|id| crate::transcript::first_prompt(id))
+                            });
+                            crate::title::generate(&key, source.as_deref().unwrap_or(&prompt))
+                        })
                         .await,
                 ),
                 None => None,
             };
             this.update(cx, |s, cx| {
-                if let Some(id) = &chat {
-                    s.chat_titling.remove(id);
-                } else {
-                    s.titling.remove(&name);
-                }
                 if s.task(&name).is_none_or(|t| t.instance_id != instance) {
                     cx.notify();
                     return;
                 }
+                if title_task {
+                    s.titling.remove(&name);
+                } else if let Some(id) = &chat {
+                    s.chat_titling.remove(id);
+                }
                 match result {
                     Some(Ok(title)) => {
-                        if chat.is_none()
+                        if title_task
                             && s.title_revisions.get(&name).copied().unwrap_or(0) == revision
                             && s.task(&name).is_some_and(|t| {
                                 t.title == before
-                                    || (before == crate::state::NEW_TASK
+                                    || ((before.is_empty() || before == crate::state::NEW_TASK)
                                         && s.title_sources.get(&name) != Some(&"Renamed"))
                             })
                         {
@@ -600,7 +618,9 @@ impl Shark {
                                 .task_mut(&name)
                                 .and_then(|t| t.chats.iter_mut().find(|c| &c.id == id))
                             {
-                                if meta.title == *old || old.is_empty() {
+                                if meta.title == *old
+                                    || (old.is_empty() && meta.title == first_line)
+                                {
                                     meta.title = title.clone();
                                     if let Some(entity) = entity {
                                         entity.update(cx, |c, cx| {
@@ -614,7 +634,11 @@ impl Shark {
                         }
                     }
                     Some(Err(reason)) => {
-                        s.title_errors.insert(name.clone(), reason);
+                        if title_task {
+                            s.title_errors.insert(name.clone(), reason);
+                        } else if let Some(id) = &chat {
+                            s.chat_title_errors.insert(id.clone(), reason);
+                        }
                     }
                     None => {}
                 }
@@ -623,6 +647,9 @@ impl Shark {
             .ok();
             if let Some(window) = report {
                 this.update(cx, |s, cx| {
+                    if s.task(&name).is_none_or(|t| t.instance_id != instance) {
+                        return;
+                    }
                     let reason = s.title_errors.get(&name).cloned().or_else(|| {
                         (s.openrouter_key == Some(None))
                             .then(|| "Add an OpenRouter key in Settings › General".into())
@@ -1594,11 +1621,15 @@ impl Shark {
             for c in ws.chats.iter().chain(&ws.closed) {
                 self.chats.remove(&c.id);
                 self.unread.remove(&c.id);
+                self.chat_titling.remove(&c.id);
+                self.chat_title_errors.remove(&c.id);
+                self.home.waiting.remove(&c.id);
                 crate::transcript::forget(&c.id);
                 crate::plan::delete(&c.id);
             }
         }
         self.title_errors.remove(name);
+        self.titling.remove(name);
         self.title_sources.remove(name);
         self.title_revisions.remove(name);
         if self.peek.task.as_deref() == Some(name) {

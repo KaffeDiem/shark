@@ -825,9 +825,23 @@ impl Shark {
             })
         });
         let code_label = pr
-            .map(|p| format!("PR #{} {} · {:?}", p.number, p.status().label(), p.checks))
-            .or_else(|| diff.map(|(a, d)| format!("+{a} −{d}")))
+            .map(|p| {
+                let checks = super::peek::checks_text(&p.checks);
+                format!("PR #{} {} · {checks}", p.number, p.status().label())
+            })
+            // Tracked files only; the row shows just the signed counts.
+            .or_else(|| diff.map(|(a, d)| format!("+{a} −{d} tracked")))
             .unwrap_or_default();
+        let row_label = [
+            w.display_title().into_owned(),
+            facts.line.to_string(),
+            code_label,
+            facts.time.to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
         let mut code = h_flex().flex_none().gap_1().text_xs().text_color(detail);
         if let Some(pr) = pr {
             code = code
@@ -913,13 +927,7 @@ impl Shark {
             .relative()
             .test_support()
             .role(gpui_kit::accesskit::Role::Button)
-            .aria_label(format!(
-                "{} · {} · {} · {}",
-                w.display_title(),
-                facts.line,
-                code_label,
-                facts.time
-            ))
+            .aria_label(row_label)
             .when(!rail, |d| d.h(px(44.)).py_0().gap_0())
             .when(section.is_some() && !rail, |d| d.ml(px(32.)))
             .map(|d| cursor_row(d, true, selected, focused, theme))

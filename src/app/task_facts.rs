@@ -13,6 +13,19 @@ pub(super) struct TaskFacts<'a> {
 }
 
 impl Shark {
+    pub(super) fn task_waiting(&self, task: &Task, cx: &App) -> Option<&'static str> {
+        task.chats
+            .iter()
+            .filter(|meta| {
+                self.chats.get(&meta.id).is_none_or(|chat| {
+                    let chat = chat.read(cx);
+                    !chat.busy && !chat.steered
+                })
+            })
+            .filter_map(|meta| self.home.waiting.get(&meta.id).copied())
+            .min_by_key(|label| *label != crate::transcript::PLAN_TO_APPROVE)
+    }
+
     pub(super) fn task_facts<'a>(&'a self, task: &Task, cx: &'a App) -> TaskFacts<'a> {
         let chats: Vec<_> = task
             .chats
@@ -22,12 +35,7 @@ impl Shark {
             .collect();
         let running = self.running_chats(&task.name, cx);
         let attn = self.attention_of(&task.name, cx);
-        let waiting = self
-            .home
-            .waiting
-            .get(&task.name)
-            .copied()
-            .filter(|_| !task.backlog);
+        let waiting = self.task_waiting(task, cx).filter(|_| !task.backlog);
         let (bucket, _) = home::bucket(running, &attn, waiting);
         let needs = match &attn {
             Attn::Needs(s) => Some(s.as_str()),
@@ -100,7 +108,8 @@ impl Shark {
             format!(
                 "{} finished",
                 task.chats
-                    .last()
+                    .iter()
+                    .find(|c| self.unread.contains(&c.id))
                     .map(&agent)
                     .unwrap_or_else(|| "Agent".into())
             )

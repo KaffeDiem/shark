@@ -230,24 +230,45 @@ pub fn probe(
             .map(|(_, _, merge)| merge.clone())
             .or_else(|| git(wt, &["merge-base", "HEAD", &base_oid]).ok());
         if let Some(merge) = merge_base {
-            l.diff = git(wt, &["diff", "--no-ext-diff", "--shortstat", &merge, "--"])
-                .ok()
-                .map(|s| shortstat(&s));
+            l.diff = crate::git::git_bytes(
+                wt,
+                &[
+                    "--no-optional-locks",
+                    "diff",
+                    "--no-ext-diff",
+                    "--numstat",
+                    "-z",
+                    &merge,
+                    "--",
+                ],
+            )
+            .ok()
+            .map(|out| numstat(&out));
             l.diff_base = Some((l.head.clone(), base_oid, merge));
         }
     }
     base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l, allow_parent_update))
 }
 
-fn shortstat(text: &str) -> (u32, u32) {
-    let mut counts = (0, 0);
-    for part in text.split(',') {
-        let mut words = part.split_whitespace();
-        let n = words.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        match words.next() {
-            Some(word) if word.starts_with("insertion") => counts.0 = n,
-            Some(word) if word.starts_with("deletion") => counts.1 = n,
-            _ => {}
+/// Sums `git diff --numstat -z` (`added<TAB>deleted<TAB>path<NUL>`, locale-independent). A rename
+/// has an empty path and its two names as the next NUL fields; binary files count `-` as zero.
+fn numstat(out: &[u8]) -> (u32, u32) {
+    let mut counts = (0u32, 0u32);
+    let mut fields = out.split(|b| *b == 0);
+    while let Some(record) = fields.next() {
+        let mut cols = record.splitn(3, |b| *b == b'\t');
+        let mut n = || {
+            cols.next()
+                .and_then(|c| std::str::from_utf8(c).ok()?.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let (added, deleted) = (n(), n());
+        counts = (
+            counts.0.saturating_add(added),
+            counts.1.saturating_add(deleted),
+        );
+        if cols.next().is_some_and(|path| path.is_empty()) {
+            fields.nth(1);
         }
     }
     counts
@@ -1232,13 +1253,16 @@ mod tests {
     }
 
     #[test]
-    fn shortstat_and_compact_age() {
+    fn numstat_and_compact_age() {
+        assert_eq!(numstat(b"10\t3\ta\0\xff\x01\x02"), (10, 3));
+        assert_eq!(numstat(b"2\t0\tx\0-\t-\tbin\0"), (2, 0));
+        assert_eq!(numstat(b"1\t1\ttab\tname\n\0"), (1, 1));
+        // A rename's names are NUL fields of their own, even when they look like records.
         assert_eq!(
-            shortstat(" 2 files changed, 12 insertions(+), 3 deletions(-)"),
-            (12, 3)
+            numstat(b"4\t1\t\x005\t6\tfoo\x007\t8\tbar\x002\t0\tz\0"),
+            (6, 1)
         );
-        assert_eq!(shortstat(" 1 file changed, 1 deletion(-)"), (0, 1));
-        assert_eq!(shortstat(""), (0, 0));
+        assert_eq!(numstat(b""), (0, 0));
         assert_eq!(compact_age(std::time::Duration::from_secs(59)), "now");
         assert_eq!(compact_age(std::time::Duration::from_secs(240)), "4m");
     }

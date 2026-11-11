@@ -130,16 +130,10 @@ pub(crate) fn last_activity(ws: &Task) -> Option<SystemTime> {
 pub const PLAN_TO_APPROVE: &str = "Plan to approve";
 pub const QUESTION: &str = "Question to answer";
 
-/// What one of the task's chats waits on the user for, by how its last turn ended: a plan
-/// to approve before a question. `None` while a turn runs. Reads each chat's transcript tail
-/// and plans: call it off the UI thread.
-pub(crate) fn waiting_on_user(ws: &Task) -> Option<&'static str> {
-    (ws.chats.iter())
-        .filter_map(|c| {
-            let plan = c.plan && crate::plan::unapproved(&c.id);
-            waiting(&read_tail(&transcript_path(&c.id)), plan)
-        })
-        .min_by_key(|l| *l != PLAN_TO_APPROVE)
+/// Reads a chat's transcript tail and plan off the UI thread.
+pub(crate) fn waiting_on_chat(chat: &crate::state::ChatMeta) -> Option<&'static str> {
+    let plan = chat.plan && crate::plan::unapproved(&chat.id);
+    waiting(&read_tail(&transcript_path(&chat.id)), plan)
 }
 
 /// How a chat's events end: a finished turn, with a plan pending or a question in its last text.
@@ -175,6 +169,23 @@ fn read_tail(path: &Path) -> Vec<Ev> {
 /// process started while this was read, and arrive live.
 pub fn read_history(path: &Path, len: u64) -> Vec<Ev> {
     read_range(path, 0, len, true)
+}
+
+/// The original prompt for title regeneration; stops reading at the first user message.
+pub(crate) fn first_prompt(chat: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = File::open(transcript_path(chat)).ok()?;
+    for line in BufReader::new(file).lines() {
+        for event in crate::harness::parse(&line.ok()?) {
+            if let Ev::User(text) = event {
+                let prompt = crate::chat::split_notes(&text).1;
+                if !prompt.trim().is_empty() {
+                    return Some(prompt.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The whole conversation as Markdown, for another chat to read when it's handed off: messages

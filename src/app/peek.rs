@@ -7,30 +7,95 @@ pub(super) struct Peek {
     pub home: bool,
     pub keyboard: bool,
     pub animate: bool,
+    /// The row under the pointer; drives its hover background, so it outlives the card.
     pub row: Option<String>,
     pub card: bool,
+    /// Arrows crossed a row with no card (a section header): the next task gets one again.
+    pub browse: bool,
+    /// Tracks focus inside the card, to hand it back to the list when the card goes.
+    pub focus: Option<FocusHandle>,
+    window: Option<AnyWindowHandle>,
+    /// Set by closing: the list (`home`) that takes focus if the card's button had it. Spent by
+    /// `restore_peek_focus`, or by `focus_fallback` should the frame draw first.
+    pub restore: Option<bool>,
     timer: Option<gpui_kit::Task<()>>,
 }
 
+impl Peek {
+    pub(super) fn new(window: &Window, cx: &mut App) -> Self {
+        Self {
+            focus: Some(cx.focus_handle()),
+            window: Some(window.window_handle()),
+            ..Default::default()
+        }
+    }
+
+    /// Starts over on `task`, keeping what outlives a card: the hovered row and the focus handle.
+    fn show(&mut self, task: Option<String>, home: bool, keyboard: bool, browse: bool) {
+        *self = Peek {
+            task,
+            home,
+            keyboard,
+            browse,
+            row: self.row.take(),
+            focus: self.focus.take(),
+            window: self.window.take(),
+            ..Default::default()
+        };
+    }
+}
+
 impl Shark {
+    /// Closes the card. Focus inside it (the Regenerate title button) goes back to the list it
+    /// came from: its button is about to unmount, and the fallback may pick another pane.
     pub(super) fn close_peek(&mut self, cx: &mut Context<Self>) {
-        self.peek = Peek::default();
+        let (open, home) = (self.peek.task.is_some(), self.peek.home);
+        self.peek.show(None, false, false, false);
+        if let (true, Some(window)) = (open, self.peek.window) {
+            self.peek.restore = Some(home);
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                window
+                    .update(cx, |_, w, cx| {
+                        this.update(cx, |s, cx| s.restore_peek_focus(w, cx)).ok();
+                    })
+                    .ok();
+            });
+        }
         cx.notify();
     }
 
+    fn restore_peek_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(home) = self.peek.restore.take() else {
+            return; // `focus_fallback` already did
+        };
+        if self.peek.task.is_none()
+            && (self.peek.focus.as_ref()).is_some_and(|f| f.contains_focused(window, cx))
+        {
+            self.focus_peek_list(home, window, cx);
+        }
+    }
+
+    pub(super) fn focus_peek_list(
+        &mut self,
+        home: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match home {
+            true => self.home.focus.focus(window, cx),
+            false => self.sidebar_focus.focus(window, cx),
+        }
+    }
+
     pub(super) fn follow_peek(&mut self, task: Option<String>, home: bool) {
-        if self.peek.task.is_some() {
-            self.peek = Peek {
-                task,
-                home,
-                keyboard: true,
-                ..Default::default()
-            };
+        if self.peek.task.is_some() || self.peek.browse {
+            self.peek.show(task, home, true, true);
         }
     }
 
     pub(super) fn toggle_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.peek.task.is_some() {
+        if self.peek.task.is_some() || self.peek.browse {
             return self.close_peek(cx);
         }
         let home = self.home.focus.is_focused(window);
@@ -46,12 +111,7 @@ impl Shark {
         } else {
             None
         };
-        self.peek = Peek {
-            task,
-            home,
-            keyboard: true,
-            ..Default::default()
-        };
+        self.peek.show(task, home, true, false);
         cx.notify();
     }
 
@@ -108,6 +168,28 @@ impl Shark {
     }
 }
 
+/// A PR's checks in words, for the card and the sidebar row's accessible label.
+pub(super) fn checks_text(checks: &crate::sync::Checks) -> String {
+    match checks {
+        crate::sync::Checks::Pending => "Checks running".into(),
+        crate::sync::Checks::Passing => "Checks passing".into(),
+        crate::sync::Checks::Failing(names) => format!("Checks failed: {}", names.join(", ")),
+    }
+}
+
+/// What a chat is doing, for its line on the card.
+pub(super) fn chat_state(chat: Option<&Chat>, cx: &App) -> String {
+    chat.filter(|c| c.asking())
+        .map(|_| "Question to answer".to_string())
+        .or_else(|| {
+            chat.filter(|c| !c.busy && c.plan_blocker(cx).is_none())
+                .map(|_| "Plan to approve".to_string())
+        })
+        .or_else(|| chat.and_then(|c| c.activity()))
+        .or_else(|| chat.and_then(|c| c.failed.clone()))
+        .unwrap_or_else(|| "Idle".into())
+}
+
 impl Shark {
     pub(super) fn render_peek(
         &self,
@@ -131,16 +213,7 @@ impl Shark {
         for meta in &task.chats {
             let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
             let agent = meta.agent.as_deref().and_then(|a| self.agent(a));
-            let state = chat
-                .filter(|c| c.asking())
-                .map(|_| "Question to answer".to_string())
-                .or_else(|| {
-                    chat.filter(|c| c.plan_blocker(cx).is_none())
-                        .map(|_| "Plan to approve".to_string())
-                })
-                .or_else(|| chat.and_then(|c| c.activity()))
-                .or_else(|| chat.and_then(|c| c.failed.clone()))
-                .unwrap_or_else(|| "Idle".into());
+            let state = chat_state(chat, cx);
             chats = chats.child(
                 v_flex()
                     .gap_1()
@@ -161,7 +234,32 @@ impl Shark {
                     .child(div().pl(px(22.)).text_xs().text_color(muted).child(format!(
                         "{} · {state}",
                         meta.model.as_deref().unwrap_or("Default model")
-                    ))),
+                    )))
+                    .when_some(self.chat_title_errors.get(&meta.id), |d, error| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.danger_foreground)
+                                .child(format!("Title failed · {error}")),
+                        )
+                    }),
+            );
+        }
+        // Handoff history, closed chats included; the home row's tooltip used to carry it.
+        let chain = (super::home::agent_chain(task).into_iter())
+            .map(|slug| self.agent(slug).map_or(slug, |a| a.name.as_str()))
+            .collect::<Vec<_>>();
+        if chain.len() > 1 {
+            let line = format!("Handoffs: {}", chain.join(" → "));
+            chats = chats.child(
+                div()
+                    .id("peek-agent-chain")
+                    .role(gpui_kit::accesskit::Role::Group)
+                    .aria_label(line.clone())
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(line),
             );
         }
         let mut repos = section("Repositories");
@@ -210,9 +308,14 @@ impl Shark {
                     }
                     details =
                         details.child(div().pl(px(22.)).text_xs().text_color(muted).child(line));
+                    // Tracked files only, as in the sidebar row; untracked files aren't counted.
                     if let Some((added, removed)) = local.diff {
                         details = details.child(
                             h_flex()
+                                .id(SharedString::from(format!("peek-diff-{}", saved.name)))
+                                .role(gpui_kit::accesskit::Role::Group)
+                                .aria_label(format!("+{added} −{removed} tracked"))
+                                .test_support()
                                 .pl(px(22.))
                                 .gap_2()
                                 .text_xs()
@@ -225,7 +328,8 @@ impl Shark {
                                     div()
                                         .text_color(theme.danger_foreground)
                                         .child(format!("−{removed}")),
-                                ),
+                                )
+                                .child(div().text_color(muted).child("tracked")),
                         );
                     }
                 }
@@ -252,13 +356,7 @@ impl Shark {
         for repo in facts.repos.into_iter().flatten() {
             if let Some(pr) = repo.pr() {
                 has_pr = true;
-                let checks = match &pr.checks {
-                    crate::sync::Checks::Pending => "Checks running".into(),
-                    crate::sync::Checks::Passing => "Checks passing".into(),
-                    crate::sync::Checks::Failing(names) => {
-                        format!("Checks failed: {}", names.join(", "))
-                    }
-                };
+                let checks = checks_text(&pr.checks);
                 prs = prs
                     .child(
                         h_flex()
@@ -329,6 +427,7 @@ impl Shark {
         let panel = menu::chrome(theme)
             .id("task-peek")
             .key_context("TaskPeek")
+            .when_some(self.peek.focus.as_ref(), |d, f| d.track_focus(f))
             .test_support()
             .role(gpui_kit::accesskit::Role::Group)
             .aria_label(format!("Details for {}", task.display_title()))

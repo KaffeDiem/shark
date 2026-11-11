@@ -71,10 +71,12 @@ fn sidebar_facts_follow_priority(cx: &mut TestAppContext) {
         });
         assert_eq!(s.task_facts(&task, cx).line, "Setting up web…");
         s.home.waiting.insert(task.name.clone(), "Plan to approve");
-        assert_eq!(s.task_facts(&task, cx).line, "Plan to approve");
-        assert!(s.task_facts(&task, cx).warning);
+        assert_eq!(s.task_facts(&task, cx).line, "Setting up web…");
+        assert!(!s.task_facts(&task, cx).warning);
         chat.update(cx, |c, _| c.busy = false);
         other.update(cx, |c, _| c.busy = false);
+        assert_eq!(s.task_facts(&task, cx).line, "Plan to approve");
+        assert!(s.task_facts(&task, cx).warning);
     });
 }
 
@@ -129,6 +131,38 @@ fn sidebar_height_and_peek_keyboard(cx: &mut TestAppContext) {
     cx.read(|cx| {
         assert!(shark.read(cx).peek.task.is_none());
         assert!(shark.read(cx).home_shown());
+    });
+}
+
+#[gpui_kit::test]
+fn peek_escape_is_scoped_to_its_window(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    let (other, _other_shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.sel = SideRow::Task(0);
+        s.sidebar_focus.focus(w, cx);
+        s.toggle_peek(w, cx);
+    });
+    press_in(other)(cx, &["escape"]);
+    cx.read(|cx| assert_eq!(shark.read(cx).peek.task.as_deref(), Some("one")));
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| assert!(shark.read(cx).peek.task.is_none()));
+}
+
+#[gpui_kit::test]
+fn entering_home_from_a_sidebar_peek_focuses_home(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    cx.run_until_parked();
+    on_app(window, shark)(cx, &|s, w, cx| {
+        s.open_task(0, w, cx);
+        s.sel = SideRow::Task(0);
+        s.sidebar_focus.focus(w, cx);
+        s.toggle_peek(w, cx);
+        s.enter_home(w, cx);
+        assert!(s.home.focus.is_focused(w));
     });
 }
 
@@ -203,6 +237,70 @@ fn chat_activity_and_turn_failure(cx: &mut TestAppContext) {
             assert!(c.ask("Next", w, cx));
             assert!(c.failed.is_none());
         });
+    });
+}
+
+#[gpui_kit::test]
+fn sidebar_completion_names_the_unread_agent(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    cx.run_until_parked();
+    on_app(window, shark)(cx, &|s, _, cx| {
+        s.state.agents = ["Planner", "Coder"]
+            .map(|name| crate::state::Agent {
+                slug: name.to_lowercase(),
+                name: name.into(),
+                ..Default::default()
+            })
+            .to_vec();
+        let task = &mut s.state.tasks[0];
+        task.chats[0].agent = Some("planner".into());
+        task.chats.push(ChatMeta {
+            id: "coder-chat".into(),
+            agent: Some("coder".into()),
+            ..Default::default()
+        });
+        s.unread.insert(task.chats[0].id.clone());
+        let task = task.clone();
+        assert_eq!(s.task_facts(&task, cx).line, "Planner finished");
+    });
+}
+
+#[gpui_kit::test]
+fn sidebar_waits_follow_each_chat_live_state(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    cx.run_until_parked();
+    on_app(window, shark)(cx, &|s, w, cx| {
+        let second = ChatMeta {
+            id: "waiting-chat".into(),
+            plan: true,
+            ..Default::default()
+        };
+        s.state.tasks[0].chats.push(second.clone());
+        let task = s.state.tasks[0].clone();
+        let chat = s.ensure_chat(&task, &task.chats[0], w, cx);
+        s.home
+            .waiting
+            .insert(task.chats[0].id.clone(), "Question to answer");
+        chat.update(cx, |c, _| c.busy = true);
+        assert_eq!(s.task_facts(&task, cx).line, "Agent · Thinking");
+        assert!(!s.task_facts(&task, cx).warning);
+
+        // An unloaded second chat's wait must survive the first chat resuming.
+        s.home.waiting.insert(second.id.clone(), "Plan to approve");
+        assert_eq!(s.task_facts(&task, cx).line, "Plan to approve");
+        let other = s.ensure_chat(&task, &second, w, cx);
+        other.update(cx, |c, cx| {
+            c.plan
+                .update(cx, |p, cx| p.add("p1".into(), "Build it".into(), cx));
+        });
+        assert_eq!(s.task_facts(&task, cx).line, "Plan to approve");
+        other.update(cx, |c, _| c.busy = true);
+        assert_eq!(s.task_facts(&task, cx).line, "2 chats running");
+        assert!(!s.task_facts(&task, cx).warning);
+        chat.update(cx, |c, _| c.busy = false);
+        other.update(cx, |c, _| c.busy = false);
     });
 }
 
@@ -294,10 +392,14 @@ fn peek_regenerate_button_handles_space(cx: &mut TestAppContext) {
 async fn restored_task_still_loads_sidebar_activity(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
-    let tasks = ["one", "two"]
+    let mut tasks = ["one", "two"]
         .map(|name| git::create_empty_task(&tasks_dir().join(name), name, name, None).unwrap())
         .to_vec();
-    let path = crate::transcript::transcript_path(&tasks[1].chats[0].id);
+    tasks[1].chats.push(ChatMeta {
+        id: "restored-waiting-chat".into(),
+        ..Default::default()
+    });
+    let path = crate::transcript::transcript_path("restored-waiting-chat");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, concat!(
         "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Should I proceed?\"}]}}\n",
@@ -313,7 +415,11 @@ async fn restored_task_still_loads_sidebar_activity(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     until(cx, window, |_, cx| {
-        shark.read(cx).home.waiting.contains_key("two")
+        shark
+            .read(cx)
+            .home
+            .waiting
+            .contains_key("restored-waiting-chat")
     })
     .await;
     cx.read(|cx| {
