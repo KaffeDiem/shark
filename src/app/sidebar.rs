@@ -278,6 +278,8 @@ pub(super) fn drag_chip(label: SharedString, cx: &App) -> Div {
 
 /// 16px icons; the rail is 32px icon buttons, 16 apart.
 const ISZ: Pixels = px(16.);
+/// Alpha of a task row's second line while the row isn't selected or shown.
+pub(super) const DETAIL_FADE: f32 = 0.7;
 
 /// A row of the sidebar's lists.
 fn sidebar_row(rail: bool, theme: &Theme) -> Div {
@@ -809,6 +811,11 @@ impl Shark {
             theme.sidebar_foreground
         };
         let facts = self.task_facts(w, cx);
+        let detail = if bright {
+            theme.muted_foreground
+        } else {
+            theme.muted_foreground.opacity(DETAIL_FADE)
+        };
         let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
         let pr = facts.repos.into_iter().flatten().find_map(|r| r.pr());
         let diff = facts.repos.and_then(|rs| {
@@ -821,11 +828,7 @@ impl Shark {
             .map(|p| format!("PR #{} {} · {:?}", p.number, p.status().label(), p.checks))
             .or_else(|| diff.map(|(a, d)| format!("+{a} −{d}")))
             .unwrap_or_default();
-        let mut code = h_flex()
-            .flex_none()
-            .gap_1()
-            .text_xs()
-            .text_color(theme.muted_foreground);
+        let mut code = h_flex().flex_none().gap_1().text_xs().text_color(detail);
         if let Some(pr) = pr {
             code = code
                 .child(pr.status().icon(theme).with_size(px(12.)))
@@ -897,7 +900,7 @@ impl Shark {
                 } else if facts.failed {
                     theme.danger_foreground
                 } else {
-                    theme.muted_foreground
+                    detail
                 })
                 .child(facts.line.clone()),
             animate: animate && facts.running == 0,

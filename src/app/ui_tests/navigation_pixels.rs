@@ -190,6 +190,25 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     ),
                                     fg,
                                 ));
+                                // The second line's diff stat fades with the title off the cursor.
+                                // The active row drops it, so check the cursor only while focused.
+                                if (matches!(ix, 2 | 4) && !(case == "hover" && ix == 2))
+                                    || (ix == 1 && case == "focus")
+                                {
+                                    let muted = theme.muted_foreground;
+                                    checks.push((
+                                        "diff stat",
+                                        Bounds::new(
+                                            point(b.right() - px(60.), b.top() + px(24.)),
+                                            size(px(52.), px(16.)),
+                                        ),
+                                        if selected || focused {
+                                            muted
+                                        } else {
+                                            theme.sidebar.blend(muted.opacity(sidebar::DETAIL_FADE))
+                                        },
+                                    ));
+                                }
                                 // The required action occupies the fixed second line.
                                 if ix == 3 {
                                     checks.push((
@@ -270,10 +289,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         .unwrap();
                 }
                 let scale = screenshot.width() as f32 / 1000.;
+                let bg = cx.update(|cx| cx.theme().sidebar.to_rgb());
+                let bg = [bg.r, bg.g, bg.b].map(|c| (c * 255.).round() as u8);
                 for (label, bounds, color) in checks {
                     let rgb = color.to_rgb();
                     let expected = [rgb.r, rgb.g, rgb.b].map(|c| (c * 255.).round() as u8);
-                    let mut matches = 0;
+                    let (mut matches, mut ink) = (0, bg);
+                    let far = |p: [u8; 3]| (0..3).map(|c| p[c].abs_diff(bg[c]) as u32).sum::<u32>();
                     for y in (bounds.top().as_f32() * scale).ceil() as u32
                         ..(bounds.bottom().as_f32() * scale).floor() as u32
                     {
@@ -283,7 +305,17 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             let pixel = screenshot.get_pixel(x, y);
                             matches +=
                                 usize::from((0..3).all(|c| pixel[c].abs_diff(expected[c]) <= 4));
+                            if far([pixel[0], pixel[1], pixel[2]]) > far(ink) {
+                                ink = [pixel[0], pixel[1], pixel[2]];
+                            }
                         }
+                    }
+                    // Glyph edges pass through every fainter shade, so a fade shows in the inkiest pixel.
+                    if label == "diff stat" {
+                        assert!(
+                            (0..3).all(|c| ink[c].abs_diff(expected[c]) <= 6),
+                            "{mode_name}, rail={rail}, {case}: {label} ink must be {expected:?}, got {ink:?}"
+                        );
                     }
                     assert!(
                         matches > 2,
