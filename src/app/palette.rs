@@ -169,6 +169,12 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.rename_task(ws.name, w, cx))),
     ),
     Row::key(
+        "Regenerate title",
+        IconName::RefreshCw,
+        &RegenerateTitle,
+        "openrouter rename task",
+    ),
+    Row::key(
         "Run or stop run scripts",
         IconName::Play,
         &RunScripts,

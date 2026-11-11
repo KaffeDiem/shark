@@ -278,8 +278,12 @@ impl Shark {
             .insert(name.clone(), agent.as_ref().map(|a| a.slug.clone()));
         let pending = name.clone();
         let staged_files = draft.files.clone();
-        // An issue's title is already a good one.
-        let titling = draft.issues.is_empty().then(|| draft.text.clone());
+        let titling = draft
+            .issues
+            .first()
+            .map(|i| format!("{}: {}", i.identifier, i.title))
+            .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.clone()))
+            .or_else(|| draft.repos.iter().find_map(|r| r.pr_label.clone()));
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx

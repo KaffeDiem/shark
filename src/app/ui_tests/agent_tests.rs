@@ -282,6 +282,32 @@ async fn first_prompt_after_cmd_n_gets_generated_title(cx: &mut TestAppContext) 
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn short_prompt_gets_generated_title(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    shark.update(cx, |s, _| s.openrouter_key = Some(Some("test-key".into())));
+    press_in(window)(cx, &["cmd-n"]);
+    let chat = active_chat(cx, &shark);
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| {
+            c.ask("Fix SecondLineSentinel", w, cx);
+        });
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        shark.read(cx).active_task().unwrap().title == "Generated task title"
+    })
+    .await;
+    assert_eq!(active_task(cx, &shark).title, "Generated task title");
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn first_prompt_after_empty_branch_task_gets_generated_title(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1130,5 +1156,129 @@ async fn startup_applies_agent_edits_saved_before_dialog_closed(cx: &mut TestApp
     assert_eq!(
         State::load().tasks[0].agents[0].instructions,
         "Use the saved instructions"
+    );
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn issue_and_pr_sources_get_generated_titles(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let (window, shark) = empty_app(cx);
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.openrouter_key = Some(Some("test-key".into()));
+        let issue = Snapshot {
+            org: "org".into(),
+            id: "issue".into(),
+            identifier: "SHA-142".into(),
+            title: "SecondLineSentinel issue".into(),
+            ..Default::default()
+        };
+        s.new_task(None, Some((issue.title.clone(), issue)), None, w, cx);
+    });
+    until(cx, window, |_, cx| {
+        shark.read(cx).state.tasks[0].title == "Generated task title"
+    })
+    .await;
+    let selected = repos(&home, &["api"]);
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.create_task_on(
+            "pr-task".into(),
+            git::on_branch(&selected, "pr-task"),
+            vec![],
+            vec![],
+            None,
+            None,
+            "SecondLineSentinel PR".into(),
+            None,
+            false,
+            w,
+            cx,
+        );
+    });
+    until(cx, window, |_, cx| {
+        let s = shark.read(cx);
+        s.state.tasks.len() == 2 && s.state.tasks[1].title == "Generated task title"
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn generated_chat_titles_preserve_task_rename_and_surface_errors(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let (window, shark) = empty_app(cx);
+    press_in(window)(cx, &["cmd-n"]);
+    let name = active_task(cx, &shark).name;
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        s.openrouter_key = Some(Some("test-key".into()));
+        s.set_title(&name, "My manual name".into(), cx);
+        s.auto_title(&name, "Fix SecondLineSentinel", cx);
+        s.set_title(&name, "Different name".into(), cx);
+        s.set_title(&name, "My manual name".into(), cx);
+    });
+    until(cx, window, |_, cx| !shark.read(cx).titling.contains(&name)).await;
+    assert_eq!(active_task(cx, &shark).title, "My manual name");
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.new_chat(w, cx));
+    let chat = active_chat(cx, &shark);
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| c.ask("Fix SecondLineSentinel", w, cx));
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        chat.read(cx).meta.title == "Generated task title"
+    })
+    .await;
+    assert_eq!(active_task(cx, &shark).title, "My manual name");
+    fs::write(home.join("bin/curl"), "#!/bin/sh\nprintf 401\n").unwrap();
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.regenerate_title(&name, w, cx));
+    until(cx, window, |_, cx| {
+        shark.read(cx).title_errors.contains_key(&name)
+    })
+    .await;
+    cx.read(|cx| assert!(shark.read(cx).title_errors[&name].contains("401")));
+    assert_eq!(active_task(cx, &shark).title, "My manual name");
+    assert!(toasts(cx, window) > 0);
+}
+
+#[test]
+fn title_curl_retries_503_but_not_401() {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let _curl = TitleCurlPath::set(&home);
+    let curl = home.join("bin/curl");
+    fs::write(&curl, "#!/bin/sh\nif [ ! -f attempt ]; then touch attempt; printf 503; else printf '%s' '{\"choices\":[{\"message\":{\"content\":\"Recovered title\"}}]}' > response; printf 200; fi\nprintf 'called\\n' >> \"$0.calls\"\n").unwrap();
+    assert_eq!(
+        crate::title::generate("test-key", "fix"),
+        Ok("Recovered title".into())
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("bin/curl.calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    fs::write(
+        &curl,
+        "#!/bin/sh\nprintf 'called\\n' >> \"$0.calls\"\nprintf 401\n",
+    )
+    .unwrap();
+    assert!(
+        crate::title::generate("test-key", "fix")
+            .unwrap_err()
+            .contains("401")
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("bin/curl.calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
     );
 }

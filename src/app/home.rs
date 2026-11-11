@@ -175,7 +175,7 @@ pub(crate) struct Home {
     pub(super) ask: Option<Ask>,
     /// Read off the UI thread when Home opens and when a turn ends, not per frame.
     pub(super) waiting: HashMap<String, &'static str>,
-    activity: HashMap<String, SystemTime>,
+    pub(super) activity: HashMap<String, SystemTime>,
     /// The latest scan that covers each task; an older scan finishing later is ignored.
     scans: HashMap<String, u64>,
     scan_no: u64,
@@ -239,7 +239,6 @@ pub(super) struct HomeRow {
     pub(super) ix: usize,
     pub(super) bucket: Bucket,
     label: Option<String>,
-    running: usize,
 }
 
 impl Shark {
@@ -283,6 +282,7 @@ impl Shark {
     }
 
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_peek(cx);
         self.draft_picker = None;
         self.home.on = true;
         self.zen = false;
@@ -568,12 +568,7 @@ impl Shark {
                 } else {
                     bucket(running, &self.attention_of(name, cx), waiting)
                 };
-                HomeRow {
-                    ix,
-                    bucket,
-                    label,
-                    running,
-                }
+                HomeRow { ix, bucket, label }
             })
             .collect();
         rows.sort_by_key(|r| r.bucket);
@@ -636,6 +631,7 @@ impl Shark {
         }
         let to = nav.to(self.home_at(&rows).unwrap_or(0), rows.len(), 10);
         self.home.sel = Some(self.state.tasks[rows[to].ix].name.clone());
+        self.follow_peek(self.home.sel.clone(), true);
         // The list's children are the rows with a heading before each group's first.
         let headings = rows[..=to]
             .chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b))
@@ -662,12 +658,16 @@ impl Shark {
     pub(super) fn home_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         if let Some(r) = self.home_cursor(&rows) {
+            self.close_peek(cx);
             self.open_task(rows[r].ix, window, cx)
         }
     }
 
     /// esc: stop the answer being written, else back to the task.
     pub(super) fn home_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.task.is_some() {
+            return self.close_peek(cx);
+        }
         if !self.cancel_ask(cx) && self.active.is_some() {
             self.leave_home(window, cx);
         }
@@ -1247,6 +1247,7 @@ impl Shark {
             .track_focus(&self.home.focus)
             .track_scroll(&self.home.rows);
         let list = nav_actions(list, true, cx, Shark::home_move)
+            .on_action(cx.listener(|s, _: &TogglePeek, w, cx| s.toggle_peek(w, cx)))
             .on_action(cx.listener(|this, _: &Confirm, w, cx| this.home_confirm(w, cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, w, cx| {
                 this.enter_home(w, cx);
@@ -1353,7 +1354,11 @@ impl Shark {
                         .children(grouping.take())
                         .into_any_element(),
                 );
-                items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+                items.extend(
+                    group
+                        .iter()
+                        .map(|r| self.home_ws_row(r, focused, now, window, cx)),
+                );
                 continue;
             }
             items.push(
@@ -1399,7 +1404,11 @@ impl Shark {
                     .children(grouping.take())
                     .into_any_element(),
             );
-            items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+            items.extend(
+                group
+                    .iter()
+                    .map(|r| self.home_ws_row(r, focused, now, window, cx)),
+            );
         }
         if !self.home.backlog_open && backlog > 0 {
             items.push(
@@ -1489,13 +1498,15 @@ impl Shark {
         r: &HomeRow,
         focused: bool,
         now: SystemTime,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
         let w = &self.state.tasks[r.ix];
         let ix = r.ix;
         let selected = self.home.sel.as_deref() == Some(w.name.as_str());
-        let repos = self.overview_repos(&w.name, cx);
+        let facts = self.task_facts(w, cx);
+        let repos = facts.repos;
         let merged = (repos.iter().copied().flatten())
             .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged));
         let when = (self.home.activity.get(&w.name))
@@ -1515,10 +1526,7 @@ impl Shark {
             1 => "1 chat".to_string(),
             n => format!("{n} chats"),
         };
-        let status = r.label.clone().or_else(|| match r.running {
-            0 | 1 => None,
-            n => Some(format!("{n} chats running")),
-        });
+        let status = Some(facts.line.clone());
         // The agents its chats use, first use first.
         let agents: Vec<_> = (w.chat_agents().into_iter())
             .filter_map(|slug| self.agent(slug))
@@ -1539,8 +1547,19 @@ impl Shark {
         }
         .into();
         let ws = w.clone();
+        let hover_name = w.name.clone();
         h_flex()
+            .relative()
             .id(("home-ws", ix))
+            .on_hover(
+                cx.listener(move |s, over: &bool, _, cx| {
+                    s.peek_hover(&hover_name, true, *over, cx)
+                }),
+            )
+            .when(
+                self.peek.task.as_deref() == Some(&w.name) && self.peek.home,
+                |d| d.child(self.render_peek(w, window, cx)),
+            )
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!(
                 "Open task {title}{}: {detail}",
@@ -1564,7 +1583,10 @@ impl Shark {
                     cx.notify()
                 })
             })
-            .on_click(cx.listener(move |this, _, w, cx| this.open_task(ix, w, cx)))
+            .on_click(cx.listener(move |this, _, w, cx| {
+                this.close_peek(cx);
+                this.open_task(ix, w, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| {

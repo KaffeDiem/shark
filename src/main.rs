@@ -96,6 +96,8 @@ actions!(
         AddToDraft,
         ChangeDraftBranch,
         ToggleSidebar,
+        TogglePeek,
+        RegenerateTitle,
         PasteAgentIcon,
         ToggleFileTree,
         ToggleViewed,
@@ -249,14 +251,14 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str = "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal";
-    const TREE: &str = "FileTree || Sidebar";
+    const NAV: &str = "(Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal) && !TaskPeek";
+    const TREE: &str = "(FileTree || Sidebar) && !TaskPeek";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features";
-    const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)";
+    const MOVE: &str = "(Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features) && !TaskPeek";
+    const ARROWS: &str = "(Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)) && !TaskPeek";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -292,6 +294,12 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w h", FocusLeft, Some("Vim")),
         KeyBinding::new("ctrl-w l", FocusRight, Some("Vim")),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new(
+            "space",
+            TogglePeek,
+            Some("(Sidebar || (Home && !Input)) && !TaskPeek"),
+        ),
+        KeyBinding::new("escape", CancelEdit, Some("Sidebar")),
         KeyBinding::new("cmd-d", PasteAgentIcon, Some("AgentEditor")),
         KeyBinding::new("b", ToggleBacklog, Some("Sidebar || (Home && !Input)")),
         KeyBinding::new("cmd-.", ToggleZen, None),
@@ -353,7 +361,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "enter",
             Confirm,
-            Some("Sidebar || Home || Transcript || FileTree || Queue || Features"),
+            Some("(Sidebar || Home || Transcript || FileTree || Queue || Features) && !TaskPeek"),
         ),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),

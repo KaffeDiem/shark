@@ -1218,3 +1218,28 @@ fn review_guard_still_blocks_other_kinds() {
     let err = run_step(a, &f.ws, job, &[], &[], &new_pr, false, false).unwrap_err();
     assert!(err.contains("local PR review checkout"), "{err}");
 }
+
+#[test]
+fn diff_counts_refresh_with_unchanged_head_and_changed_file_count() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("diff-counts");
+    fs::write(f.wt.join("tracked"), "first\n").unwrap();
+    git(&f.wt, &["add", "tracked"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "tracked"]);
+    let first = status::probe(&f.wt, "feature", "main", None, false).unwrap();
+    assert_eq!(first.diff, Some((1, 0)));
+    fs::write(f.wt.join("tracked"), "first\nsecond\n").unwrap();
+    let second = status::probe(&f.wt, "feature", "main", Some(&first), false).unwrap();
+    assert_eq!(second.diff, Some((2, 0)));
+    fs::write(f.wt.join("tracked"), "first\nsecond\nthird\n").unwrap();
+    let third = status::probe(&f.wt, "feature", "main", Some(&second), false).unwrap();
+    assert_eq!(third.head, second.head);
+    assert_eq!(third.changed, second.changed);
+    assert_eq!(third.diff, Some((3, 0)));
+    git(&f.wt, &["branch", "alternate", "HEAD"]).unwrap();
+    let retargeted = status::probe(&f.wt, "feature", "alternate", Some(&third), false).unwrap();
+    assert_eq!(retargeted.diff, Some((2, 0)));
+    assert_eq!(retargeted.head, third.head);
+}

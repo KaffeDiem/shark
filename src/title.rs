@@ -17,11 +17,6 @@ pub fn key_from(read: anyhow::Result<Option<(String, Vec<u8>)>>) -> Option<Strin
     (read.ok().flatten()).and_then(|(_, bytes)| String::from_utf8(bytes).ok())
 }
 
-/// A prompt of four words or fewer already is its title.
-pub fn wanted(prompt: &str) -> bool {
-    prompt.split_whitespace().nth(4).is_some()
-}
-
 fn body(prompt: &str) -> String {
     let prompt: String = prompt.trim().chars().take(MAX_PROMPT).collect();
     json!({
@@ -99,14 +94,51 @@ pub fn generate(key: &str, prompt: &str) -> Result<String, String> {
         "--",
         URL,
     ];
-    let mut c = Command::new("curl");
-    c.env_remove("NETRC").env_remove("CURL_HOME");
-    let status = crate::proc::wait_bounded(c, &dir.0, "curl", &args, 25, false)?;
-    let response = std::fs::read(dir.0.join("response")).unwrap_or_default();
-    if status != "200" {
-        return Err(format!("OpenRouter answered HTTP {status}"));
+    retry(
+        || {
+            let mut c = Command::new("curl");
+            c.env_remove("NETRC").env_remove("CURL_HOME");
+            let output = crate::proc::wait_output(c, &dir.0, "curl", &args, 25, false).map_err(
+                |reason| {
+                    let transient = reason.contains("timed out");
+                    (reason, transient)
+                },
+            )?;
+            if !output.status.success() {
+                return Err((
+                    format!(
+                        "OpenRouter: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    output.status.code() == Some(28),
+                ));
+            }
+            let status = String::from_utf8_lossy(&output.stdout);
+            if status.trim() != "200" {
+                let code = status.trim().parse::<u16>().unwrap_or(0);
+                return Err((
+                    format!("OpenRouter answered HTTP {}", status.trim()),
+                    code == 429 || (500..600).contains(&code),
+                ));
+            }
+            let response = std::fs::read(dir.0.join("response")).unwrap_or_default();
+            parse(&response).ok_or_else(|| ("OpenRouter sent no title".into(), false))
+        },
+        || std::thread::sleep(std::time::Duration::from_secs(2)),
+    )
+}
+
+fn retry(
+    mut request: impl FnMut() -> Result<String, (String, bool)>,
+    wait: impl FnOnce(),
+) -> Result<String, String> {
+    match request() {
+        Err((_, true)) => {
+            wait();
+            request().map_err(|(reason, _)| reason)
+        }
+        result => result.map_err(|(reason, _)| reason),
     }
-    parse(&response).ok_or_else(|| "OpenRouter sent no title".into())
 }
 
 #[cfg(test)]
@@ -139,10 +171,35 @@ mod tests {
     }
 
     #[test]
-    fn short_prompts_keep_their_text() {
-        assert!(!wanted("fix login bug"));
-        assert!(!wanted("  one two three four "));
-        assert!(wanted("when launching a new task add a title"));
+    fn retries_transient_failure_once() {
+        let mut calls = 0;
+        assert_eq!(
+            retry(
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(("HTTP 503".into(), true))
+                    } else {
+                        Ok("Title".into())
+                    }
+                },
+                || {}
+            ),
+            Ok("Title".into())
+        );
+        assert_eq!(calls, 2);
+        calls = 0;
+        assert_eq!(
+            retry(
+                || {
+                    calls += 1;
+                    Err(("HTTP 401".into(), false))
+                },
+                || panic!("no retry")
+            ),
+            Err("HTTP 401".into())
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

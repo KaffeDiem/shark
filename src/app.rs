@@ -58,6 +58,7 @@ mod linear_issues;
 pub(crate) mod menus;
 mod new_task;
 mod palette;
+mod peek;
 mod picker;
 mod reference_completion;
 mod reorder;
@@ -68,6 +69,7 @@ mod skill_import;
 mod storage;
 mod task;
 mod task_draft;
+mod task_facts;
 mod task_picker;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
@@ -116,6 +118,7 @@ pub struct Shark {
     quit_hold: gpui_kit::Task<()>,
     /// Chats whose turn ended while another chat was shown.
     unread: HashSet<String>,
+    peek: peek::Peek,
     tab: Tab,
     differ: Entity<Differ>,
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
@@ -131,6 +134,11 @@ pub struct Shark {
     creating: HashMap<String, Option<String>>,
     /// The OpenRouter key for task titles: `None` until the Keychain is first read.
     pub(crate) openrouter_key: Option<Option<String>>,
+    titling: HashSet<String>,
+    chat_titling: HashSet<String>,
+    title_errors: HashMap<String, String>,
+    title_sources: HashMap<String, &'static str>,
+    title_revisions: HashMap<String, u64>,
     /// Agents with a repository being created right now (`Task::attaching` has the rest).
     adding_repos: HashSet<String>,
     /// Per agent, how the attachment operation has gone.
@@ -238,6 +246,9 @@ impl Shark {
                 }
             }
             s.restore_last_open(window, cx);
+            if !s.home_shown() {
+                s.refresh_home(None, cx);
+            }
             s.check_deps(cx);
             s.usage_polling(window, cx);
             let msg = match (backup, read_only) {
@@ -317,6 +328,7 @@ impl Shark {
             quit_warned: None,
             quit_hold: gpui_kit::Task::ready(()),
             unread: HashSet::new(),
+            peek: peek::Peek::default(),
             tab: Tab::Chat,
             differ,
             sidebar_resize,
@@ -329,6 +341,11 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashMap::new(),
             openrouter_key: None,
+            titling: HashSet::new(),
+            chat_titling: HashSet::new(),
+            title_errors: HashMap::new(),
+            title_sources: HashMap::new(),
+            title_revisions: HashMap::new(),
             adding_repos: HashSet::new(),
             attach_results: HashMap::new(),
             setting_up: vec![],
@@ -1030,6 +1047,9 @@ impl Render for Shark {
                 cx.listener(|this, _: &NewSection, w, cx| this.start_naming(None, None, w, cx)),
             )
             .on_action(cx.listener(|this, _: &MoveToSection, w, cx| this.pick_section(w, cx)))
+            .on_action(cx.listener(|this, _: &RegenerateTitle, w, cx| {
+                this.with_target(w, cx, |s, ws, w, cx| s.regenerate_title(&ws.name, w, cx));
+            }))
             .on_action(cx.listener(|this, _: &ToggleBacklog, w, cx| {
                 this.with_target(w, cx, |s, ws, w, cx| {
                     if !s.can_backlog(&ws.name, cx) {

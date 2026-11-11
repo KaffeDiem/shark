@@ -322,7 +322,9 @@ pub(crate) fn render_pixels() {
         super::tree_pixels::render_artifact_pixels(&mut cx);
         return;
     }
-    if std::env::var_os("SHARK_RENDER_HOME_ONLY").is_some() {
+    if std::env::var_os("SHARK_RENDER_HOME_ONLY").is_some()
+        || std::env::var_os("SHARK_RENDER_SIDEBAR_ONLY").is_some()
+    {
         super::navigation_pixels::render_pixels(&mut cx);
         return;
     }

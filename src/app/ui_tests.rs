@@ -35,6 +35,7 @@ mod mixed_tab_tests;
 mod navigation_pixels;
 mod repo_menu_tests;
 mod repo_settings_tests;
+mod sidebar_tests;
 mod skill_import_tests;
 mod storage_tests;
 mod tab_tests;

@@ -12,7 +12,7 @@ Shark needs `git`, `gh` logged into GitHub, and `claude` on your login shell's P
 
 1. **Add repo** from `cmd-k` or Settings › Repositories. Repositories are registered once and can serve many tasks.
 2. Optionally make an agent: **New agent…** in a composer's agent menu or in `cmd-k`. Give it a name and instructions. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
-3. On Home, describe the work and press `enter`. The first line becomes the task's title. Pick an agent for its first chat with the **@ Agent** chip, or type `@designer fix the onboarding spacing`.
+3. On Home, describe the work and press `enter`. The first line becomes its initial title; with an OpenRouter key in Settings › General, Shark generates a short title for every task and chat tab, including short prompts, issues and PRs. A manual rename made during generation wins. Pick an agent for its first chat with the **@ Agent** chip, or type `@designer fix the onboarding spacing`.
 4. Plan or work in its chat, review the changes with **Differ**, and use the git button to commit, open PRs and merge.
 5. Delete the completed task when you no longer need its worktrees and conversations. Agents stay ready for the next chat.
 
@@ -74,7 +74,9 @@ The **All repositories** control on the first group heading filters Home to one 
 
 The filter icon beside Home in the expanded sidebar opens a repository menu with **All repositories** and **No repository**. This independent filter narrows task rows, section counts and `cmd-1…9` shortcuts; section headers stay. Global task search still finds every task. The sidebar filter resets on restart.
 
-The sidebar lists Home, then your sections with their tasks, then ungrouped tasks. Hover **Tasks** and choose **+**, or right-click empty sidebar space, to add a section. A section's right-click menu folds it, renames it, changes its icon or deletes it; deleting a section leaves its tasks intact. Drag tasks into and out of sections and drag sections to reorder them; task menus also offer **Move to section**. `left` and `right` fold and unfold the section at the cursor, and `cmd-1…9` skip folded sections. A folded section shows its task count, or a warning when a hidden task needs you. Home's grouping control switches between status and section, in the sidebar's order. Sections never change a chat's agent.
+The sidebar lists Home, then your sections with their tasks, then ungrouped tasks. Hover **Tasks** and choose **+**, or right-click empty sidebar space, to add a section. A section's right-click menu folds it, renames it, changes its icon or deletes it; deleting a section leaves its tasks intact. Drag tasks into and out of sections and drag sections to reorder them; task menus also offer **Move to section**. `left` and `right` fold and unfold the section at the cursor, and `cmd-1…9` skip folded sections. A folded section shows its needs-you count, running count, or task count, in that order. Home's grouping control switches between status and section, in the sidebar's order. Sections never change a chat's agent.
+
+Sidebar tasks have two lines: title and age, then the current action/activity/issue/repository fact with PR checks or line counts. Press `space` on a task in Sidebar or Home to peek at its chats, repositories, checks, issue and dev server; arrows browse and `esc` closes. Hovering a row also opens the card. **Regenerate title** is available in the task menu, command palette and peek card.
 
 `cmd-0` opens Home; from Home it returns to the active task. `esc` leaves an overview for the active task, or returns to Home if none is active. The task picker (`cmd-shift-o`) searches task titles and repositories. With no query it selects the most recent task from Home, or the most recent other task while a task is open. The app switcher (`cmd-o`, held) cycles tasks until you release Command.
 

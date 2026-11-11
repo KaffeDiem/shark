@@ -39,6 +39,9 @@ pub struct Local {
     /// HEAD holds parent commits the base doesn't: the parent was rewritten or squash-merged,
     /// so what follows `parent_tip` must be rebased onto the base.
     pub restack: bool,
+    /// Tracked lines against the Diff view base, refreshed on every probe.
+    pub diff: Option<(u32, u32)>,
+    pub(crate) diff_base: Option<(String, String, String)>,
     pub changed: u32,
     pub conflicts: u32,
     pub op: Option<Op>,
@@ -219,7 +222,43 @@ pub fn probe(
             l.remote = Some(ab);
         }
     }
+    let base_oid = crate::git::ref_oid(wt, base);
+    if let Some(base_oid) = base_oid {
+        let merge_base = prev
+            .and_then(|p| p.diff_base.as_ref())
+            .filter(|(head, base, _)| head == &l.head && base == &base_oid)
+            .map(|(_, _, merge)| merge.clone())
+            .or_else(|| git(wt, &["merge-base", "HEAD", &base_oid]).ok());
+        if let Some(merge) = merge_base {
+            l.diff = git(wt, &["diff", "--no-ext-diff", "--shortstat", &merge, "--"])
+                .ok()
+                .map(|s| shortstat(&s));
+            l.diff_base = Some((l.head.clone(), base_oid, merge));
+        }
+    }
     base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l, allow_parent_update))
+}
+
+fn shortstat(text: &str) -> (u32, u32) {
+    let mut counts = (0, 0);
+    for part in text.split(',') {
+        let mut words = part.split_whitespace();
+        let n = words.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        match words.next() {
+            Some(word) if word.starts_with("insertion") => counts.0 = n,
+            Some(word) if word.starts_with("deletion") => counts.1 = n,
+            _ => {}
+        }
+    }
+    counts
+}
+
+pub fn compact_age(d: std::time::Duration) -> String {
+    if d.as_secs() < 60 {
+        "now".into()
+    } else {
+        ago(d).trim_end_matches(" ago").into()
+    }
 }
 
 /// The trunk the last probe found, else the repo's default branch.
@@ -1190,6 +1229,18 @@ mod tests {
         ] {
             assert!(kind.needs_idle(), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn shortstat_and_compact_age() {
+        assert_eq!(
+            shortstat(" 2 files changed, 12 insertions(+), 3 deletions(-)"),
+            (12, 3)
+        );
+        assert_eq!(shortstat(" 1 file changed, 1 deletion(-)"), (0, 1));
+        assert_eq!(shortstat(""), (0, 0));
+        assert_eq!(compact_age(std::time::Duration::from_secs(59)), "now");
+        assert_eq!(compact_age(std::time::Duration::from_secs(240)), "4m");
     }
 
     #[test]

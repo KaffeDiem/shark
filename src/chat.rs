@@ -141,6 +141,7 @@ pub struct Chat {
     hopping: Option<gpui_kit::Task<()>>,
     /// When the running turn started.
     pub started: Option<Instant>,
+    pub failed: Option<String>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
     /// Set while the agent has an attachment operation (`Task::attaching`). Its own field:
@@ -337,6 +338,7 @@ impl Chat {
             hop: 0,
             hopping: None,
             started: None,
+            failed: None,
             hold: false,
             attach_hold,
             archiving: false,
@@ -872,8 +874,29 @@ impl Chat {
             .collect()
     }
 
+    /// Only the current turn: old unfinished tools must not look like live work.
+    pub fn activity(&self) -> Option<String> {
+        if !self.busy {
+            return None;
+        }
+        for block in self.blocks.iter().rev() {
+            let call = match block {
+                Block::Tools { calls, .. } => calls.iter().rev().find(|c| c.result.is_none()),
+                Block::Tool(call) if call.result.is_none() => Some(call),
+                Block::Text { done: false, .. } => return Some("Writing".into()),
+                Block::User(..) | Block::Info(_) => break,
+                _ => None,
+            };
+            if let Some(call) = call {
+                return Some(format!("{} {}", call.name, call.summary));
+            }
+        }
+        Some("Thinking".into())
+    }
+
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
         self.handoff_dismissed = false;
+        self.failed = None;
         // codex runs `/compact` as a request of its own, with no user message to echo.
         let echoed = !(self.active_codex() && text.trim() == "/compact");
         let queued = self.busy && echoed;
@@ -1355,6 +1378,7 @@ impl Chat {
     fn on_result(&mut self, is_error: bool, text: String, secs: u64, cx: &mut Context<Self>) {
         self.busy = false;
         if !self.replaying {
+            self.failed = is_error.then(|| text.clone());
             self.stopping = None; // a live interrupt's fallback outlives history
             self.drop_asked(cx);
         }

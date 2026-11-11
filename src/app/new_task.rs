@@ -911,6 +911,11 @@ impl NewTaskForm {
             .filter_map(|((r, p), f)| Some((r.name.clone(), f.clone().filter(|_| *p)?)))
             .collect();
         let prompt = self.first.clone();
+        let pr_title = self
+            .chosen_pr
+            .iter()
+            .zip(&self.picked)
+            .find_map(|(pr, picked)| pr.as_ref().filter(|_| *picked).map(|p| p.title.clone()));
         let insert = self.insert.clone();
         let agent = self.agent.clone();
         self.shark
@@ -918,6 +923,7 @@ impl NewTaskForm {
                 let title = prompt
                     .as_deref()
                     .map(crate::chat::title_of)
+                    .or(pr_title)
                     .unwrap_or_default();
                 s.create_task_on(
                     branch, repos, prs, parents, insert, prompt, title, agent, false, window, cx,
