@@ -33,8 +33,10 @@ mod issue_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
+mod peek_review_tests;
 mod repo_menu_tests;
 mod repo_settings_tests;
+mod sidebar_tests;
 mod skill_import_tests;
 mod storage_tests;
 mod tab_tests;
@@ -4342,7 +4344,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
         std::io::Write::write_all(&mut f, said.as_bytes()).unwrap();
         cx.update(|cx| chat.update(cx, |_, cx| cx.emit(crate::chat::ChatEvent::TurnDone)));
         cx.run_until_parked();
-        cx.update(|cx| shark.read(cx).home.waiting.get("one").copied())
+        cx.update(|cx| shark.read(cx).home.waiting.get(&id).copied())
     };
     assert_eq!(
         waiting(cx, said("Shall I push it?")),

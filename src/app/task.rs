@@ -194,6 +194,7 @@ impl Shark {
         let Some(ws) = self.state.tasks.get(ix).cloned() else {
             return;
         };
+        self.close_peek(cx);
         let changed = self.active.as_ref() != Some(&ws.name);
         if changed {
             self.drop_editor(cx);
@@ -391,7 +392,9 @@ impl Shark {
                 || tasks_dir().join(n).exists()
                 || crate::transcript::transcript_path(n).exists()
         });
-        let from_issue = issue.is_some();
+        let issue_source = issue
+            .as_ref()
+            .map(|(_, issue)| format!("{}: {}", issue.identifier, issue.title));
         let title = match (&issue, first.as_deref()) {
             (Some((title, _)), _) => title.clone(),
             (None, Some(first)) => crate::chat::title_of(first),
@@ -429,10 +432,10 @@ impl Shark {
             window,
             cx,
         );
-        let Some(first) = first else { return };
-        if !from_issue {
-            self.auto_title(&name, &first, cx);
+        if let Some(source) = issue_source.as_deref().or(first.as_deref()) {
+            self.auto_title(&name, source, cx);
         }
+        let Some(first) = first else { return };
         if let Some(chat) = self.active_chat().cloned() {
             chat.update(cx, |c, cx| c.ask(&first, window, cx));
         }
@@ -478,58 +481,186 @@ impl Shark {
         let edited = |w: &&mut Task| !title.is_empty() && title != w.display_title();
         if let Some(ws) = self.task_mut(name).filter(edited) {
             ws.title = title;
+            self.title_sources.insert(name.into(), "Renamed");
+            *self.title_revisions.entry(name.into()).or_default() += 1;
             let _ = self.state.save();
             cx.notify();
         }
     }
 
-    /// With an OpenRouter key (Settings > General), a prompt of more than four words gets a 3-4
-    /// word title. A rename made meanwhile wins; any failure keeps the prompt's first line.
     pub(super) fn auto_title(&mut self, name: &str, prompt: &str, cx: &mut Context<Self>) {
+        self.request_title(name, None, prompt, None, cx);
+    }
+
+    pub(super) fn regenerate_title(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.openrouter_key == Some(None) {
+            return notify_err(window, cx, "Add an OpenRouter key in Settings › General");
+        }
+        let Some(task) = self.task(name) else { return };
+        let prompt = task
+            .primary_issue()
+            .map(|i| format!("{}: {}", i.identifier, i.title))
+            .unwrap_or_else(|| task.display_title().into_owned());
+        self.request_title(name, None, &prompt, Some(window.window_handle()), cx);
+    }
+
+    pub(super) fn request_title(
+        &mut self,
+        name: &str,
+        chat: Option<String>,
+        prompt: &str,
+        report: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if prompt.trim().is_empty() || self.openrouter_key == Some(None) {
+            return;
+        }
         let Some(task) = self.task(name) else {
             return;
         };
         let before = task.title.clone();
         let instance = task.instance_id.clone();
-        // A creation hook precedes the first send; its Title event will request this once.
-        if before == crate::state::NEW_TASK && task.chats.iter().all(|c| c.title.is_empty()) {
-            return;
-        }
-        if !crate::title::wanted(prompt) || self.openrouter_key == Some(None) {
-            return;
+        let title_task = chat.is_none()
+            || ((before.is_empty() || before == crate::state::NEW_TASK)
+                && !self.titling.contains(name));
+        let original = (report.is_some() && task.primary_issue().is_none()).then(|| {
+            task.chats
+                .iter()
+                .chain(&task.closed)
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        });
+        let revision = self.title_revisions.get(name).copied().unwrap_or(0);
+        let meta = match &chat {
+            Some(id) => {
+                let Some(meta) = task.chats.iter().find(|c| &c.id == id) else {
+                    return;
+                };
+                Some(meta)
+            }
+            None => task.chats.first(),
+        };
+        let tab = meta.map(|c| (c.id.clone(), c.title.clone()));
+        let first_line = crate::chat::title_of(prompt);
+        if title_task {
+            if !self.titling.insert(name.into()) {
+                return;
+            }
+            self.title_errors.remove(name);
+        } else if let Some(id) = &chat {
+            if !self.chat_titling.insert(id.clone()) {
+                return;
+            }
+            self.chat_title_errors.remove(id);
         }
         let cached = self.openrouter_key.clone();
         let read = cached
             .is_none()
             .then(|| cx.read_credentials(crate::title::KEYCHAIN));
         let (name, prompt) = (name.to_string(), prompt.to_string());
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let key = match (cached, read) {
                 (Some(key), _) => key,
                 (None, Some(read)) => {
-                    // ponytail: a declined Keychain prompt reads as "no key" until relaunch.
                     let key = crate::title::key_from(read.await);
-                    // A key saved or removed in Settings meanwhile wins.
                     this.update(cx, |s, _| s.openrouter_key.get_or_insert(key).clone())
                         .ok()
                         .flatten()
                 }
-                (None, None) => None,
+                _ => None,
             };
-            let Some(key) = key else { return };
-            let title = cx
-                .background_executor()
-                .spawn(async move { crate::title::generate(&key, &prompt) })
-                .await;
-            let Ok(title) = title else { return };
+            let result = match key {
+                Some(key) => Some(
+                    cx.background_executor()
+                        .spawn(async move {
+                            let source = original.and_then(|ids| {
+                                ids.iter()
+                                    .find_map(|id| crate::transcript::first_prompt(id))
+                            });
+                            crate::title::generate(&key, source.as_deref().unwrap_or(&prompt))
+                        })
+                        .await,
+                ),
+                None => None,
+            };
             this.update(cx, |s, cx| {
-                if s.task(&name)
-                    .is_some_and(|t| t.instance_id == instance && t.title == before)
-                {
-                    s.set_title(&name, title, cx);
+                if s.task(&name).is_none_or(|t| t.instance_id != instance) {
+                    cx.notify();
+                    return;
                 }
+                if title_task {
+                    s.titling.remove(&name);
+                } else if let Some(id) = &chat {
+                    s.chat_titling.remove(id);
+                }
+                match result {
+                    Some(Ok(title)) => {
+                        if title_task
+                            && s.title_revisions.get(&name).copied().unwrap_or(0) == revision
+                            && s.task(&name).is_some_and(|t| {
+                                t.title == before
+                                    || ((before.is_empty() || before == crate::state::NEW_TASK)
+                                        && s.title_sources.get(&name) != Some(&"Renamed"))
+                            })
+                        {
+                            s.set_title(&name, title.clone(), cx);
+                            s.title_sources.insert(name.clone(), "OpenRouter");
+                        }
+                        if let Some((id, old)) = &tab {
+                            let entity = s.chats.get(id).cloned();
+                            if let Some(meta) = s
+                                .task_mut(&name)
+                                .and_then(|t| t.chats.iter_mut().find(|c| &c.id == id))
+                            {
+                                if meta.title == *old
+                                    || (old.is_empty() && meta.title == first_line)
+                                {
+                                    meta.title = title.clone();
+                                    if let Some(entity) = entity {
+                                        entity.update(cx, |c, cx| {
+                                            c.meta.title = title;
+                                            cx.notify();
+                                        });
+                                    }
+                                    let _ = s.state.save();
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(reason)) => {
+                        if title_task {
+                            s.title_errors.insert(name.clone(), reason);
+                        } else if let Some(id) = &chat {
+                            s.chat_title_errors.insert(id.clone(), reason);
+                        }
+                    }
+                    None => {}
+                }
+                cx.notify();
             })
             .ok();
+            if let Some(window) = report {
+                this.update(cx, |s, cx| {
+                    if s.task(&name).is_none_or(|t| t.instance_id != instance) {
+                        return;
+                    }
+                    let reason = s.title_errors.get(&name).cloned().or_else(|| {
+                        (s.openrouter_key == Some(None))
+                            .then(|| "Add an OpenRouter key in Settings › General".into())
+                    });
+                    if let Some(reason) = reason {
+                        // Regeneration can be invoked from either window's task list.
+                        let _ = window.update(cx, |_, w, cx| notify_err(w, cx, reason));
+                    }
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -736,9 +867,8 @@ impl Shark {
                             ws = s.task(&name).unwrap().clone();
                         }
                         let _ = s.state.save();
-                        if let Some(p) = &prompt {
-                            s.auto_title(&name, p, cx);
-                        }
+                        let source = prompt.as_deref().unwrap_or(&ws.title);
+                        s.auto_title(&name, source, cx);
                         // A dirty file tab in the task left behind asks first: send once opened.
                         let deferred = Rc::new(std::cell::Cell::new(false));
                         let (later, setup_ws, key) = (deferred.clone(), ws.clone(), name.clone());
@@ -1491,9 +1621,19 @@ impl Shark {
             for c in ws.chats.iter().chain(&ws.closed) {
                 self.chats.remove(&c.id);
                 self.unread.remove(&c.id);
+                self.chat_titling.remove(&c.id);
+                self.chat_title_errors.remove(&c.id);
+                self.home.waiting.remove(&c.id);
                 crate::transcript::forget(&c.id);
                 crate::plan::delete(&c.id);
             }
+        }
+        self.title_errors.remove(name);
+        self.titling.remove(name);
+        self.title_sources.remove(name);
+        self.title_revisions.remove(name);
+        if self.peek.task.as_deref() == Some(name) {
+            self.close_peek(cx);
         }
         self.syncs.remove(name);
         self.parked_sessions.remove(name);

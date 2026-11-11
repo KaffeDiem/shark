@@ -8,7 +8,7 @@ mod status;
 pub use run::check_in_background;
 #[cfg(test)]
 pub(crate) use status::parse_prs;
-pub use status::{Kind, Pr, PrState, Repo, ago};
+pub use status::{Checks, Kind, Pr, PrState, Repo, ago, compact_age};
 
 use crate::chat::Chat;
 use crate::menu::each_or_all;
@@ -868,6 +868,10 @@ impl GitSync {
     }
 
     /// Each repo's state, once the first probe landed.
+    pub(crate) fn checked_age(&self) -> Option<Duration> {
+        self.pr_checked.map(|t| t.elapsed())
+    }
+
     pub fn repos(&self) -> Option<&[Repo]> {
         self.action.as_ref().map(|_| &self.repos[..])
     }

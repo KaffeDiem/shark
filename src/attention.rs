@@ -229,6 +229,12 @@ impl Shark {
         }
     }
 
+    pub(crate) fn task_checked_age(&self, name: &str, cx: &App) -> Option<Duration> {
+        self.bg_checked(name)
+            .map(|c| c.at.elapsed())
+            .or_else(|| self.syncs.get(name)?.read(cx).checked_age())
+    }
+
     pub(crate) fn turn_done(&mut self, name: &str, chat: &str, cx: &mut Context<Self>) {
         // Home covers the open task: its turns end unseen.
         let shown = self.active.as_deref() == Some(name) && !self.home_shown();

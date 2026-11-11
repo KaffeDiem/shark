@@ -1,6 +1,7 @@
 //! The sidebar: Home, sections and their tasks, ungrouped tasks, the cursor.
 use super::*;
 use gpui_kit::component::Selectable as _;
+use std::time::Duration;
 
 /// A task's status icon: a spinner while an agent runs, else by what it needs from you.
 /// `idle` colours the dashed circle of a task that needs nothing.
@@ -10,23 +11,101 @@ pub(super) fn indicator(
     size: Pixels,
     theme: &Theme,
 ) -> AnyElement {
+    match status_icon(bucket, idle, theme) {
+        Some(icon) => icon.with_size(size).into_any_element(),
+        None => Spinner::new()
+            .icon(IconName::LoaderCircle)
+            .color(theme.primary)
+            .with_size(size)
+            .into_any_element(),
+    }
+}
+
+fn status_icon(bucket: home::Bucket, idle: Hsla, theme: &Theme) -> Option<Icon> {
     let (icon, color) = match bucket {
-        home::Bucket::Running => {
-            return Spinner::new()
-                .icon(IconName::LoaderCircle)
-                .color(theme.primary)
-                .with_size(size)
-                .into_any_element();
-        }
+        home::Bucket::Running => return None,
         home::Bucket::Needs => (IconName::CircleAlert, theme.warning_foreground),
         home::Bucket::Unread => (IconName::CircleCheck, theme.success_foreground),
         home::Bucket::Idle => (IconName::CircleDashed, idle),
         home::Bucket::Backlog => (IconName::CirclePause, idle),
     };
-    Icon::new(icon)
-        .with_size(size)
-        .text_color(color)
-        .into_any_element()
+    Some(Icon::new(icon).text_color(color))
+}
+
+/// Remember the first frame so mounting/folding rows never animates them.
+fn changed(
+    id: SharedString,
+    value: SharedString,
+    animate: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let state = window.use_keyed_state(id, cx, |_, _| (value.clone(), false));
+    if state.read(cx).0 != value {
+        state.update(cx, |s, _| {
+            let play = animate && s.0.as_ref() != "Backlog" && value.as_ref() != "Backlog";
+            *s = (value, play);
+        });
+    }
+    state.read(cx).1 && animate && !cx.reduce_motion()
+}
+
+#[derive(IntoElement)]
+struct StatusIcon {
+    id: SharedString,
+    bucket: home::Bucket,
+    foreground: Hsla,
+    animate: bool,
+}
+
+impl RenderOnce for StatusIcon {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let value = SharedString::from(format!("{:?}", self.bucket));
+        let animate = changed(self.id, value.clone(), self.animate, window, cx);
+        match status_icon(self.bucket, self.foreground, cx.theme()) {
+            Some(icon) if animate => icon
+                .with_size(ISZ)
+                .with_animation(
+                    value,
+                    Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                    |icon, p| {
+                        icon.opacity(p)
+                            .transform(Transformation::scale(size(0.9 + 0.1 * p, 0.9 + 0.1 * p)))
+                    },
+                )
+                .into_any_element(),
+            Some(icon) => icon.with_size(ISZ).into_any_element(),
+            None => indicator(self.bucket, self.foreground, ISZ, cx.theme()),
+        }
+    }
+}
+
+#[derive(IntoElement)]
+struct FactText {
+    id: SharedString,
+    value: SharedString,
+    child: Div,
+    animate: bool,
+    rise: bool,
+}
+
+impl RenderOnce for FactText {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if changed(self.id, self.value.clone(), self.animate, window, cx) {
+            let rise = self.rise;
+            self.child
+                .relative()
+                .with_animation(
+                    self.value,
+                    Animation::new(Duration::from_millis(if rise { 200 } else { 160 }))
+                        .with_easing(ease_out_quint()),
+                    move |d, p| d.opacity(p).top(px(if rise { 2. * (1. - p) } else { 0. })),
+                )
+                .into_any_element()
+        } else {
+            self.child.into_any_element()
+        }
+    }
 }
 
 pub(super) fn task_indicator(
@@ -199,6 +278,8 @@ pub(super) fn drag_chip(label: SharedString, cx: &App) -> Div {
 
 /// 16px icons; the rail is 32px icon buttons, 16 apart.
 const ISZ: Pixels = px(16.);
+/// Alpha of a task row's second line while the row isn't selected or shown.
+pub(super) const DETAIL_FADE: f32 = 0.7;
 
 /// A row of the sidebar's lists.
 fn sidebar_row(rail: bool, theme: &Theme) -> Div {
@@ -409,6 +490,13 @@ impl Shark {
         let at = rows.iter().position(|r| *r == self.sel).unwrap_or(0);
         let to = nav.to(at, rows.len(), 0);
         self.sel = rows[to];
+        self.follow_peek(
+            match self.sel {
+                SideRow::Task(i) => Some(self.state.tasks[i].name.clone()),
+                _ => None,
+            },
+            false,
+        );
         // Child 0 of the scrolled list is the Tasks header.
         self.sidebar_scroll.scroll_to_item(to + 1);
         cx.notify();
@@ -714,7 +802,6 @@ impl Shark {
         let focused = self.sidebar_focus.is_focused(window);
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
-        let running = self.running_chats(&w.name, cx);
         let selected = self.sel == SideRow::Task(ix);
         let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
         let bright = active || (selected && focused);
@@ -723,96 +810,226 @@ impl Shark {
         } else {
             theme.sidebar_foreground
         };
-        let attn = self.attention_of(&w.name, cx);
-        let needs = match &attn {
-            Attn::Needs(step) => Some(step.clone()),
-            _ => None,
+        let facts = self.task_facts(w, cx);
+        let detail = if bright {
+            theme.muted_foreground
+        } else {
+            theme.muted_foreground.opacity(DETAIL_FADE)
         };
         let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
+        let pr = facts.repos.into_iter().flatten().find_map(|r| r.pr());
+        let diff = facts.repos.and_then(|rs| {
+            rs.iter().try_fold((0u32, 0u32), |(a, d), r| {
+                let (add, del) = r.local.as_ref().ok()?.diff?;
+                Some((a.saturating_add(add), d.saturating_add(del)))
+            })
+        });
+        let code_label = pr
+            .map(|p| {
+                let checks = super::peek::checks_text(&p.checks);
+                format!("PR #{} {} · {checks}", p.number, p.status().label())
+            })
+            // Tracked files only; the row shows just the signed counts.
+            .or_else(|| diff.map(|(a, d)| format!("+{a} −{d} tracked")))
+            .unwrap_or_default();
+        let row_label = [
+            w.display_title().into_owned(),
+            facts.line.to_string(),
+            code_label,
+            facts.time.to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let mut code = h_flex().flex_none().gap_1().text_xs().text_color(detail);
+        if let Some(pr) = pr {
+            code = code
+                .child(pr.status().icon(theme).with_size(px(12.)))
+                .child(format!("#{}", pr.number));
+            code = match &pr.checks {
+                crate::sync::Checks::Failing(_) => code.child(
+                    Icon::new(IconName::X)
+                        .with_size(px(12.))
+                        .text_color(theme.danger_foreground),
+                ),
+                crate::sync::Checks::Pending => {
+                    code.child(Icon::new(IconName::Clock).with_size(px(12.)))
+                }
+                _ => code,
+            };
+        } else if let Some((a, d)) = diff {
+            code = code.child(format!("+{a} −{d}"));
+        }
+        let animate = !cx.reduce_motion();
+        let icon = div()
+            .size(ISZ)
+            .flex_none()
+            .child(match nth {
+                Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
+                _ => StatusIcon {
+                    id: format!("status-{}", w.name).into(),
+                    bucket: facts.bucket,
+                    foreground,
+                    animate,
+                }
+                .into_any_element(),
+            })
+            .into_any_element();
+        let title = div().truncate().child(w.display_title().into_owned());
+        let title = if self.titling.contains(&w.name) && !cx.reduce_motion() {
+            title
+                .with_animation(
+                    "title-pulse",
+                    Animation::new(Duration::from_millis(1200))
+                        .repeat()
+                        .with_easing(pulsating_between(0.5, 1.0)),
+                    |d, p| d.opacity(p),
+                )
+                .into_any_element()
+        } else {
+            title.into_any_element()
+        };
+        let title = FactText {
+            id: format!("title-{}", w.name).into(),
+            value: w.title.clone().into(),
+            child: div()
+                .flex_1()
+                .min_w_0()
+                .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                .child(title),
+            animate: animate && self.title_sources.get(&w.name) == Some(&"OpenRouter"),
+            rise: true,
+        };
+        let line = FactText {
+            id: format!("detail-{}", w.name).into(),
+            value: facts.line.clone().into(),
+            child: div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(if facts.warning {
+                    theme.warning_foreground
+                } else if facts.failed {
+                    theme.danger_foreground
+                } else {
+                    detail
+                })
+                .child(facts.line.clone()),
+            animate: animate && facts.running == 0,
+            rise: false,
+        };
         let ws = w.clone();
+        let name = w.name.clone();
         sidebar_row(rail, theme)
             .id(ix)
+            .relative()
             .test_support()
-            // One line; a task waiting on you adds what it waits on beneath, as Devin's
-            // sessions do. Section tasks indent one step, so their status icon lines up with
-            // the section's name.
-            .when(!rail && needs.is_some(), |d| d.h(px(44.)))
+            .role(gpui_kit::accesskit::Role::Button)
+            .aria_label(row_label)
+            .when(!rail, |d| d.h(px(44.)).py_0().gap_0())
             .when(section.is_some() && !rail, |d| d.ml(px(32.)))
-            .map(|d| cursor_row(d, active, selected, focused, theme))
+            .map(|d| cursor_row(d, true, selected, focused, theme))
+            .when(!bright, |d| d.bg(theme.transparent))
             .text_color(foreground)
-            // The cursor moves on press, not release: a held or dragged row is the one ringed.
+            .on_hover(
+                cx.listener(move |s, over: &bool, _, cx| s.peek_hover(&name, false, *over, cx)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.sel = SideRow::Task(ix);
+                cx.listener(move |s, _, _, cx| {
+                    s.sel = SideRow::Task(ix);
                     cx.notify();
                 }),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.open_task(ix, window, cx)))
-            // Right-click moves the cursor too, so it's clear which row the menu is for.
+            .on_click(cx.listener(move |s, _, window, cx| {
+                s.close_peek(cx);
+                s.open_task(ix, window, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                    this.sel = SideRow::Task(ix);
-                    let entries = ws_menu(this, &ws, cx);
-                    this.show_menu(e.position, entries, w, cx);
+                cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                    s.sel = SideRow::Task(ix);
+                    let entries = ws_menu(s, &ws, cx);
+                    s.close_peek(cx);
+                    s.show_menu(e.position, entries, w, cx);
                 }),
             )
             .map(|d| {
                 self.reorder_source(
                     d,
                     reorder::Item::Task(w.name.clone()),
-                    w.display_title().to_string().into(),
+                    w.display_title().into_owned().into(),
                 )
             })
-            .child(match nth {
-                Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                _ => task_indicator(w.backlog, running, &attn, foreground, ISZ, theme),
+            .when(self.peek.row.as_deref() == Some(&w.name) && !bright, |d| {
+                let hover = side_hover(theme);
+                if cx.reduce_motion() {
+                    d.bg(hover)
+                } else {
+                    // Animate a child so pointer-down state stays on the same row element.
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .rounded(if rail { px(8.) } else { theme.radius })
+                            .with_animation(
+                                "row-hover",
+                                Animation::new(Duration::from_millis(120)).with_easing(
+                                    gpui_kit::base::animation::cubic_bezier(0.25, 0.1, 0.25, 1.),
+                                ),
+                                move |d, p| d.bg(hover.opacity(p)),
+                            ),
+                    )
+                }
             })
-            .when(!rail, |d| {
-                d.child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
+            .child(if rail {
+                icon
+            } else {
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(1.))
+                    .child(
+                        h_flex().h(px(18.)).gap_2().child(icon).child(title).child(
                             div()
-                                .truncate()
-                                .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(w.display_title().to_string()),
-                        )
-                        .children(needs.map(|step| {
-                            div()
-                                .truncate()
+                                .flex_none()
                                 .text_xs()
-                                .text_color(theme.warning_foreground)
-                                .child(step)
-                        })),
-                )
+                                .text_color(if facts.running > 0 {
+                                    theme.link
+                                } else {
+                                    theme.muted_foreground
+                                })
+                                .child(facts.time),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(15.))
+                            .pl(px(24.))
+                            .gap_2()
+                            .child(line)
+                            .child(code),
+                    )
+                    .into_any_element()
             })
-            .when(rail, |d| {
-                let name: SharedString = w.display_title().to_string().into();
-                d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
-            })
-            // Holding cmd in the rail names every task beside its cmd-N key.
+            .when(
+                self.peek.task.as_deref() == Some(&w.name) && !self.peek.home,
+                |d| d.child(self.render_peek(w, window, cx)),
+            )
             .when(rail && cmd_held, |d| {
-                d.relative().child(
+                d.child(
                     div().absolute().top_0().left_full().child(deferred(
                         anchored().child(
-                            div()
+                            menu::chrome(theme)
                                 .ml_2()
-                                .h(px(28.))
                                 .px_2()
-                                .flex()
-                                .items_center()
+                                .py_1()
                                 .whitespace_nowrap()
-                                .rounded(theme.radius)
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.popover)
-                                .text_color(theme.popover_foreground)
-                                .text_sm()
-                                .shadow_md()
-                                .child(w.display_title().to_string()),
+                                .child(w.display_title().into_owned()),
                         ),
                     )),
                 )
@@ -839,8 +1056,9 @@ impl Shark {
             .filter(|t| !t.backlog && self.sidebar_task_matches(t))
             .collect();
         let needs = (tasks.iter())
-            .filter(|t| matches!(self.attention_of(&t.name, cx), Attn::Needs(_)))
+            .filter(|t| self.task_facts(t, cx).warning)
             .count();
+        let running: usize = tasks.iter().map(|t| self.running_chats(&t.name, cx)).sum();
         let warning = collapsed && needs > 0;
         let tip: SharedString = sec.name.clone().into();
         let badge = match (collapsed, needs) {
@@ -856,6 +1074,15 @@ impl Shark {
                     .child(needs.to_string())
                     .into_any_element(),
             ),
+            (true, 0) if running > 0 => Some(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.link)
+                    .child(Spinner::new().with_size(px(12.)))
+                    .child(running.to_string())
+                    .into_any_element(),
+            ),
             (true, 0) if !tasks.is_empty() => Some(
                 div()
                     .text_xs()
@@ -867,6 +1094,11 @@ impl Shark {
         sidebar_row(rail, theme)
             .relative()
             .id(("section", i))
+            .on_hover(cx.listener(|s, over: &bool, _, cx| {
+                if *over {
+                    s.close_peek(cx);
+                }
+            }))
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!(
                 "{} section, {} tasks{}",
@@ -1052,12 +1284,17 @@ impl Shark {
             .h_full()
             .flex_none()
             .map(|d| nav_actions(d, false, cx, Shark::move_sel))
+            .on_action(cx.listener(|s, _: &TogglePeek, w, cx| s.toggle_peek(w, cx)))
+            .on_action(cx.listener(|s, _: &CancelEdit, _, cx| s.close_peek(cx)))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 if !this.side_rows(false).contains(&this.sel) {
                     return;
                 }
                 match this.sel {
-                    SideRow::Task(ix) => this.open_task(ix, window, cx),
+                    SideRow::Task(ix) => {
+                        this.close_peek(cx);
+                        this.open_task(ix, window, cx);
+                    }
                     SideRow::Section(i) => this.toggle_section(i, cx),
                 }
             }))

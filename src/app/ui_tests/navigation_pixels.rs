@@ -50,12 +50,27 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     tasks: vec!["Warning".into()],
                 }];
                 s.unread.insert("Unread".into());
+                for task in &s.state.tasks {
+                    s.home.activity.insert(task.name.clone(), std::time::SystemTime::now() - Duration::from_secs(240));
+                    let mut repo = crate::sync::Repo::fresh(&task.repos[0], task);
+                    let local = repo.local.as_mut().unwrap();
+                    local.head = "fixture".into();
+                    local.branch = Some(task.branch.clone());
+                    local.diff = Some((42, 7));
+                    local.changed = 3;
+                    local.remote = Some((2, 0));
+                    if task.name == "Warning" {
+                        repo.pr = Some(Ok(crate::sync::parse_prs(r#"[{"number":142,"url":"https://github.com/o/api/pull/142","state":"OPEN","headRefOid":"fixture","baseRefName":"main","reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"tests","status":"COMPLETED","conclusion":"FAILURE"}]}]"#)));
+                    }
+                    s.attn.set_checked(&task.name, vec![repo]);
+                }
                 for ix in [0, 1, 3, 5] {
                     let ws = s.state.tasks[ix].clone();
                     let chat = cx.new(|cx| Chat::new(ws.clone(), ws.chats[0].clone(), s.state.vim, w, cx));
                     chat.update(cx, |c, cx| {
                         if ix == 5 {
                             c.busy = true;
+                            c.started = Some(Instant::now());
                         } else if ix == 3 {
                             crate::chat::ui_tests::play(c, &[r#"{"type":"control_request","request_id":"nav-question","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"nav-tool","input":{"questions":[{"header":"Color","question":"Which color?","options":[{"label":"Blue","description":"Blue"},{"label":"Red","description":"Red"}]}]}}}"#], cx);
                         }
@@ -78,11 +93,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "folded",
                 "switched",
                 "hover",
+                "peek",
             ] {
                 let checks = cx
                     .update_window(window, |_, w, cx| {
                         shark.update(cx, |s, cx| {
                             s.rail = rail;
+                            s.peek = Default::default();
+                            s.peek.task = (case == "peek").then(|| "Warning".into());
+                            s.peek.keyboard = true;
                             s.state.sections[0].collapsed = case == "folded";
                             s.active = Some(
                                 if case == "switched" {
@@ -131,7 +150,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             let focused = case == "focus" && ix == 1;
                             let fg = if selected || focused { bright } else { dim };
                             let icon = Bounds::new(
-                                point(b.left() + px(8.), b.top() + (b.size.height - px(16.)) / 2.),
+                                point(
+                                    b.left() + px(8.),
+                                    b.top()
+                                        + if rail {
+                                            (b.size.height - px(16.)) / 2.
+                                        } else {
+                                            px(6.)
+                                        },
+                                ),
                                 size(px(16.), px(16.)),
                             );
                             checks.push((
@@ -145,6 +172,16 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 },
                             ));
                             if !rail {
+                                if ix == 5 {
+                                    checks.push((
+                                        "running age",
+                                        Bounds::new(
+                                            point(b.right() - px(38.), b.top()),
+                                            size(px(30.), px(24.)),
+                                        ),
+                                        theme.link,
+                                    ));
+                                }
                                 checks.push((
                                     "workspace label",
                                     Bounds::new(
@@ -153,7 +190,26 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     ),
                                     fg,
                                 ));
-                                // Rows are one line; only a task waiting on you adds its step.
+                                // The second line's diff stat fades with the title off the cursor.
+                                // The active row drops it, so check the cursor only while focused.
+                                if (matches!(ix, 2 | 4) && !(case == "hover" && ix == 2))
+                                    || (ix == 1 && case == "focus")
+                                {
+                                    let muted = theme.muted_foreground;
+                                    checks.push((
+                                        "diff stat",
+                                        Bounds::new(
+                                            point(b.right() - px(60.), b.top() + px(24.)),
+                                            size(px(52.), px(16.)),
+                                        ),
+                                        if selected || focused {
+                                            muted
+                                        } else {
+                                            theme.sidebar.blend(muted.opacity(sidebar::DETAIL_FADE))
+                                        },
+                                    ));
+                                }
+                                // The required action occupies the fixed second line.
                                 if ix == 3 {
                                     checks.push((
                                         "needs-you step",
@@ -177,7 +233,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         checks.push((
                             "section icon",
                             Bounds::new(
-                                point(b.left() + px(8.), b.top() + (b.size.height - px(16.)) / 2.),
+                                point(
+                                    b.left() + px(8.),
+                                    b.top()
+                                        + if rail {
+                                            (b.size.height - px(16.)) / 2.
+                                        } else {
+                                            px(6.)
+                                        },
+                                ),
                                 size(px(16.), px(16.)),
                             ),
                             if case == "section-focus" { bright } else { dim },
@@ -201,6 +265,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         for id in ["toggle-sidebar", "new-workspace"] {
                             checks.push((id, w.find(id).bounds(), toolbar_ink));
                         }
+                        if case == "peek" {
+                            // The card's shadow covers nearby rail pixels; check its own surface.
+                            let card = w.find("task-peek").bounds();
+                            assert!(card.left() >= px(0.) && card.right() <= px(1000.));
+                            assert!(card.top() >= px(0.) && card.bottom() <= px(720.));
+                            checks = vec![("peek text", card, theme.popover_foreground)];
+                        }
                         checks
                     })
                     .unwrap();
@@ -218,10 +289,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         .unwrap();
                 }
                 let scale = screenshot.width() as f32 / 1000.;
+                let bg = cx.update(|cx| cx.theme().sidebar.to_rgb());
+                let bg = [bg.r, bg.g, bg.b].map(|c| (c * 255.).round() as u8);
                 for (label, bounds, color) in checks {
                     let rgb = color.to_rgb();
                     let expected = [rgb.r, rgb.g, rgb.b].map(|c| (c * 255.).round() as u8);
-                    let mut matches = 0;
+                    let (mut matches, mut ink) = (0, bg);
+                    let far = |p: [u8; 3]| (0..3).map(|c| p[c].abs_diff(bg[c]) as u32).sum::<u32>();
                     for y in (bounds.top().as_f32() * scale).ceil() as u32
                         ..(bounds.bottom().as_f32() * scale).floor() as u32
                     {
@@ -231,7 +305,17 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             let pixel = screenshot.get_pixel(x, y);
                             matches +=
                                 usize::from((0..3).all(|c| pixel[c].abs_diff(expected[c]) <= 4));
+                            if far([pixel[0], pixel[1], pixel[2]]) > far(ink) {
+                                ink = [pixel[0], pixel[1], pixel[2]];
+                            }
                         }
+                    }
+                    // Glyph edges pass through every fainter shade, so a fade shows in the inkiest pixel.
+                    if label == "diff stat" {
+                        assert!(
+                            (0..3).all(|c| ink[c].abs_diff(expected[c]) <= 6),
+                            "{mode_name}, rail={rail}, {case}: {label} ink must be {expected:?}, got {ink:?}"
+                        );
                     }
                     assert!(
                         matches > 2,

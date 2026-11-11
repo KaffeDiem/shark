@@ -14,7 +14,7 @@ const ASK: &str = "Ask how to do something in Shark";
 const RELEASES: &str = "https://github.com/KaffeDiem/shark/releases/tag/v";
 
 /// Chat IDs keep creation order even after tabs are moved or closed.
-fn agent_chain(task: &Task) -> Vec<&str> {
+pub(super) fn agent_chain(task: &Task) -> Vec<&str> {
     let mut chats: Vec<_> = task.chats.iter().chain(&task.closed).collect();
     chats.sort_by_key(|c| {
         c.id.rsplit_once('~')
@@ -138,12 +138,21 @@ fn key_button(b: Button, keys: &str, go: Go, cx: &Context<Shark>) -> Div {
 }
 
 /// What each task waits on and when it last changed. Reads transcript tails.
-fn scan(wss: Vec<Task>) -> Vec<(String, Option<&'static str>, Option<SystemTime>)> {
+fn scan(
+    wss: Vec<Task>,
+) -> Vec<(
+    String,
+    Vec<(String, Option<&'static str>)>,
+    Option<SystemTime>,
+)> {
     (wss.into_iter())
         .map(|ws| {
             (
                 ws.name.clone(),
-                crate::transcript::waiting_on_user(&ws),
+                ws.chats
+                    .iter()
+                    .map(|c| (c.id.clone(), crate::transcript::waiting_on_chat(c)))
+                    .collect(),
                 crate::transcript::last_activity(&ws),
             )
         })
@@ -173,9 +182,9 @@ pub(crate) struct Home {
     /// The prompt asks Shark instead of starting a task.
     pub(super) asking: bool,
     pub(super) ask: Option<Ask>,
-    /// Read off the UI thread when Home opens and when a turn ends, not per frame.
+    /// Per-chat waits, read off the UI thread; live running chats override these.
     pub(super) waiting: HashMap<String, &'static str>,
-    activity: HashMap<String, SystemTime>,
+    pub(super) activity: HashMap<String, SystemTime>,
     /// The latest scan that covers each task; an older scan finishing later is ignored.
     scans: HashMap<String, u64>,
     scan_no: u64,
@@ -239,7 +248,6 @@ pub(super) struct HomeRow {
     pub(super) ix: usize,
     pub(super) bucket: Bucket,
     label: Option<String>,
-    running: usize,
 }
 
 impl Shark {
@@ -283,6 +291,8 @@ impl Shark {
     }
 
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_peek(cx);
+        self.peek.restore = None; // Explicit navigation chooses Home's focus.
         self.draft_picker = None;
         self.home.on = true;
         self.zen = false;
@@ -299,6 +309,10 @@ impl Shark {
     /// Where keys go when nothing else has them: Home's list (its prompt while it has no
     /// rows), or the sidebar.
     pub(super) fn focus_fallback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The card's button went away with the card: back to the list that showed it.
+        if let Some(home) = self.peek.restore.take() {
+            return self.focus_peek_list(home, window, cx);
+        }
         match (self.home_shown(), self.home_rows(cx).is_empty()) {
             (true, true) => self.home.prompt.update(cx, |p, cx| p.focus(window, cx)),
             (true, _) => self.home.focus.focus(window, cx),
@@ -351,10 +365,12 @@ impl Shark {
                     if h.scans.get(&name) != Some(&no) {
                         continue;
                     }
-                    match waiting {
-                        Some(l) => h.waiting.insert(name.clone(), l),
-                        None => h.waiting.remove(&name),
-                    };
+                    for (chat, waiting) in waiting {
+                        match waiting {
+                            Some(l) => h.waiting.insert(chat, l),
+                            None => h.waiting.remove(&chat),
+                        };
+                    }
                     match activity {
                         Some(t) => h.activity.insert(name, t),
                         None => h.activity.remove(&name),
@@ -562,18 +578,13 @@ impl Shark {
             .map(|ix| {
                 let name = &self.state.tasks[ix].name;
                 let running = self.running_chats(name, cx);
-                let waiting = self.home.waiting.get(name).copied();
+                let waiting = self.task_waiting(&self.state.tasks[ix], cx);
                 let (bucket, label) = if self.state.tasks[ix].backlog {
                     (Bucket::Backlog, waiting.map(str::to_string))
                 } else {
                     bucket(running, &self.attention_of(name, cx), waiting)
                 };
-                HomeRow {
-                    ix,
-                    bucket,
-                    label,
-                    running,
-                }
+                HomeRow { ix, bucket, label }
             })
             .collect();
         rows.sort_by_key(|r| r.bucket);
@@ -636,6 +647,7 @@ impl Shark {
         }
         let to = nav.to(self.home_at(&rows).unwrap_or(0), rows.len(), 10);
         self.home.sel = Some(self.state.tasks[rows[to].ix].name.clone());
+        self.follow_peek(self.home.sel.clone(), true);
         // The list's children are the rows with a heading before each group's first.
         let headings = rows[..=to]
             .chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b))
@@ -662,12 +674,16 @@ impl Shark {
     pub(super) fn home_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         if let Some(r) = self.home_cursor(&rows) {
+            self.close_peek(cx);
             self.open_task(rows[r].ix, window, cx)
         }
     }
 
     /// esc: stop the answer being written, else back to the task.
     pub(super) fn home_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.task.is_some() {
+            return self.close_peek(cx);
+        }
         if !self.cancel_ask(cx) && self.active.is_some() {
             self.leave_home(window, cx);
         }
@@ -1247,6 +1263,7 @@ impl Shark {
             .track_focus(&self.home.focus)
             .track_scroll(&self.home.rows);
         let list = nav_actions(list, true, cx, Shark::home_move)
+            .on_action(cx.listener(|s, _: &TogglePeek, w, cx| s.toggle_peek(w, cx)))
             .on_action(cx.listener(|this, _: &Confirm, w, cx| this.home_confirm(w, cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, w, cx| {
                 this.enter_home(w, cx);
@@ -1353,7 +1370,11 @@ impl Shark {
                         .children(grouping.take())
                         .into_any_element(),
                 );
-                items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+                items.extend(
+                    group
+                        .iter()
+                        .map(|r| self.home_ws_row(r, focused, now, window, cx)),
+                );
                 continue;
             }
             items.push(
@@ -1399,7 +1420,11 @@ impl Shark {
                     .children(grouping.take())
                     .into_any_element(),
             );
-            items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
+            items.extend(
+                group
+                    .iter()
+                    .map(|r| self.home_ws_row(r, focused, now, window, cx)),
+            );
         }
         if !self.home.backlog_open && backlog > 0 {
             items.push(
@@ -1489,13 +1514,15 @@ impl Shark {
         r: &HomeRow,
         focused: bool,
         now: SystemTime,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
         let w = &self.state.tasks[r.ix];
         let ix = r.ix;
         let selected = self.home.sel.as_deref() == Some(w.name.as_str());
-        let repos = self.overview_repos(&w.name, cx);
+        let facts = self.task_facts(w, cx);
+        let repos = facts.repos;
         let merged = (repos.iter().copied().flatten())
             .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged));
         let when = (self.home.activity.get(&w.name))
@@ -1515,10 +1542,7 @@ impl Shark {
             1 => "1 chat".to_string(),
             n => format!("{n} chats"),
         };
-        let status = r.label.clone().or_else(|| match r.running {
-            0 | 1 => None,
-            n => Some(format!("{n} chats running")),
-        });
+        let status = Some(facts.line.clone());
         // The agents its chats use, first use first.
         let agents: Vec<_> = (w.chat_agents().into_iter())
             .filter_map(|slug| self.agent(slug))
@@ -1526,21 +1550,20 @@ impl Shark {
         let name = w.name.clone();
         let title = w.display_title().to_string();
         let detail = format!("{} · {chats} · {names}", w.branch);
-        let chain = agent_chain(w);
-        let chain = chain
-            .into_iter()
-            .map(|slug| self.agent(slug).map_or(slug, |a| a.name.as_str()))
-            .collect::<Vec<_>>()
-            .join(" → ");
-        let tip: SharedString = if chain.is_empty() {
-            detail.clone()
-        } else {
-            format!("{detail}\n{chain}")
-        }
-        .into();
         let ws = w.clone();
+        let hover_name = w.name.clone();
         h_flex()
+            .relative()
             .id(("home-ws", ix))
+            .on_hover(
+                cx.listener(move |s, over: &bool, _, cx| {
+                    s.peek_hover(&hover_name, true, *over, cx)
+                }),
+            )
+            .when(
+                self.peek.task.as_deref() == Some(&w.name) && self.peek.home,
+                |d| d.child(self.render_peek(w, window, cx)),
+            )
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!(
                 "Open task {title}{}: {detail}",
@@ -1556,7 +1579,7 @@ impl Shark {
             .rounded(theme.radius)
             .text_sm()
             .map(|d| list_cursor_row(d, selected, focused, theme))
-            .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+            // No tooltip: the hover card opens on the same hover and shows these facts.
             .on_mouse_down(MouseButton::Left, {
                 let name = name.clone();
                 cx.listener(move |this, _, _, cx| {
@@ -1564,7 +1587,10 @@ impl Shark {
                     cx.notify()
                 })
             })
-            .on_click(cx.listener(move |this, _, w, cx| this.open_task(ix, w, cx)))
+            .on_click(cx.listener(move |this, _, w, cx| {
+                this.close_peek(cx);
+                this.open_task(ix, w, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| {

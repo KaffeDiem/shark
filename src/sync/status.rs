@@ -39,6 +39,9 @@ pub struct Local {
     /// HEAD holds parent commits the base doesn't: the parent was rewritten or squash-merged,
     /// so what follows `parent_tip` must be rebased onto the base.
     pub restack: bool,
+    /// Tracked lines against the Diff view base, refreshed on every probe.
+    pub diff: Option<(u32, u32)>,
+    pub(crate) diff_base: Option<(String, String, String)>,
     pub changed: u32,
     pub conflicts: u32,
     pub op: Option<Op>,
@@ -219,7 +222,64 @@ pub fn probe(
             l.remote = Some(ab);
         }
     }
+    let base_oid = crate::git::ref_oid(wt, base);
+    if let Some(base_oid) = base_oid {
+        let merge_base = prev
+            .and_then(|p| p.diff_base.as_ref())
+            .filter(|(head, base, _)| head == &l.head && base == &base_oid)
+            .map(|(_, _, merge)| merge.clone())
+            .or_else(|| git(wt, &["merge-base", "HEAD", &base_oid]).ok());
+        if let Some(merge) = merge_base {
+            l.diff = crate::git::git_bytes(
+                wt,
+                &[
+                    "--no-optional-locks",
+                    "diff",
+                    "--no-ext-diff",
+                    "--numstat",
+                    "-z",
+                    &merge,
+                    "--",
+                ],
+            )
+            .ok()
+            .map(|out| numstat(&out));
+            l.diff_base = Some((l.head.clone(), base_oid, merge));
+        }
+    }
     base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l, allow_parent_update))
+}
+
+/// Sums `git diff --numstat -z` (`added<TAB>deleted<TAB>path<NUL>`, locale-independent). A rename
+/// has an empty path and its two names as the next NUL fields; binary files count `-` as zero.
+fn numstat(out: &[u8]) -> (u32, u32) {
+    let mut counts = (0u32, 0u32);
+    let mut fields = out.split(|b| *b == 0);
+    while let Some(record) = fields.next() {
+        let mut cols = record.splitn(3, |b| *b == b'\t');
+        let mut n = || {
+            cols.next()
+                .and_then(|c| std::str::from_utf8(c).ok()?.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let (added, deleted) = (n(), n());
+        counts = (
+            counts.0.saturating_add(added),
+            counts.1.saturating_add(deleted),
+        );
+        if cols.next().is_some_and(|path| path.is_empty()) {
+            fields.nth(1);
+        }
+    }
+    counts
+}
+
+pub fn compact_age(d: std::time::Duration) -> String {
+    if d.as_secs() < 60 {
+        "now".into()
+    } else {
+        ago(d).trim_end_matches(" ago").into()
+    }
 }
 
 /// The trunk the last probe found, else the repo's default branch.
@@ -1190,6 +1250,21 @@ mod tests {
         ] {
             assert!(kind.needs_idle(), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn numstat_and_compact_age() {
+        assert_eq!(numstat(b"10\t3\ta\0\xff\x01\x02"), (10, 3));
+        assert_eq!(numstat(b"2\t0\tx\0-\t-\tbin\0"), (2, 0));
+        assert_eq!(numstat(b"1\t1\ttab\tname\n\0"), (1, 1));
+        // A rename's names are NUL fields of their own, even when they look like records.
+        assert_eq!(
+            numstat(b"4\t1\t\x005\t6\tfoo\x007\t8\tbar\x002\t0\tz\0"),
+            (6, 1)
+        );
+        assert_eq!(numstat(b""), (0, 0));
+        assert_eq!(compact_age(std::time::Duration::from_secs(59)), "now");
+        assert_eq!(compact_age(std::time::Duration::from_secs(240)), "4m");
     }
 
     #[test]

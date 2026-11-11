@@ -47,7 +47,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
-use review::{NOTES_END, info_notes, review_title, split_notes};
+pub(crate) use review::split_notes;
+use review::{NOTES_END, info_notes, review_title};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
@@ -141,6 +142,7 @@ pub struct Chat {
     hopping: Option<gpui_kit::Task<()>>,
     /// When the running turn started.
     pub started: Option<Instant>,
+    pub failed: Option<String>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
     /// Set while the agent has an attachment operation (`Task::attaching`). Its own field:
@@ -337,6 +339,7 @@ impl Chat {
             hop: 0,
             hopping: None,
             started: None,
+            failed: None,
             hold: false,
             attach_hold,
             archiving: false,
@@ -872,8 +875,29 @@ impl Chat {
             .collect()
     }
 
+    /// Only the current turn: old unfinished tools must not look like live work.
+    pub fn activity(&self) -> Option<String> {
+        if !self.busy {
+            return None;
+        }
+        for block in self.blocks.iter().rev() {
+            let call = match block {
+                Block::Tools { calls, .. } => calls.iter().rev().find(|c| c.result.is_none()),
+                Block::Tool(call) if call.result.is_none() => Some(call),
+                Block::Text { done: false, .. } => return Some("Writing".into()),
+                Block::User(_, false) | Block::Review(_, false) | Block::Info(_) => break,
+                _ => None,
+            };
+            if let Some(call) = call {
+                return Some(format!("{} {}", call.name, call.summary));
+            }
+        }
+        Some("Thinking".into())
+    }
+
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
         self.handoff_dismissed = false;
+        self.failed = None;
         // codex runs `/compact` as a request of its own, with no user message to echo.
         let echoed = !(self.active_codex() && text.trim() == "/compact");
         let queued = self.busy && echoed;
@@ -1355,6 +1379,7 @@ impl Chat {
     fn on_result(&mut self, is_error: bool, text: String, secs: u64, cx: &mut Context<Self>) {
         self.busy = false;
         if !self.replaying {
+            self.failed = is_error.then(|| text.clone());
             self.stopping = None; // a live interrupt's fallback outlives history
             self.drop_asked(cx);
         }
@@ -4224,6 +4249,54 @@ done
                 );
                 assert_eq!(c.unread.len(), 2, "only the matching message was read");
             })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn activity_survives_queued_steering(cx: &mut TestAppContext) {
+        let chat = open_chat("activity-steer", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::TextDelta("Working".into()), cx);
+                assert_eq!(c.activity().as_deref(), Some("Writing"));
+                c.sent("also check this".into(), None, cx);
+                assert_eq!(c.activity().as_deref(), Some("Writing"));
+                c.apply(
+                    Ev::ToolUse {
+                        id: "edit".into(),
+                        name: "Edit".into(),
+                        input: serde_json::json!({"file_path": "sidebar.rs"}),
+                    },
+                    cx,
+                );
+                let activity = c.activity();
+                assert!(activity.as_ref().unwrap().starts_with("Edit "));
+                c.sent("and keep this".into(), None, cx);
+                assert_eq!(c.activity(), activity);
+                c.busy = false;
+                c.sent("new turn".into(), None, cx);
+                assert_eq!(c.activity().as_deref(), Some("Thinking"));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn review_starts_a_new_activity_turn(cx: &mut TestAppContext) {
+        let chat = open_chat("activity-review", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::TextDelta("Old activity".into()), cx);
+                c.busy = false;
+                let review = Rc::new(ReviewCard {
+                    prompt: "Review this".into(),
+                    items: vec![],
+                    changes: String::new(),
+                });
+                c.sent(review.prompt.clone(), Some(review), cx);
+                assert_eq!(c.activity().as_deref(), Some("Thinking"));
+            });
         });
     }
 

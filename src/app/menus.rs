@@ -163,6 +163,11 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
         "Rename task…",
         on_task(cx, &ws.name, |s, n, w, cx| s.rename_task(n, w, cx)),
     ));
+    entries.push(menu::item(
+        IconName::RefreshCw,
+        "Regenerate title",
+        on_task(cx, &ws.name, |s, n, w, cx| s.regenerate_title(&n, w, cx)),
+    ));
     entries.push(move_submenu(this, &ws.name, cx));
     if ws.backlog || this.can_backlog(&ws.name, cx) {
         let on = !ws.backlog;
