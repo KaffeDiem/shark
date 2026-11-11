@@ -45,12 +45,10 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     ws.normalize_tabs();
                 }
                 s.state.repos = vec![Repo { name: "api".into(), path: home.join("api") }];
-                s.state.agents = vec![crate::state::Agent {
-                    slug: "projects".into(), name: "Projects".into(), icon: "bot".into(), ..Default::default()
+                s.state.sections = vec![Section {
+                    name: "Projects".into(), icon: "folder".into(), collapsed: false,
+                    tasks: vec!["Warning".into()],
                 }];
-                s.state.tasks[3].agent = Some(crate::state::AgentLink {
-                    slug: "projects".into(), name: "Projects".into(), instructions: String::new(), siblings: vec![],
-                });
                 s.unread.insert("Unread".into());
                 for ix in [0, 1, 3, 5] {
                     let ws = s.state.tasks[ix].clone();
@@ -76,7 +74,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "workspace",
                 "home",
                 "focus",
-                "agent-focus",
+                "section-focus",
                 "folded",
                 "switched",
                 "hover",
@@ -85,10 +83,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     .update_window(window, |_, w, cx| {
                         shark.update(cx, |s, cx| {
                             s.rail = rail;
-                            s.collapsed_agents.clear();
-                            if case == "folded" {
-                                s.collapsed_agents.insert("projects".into());
-                            }
+                            s.state.sections[0].collapsed = case == "folded";
                             s.active = Some(
                                 if case == "switched" {
                                     "Cursor"
@@ -98,12 +93,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 .into(),
                             );
                             s.home.on = case == "home";
-                            s.sel = if case == "agent-focus" {
-                                SideRow::Agent(0)
+                            s.sel = if case == "section-focus" {
+                                SideRow::Section(0)
                             } else {
                                 SideRow::Task(1)
                             };
-                            if matches!(case, "focus" | "agent-focus") {
+                            if matches!(case, "focus" | "section-focus") {
                                 s.sidebar_focus.focus(w, cx);
                             } else {
                                 s.home.focus.focus(w, cx);
@@ -117,10 +112,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             w.render_frame(cx);
                         }
                         let theme = cx.theme();
-                        let (dim, bright, secondary, primary, warning, unread) = (
+                        let (dim, bright, primary, warning, unread) = (
                             theme.sidebar_foreground,
                             theme.foreground,
-                            theme.muted_foreground,
                             theme.primary,
                             theme.warning_foreground,
                             theme.success_foreground,
@@ -159,14 +153,17 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     ),
                                     fg,
                                 ));
-                                checks.push((
-                                    "workspace metadata",
-                                    Bounds::new(
-                                        point(b.left() + px(32.), b.top() + px(24.)),
-                                        size(b.size.width - px(40.), px(18.)),
-                                    ),
-                                    if selected || focused { secondary } else { dim },
-                                ));
+                                // Rows are one line; only a task waiting on you adds its step.
+                                if ix == 3 {
+                                    checks.push((
+                                        "needs-you step",
+                                        Bounds::new(
+                                            point(b.left() + px(32.), b.top() + px(24.)),
+                                            size(b.size.width - px(40.), px(16.)),
+                                        ),
+                                        warning,
+                                    ));
+                                }
                             }
                             if focused {
                                 checks.push((
@@ -176,15 +173,24 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 ));
                             }
                         }
-                        let b = w.find(("agent", 0usize)).bounds();
+                        let b = w.find(("section", 0usize)).bounds();
                         checks.push((
-                            "agent icon",
+                            "section icon",
                             Bounds::new(
                                 point(b.left() + px(8.), b.top() + (b.size.height - px(16.)) / 2.),
                                 size(px(16.), px(16.)),
                             ),
-                            warning,
+                            if case == "section-focus" { bright } else { dim },
                         ));
+                        // A folded section still shows that a task inside needs you.
+                        if case == "folded" {
+                            let id = if rail {
+                                "section-rail-warning"
+                            } else {
+                                "section-needs"
+                            };
+                            checks.push(("folded warning", w.find((id, 0usize)).bounds(), warning));
+                        }
                         let toolbar_ink = if cx.theme().is_dark() {
                             cx.theme()
                                 .background
@@ -249,7 +255,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.rail = false;
                     s.home.on = true;
                     s.state.home_checklist_dismissed = true;
-                    s.home.destination = home::Destination::Home;
                     s.state.tasks[2].backlog = true;
                     s.state.tasks[1].repos.clear();
                     s.home.waiting.insert("Inactive".into(), "Plan to approve");

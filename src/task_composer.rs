@@ -2,8 +2,8 @@
 use crate::complete::{self, Item, Kind};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InlineToken, InputContent, InputEvent, MoveDown, MoveUp,
-    OutdentInline, Redo, Textarea, TextareaState, Undo,
+    Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveUp, OutdentInline, Redo,
+    Textarea, TextareaState, Undo,
 };
 use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -49,7 +49,6 @@ pub(crate) enum Event {
 struct PastedReference {
     id: u64,
     restored: String,
-    restored_content: InputContent,
     removed: String,
     text: String,
     start: usize,
@@ -251,15 +250,6 @@ impl TaskComposer {
         cx.defer_in(window, |_, window, cx| {
             cx.defer_in(window, |this, _, _| this.history_redo = None);
         });
-    }
-
-    pub(crate) fn take_failed_reference(&mut self, id: u64) -> Option<(String, InputContent)> {
-        let index = self
-            .pasted_references
-            .iter()
-            .rposition(|paste| paste.id == id)?;
-        let paste = self.pasted_references.remove(index);
-        Some((paste.removed, paste.restored_content))
     }
 
     pub(crate) fn restore_failed_reference(
@@ -516,6 +506,15 @@ impl TaskComposer {
         }
     }
 
+    /// The cursor is on a first line with nothing typed: empty, or only the picked `@agent`.
+    fn on_blank_first_line(&self, cx: &App) -> bool {
+        let input = self.input.read(cx);
+        let value = input.value();
+        let line = value.split('\n').next().unwrap_or_default();
+        let picked = (self.home_agent.as_ref()).is_some_and(|a| line.trim_end() == format!("@{a}"));
+        input.cursor() <= line.len() && (line.is_empty() || picked)
+    }
+
     fn completing_agent(&self, cx: &App) -> bool {
         self.home_agents
             && !self.asking
@@ -696,19 +695,17 @@ impl TaskComposer {
                     .is_empty();
             if own_line {
                 let start = range.start;
-                let (restored, restored_content) = self.input.update(cx, |input, cx| {
+                let restored = self.input.update(cx, |input, cx| {
                     input.replace(text.clone(), window, cx);
                     let restored = input.value().to_string();
-                    let restored_content = input.content();
                     input.set_selected_range(start..start + text.len(), cx);
                     input.replace("", window, cx);
-                    (restored, restored_content)
+                    restored
                 });
                 let id = NEXT_PASTE_ID.fetch_add(1, Ordering::Relaxed);
                 self.pasted_references.push(PastedReference {
                     id,
                     restored,
-                    restored_content,
                     removed: self.input.read(cx).value().to_string(),
                     text: text.clone(),
                     start,
@@ -928,10 +925,7 @@ impl Render for TaskComposer {
                 } else if this.completing_agent(cx) {
                     cx.emit(Event::AgentMove(-1));
                     cx.stop_propagation();
-                } else if !this.asking && {
-                    let input = this.input.read(cx);
-                    input.cursor() == 0 && input.value().split('\n').next() == Some("")
-                } {
+                } else if !this.asking && this.on_blank_first_line(cx) {
                     cx.emit(Event::Tray);
                     cx.stop_propagation();
                 }
@@ -1403,9 +1397,17 @@ mod tests {
                         input.set_selected_range(8..8, cx);
                     });
                     assert!(this.paste(&ClipboardItem::new_string(url.into()), window, cx));
-                    let (removed, _) = this.take_failed_reference(id).unwrap();
-                    assert_eq!(removed, "", "draft A failure must recover A's paste record");
-                    assert_eq!(this.pasted_references.len(), 1);
+                    this.restore_failed_reference(id, window, cx);
+                    assert_eq!(
+                        this.pasted_references.len(),
+                        1,
+                        "A's failure takes A's record"
+                    );
+                    assert_eq!(
+                        this.input.read(cx).value().as_ref(),
+                        format!("draft B\n{url}"),
+                        "A's link comes back, after B's text"
+                    );
                     assert_eq!(this.pasted_references[0].removed, "draft B\n");
                     let b_id = this.pasted_references[0].id;
                     assert_ne!(id, b_id);
@@ -1414,9 +1416,12 @@ mod tests {
                 })
             })
             .unwrap();
-        cx.run_until_parked();
-        cx.update_window(window, |_, window, cx| window.press("cmd-z", cx))
-            .unwrap();
+        // The first undo takes back A's restored link; the second, B's paste.
+        for _ in 0..2 {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.press("cmd-z", cx))
+                .unwrap();
+        }
         cx.run_until_parked();
         assert_eq!(&*undone.borrow(), &[b_id]);
     }

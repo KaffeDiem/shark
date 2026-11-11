@@ -1,5 +1,4 @@
-//! Shared, connection-scoped issue sources and attachment reads for both composers.
-use super::home::Destination;
+//! Shared, connection-scoped issue sources and attachment reads for Home's and chat composers.
 use super::task_draft::{BranchSpec, DraftRepo};
 use super::*;
 use crate::complete::Reference;
@@ -65,7 +64,6 @@ fn selected_issue_target(hit: Hit) -> Target {
 struct PastedReference {
     id: u64,
     composer_id: u64,
-    destination: Destination,
     text: String,
     repos: Vec<DraftRepo>,
     repos_edited: bool,
@@ -90,7 +88,6 @@ impl Shark {
             .iter()
             .flat_map(|t| &t.issues)
             .chain(self.home.draft.issues.iter())
-            .chain(self.home.agent_draft.issues.iter())
             .filter(|snapshot| Some(snapshot.org.as_str()) == self.linear_org_id())
         {
             if !hits.iter().any(|hit| hit.id == snapshot.id) {
@@ -100,16 +97,11 @@ impl Shark {
         hits
     }
 
-    pub(super) fn sync_reference_completion(&mut self, agent: bool, cx: &mut Context<Self>) {
+    pub(super) fn sync_reference_completion(&mut self, cx: &mut Context<Self>) {
         self.reference_completion
             .sync_epoch(self.linear_connection_epoch());
         let hits = self.reference_hits();
-        let composer = if agent {
-            &self.home.agent_composer
-        } else {
-            &self.home.composer
-        };
-        composer.update(cx, |c, cx| c.set_issues(hits.clone(), cx));
+        (self.home.composer).update(cx, |c, cx| c.set_issues(hits.clone(), cx));
         for chat in self.chats.values() {
             chat.update(cx, |chat, cx| chat.set_completion_issues(hits.clone(), cx));
         }
@@ -133,7 +125,7 @@ impl Shark {
     }
 
     pub(super) fn search_reference_issues(&mut self, query: String, cx: &mut Context<Self>) {
-        self.sync_reference_completion(self.draft_target(), cx);
+        self.sync_reference_completion(cx);
         self.reference_completion.generation += 1;
         let generation = self.reference_completion.generation;
         if !self.linear_in_use()
@@ -198,7 +190,7 @@ impl Shark {
                             .retain(|known| known.id != hit.id);
                         s.reference_completion.hits.push(hit);
                     }
-                    s.sync_reference_completion(s.draft_target(), cx);
+                    s.sync_reference_completion(cx);
                 }
             })
             .ok();
@@ -208,12 +200,11 @@ impl Shark {
 
     pub(super) fn attach_draft_reference(
         &mut self,
-        agent: bool,
         reference: Reference,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.draft(agent).starting {
+        if self.home.draft.starting {
             return;
         }
         match reference {
@@ -227,7 +218,7 @@ impl Shark {
                 else {
                     return;
                 };
-                let draft = self.draft_mut(agent);
+                let draft = &mut self.home.draft;
                 if let Some(existing) = draft
                     .repos
                     .iter_mut()
@@ -243,18 +234,10 @@ impl Shark {
                     });
                 }
                 draft.repos_edited = true;
-                self.focus_draft(agent, window, cx);
+                self.focus_draft(window, cx);
             }
             Reference::Issue(hit) => {
-                let destination = if agent {
-                    let Some(slug) = self.draft_slug(true) else {
-                        return;
-                    };
-                    Destination::Agent(slug.to_string())
-                } else {
-                    Destination::Home
-                };
-                self.draft_mut(agent).staging += 1;
+                self.home.draft.staging += 1;
                 let org = self.linear_org_id().map(str::to_string);
                 let epoch = self.linear_connection_epoch();
                 let target = selected_issue_target(hit);
@@ -265,9 +248,8 @@ impl Shark {
                 cx.spawn_in(window, async move |this, cx| {
                     let result = task.await;
                     this.update_in(cx, |s, window, cx| {
-                        if let Some(draft) = s.draft_at_mut(&destination) {
-                            draft.staging = draft.staging.saturating_sub(1);
-                        }
+                        let draft = &mut s.home.draft;
+                        draft.staging = draft.staging.saturating_sub(1);
                         if s.linear_connection_epoch() != epoch
                             || s.linear_org_id() != org.as_deref()
                         {
@@ -275,7 +257,7 @@ impl Shark {
                         }
                         match result {
                             Ok(snapshot) if Some(snapshot.org.as_str()) == org.as_deref() => {
-                                s.add_draft_issues_to(&destination, vec![snapshot], window, cx)
+                                s.add_draft_issues(vec![snapshot], window, cx)
                             }
                             Ok(_) => notify_err(
                                 window,
@@ -294,30 +276,20 @@ impl Shark {
 
     pub(super) fn paste_draft_reference(
         &mut self,
-        agent: bool,
         composer_id: u64,
         text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.draft(agent).starting || crate::complete::pasted_reference(&text).is_none() {
+        if self.home.draft.starting || crate::complete::pasted_reference(&text).is_none() {
             return;
         }
-        let destination = if agent {
-            let Some(slug) = self.draft_slug(true) else {
-                return;
-            };
-            Destination::Agent(slug.to_string())
-        } else {
-            Destination::Home
-        };
         self.reference_completion.next_paste += 1;
         let id = self.reference_completion.next_paste;
-        let draft = self.draft(agent);
+        let draft = &self.home.draft;
         let undo = PastedReference {
             id,
             composer_id,
-            destination: destination.clone(),
             text: text.clone(),
             repos: draft.repos.clone(),
             repos_edited: draft.repos_edited,
@@ -325,7 +297,7 @@ impl Shark {
             applied: None,
         };
         self.reference_completion.pastes.push(undo);
-        self.draft_mut(agent).staging += 1;
+        self.home.draft.staging += 1;
         if let Some(target) = linear::parse_issue(text.trim()) {
             let org = self.linear_org_id().map(str::to_string);
             let epoch = self.linear_connection_epoch();
@@ -350,8 +322,8 @@ impl Shark {
                     }
                     match result {
                         Ok(snapshot) if Some(snapshot.org.as_str()) == org.as_deref() => {
-                            s.track_pasted_issue(id, &destination, &snapshot);
-                            s.add_draft_issues_to(&destination, vec![snapshot], window, cx)
+                            s.track_pasted_issue(id, &snapshot);
+                            s.add_draft_issues(vec![snapshot], window, cx)
                         }
                         Ok(_) => s.fail_pasted_reference(
                             id,
@@ -446,9 +418,7 @@ impl Shark {
                             s.fail_pasted_reference(id, "The repository selection changed while looking up this pull request".into(), window, cx);
                             return;
                         }
-                        if s.home.destination == destination {
-                            s.focus_draft(agent, window, cx);
-                        }
+                        s.focus_draft(window, cx);
                         cx.notify();
                     }
                     Err(error) => s.fail_pasted_reference(id, error, window, cx),
@@ -459,13 +429,11 @@ impl Shark {
         .detach();
     }
 
-    fn track_pasted_issue(&mut self, id: u64, destination: &Destination, snapshot: &Snapshot) {
-        let Some(draft) = self
-            .draft_at_mut(destination)
-            .filter(|draft| !draft.starting)
-        else {
+    fn track_pasted_issue(&mut self, id: u64, snapshot: &Snapshot) {
+        let draft = &self.home.draft;
+        if draft.starting {
             return;
-        };
+        }
         let existing = draft
             .issues
             .iter()
@@ -474,7 +442,7 @@ impl Shark {
         let applied = match existing {
             None => snapshot.clone(),
             Some(existing) if self.reference_completion.pastes.iter().any(|paste| {
-                &paste.destination == destination && matches!(&paste.applied, Some(PastedMutation::Issue(owned)) if owned == &existing)
+                matches!(&paste.applied, Some(PastedMutation::Issue(owned)) if owned == &existing)
             }) => existing,
             Some(_) => return,
         };
@@ -482,7 +450,7 @@ impl Shark {
             .reference_completion
             .pastes
             .iter_mut()
-            .find(|paste| paste.id == id && &paste.destination == destination)
+            .find(|paste| paste.id == id)
         {
             paste.applied = Some(PastedMutation::Issue(applied));
         }
@@ -503,14 +471,11 @@ impl Shark {
         else {
             return false;
         };
-        let destination = paste.destination.clone();
         let baseline = paste.repos.clone();
-        let Some(draft) = self
-            .draft_at_mut(&destination)
-            .filter(|draft| !draft.starting)
-        else {
+        let draft = &self.home.draft;
+        if draft.starting {
             return false;
-        };
+        }
         let (repos, repos_edited) = (draft.repos.clone(), draft.repos_edited);
         let current = repos.iter().find(|item| item.repo.name == repo.name);
         let unchanged = |left: Option<&DraftRepo>, right: Option<&DraftRepo>| match (left, right) {
@@ -524,12 +489,7 @@ impl Shark {
             _ => false,
         };
         let mut earlier_applied = false;
-        for paste in self
-            .reference_completion
-            .pastes
-            .iter()
-            .filter(|paste| paste.destination == destination)
-        {
+        for paste in &self.reference_completion.pastes {
             if let Some(PastedMutation::Repo(applied)) = &paste.applied {
                 if applied.repo.name != repo.name {
                     continue;
@@ -552,7 +512,7 @@ impl Shark {
             branch: BranchSpec::Pr(pr),
             pr_label: Some(label),
         };
-        let draft = self.draft_at_mut(&destination).unwrap();
+        let draft = &mut self.home.draft;
         if let Some(existing) = draft
             .repos
             .iter_mut()
@@ -591,53 +551,9 @@ impl Shark {
             return;
         };
         let paste = self.reference_completion.pastes.remove(index);
-        let current_input = match &paste.destination {
-            Destination::Home => Some(self.home.composer.clone()),
-            Destination::Agent(slug) if self.home.agent_prompt_for.as_ref() == Some(slug) => {
-                Some(self.home.agent_composer.clone())
-            }
-            Destination::Agent(_) => None,
-        };
-        if let Some(composer) = current_input {
-            composer.update(cx, |composer, cx| {
-                composer.restore_failed_reference(paste.composer_id, window, cx)
-            });
-        } else {
-            let recovery = self.home.agent_composer.update(cx, |composer, _| {
-                composer.take_failed_reference(paste.composer_id)
-            });
-            if let Some(draft) = self.draft_at_mut(&paste.destination) {
-                let content = draft
-                    .content
-                    .clone()
-                    .unwrap_or_else(|| draft.text.clone().into());
-                let restored = match recovery {
-                    Some((removed, restored)) if content.text().as_ref() == removed => restored,
-                    _ if content.text().contains(paste.text.trim()) => content,
-                    _ => {
-                        let text = format!(
-                            "{}{}{}",
-                            content.text(),
-                            if content.text().is_empty() || content.text().ends_with('\n') {
-                                ""
-                            } else {
-                                "\n"
-                            },
-                            paste.text
-                        );
-                        let mut restored = gpui_kit::component::input::InputContent::new(text);
-                        for span in content.tokens() {
-                            restored = restored
-                                .with_token(span.range(), span.token().clone())
-                                .expect("appending a new line preserves existing token ranges");
-                        }
-                        restored
-                    }
-                };
-                draft.text = restored.text().to_string();
-                draft.content = Some(restored);
-            }
-        }
+        self.home.composer.update(cx, |composer, cx| {
+            composer.restore_failed_reference(paste.composer_id, window, cx)
+        });
         notify_err(
             window,
             cx,
@@ -656,44 +572,31 @@ impl Shark {
             return false;
         };
         paste.pending = false;
-        let destination = paste.destination.clone();
-        if let Some(draft) = self.draft_at_mut(&destination) {
-            draft.staging = draft.staging.saturating_sub(1);
-        }
+        let draft = &mut self.home.draft;
+        draft.staging = draft.staging.saturating_sub(1);
         true
     }
 
     pub(super) fn undo_draft_reference(
         &mut self,
-        agent: bool,
         composer_id: u64,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let destination = if agent {
-            let Some(slug) = self.draft_slug(true) else {
-                return;
-            };
-            Destination::Agent(slug.to_string())
-        } else {
-            Destination::Home
-        };
-        let Some(index) = self.reference_completion.pastes.iter().rposition(|paste| {
-            paste.destination == destination && paste.composer_id == composer_id
-        }) else {
+        let Some(index) = (self.reference_completion.pastes.iter())
+            .rposition(|paste| paste.composer_id == composer_id)
+        else {
             return;
         };
         let before = self.reference_completion.pastes.remove(index);
         let shared_issue = match &before.applied {
             Some(PastedMutation::Issue(issue)) => self.reference_completion.pastes.iter().any(|paste| {
-                paste.destination == destination && matches!(&paste.applied, Some(PastedMutation::Issue(owned)) if owned.id == issue.id && owned.org == issue.org)
+                matches!(&paste.applied, Some(PastedMutation::Issue(owned)) if owned.id == issue.id && owned.org == issue.org)
             }),
             _ => false,
         };
-        if let Some(draft) = self
-            .draft_at_mut(&destination)
-            .filter(|draft| !draft.starting)
-        {
+        let draft = &mut self.home.draft;
+        if !draft.starting {
             if before.pending {
                 draft.staging = draft.staging.saturating_sub(1);
             }
@@ -738,7 +641,7 @@ impl Shark {
                 None => {}
             }
         }
-        self.refresh_draft_sources(agent, cx);
+        self.refresh_draft_sources(cx);
         cx.notify();
     }
 
@@ -828,73 +731,8 @@ mod tests {
 mod ui_tests {
     use super::*;
     use crate::app::ui_tests::{UI_LOCK, boot};
-    use crate::state::Agent;
     use core::prelude::v1::test;
-    use gpui_kit::test::TestWindowExt as _;
 
-    #[gpui_kit::test]
-    fn same_url_failures_restore_their_original_agent_drafts(cx: &mut TestAppContext) {
-        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::state::TEST_HOME
-            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
-        let (window, shark) = boot(
-            cx,
-            State {
-                agents: vec![
-                    Agent {
-                        slug: "first".into(),
-                        name: "First".into(),
-                        ..Default::default()
-                    },
-                    Agent {
-                        slug: "second".into(),
-                        name: "Second".into(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
-            WindowOptions::default(),
-        );
-        let url = "https://linear.app/acme/issue/SHA-42/test";
-        let mut attempts = Vec::new();
-        for (slug, body) in [("first", "first body\n"), ("second", "second body\n")] {
-            cx.update_window(window, |_, window, cx| {
-                shark.update(cx, |s, cx| s.prefill_agent_task(slug, window, cx));
-                window.input(body, cx);
-                cx.write_to_clipboard(ClipboardItem::new_string(url.into()));
-                window.press("cmd-v", cx);
-            })
-            .unwrap();
-            attempts.push(cx.read(|cx| {
-                shark
-                    .read(cx)
-                    .reference_completion
-                    .pastes
-                    .last()
-                    .unwrap()
-                    .id
-            }));
-        }
-        cx.update_window(window, |_, window, cx| {
-            shark.update(cx, |s, cx| {
-                for id in attempts {
-                    s.fail_pasted_reference(id, "offline failure".into(), window, cx);
-                }
-                assert_eq!(
-                    s.home.agent_drafts["first"].text,
-                    format!("first body\n{url}")
-                );
-                assert_eq!(
-                    s.home.agent_prompt.read(cx).value().as_ref(),
-                    format!("second body\n{url}")
-                );
-                assert!(s.reference_completion.pastes.is_empty());
-            });
-        })
-        .unwrap();
-        cx.run_until_parked();
-    }
     fn pr_completion_race(cx: &mut TestAppContext, case: u8) {
         let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::state::TEST_HOME
@@ -905,7 +743,7 @@ mod ui_tests {
             s.home.draft.repos = vec![DraftRepo { repo: repo.clone(), branch: BranchSpec::Existing("main".into()), pr_label: None }];
             for id in 1..=2 {
                 s.reference_completion.pastes.push(PastedReference {
-                    id, composer_id: id, destination: Destination::Home,
+                    id, composer_id: id,
                     text: format!("https://github.com/o/api/pull/{id}"),
                     repos: s.home.draft.repos.clone(), repos_edited: false,
                     pending: false, applied: None,
@@ -928,9 +766,9 @@ mod ui_tests {
                 _ => {
                     assert!(apply(s, 1));
                     assert!(apply(s, 2));
-                    s.undo_draft_reference(false, 2, window, cx);
+                    s.undo_draft_reference(2, window, cx);
                     assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::Pr(pr) if pr.number == 1), "undo B must restore A at apply time");
-                    s.undo_draft_reference(false, 1, window, cx);
+                    s.undo_draft_reference(1, window, cx);
                     assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::Existing(branch) if branch == "main"));
                     assert!(!s.home.draft.repos_edited);
                 }
@@ -972,24 +810,11 @@ mod ui_tests {
                     s.reference_completion.pastes.push(PastedReference {
                         id,
                         composer_id: id,
-                        destination: Destination::Home,
                         text: "https://linear.app/acme/issue/ENG-1".into(),
                         repos: vec![],
                         repos_edited: false,
                         pending: false,
                         applied: None,
-                    });
-                }
-                if preexisting {
-                    s.reference_completion.pastes.push(PastedReference {
-                        id: 3,
-                        composer_id: 3,
-                        destination: Destination::Agent("other".into()),
-                        text: String::new(),
-                        repos: vec![],
-                        repos_edited: false,
-                        pending: false,
-                        applied: Some(PastedMutation::Issue(issue.clone())),
                     });
                 }
                 let order = if reverse { [2, 1] } else { [1, 2] };
@@ -998,26 +823,22 @@ mod ui_tests {
                     if index == 1 {
                         fetched.title = "newly fetched title".into();
                     }
-                    s.track_pasted_issue(id, &Destination::Home, &fetched);
-                    s.add_draft_issues_to(&Destination::Home, vec![fetched], window, cx);
+                    s.track_pasted_issue(id, &fetched);
+                    s.add_draft_issues(vec![fetched], window, cx);
                 }
                 if preexisting {
                     assert!(
-                        s.reference_completion
-                            .pastes
-                            .iter()
-                            .filter(|paste| paste.destination == Destination::Home)
-                            .all(|paste| paste.applied.is_none()),
-                        "an owner in another draft must not claim a preexisting attachment"
+                        (s.reference_completion.pastes.iter()).all(|paste| paste.applied.is_none()),
+                        "a paste must not claim an attachment that was there before it"
                     );
                 }
-                s.undo_draft_reference(false, 2, window, cx);
+                s.undo_draft_reference(2, window, cx);
                 assert_eq!(
                     s.home.draft.issues,
                     vec![issue.clone()],
                     "undo B must preserve A's attachment and its actual stored snapshot"
                 );
-                s.undo_draft_reference(false, 1, window, cx);
+                s.undo_draft_reference(1, window, cx);
                 assert_eq!(
                     s.home.draft.issues,
                     if preexisting { vec![issue] } else { vec![] },

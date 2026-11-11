@@ -1951,8 +1951,8 @@ async fn starting_from_an_issue_combines_agent_repos_and_typed_notes(cx: &mut Te
     on(cx, &|s, w, cx| {
         s.prefill_agent_task("designer", w, cx);
         s.home
-            .agent_prompt
-            .update(cx, |p, cx| p.set_value("Keep this draft", w, cx));
+            .prompt
+            .update(cx, |p, cx| p.insert("Keep this draft", w, cx));
         s.start_from_issue(w, cx);
     });
     type_in(cx, window, "ENG-7");
@@ -1961,30 +1961,26 @@ async fn starting_from_an_issue_combines_agent_repos_and_typed_notes(cx: &mut Te
     cx.read(|cx| {
         let s = shark.read(cx);
         assert!(s.state.tasks.is_empty());
-        assert_eq!(s.home.agent_draft.repos[0].repo.name, "web");
-        assert_eq!(s.home.agent_prompt.read(cx).value(), "Keep this draft");
+        assert_eq!(s.home.draft.repos[0].repo.name, "web");
+        assert_eq!(s.home.prompt.read(cx).value(), "@designer Keep this draft");
     });
     press_in(window)(cx, &["enter"]);
     until(cx, window, |_, cx| shark.read(cx).state.tasks.len() == 1).await;
     let task = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
-    assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
-    assert_eq!(
-        task.agent.as_ref().unwrap().instructions,
-        "Keep spacing consistent"
-    );
+    assert_eq!(task.chats[0].agent.as_deref(), Some("designer"));
+    assert_eq!(task.agents[0].instructions, "Keep spacing consistent");
     assert_eq!(task.chats[0].model.as_deref(), Some("opus"));
     assert_eq!(task.chats[0].effort.as_deref(), Some("low"));
     assert_eq!(task.repos.len(), 1);
     assert_eq!(task.repos[0].name, "web");
     assert!(!task.chats[0].plan);
     assert_eq!(ids(&task), ["uuid-7"]);
-    for doc in ["AGENTS.md", "CLAUDE.md"] {
-        assert!(
-            fs::read_to_string(task.dir().join(doc))
-                .unwrap()
-                .contains("Keep spacing consistent")
-        );
-    }
+    // The agent's instructions reach its chat's system prompt, not the shared root docs.
+    assert!(
+        git::agent_prompt(&task, &task.chats[0])
+            .unwrap()
+            .contains("Keep spacing consistent")
+    );
     for folder in [".agents/skills", ".claude/skills"] {
         assert_eq!(
             fs::canonicalize(task.dir().join(folder).join("spacing")).unwrap(),
@@ -1997,7 +1993,7 @@ async fn starting_from_an_issue_combines_agent_repos_and_typed_notes(cx: &mut Te
         sent.ends_with("Keep this draft"),
         "typed notes are the request: {sent}"
     );
-    cx.read(|cx| assert_eq!(shark.read(cx).home.agent_prompt.read(cx).value(), ""));
+    cx.read(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), ""));
 }
 
 /// A refused delete leaves the snapshots; a finished one takes them. And in the end: Linear only

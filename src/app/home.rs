@@ -1,9 +1,7 @@
-//! Home starts tasks and lists every task; agent pages do both for one agent. Neither leaves
-//! the open task.
+//! Home starts tasks and lists every task. It shows over the open task without leaving it.
 use super::ask::Ask;
 use super::task_draft::TaskDraft;
 use super::*;
-use crate::state::AgentLink;
 use crate::state::Appearance;
 use crate::sync::PrState;
 use crate::task_composer::{Event as ComposerEvent, TaskComposer};
@@ -52,12 +50,6 @@ mod handoff_chain_tests {
         };
         assert_eq!(agent_chain(&task), vec!["designer", "planner", "coder"]);
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Destination {
-    Home,
-    Agent(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,7 +153,6 @@ fn scan(wss: Vec<Task>) -> Vec<(String, Option<&'static str>, Option<SystemTime>
 pub(crate) struct Home {
     /// Shown over the open task. With none open, Home shows anyway.
     pub(super) on: bool,
-    pub(super) destination: Destination,
     pub(super) group_tasks: bool,
     pub(super) backlog_open: bool,
     pub(super) repo_filter: Option<RepoFilter>,
@@ -177,15 +168,6 @@ pub(crate) struct Home {
     pub(super) tray_stop: Option<super::draft_view::DraftStop>,
     pub(super) tray_shown: usize,
     pub(super) footer_density: u8,
-    /// The agent page's task composer, holding `agent_prompt_for`'s draft; other agents'
-    /// drafts wait in `agent_drafts`.
-    pub(super) agent_prompt: Entity<TextareaState>,
-    pub(super) agent_composer: Entity<TaskComposer>,
-    pub(super) agent_draft: TaskDraft,
-    pub(super) agent_prompt_for: Option<String>,
-    pub(super) agent_drafts: HashMap<String, TaskDraft>,
-    /// The agent page's header fields.
-    pub(super) agent_header: Option<Entity<super::agent_settings::AgentHeader>>,
     /// The highlighted `@agent` completion under Home's prompt.
     pub(super) mention: usize,
     /// The prompt asks Shark instead of starting a task.
@@ -209,23 +191,15 @@ impl Home {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Shark>) -> Self {
         let composer = cx.new(|cx| TaskComposer::new(window, cx));
         composer.update(cx, |c, cx| c.set_sources(vec![], vec![], true, false, cx));
-        let agent_composer = cx.new(|cx| TaskComposer::new(window, cx));
         let prompt = composer.read(cx).input.clone();
-        let agent_prompt = agent_composer.read(cx).input.clone();
         prompt.update(cx, |p, cx| p.set_placeholder(BUILD, window, cx));
         let _subs = vec![
             cx.subscribe_in(&composer, window, |s, _, ev: &ComposerEvent, w, cx| {
-                s.draft_composer_event(false, ev, w, cx)
+                s.draft_composer_event(ev, w, cx)
             }),
-            cx.subscribe_in(
-                &agent_composer,
-                window,
-                |s, _, ev: &ComposerEvent, w, cx| s.draft_composer_event(true, ev, w, cx),
-            ),
         ];
         Home {
             on: false,
-            destination: Destination::Home,
             group_tasks: false,
             backlog_open: false,
             repo_filter: None,
@@ -239,12 +213,6 @@ impl Home {
             tray_stop: None,
             tray_shown: usize::MAX,
             footer_density: 0,
-            agent_prompt,
-            agent_composer,
-            agent_draft: TaskDraft::default(),
-            agent_prompt_for: None,
-            agent_drafts: HashMap::new(),
-            agent_header: None,
             mention: 0,
             asking: false,
             ask: None,
@@ -263,9 +231,6 @@ impl Home {
         self.focus.is_focused(window)
             || self.tray_focus.is_focused(window)
             || self.prompt.read(cx).focus_handle(cx).is_focused(window)
-            || (self.agent_prompt.read(cx))
-                .focus_handle(cx)
-                .is_focused(window)
     }
 }
 
@@ -278,44 +243,21 @@ pub(super) struct HomeRow {
 }
 
 impl Shark {
-    /// cmd-n opens the selected agent’s prompt, otherwise an empty task.
+    /// cmd-n: an empty task.
     pub(super) fn new_empty_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home_shown()
-            && let Destination::Agent(slug) = self.home.destination.clone()
-        {
-            self.prefill_agent_task(&slug, window, cx);
-        } else {
-            self.new_task(None, None, None, window, cx)
-        }
+        self.new_task(None, None, None, window, cx)
     }
 
     /// Overview commands add draft context; an open task keeps the standalone branch dialog.
     pub(super) fn new_task_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.home_shown() {
-            if self.home.destination == Destination::Home && self.home.asking {
+            if self.home.asking {
                 self.toggle_ask_mode(window, cx);
             }
             self.change_draft_branch(window, cx);
         } else {
             self.new_task_from_repos(self.state.last_repos.clone(), None, window, cx);
         }
-    }
-
-    /// Capture the visible choice before a task dialog or asynchronous lookup opens.
-    pub(super) fn selected_task_agent(&self, cx: &App) -> Option<AgentLink> {
-        if !self.home_shown() {
-            return None;
-        }
-        let slug = match &self.home.destination {
-            Destination::Agent(slug) => slug.clone(),
-            Destination::Home if !self.home.asking => {
-                let text = self.home.prompt.read(cx).value();
-                agent_prompt(text.trim(), &self.state.agents).0?.to_string()
-            }
-            _ => return None,
-        };
-        let agent = self.state.agents.iter().find(|a| a.slug == slug)?;
-        Some(AgentLink::from(agent))
     }
 
     /// Home is on screen: asked for, or nothing else to show.
@@ -325,7 +267,7 @@ impl Shark {
 
     /// cmd-0: Home, or back to the open task.
     pub(super) fn toggle_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home_shown() && self.home.destination == Destination::Home {
+        if self.home_shown() {
             self.leave_home(window, cx);
         } else {
             self.enter_home(window, cx);
@@ -343,7 +285,6 @@ impl Shark {
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_picker = None;
         self.home.on = true;
-        self.home.destination = Destination::Home;
         self.zen = false;
         self.remember_open();
         self.refresh_home(None, cx);
@@ -359,9 +300,7 @@ impl Shark {
     /// rows), or the sidebar.
     pub(super) fn focus_fallback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match (self.home_shown(), self.home_rows(cx).is_empty()) {
-            (true, true) if self.home.destination == Destination::Home => {
-                self.home.prompt.update(cx, |p, cx| p.focus(window, cx))
-            }
+            (true, true) => self.home.prompt.update(cx, |p, cx| p.focus(window, cx)),
             (true, _) => self.home.focus.focus(window, cx),
             // A closed dialog gives the focus back to a line input that left with the edit.
             _ if self.active.is_some() && matches!(self.tab, Tab::Feature(_)) => {
@@ -460,12 +399,7 @@ impl Shark {
     }
 
     pub(super) fn home_hidden(&self, cx: &App) -> (usize, usize) {
-        let Some(filter) = self
-            .home
-            .repo_filter
-            .as_ref()
-            .filter(|_| self.home.destination == Destination::Home)
-        else {
+        let Some(filter) = self.home.repo_filter.as_ref() else {
             return (0, 0);
         };
         self.state
@@ -574,18 +508,9 @@ impl Shark {
         );
     }
 
+    /// On Home's list under its repo filter.
     pub(super) fn home_task_matches(&self, task: &Task) -> bool {
-        match &self.home.destination {
-            Destination::Agent(slug) if self.home_shown() => {
-                task.agent.as_ref().is_some_and(|a| &a.slug == slug)
-            }
-            Destination::Home => self
-                .home
-                .repo_filter
-                .as_ref()
-                .is_none_or(|f| repo_matches(task, f)),
-            _ => true,
-        }
+        (self.home.repo_filter.as_ref()).is_none_or(|f| repo_matches(task, f))
     }
 
     pub(super) fn toggle_backlog_open(&mut self, cx: &mut Context<Self>) {
@@ -652,12 +577,13 @@ impl Shark {
             })
             .collect();
         rows.sort_by_key(|r| r.bucket);
-        if self.home.destination == Destination::Home && self.home.group_tasks {
+        if self.home.group_tasks {
+            // Sections, their tasks and then Ungrouped, in the sidebar's order.
+            let order = self.ws_order(true);
             rows.sort_by_key(|r| {
                 (
                     r.bucket == Bucket::Backlog,
-                    self.plain_task_group(r)
-                        .unwrap_or(self.state.sections.len()),
+                    order.iter().position(|&ix| ix == r.ix),
                 )
             });
         }
@@ -665,15 +591,13 @@ impl Shark {
     }
 
     fn plain_task_group(&self, row: &HomeRow) -> Option<usize> {
-        self.state.sections.iter().position(|section| {
-            section.agent.is_none() && section.tasks.contains(&self.state.tasks[row.ix].name)
-        })
+        self.section_of(&self.state.tasks[row.ix].name)
     }
 
     fn home_group_key(&self, row: &HomeRow) -> (Option<usize>, Option<Bucket>) {
         if row.bucket == Bucket::Backlog {
             (None, Some(Bucket::Backlog))
-        } else if self.home.destination == Destination::Home && self.home.group_tasks {
+        } else if self.home.group_tasks {
             (self.plain_task_group(row), None)
         } else {
             (None, Some(row.bucket))
@@ -684,10 +608,10 @@ impl Shark {
         if row.bucket == Bucket::Backlog {
             return Bucket::Backlog.title().into();
         }
-        if self.home.destination == Destination::Home && self.home.group_tasks {
+        if self.home.group_tasks {
             self.plain_task_group(row)
                 .map(|i| self.state.sections[i].name.clone())
-                .unwrap_or_else(|| "Ungrouped".into())
+                .unwrap_or_else(|| super::sidebar::UNGROUPED.into())
         } else {
             row.bucket.title().into()
         }
@@ -744,12 +668,8 @@ impl Shark {
 
     /// esc: stop the answer being written, else back to the task.
     pub(super) fn home_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home.destination != Destination::Home || !self.cancel_ask(cx) {
-            if self.active.is_some() {
-                self.leave_home(window, cx);
-            } else if self.home.destination != Destination::Home {
-                self.enter_home(window, cx);
-            }
+        if !self.cancel_ask(cx) && self.active.is_some() {
+            self.leave_home(window, cx);
         }
     }
 
@@ -782,19 +702,20 @@ impl Shark {
         self.submit_task_draft(window, cx);
     }
 
-    /// The agent's page, typing into its task composer.
+    /// Home, typing into its composer with agent `slug` picked.
     pub(super) fn prefill_agent_task(
         &mut self,
         slug: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_agent(slug, window, cx);
-        if self.home.destination == Destination::Agent(slug.into()) {
-            self.home
-                .agent_prompt
-                .update(cx, |p, cx| p.focus(window, cx));
+        // Agents are chat presets: a task for one starts on Home, its first chat on the agent.
+        if self.agent(slug).is_none() {
+            return;
         }
+        self.enter_home(window, cx);
+        self.set_home_agent(Some(slug), window, cx);
+        self.home.prompt.update(cx, |p, cx| p.focus(window, cx));
     }
 
     pub(super) fn set_home_agent(
@@ -829,7 +750,7 @@ impl Shark {
             p.set_selected_range(end..end, cx);
             p.focus(w, cx);
         });
-        self.draft_composer_event(false, &ComposerEvent::Change, w, cx);
+        self.draft_composer_event(&ComposerEvent::Change, w, cx);
         cx.notify();
     }
 
@@ -846,13 +767,22 @@ impl Shark {
                 .iter()
                 .map(|agent| super::agent_icon_view::command(agent)),
         );
+        rows.push(CommandItem::new().label("New agent…").icon(IconName::Plus));
         open_menu(
             cx.entity().downgrade(),
             "Start the task with an agent…",
             rows,
             selected,
-            move |s, i, w, cx| {
-                s.set_home_agent(i.checked_sub(1).map(|i| agents[i].slug.as_str()), w, cx);
+            move |s, i, w, cx| match i.checked_sub(1) {
+                Some(i) if i == agents.len() => {
+                    let then = Rc::new(
+                        |s: &mut Shark, slug: &str, w: &mut Window, cx: &mut Context<Shark>| {
+                            s.set_home_agent(Some(slug), w, cx)
+                        },
+                    );
+                    s.agent_dialog(None, Some(then), w, cx)
+                }
+                i => s.set_home_agent(i.map(|i| agents[i].slug.as_str()), w, cx),
             },
             window,
             cx,
@@ -904,7 +834,7 @@ impl Shark {
             p.set_selected_range(end..end, cx);
             p.focus(window, cx);
         });
-        self.draft_composer_event(false, &ComposerEvent::Change, window, cx);
+        self.draft_composer_event(&ComposerEvent::Change, window, cx);
         cx.notify();
     }
 
@@ -937,16 +867,6 @@ impl Shark {
             };
         if used {
             prompt.update(cx, |p, cx| p.set_value("", window, cx));
-        }
-        let Some(slug) = agent else { return };
-        let first = first.unwrap_or_default();
-        if self.home.agent_prompt_for.as_deref() == Some(slug) {
-            let composer = self.home.agent_prompt.clone();
-            if composer.read(cx).value().trim() == first {
-                composer.update(cx, |p, cx| p.set_value("", window, cx));
-            }
-        } else if self.home.agent_drafts.get(slug).map(|d| d.text.trim()) == Some(first) {
-            self.home.agent_drafts.remove(slug);
         }
     }
 
@@ -1018,7 +938,7 @@ impl Shark {
         let theme = cx.theme();
         let modifiers = window.modifiers();
         let cmd_held = modifiers.platform && modifiers.number_of_modifiers() == 1;
-        let selected = self.home_shown() && self.home.destination == Destination::Home;
+        let selected = self.home_shown();
         side_row(theme)
             .text_color(theme.sidebar_foreground)
             .id("home-row")
@@ -1044,10 +964,6 @@ impl Shark {
     }
 
     pub(super) fn render_home(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        match &self.home.destination {
-            Destination::Agent(slug) => return self.render_agent_page(slug, window, cx),
-            Destination::Home => {}
-        }
         let prompt = self.render_prompt(window, cx);
         let ask = self.render_ask(cx);
         // Shrinks with the window; its fix commands truncate.
@@ -1131,12 +1047,11 @@ impl Shark {
             .sections
             .iter()
             .enumerate()
-            .filter(|(_, section)| section.agent.is_none())
             .map(|(i, section)| (i, section.name.clone(), section.icon.clone()))
             .collect();
         let mut rows = vec![
             CommandItem::new()
-                .label("New task group…")
+                .label("New section…")
                 .icon(IconName::FolderPlus),
         ];
         rows.extend(groups.iter().map(|(_, name, icon)| {
@@ -1146,7 +1061,7 @@ impl Shark {
         }));
         open_menu(
             cx.entity().downgrade(),
-            "Task groups",
+            "Sections",
             rows,
             0,
             move |s, i, w, cx| {
@@ -1170,7 +1085,7 @@ impl Shark {
             } else {
                 "What do you want to build?"
             }))
-            .child(self.render_task_composer(false, window, cx))
+            .child(self.render_task_composer(window, cx))
             .into_any_element()
     }
 
@@ -1315,7 +1230,7 @@ impl Shark {
             .into_any_element()
     }
 
-    /// The task list, grouped by what each task needs; Home can group by task group instead.
+    /// The task list, grouped by what each task needs; Home can group by section instead.
     pub(super) fn render_ws_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.home_rows(cx);
         let backlog = self
@@ -1326,7 +1241,6 @@ impl Shark {
             .count();
         let theme = cx.theme();
         let focused = self.home.focus.is_focused(window);
-        let on_home = self.home.destination == Destination::Home;
         let list = v_flex()
             .id("home-list")
             .key_context("Home")
@@ -1335,23 +1249,18 @@ impl Shark {
         let list = nav_actions(list, true, cx, Shark::home_move)
             .on_action(cx.listener(|this, _: &Confirm, w, cx| this.home_confirm(w, cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, w, cx| {
-                match this.home.destination.clone() {
-                    Destination::Agent(slug) => this.prefill_agent_task(&slug, w, cx),
-                    Destination::Home => {
-                        this.enter_home(w, cx);
-                        this.home.prompt.update(cx, |p, cx| p.focus(w, cx))
-                    }
-                }
+                this.enter_home(w, cx);
+                this.home.prompt.update(cx, |p, cx| p.focus(w, cx))
             }));
         let now = SystemTime::now();
         let mut items: Vec<AnyElement> = vec![];
-        let grouping = on_home.then(|| {
+        let grouping = Some(
             Button::new("task-grouping")
                 .ghost()
                 .xsmall()
                 .icon(IconName::ListFilter)
                 .label(if self.home.group_tasks {
-                    "Task group"
+                    "Section"
                 } else {
                     "Status"
                 })
@@ -1365,10 +1274,10 @@ impl Shark {
                                 .label("Status")
                                 .checked(!s.home.group_tasks),
                             CommandItem::new()
-                                .label("Task group")
+                                .label("Section")
                                 .checked(s.home.group_tasks),
                             CommandItem::new()
-                                .label("Task groups…")
+                                .label("Sections…")
                                 .icon(IconName::FolderPlus),
                         ],
                         usize::from(s.home.group_tasks),
@@ -1382,8 +1291,8 @@ impl Shark {
                         w,
                         cx,
                     );
-                }))
-        });
+                })),
+        );
         let mut grouping = grouping.map(|b| {
             h_flex().gap_2().child(b).child(
                 Button::new("repo-filter")
@@ -1414,7 +1323,6 @@ impl Shark {
         });
         if rows.is_empty()
             && backlog == 0
-            && on_home
             && let Some(filter) = &self.home.repo_filter
         {
             return list
@@ -1435,18 +1343,7 @@ impl Shark {
                 .into_any_element();
         }
         if rows.is_empty() && backlog == 0 {
-            return match on_home {
-                true => self.render_empty(list, cx),
-                false => list
-                    .child(super::agent_settings::empty_state(
-                        theme,
-                        "agent-empty-tasks",
-                        IconName::Inbox,
-                        "No tasks yet",
-                        "Describe the work above and press enter. Each task gets its own branch and chat.",
-                    ))
-                    .into_any_element(),
-            };
+            return self.render_empty(list, cx);
         }
 
         for group in rows.chunk_by(|a, b| self.home_group_key(a) == self.home_group_key(b)) {
@@ -1482,13 +1379,13 @@ impl Shark {
                             .child(group.len().to_string()),
                     )
                     .child(div().flex_1())
-                    .when(on_home && self.home.group_tasks, |d| {
+                    .when(self.home.group_tasks, |d| {
                         if let Some(i) = self.plain_task_group(&group[0]) {
                             d.child(
                                 Button::new(("task-group-actions", i))
                                     .ghost()
                                     .xsmall()
-                                    .label("Group actions…")
+                                    .label("Section actions…")
                                     .on_click(cx.listener(move |s, _, w, cx| {
                                         let entries = super::sidebar::section_menu(s, i, cx);
                                         s.show_menu(w.mouse_position(), entries, w, cx);
@@ -1622,12 +1519,10 @@ impl Shark {
             0 | 1 => None,
             n => Some(format!("{n} chats running")),
         });
-        let agent = (self.home.destination == Destination::Home)
-            .then(|| {
-                let link = w.agent.as_ref()?;
-                self.state.agents.iter().find(|a| a.slug == link.slug)
-            })
-            .flatten();
+        // The agents its chats use, first use first.
+        let agents: Vec<_> = (w.chat_agents().into_iter())
+            .filter_map(|slug| self.agent(slug))
+            .collect();
         let name = w.name.clone();
         let title = w.display_title().to_string();
         let detail = format!("{} · {chats} · {names}", w.branch);
@@ -1717,14 +1612,22 @@ impl Shark {
                 )
             })
             .child(div().flex_1().min_w(px(12.)))
-            .children(agent.map(|a| {
+            .children((!agents.is_empty()).then(|| {
                 h_flex()
                     .flex_none()
                     .gap_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(super::agent_icon_view::agent_icon(&a.icon))
-                    .child(a.name.clone())
+                    .children(
+                        agents
+                            .iter()
+                            .map(|a| super::agent_icon_view::agent_icon(&a.icon)),
+                    )
+                    .child(
+                        (agents.iter().map(|a| a.name.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
             }))
             .child(
                 div()

@@ -142,6 +142,60 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
     });
 }
 
+/// Home's composer with an agent picked starts a task whose first chat is that agent's, on its
+/// model and thinking level; the task keeps a snapshot of it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_agent_starts_a_task_on_that_agent(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    test_home();
+    let state = State {
+        agents: vec![crate::state::Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            instructions: "Use Mobbin".into(),
+            model: Some("sonnet".into()),
+            effort: Some("low".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.run_until_parked();
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
+    cx.update_window(window, |_, w, cx| w.input("sketch a login page", cx))
+        .unwrap();
+    press_in(window)(cx, &["enter"]);
+    until(cx, window, |_, cx| {
+        let s = shark.read(cx);
+        s.state.tasks.len() == 1 && !s.home.draft.starting
+    })
+    .await;
+    let ws = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
+    let chat = &ws.chats[0];
+    assert_eq!(chat.agent.as_deref(), Some("designer"));
+    assert_eq!(
+        (chat.model.as_deref(), chat.effort.as_deref()),
+        (Some("sonnet"), Some("low"))
+    );
+    assert_eq!(ws.agents.len(), 1);
+    assert_eq!(ws.agents[0].instructions, "Use Mobbin");
+    assert_eq!(
+        ws.title, "sketch a login page",
+        "the @slug isn't part of the task"
+    );
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.prompt.read(cx).value(), "");
+        assert!(
+            s.home.draft_agent.is_none(),
+            "the next draft starts without an agent"
+        );
+    });
+}
+
 /// cmd-n opens an empty conversation, also with repos registered, and no provider runs yet;
 /// the first message titles it, and a second doesn't.
 #[gpui_kit::test]
@@ -805,6 +859,49 @@ async fn delete_agent_confirms_and_removes_everything(cx: &mut TestAppContext) {
     assert!(State::load().tasks.is_empty());
 }
 
+/// An agent a chat uses can be deleted: the chat goes on without it, its button back to Agent.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn deleting_an_agent_in_use_leaves_its_chats_without_one(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let link = AgentLink {
+        slug: "designer".into(),
+        name: "Designer".into(),
+        ..Default::default()
+    };
+    let task = git::create_empty_task(&tasks_dir().join("design"), "design", "design", Some(link))
+        .unwrap();
+    let state = State {
+        agents: vec![crate::state::Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            ..Default::default()
+        }],
+        tasks: vec![task],
+        ..Default::default()
+    };
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    let chip = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find("chat-agent").label().map(|l| l.to_string())
+        })
+        .unwrap()
+    };
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_now(0, w, cx));
+    assert_eq!(chip(cx).as_deref(), Some("Agent: Designer"));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.delete_agent("designer", w, cx));
+    press_in(window)(cx, &["enter"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(s.state.agents.is_empty());
+        assert!(s.state.tasks[0].agents.is_empty(), "its snapshot goes too");
+    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_now(0, w, cx));
+    assert_eq!(chip(cx).as_deref(), Some("Agent: none"));
+}
+
 /// The branch and PR dialog stays reachable and keeps refusing with no repo to check out;
 /// typing on Home first makes that its first message.
 #[gpui_kit::test]
@@ -847,123 +944,6 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn agent_pages_do_not_target_hidden_tasks(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let link = AgentLink {
-        slug: "designer".into(),
-        name: "Designer".into(),
-        ..Default::default()
-    };
-    let tasks = [("design", Some(link)), ("other", None)]
-        .into_iter()
-        .map(|(name, agent)| {
-            git::create_empty_task(&tasks_dir().join(name), name, name, agent).unwrap()
-        })
-        .collect();
-    let (window, shark) = boot(
-        cx,
-        State {
-            tasks,
-            agents: vec![crate::state::Agent {
-                slug: "designer".into(),
-                name: "Designer".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        WindowOptions::default(),
-    );
-    on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.open_task_now(1, w, cx);
-        s.open_agent("designer", w, cx);
-        assert_eq!(s.target(w).unwrap().name, "design");
-        s.sidebar_focus.focus(w, cx);
-        s.sel = SideRow::Task(1);
-        assert_eq!(
-            s.target(w).unwrap().name,
-            "other",
-            "explicit sidebar selection wins"
-        );
-        s.open_task_then("other", None, w, cx, |_, _, _| {});
-        assert!(
-            !s.home_shown(),
-            "opening the active task leaves the agent page"
-        );
-    });
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn agent_history_requires_all_repositories_to_be_merged(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let home = test_home();
-    let repos = repos(&home, &["api", "web"]);
-    let (window, shark) = boot(
-        cx,
-        State {
-            repos: repos.clone(),
-            agents: vec![crate::state::Agent {
-                slug: "designer".into(),
-                name: "Designer".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        WindowOptions::default(),
-    );
-    cx.run_until_parked();
-    for (name, other_state, expected) in [
-        ("all-merged", Some("MERGED"), Some(true)),
-        ("partly-merged", Some("OPEN"), Some(false)),
-        ("merged-unknown", None, None),
-    ] {
-        let task = git::create_task_with_prs(
-            &tasks_dir().join(name),
-            name,
-            name,
-            &repos
-                .iter()
-                .map(|r| (r.clone(), name.into()))
-                .collect::<Vec<_>>(),
-            &[],
-            &[],
-            name,
-            Some(AgentLink {
-                slug: "designer".into(),
-                ..Default::default()
-            }),
-            true,
-        )
-        .unwrap();
-        let checked: Vec<_> = task.repos.iter().enumerate().map(|(i, repo)| {
-            let mut checked = crate::sync::Repo::fresh(repo, &task);
-            if let Some(state) = if i == 0 { Some("MERGED") } else { other_state } {
-                checked.pr = Some(Ok(crate::sync::parse_prs(&format!(
-                    r#"[{{"url":"https://github.com/example/{}/pull/7","number":7,"state":"{state}"}}]"#,
-                    repo.name,
-                ))));
-            }
-            checked
-        }).collect();
-        on_app(window, shark.clone())(cx, &|s, w, cx| {
-            s.state.tasks.push(task.clone());
-            s.attn.set_checked(name, checked.clone());
-            s.remove_task(name, true, w, cx);
-        });
-        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-            shark.read(cx).state.tasks.is_empty()
-        })
-        .await;
-        cx.update(|cx| {
-            let s = shark.read(cx);
-            assert_eq!(s.state.agents[0].history[0].merged, expected, "{name}");
-        });
-    }
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
 async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -987,12 +967,9 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.run_until_parked();
     for (count, prompt) in [(1, "one"), (2, "two")] {
-        on_app(window, shark.clone())(cx, &|s, w, cx| {
-            s.prefill_agent_task("designer", w, cx);
-            s.home
-                .agent_prompt
-                .update(cx, |p, cx| p.set_value(prompt, w, cx));
-        });
+        on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
+        cx.update_window(window, |_, w, cx| w.input(prompt, cx))
+            .unwrap();
         press_in(window)(cx, &["enter"]);
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             let s = shark.read(cx);
@@ -1000,22 +977,8 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         })
         .await;
         cx.run_until_parked();
-        cx.update(|cx| assert_eq!(shark.read(cx).home.agent_prompt.read(cx).value(), ""));
-        if count == 1 {
-            let task = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
-            fs::write(task.dir().join("api/first.rs"), "first").unwrap();
-        }
+        cx.update(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), ""));
     }
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.tasks[1]
-            .agent
-            .as_ref()
-            .unwrap()
-            .siblings[0]
-            .files
-            == ["api/first.rs"]
-    })
-    .await;
     let tasks = cx.update(|cx| shark.read(cx).state.tasks.clone());
     assert_eq!(
         tasks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
@@ -1027,12 +990,7 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
             s.state.sections.is_empty(),
             "agents do not create task groups"
         );
-        assert_eq!(
-            s.side_rows(true),
-            [SideRow::Agent(0), SideRow::Task(0), SideRow::Task(1)]
-        );
         s.state.sections.push(Section {
-            agent: None,
             name: "Release".into(),
             icon: "folder".into(),
             collapsed: false,
@@ -1041,84 +999,52 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         let instructions = s.state.tasks[0].context()["agent:designer"].clone();
         s.move_to_section(&tasks[0].name, Some(0), cx);
         assert_eq!(s.state.tasks[0].context()["agent:designer"], instructions);
-        assert_eq!(
-            s.side_rows(true),
-            [SideRow::Agent(0), SideRow::Task(0), SideRow::Task(1)]
-        );
         s.open_task_now(1, w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        let agent = w.find("task-agent");
-        assert_eq!(agent.label().as_deref(), Some("Designer"));
-        let agent_bounds = agent.bounds();
-        let attach_bounds = w.find("header-attach").bounds();
-        assert_eq!(
-            agent_bounds.center().y,
-            attach_bounds.center().y,
-            "the task agent belongs in the Attach toolbar row"
-        );
-        assert!(
-            w.try_find("task-identity").is_none(),
-            "agent tasks must not add a separate title row"
-        );
-        w.click("task-agent", cx);
-        w.render_frame(cx);
-        assert!(w.try_find("agent-page").is_some());
+        let agent = w.find("chat-agent");
+        assert_eq!(agent.label().as_deref(), Some("Agent: Designer"));
     })
     .unwrap();
     for (i, task) in tasks.iter().enumerate() {
-        let agent = task.agent.as_ref().unwrap();
+        let agent = &task.agents[0];
         assert_eq!(agent.slug, "designer");
-        assert_eq!(agent.siblings.len(), 1);
-        assert_eq!(agent.siblings[0].title, tasks[1 - i].title);
+        assert_eq!(task.chats[0].agent.as_deref(), Some("designer"));
+        // Tasks stay encapsulated: nothing tells a chat about another task.
+        let other = &tasks[1 - i].title;
+        assert!(
+            task.context()
+                .values()
+                .all(|note| !note.text.contains(other.as_str()))
+        );
         assert!(task.branch.starts_with("designer/"));
+        // Instructions go to the chat's harness; root docs are every chat's.
+        assert!(
+            git::agent_prompt(task, &task.chats[0])
+                .unwrap()
+                .contains(instructions)
+        );
         for doc in ["CLAUDE.md", "AGENTS.md"] {
             assert!(
-                fs::read_to_string(task.dir().join(doc))
+                !fs::read_to_string(task.dir().join(doc))
                     .unwrap()
                     .contains(instructions)
             );
         }
     }
-    fs::remove_file(tasks[0].dir().join("api/first.rs")).unwrap();
-    fs::write(tasks[0].dir().join("api/second.rs"), "second").unwrap();
-    on_app(window, shark.clone())(cx, &|s, _, cx| s.turn_done(&tasks[0].name, "", cx));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.tasks[1]
-            .agent
-            .as_ref()
-            .unwrap()
-            .siblings[0]
-            .files
-            == ["api/second.rs"]
-    })
-    .await;
     on_app(window, shark.clone())(cx, &|s, _, cx| {
         s.state.agents[0].instructions = "Use the design system".into();
         s.sync_agent("designer", true, cx).unwrap();
-        s.set_title(&tasks[0].name, "renamed".into(), cx);
     });
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(
-            s.state.tasks[1].agent.as_ref().unwrap().siblings[0].title,
-            "renamed"
-        );
         for task in &s.state.tasks {
-            assert_eq!(
-                task.agent.as_ref().unwrap().instructions,
-                "Use the design system"
-            );
-            assert!(
-                fs::read_to_string(task.dir().join("AGENTS.md"))
-                    .unwrap()
-                    .contains("Use the design system")
-            );
+            assert_eq!(task.agents[0].instructions, "Use the design system");
+            let prompt = git::agent_prompt(task, &task.chats[0]).unwrap();
+            assert!(prompt.contains("Use the design system"));
         }
     });
-    let sibling_before =
-        cx.read(|cx| shark.read(cx).state.tasks[1].context()["siblings:designer"].fingerprint);
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         for chat in s.started_chats(&tasks[0].name) {
             chat.update(cx, |c, _| c.busy = false);
@@ -1134,161 +1060,12 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         shark.read(cx).state.tasks.len() == 1
     })
     .await;
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        let record = &s.state.agents[0].history[0];
-        assert_eq!(record.title, "renamed");
-        assert_eq!(record.branch, tasks[0].branch);
-        assert_eq!(
-            record.prs,
-            [("api".into(), "https://github.com/example/api/pull/7".into())]
-        );
-        assert_eq!(
-            record.merged,
-            Some(true),
-            "force deletion still records the known merged PR"
-        );
-        assert!(record.at > 0);
-        assert!(s.state.tasks[0].agent.as_ref().unwrap().siblings.is_empty());
-        assert_ne!(
-            sibling_before,
-            s.state.tasks[0].context()["siblings:designer"].fingerprint
-        );
-        assert!(
-            s.state.tasks[0].context()["siblings:designer"]
-                .text
-                .contains("no other open tasks")
-        );
-    });
     assert!(!tasks[0].dir().exists());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         assert!(
-            !s.can_delete_agent("designer", w, cx),
-            "an open task prevents agent deletion"
+            s.can_delete_agent("designer", w, cx),
+            "chats using an agent don't keep it from being deleted"
         );
-        for chat in s.started_chats(&tasks[1].name) {
-            chat.update(cx, |c, _| c.busy = false);
-        }
-        s.syncs.remove(&tasks[1].name);
-        s.attn.forget(&tasks[1].name);
-        s.remove_task(&tasks[1].name, true, w, cx);
-    });
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.tasks.is_empty()
-    })
-    .await;
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        assert_eq!(s.state.agents[0].history.len(), 2);
-        assert_eq!(s.state.agents[0].history[0].title, "two", "newest first");
-        assert_eq!(
-            s.state.agents[0].history[0].merged, None,
-            "no probe means unknown"
-        );
-        assert!(s.state.agents[0].history[0].prs.is_empty());
-    });
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn agent_tasks_reuse_known_files_and_attachment_updates_siblings(cx: &mut TestAppContext) {
-    let quiet = quiet_claude();
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _claude = ClaudeGuard::set(&quiet);
-    let home = test_home();
-    let repos = repos(&home, &["api"]);
-    let link = crate::state::AgentLink {
-        slug: "designer".into(),
-        name: "Designer".into(),
-        ..Default::default()
-    };
-    let (window, shark) = boot(
-        cx,
-        State {
-            repos: repos.clone(),
-            agents: vec![crate::state::Agent {
-                slug: "designer".into(),
-                name: "Designer".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        WindowOptions::default(),
-    );
-    let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| {
-        s.new_task(None, None, Some(link.clone()), w, cx);
-        s.new_task(None, None, Some(link.clone()), w, cx);
-    });
-    let first = cx.read(|cx| shark.read(cx).state.tasks[0].name.clone());
-    on(cx, &|s, w, cx| {
-        s.queue_attachment(
-            first.clone(),
-            vec![crate::state::Attachment::fresh(
-                &repos[0],
-                "designer/one",
-                "main",
-            )],
-            w,
-            cx,
-        );
-    });
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        let s = shark.read(cx);
-        s.state.tasks[1].agent.as_ref().unwrap().siblings[0].branch == "designer/one"
-            && s.adding_repos.is_empty()
-            && s.setting_up.is_empty()
-    })
-    .await;
-    let dir = tasks_dir().join(&first).join("api");
-    cx.read(|cx| {
-        assert_eq!(
-            shark.read(cx).state.tasks[1]
-                .agent
-                .as_ref()
-                .unwrap()
-                .siblings[0]
-                .dirs,
-            [dir.to_string_lossy().to_string()]
-        )
-    });
-    fs::write(dir.join("known.rs"), "known").unwrap();
-    on(cx, &|s, _, cx| s.turn_done(&first, "", cx));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.tasks[1]
-            .agent
-            .as_ref()
-            .unwrap()
-            .siblings[0]
-            .files
-            == ["api/known.rs"]
-    })
-    .await;
-    on(cx, &|s, w, cx| {
-        s.new_task(Some("three".into()), None, Some(link.clone()), w, cx);
-        let task = s.active_task().unwrap();
-        let context = &task.context()["siblings:designer"];
-        assert!(
-            context.text.contains("api/known.rs"),
-            "known files are present before any background refresh: {}",
-            context.text
-        );
-        let context = context.clone();
-        let chat = s.active_chat().unwrap().clone();
-        chat.update(cx, |c, cx| {
-            assert!(
-                !c.meta.delivered.contains_key("siblings:designer"),
-                "awaiting the harness echo"
-            );
-            c.play(
-                crate::harness::Ev::User(format!("{}\n[/shark]\n\nthree", context.text)),
-                cx,
-            );
-            assert_eq!(
-                c.meta.delivered["siblings:designer"], context.fingerprint,
-                "the exact first-message echo acknowledges those known files"
-            );
-        });
     });
 }
 
@@ -1307,7 +1084,7 @@ async fn startup_applies_agent_edits_saved_before_dialog_closed(cx: &mut TestApp
             slug: "designer".into(),
             name: "Old name".into(),
             instructions: "Old instructions".into(),
-            siblings: vec![],
+            ..Default::default()
         }),
     )
     .unwrap();
@@ -1332,13 +1109,14 @@ async fn startup_applies_agent_edits_saved_before_dialog_closed(cx: &mut TestApp
     cx.read(|cx| {
         let s = shark.read(cx);
         let task = s.task(name).unwrap();
-        assert_eq!(task.agent.as_ref().unwrap().name, "Designer");
-        assert_eq!(
-            task.agent.as_ref().unwrap().instructions,
-            "Use the saved instructions"
-        );
+        assert_eq!(task.agents[0].name, "Designer");
+        assert_eq!(task.agents[0].instructions, "Use the saved instructions");
         let chat = s.active_chat().unwrap().read(cx);
-        assert_eq!(chat.ws.agent, task.agent);
+        assert_eq!(chat.ws.agents, task.agents);
+        let prompt = git::agent_prompt(task, &task.chats[0]).unwrap();
+        assert!(
+            prompt.contains("## Agent: Designer") && prompt.contains("Use the saved instructions")
+        );
         assert_ne!(
             chat.ws.context()["agent:designer"].fingerprint,
             old_fingerprint
@@ -1349,13 +1127,8 @@ async fn startup_applies_agent_edits_saved_before_dialog_closed(cx: &mut TestApp
             "the resumed session still needs the changed-instructions note"
         );
     });
-    for doc in ["CLAUDE.md", "AGENTS.md"] {
-        let text = fs::read_to_string(dir.join(doc)).unwrap();
-        assert!(text.contains("## Agent: Designer") && text.contains("Use the saved instructions"));
-        assert!(!text.contains("Old instructions"));
-    }
     assert_eq!(
-        State::load().tasks[0].agent.as_ref().unwrap().instructions,
+        State::load().tasks[0].agents[0].instructions,
         "Use the saved instructions"
     );
 }

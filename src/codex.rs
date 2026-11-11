@@ -74,6 +74,10 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
     if let Some(m) = model_id(chat.model.as_deref()) {
         params["model"] = m.into();
     }
+    // The chat's agent, on start and on every resume.
+    if let Some(p) = crate::git::agent_prompt(ws, chat) {
+        params["developerInstructions"] = p.into();
+    }
     // The server takes requests in order, so nothing waits for a reply here; `track` sends
     // the messages once the thread is there.
     let version = env!("CARGO_PKG_VERSION");

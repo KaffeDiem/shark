@@ -1,7 +1,7 @@
 //! Creating, opening, growing and deleting tasks.
 use super::new_task::NewTaskForm;
 use super::*;
-use crate::state::{AgentLink, AttachStage, Sibling};
+use crate::state::{AgentLink, AttachStage};
 
 impl Shark {
     pub(super) fn can_backlog(&self, name: &str, cx: &App) -> bool {
@@ -42,80 +42,66 @@ impl Shark {
         cx.notify();
     }
 
+    /// Refreshes agent `slug`'s snapshot (identity and instructions) in every task whose chats
+    /// use it. `docs` also rewrites those tasks' root docs and skill links.
     pub(crate) fn sync_agent(
         &mut self,
         slug: &str,
         docs: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
+        let Some(agent) = self.agent(slug).map(AgentLink::from) else {
             return Ok(());
         };
-        let tasks: Vec<_> = self
-            .state
-            .tasks
-            .iter()
-            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == slug))
-            .cloned()
+        let tasks: Vec<_> = (self.state.tasks.iter())
+            .filter(|t| t.agent_link(slug).is_some())
+            .map(|t| t.name.clone())
             .collect();
         let mut errors = vec![];
-        for task in &tasks {
-            let siblings = tasks
-                .iter()
-                .filter(|other| other.name != task.name)
-                .map(|other| {
-                    let dirs: Vec<_> = other
-                        .repos
-                        .iter()
-                        .map(|r| other.dir().join(&r.name).to_string_lossy().into_owned())
-                        .collect();
-                    let files = task
-                        .agent
-                        .as_ref()
-                        .and_then(|a| {
-                            a.siblings
-                                .iter()
-                                .find(|s| s.branch == other.branch && s.dirs == dirs)
-                        })
-                        .or_else(|| {
-                            tasks.iter().find_map(|known| {
-                                known
-                                    .agent
-                                    .as_ref()?
-                                    .siblings
-                                    .iter()
-                                    .find(|s| s.branch == other.branch && s.dirs == dirs)
-                            })
-                        })
-                        .map(|s| s.files.clone())
-                        .unwrap_or_default();
-                    Sibling {
-                        title: other.display_title().into(),
-                        branch: other.branch.clone(),
-                        dirs,
-                        files,
-                    }
-                })
-                .collect();
-            let mut link = task.agent.clone().unwrap();
-            // Instruction snapshots change only once the root docs can deliver them too.
-            if docs {
-                link.name = agent.name.clone();
-                link.instructions = agent.instructions.clone();
+        for name in &tasks {
+            let ws = self.task_mut(name).unwrap();
+            if let Some(link) = ws.agents.iter_mut().find(|a| a.slug == slug) {
+                *link = agent.clone();
             }
-            link.siblings = siblings;
-            let mut current = task.clone();
-            current.agent = Some(link);
-            if docs && let Err(e) = git::write_claude_md(&current) {
-                errors.push(format!("{}: {e}", task.display_title()));
-                continue;
+            let ws = ws.clone();
+            if docs && let Err(e) = git::write_claude_md(&ws) {
+                errors.push(format!("{}: {e}", ws.display_title()));
             }
-            self.task_mut(&task.name).unwrap().agent = current.agent;
-            self.publish_task(&task.name, cx);
+            self.publish_task(name, cx);
         }
         if let Err(e) = self.state.save() {
             errors.push(e.to_string());
         }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+
+    /// After a chat of `task` changed agent: one snapshot per agent its chats use, and their
+    /// skills linked. Tasks don't see each other.
+    pub(crate) fn relink_agents(
+        &mut self,
+        task: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let agents = self.state.agents.clone();
+        let Some(ws) = self.task_mut(task) else {
+            return Ok(());
+        };
+        if !ws.link_agents(&agents) {
+            return Ok(());
+        }
+        let ws = ws.clone();
+        let mut errors = vec![];
+        if let Err(e) = git::link_skills(&ws, &ws.dir()) {
+            errors.push(format!("Couldn't link skills: {e}"));
+        }
+        if let Err(e) = self.state.save() {
+            errors.push(e.to_string());
+        }
+        self.publish_task(task, cx);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -213,8 +199,12 @@ impl Shark {
             self.drop_editor(cx);
         }
         self.sel = SideRow::Task(ix);
-        if let Some(agent) = &ws.agent {
-            self.collapsed_agents.remove(&agent.slug);
+        // Not `set_collapsed`: its cursor repair would run before the task is active.
+        if let Some(i) = self.section_of(&ws.name)
+            && self.state.sections[i].collapsed
+        {
+            self.state.sections[i].collapsed = false;
+            let _ = self.state.save();
         }
         self.ensure_sync(&ws, window, cx);
         for (name, sync) in &self.syncs {
@@ -421,7 +411,8 @@ impl Shark {
             ws.linear.attach((&snapshot).into());
             ws.issues.push(snapshot);
         }
-        let (model, effort) = self.state.defaults_for(&ws);
+        let agent = ws.agents.first().map(|a| a.slug.clone());
+        let (model, effort) = self.state.defaults_for(&ws, agent.as_deref());
         ws.fill_models(&model, effort.as_ref());
         self.state.tasks.push(ws.clone());
         if let Err(e) = self.state.save() {
@@ -430,15 +421,11 @@ impl Shark {
             crate::linear::delete_snapshots(&name);
             return notify_err(window, cx, format!("Couldn't save the new task: {e}"));
         }
-        if let Some(agent) = &ws.agent {
-            let _ = self.sync_agent(&agent.slug, false, cx);
-            self.refresh_agent_files(&agent.slug, cx);
-        }
         self.open_task_now(self.state.tasks.len() - 1, window, cx);
         self.record_interaction(&name, cx);
         self.home_prompt_used(
             first.as_deref(),
-            ws.agent.as_ref().map(|a| a.slug.as_str()),
+            ws.agents.first().map(|a| a.slug.as_str()),
             window,
             cx,
         );
@@ -491,10 +478,6 @@ impl Shark {
         let edited = |w: &&mut Task| !title.is_empty() && title != w.display_title();
         if let Some(ws) = self.task_mut(name).filter(edited) {
             ws.title = title;
-            let agent = ws.agent.as_ref().map(|a| a.slug.clone());
-            if let Some(slug) = agent {
-                let _ = self.sync_agent(&slug, false, cx);
-            }
             let _ = self.state.save();
             cx.notify();
         }
@@ -728,11 +711,12 @@ impl Shark {
                             ),
                             _ => {}
                         }
-                        let (model, effort) = s.state.defaults_for(&ws);
+                        let agent = ws.agents.first().map(|a| a.slug.clone());
+                        let (model, effort) = s.state.defaults_for(&ws, agent.as_deref());
                         ws.fill_models(&model, effort.as_ref());
                         let name = ws.name.clone();
                         s.state.tasks.push(ws.clone());
-                        if let Some(agent) = &ws.agent {
+                        if let Some(agent) = ws.agents.first().cloned() {
                             // Settings may have changed while the worktrees were created.
                             let docs = s
                                 .state
@@ -749,9 +733,7 @@ impl Shark {
                                     format!("Couldn't refresh agent instructions: {e}"),
                                 );
                             }
-                            let current = s.task(&name).unwrap().clone();
-                            s.refresh_agent_files(&agent.slug, cx);
-                            ws = current;
+                            ws = s.task(&name).unwrap().clone();
                         }
                         let _ = s.state.save();
                         if let Some(p) = &prompt {
@@ -763,7 +745,7 @@ impl Shark {
                         s.open_task_then(&key, None, window, cx, move |s, window, cx| {
                             s.home_prompt_used(
                                 prompt.as_deref(),
-                                ws.agent.as_ref().map(|a| a.slug.as_str()),
+                                ws.agents.first().map(|a| a.slug.as_str()),
                                 window,
                                 cx,
                             );
@@ -1455,21 +1437,6 @@ impl Shark {
                 .get(name)
                 .map_or(vec![], |g| g.read(cx).merged_branches()),
         };
-        let overview = self.overview_repos(name, cx);
-        let known = overview.is_some_and(|repos| {
-            !repos.is_empty()
-                && repos.len() == ws.repos.len()
-                && ws.repos.iter().all(|expected| {
-                    repos
-                        .iter()
-                        .any(|r| r.name == expected.name && matches!(r.pr, Some(Ok(_))))
-                })
-        });
-        let prs: Vec<_> = overview
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.pr().map(|pr| (r.name.clone(), pr.url.clone(), pr.state)))
-            .collect();
         // Its dev servers would run on in a removed worktree: stopped (and waited for) first.
         let run = self.runs.remove(name);
         let jobs = crate::scripts::jobs(&self.state, &ws, crate::scripts::Phase::Archive, None);
@@ -1510,36 +1477,6 @@ impl Shark {
                 if let Some(e) = scripts {
                     super::run::script_failed(&name, e, window, cx);
                 }
-                if let Ok(deleted) = &result
-                    && let Some(task) = s.task(&name)
-                    && let Some(link) = &task.agent
-                {
-                    let slug = link.slug.clone();
-                    let record = crate::state::TaskRecord {
-                        title: task.display_title().into(),
-                        branch: task.branch.clone(),
-                        prs: prs
-                            .iter()
-                            .map(|(repo, url, _)| (repo.clone(), url.clone()))
-                            .collect(),
-                        merged: if !task.repos.is_empty()
-                            && task.repos.iter().all(|r| {
-                                deleted.contains(&r.name)
-                                    || prs.iter().any(|(repo, _, state)| {
-                                        repo == &r.name && *state == sync::PrState::Merged
-                                    })
-                            }) {
-                            Some(true)
-                        } else {
-                            known.then_some(false)
-                        },
-                        at: interaction::now_ms(),
-                    };
-                    if let Some(agent) = s.state.agents.iter_mut().find(|a| a.slug == slug) {
-                        agent.history.insert(0, record);
-                        agent.history.truncate(100);
-                    }
-                }
                 s.archived(&name, result, window, cx)
             })
             .ok();
@@ -1558,7 +1495,6 @@ impl Shark {
                 crate::plan::delete(&c.id);
             }
         }
-        self.sibling_refreshes.remove(name);
         self.syncs.remove(name);
         self.parked_sessions.remove(name);
         self.git_features.remove(name);
@@ -1586,14 +1522,7 @@ impl Shark {
                 let repoless = self.task(name).is_some_and(|w| w.repos.is_empty());
                 let before = self.cursors(cx);
                 self.forget_task_views(name, cx);
-                let agent = self
-                    .task(name)
-                    .and_then(|t| t.agent.as_ref())
-                    .map(|a| a.slug.clone());
                 self.state.remove_task(name);
-                if let Some(slug) = agent {
-                    let _ = self.sync_agent(&slug, false, cx);
-                }
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));
                 // Names come back around, and a later agent must not find these.

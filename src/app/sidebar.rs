@@ -1,4 +1,4 @@
-//! Agent navigation, task rows, manual task groups, and the sidebar cursor.
+//! The sidebar: Home, sections and their tasks, ungrouped tasks, the cursor.
 use super::*;
 use gpui_kit::component::Selectable as _;
 
@@ -89,17 +89,14 @@ pub(super) fn section_icon(name: &str) -> IconName {
         .map_or(IconName::Folder, |(_, i)| *i)
 }
 
-/// "Move to task group" in a task's right-click menu; ends with "New task group", which moves it there.
+/// The label for tasks in no section, in menus and Home's headings alike.
+pub(super) const UNGROUPED: &str = "Ungrouped";
+
+/// "Move to section" in a task's right-click menu; ends with "New section…", which moves it there.
 pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
     let current = this.section_of(ws);
     let mut entries = vec![];
-    for (i, sec) in this
-        .state
-        .sections
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.agent.is_none())
-    {
+    for (i, sec) in this.state.sections.iter().enumerate() {
         let ws = ws.to_string();
         let item = menu::item(
             section_icon(&sec.icon),
@@ -112,7 +109,7 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
         let ws = ws.to_string();
         entries.push(menu::item(
             IconName::FolderOutput,
-            "No task group",
+            UNGROUPED,
             on_shark(cx, move |s, _, cx| s.move_to_section(&ws, None, cx)),
         ));
     }
@@ -122,20 +119,30 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
     let ws = ws.to_string();
     entries.push(menu::item(
         IconName::FolderPlus,
-        "New task group",
+        "New section…",
         on_shark(cx, move |s, w, cx| {
             s.start_naming(None, Some(ws.clone()), w, cx)
         }),
     ));
-    menu::sub(IconName::FolderInput, "Move to task group", entries)
+    menu::sub(IconName::FolderInput, "Move to section", entries)
 }
 
 /// Right-click menu of a section header.
-pub(super) fn section_menu(_this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
+pub(super) fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
+    let collapsed = this.state.sections.get(i).is_some_and(|s| s.collapsed);
     vec![
         menu::item(
+            if collapsed {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            },
+            if collapsed { "Expand" } else { "Collapse" },
+            on_shark(cx, move |s, _, cx| s.toggle_section(i, cx)),
+        ),
+        menu::item(
             IconName::Pencil,
-            "Rename",
+            "Rename…",
             on_shark(cx, move |s, w, cx| s.start_naming(Some(i), None, w, cx)),
         ),
         menu::item(
@@ -145,30 +152,32 @@ pub(super) fn section_menu(_this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<
         ),
         menu::item(
             IconName::FolderPlus,
-            "New task group",
+            "New section…",
             on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
         ),
         Entry::Sep,
         menu::item(
             IconName::Trash,
-            "Delete task group",
+            "Delete section",
             on_shark(cx, move |s, w, cx| s.delete_section(i, w, cx)),
         ),
     ]
 }
 
-/// Cursor state taken by [`Shark::cursors`]: sidebar row, its task's name, home row.
+/// Cursor state taken by [`Shark::cursors`]: sidebar row, its task's or section's name,
+/// home row.
 pub(super) struct Cursors {
     side: Option<usize>,
     ws: Option<String>,
+    section: Option<String>,
     home: Option<usize>,
 }
 
 /// A sidebar row the cursor can sit on.
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub(super) enum SideRow {
-    /// Index into `state.agents`.
-    Agent(usize),
+    /// Index into `state.sections`.
+    Section(usize),
     /// Index into `state.tasks`.
     Task(usize),
 }
@@ -265,89 +274,81 @@ impl Shark {
         self.state
             .sections
             .iter()
-            .position(|s| s.agent.is_none() && s.tasks.iter().any(|w| w == ws))
+            .position(|s| s.tasks.iter().any(|w| w == ws))
     }
 
-    /// Agent children come from their task snapshots, never from manual groups.
+    /// Sidebar rows top to bottom: each section, then its tasks unless it is folded (and not
+    /// `unfold`); then the tasks in no section. Without `unfold`, Backlog (except the open
+    /// task) and the repository filter hide task rows; section headers always stay.
     pub(super) fn side_rows(&self, unfold: bool) -> Vec<SideRow> {
+        let tasks = &self.state.tasks;
         let mut rows = vec![];
-        for (i, agent) in self.state.agents.iter().enumerate() {
-            rows.push(SideRow::Agent(i));
-            if unfold || !self.collapsed_agents.contains(&agent.slug) {
+        for (i, s) in self.state.sections.iter().enumerate() {
+            rows.push(SideRow::Section(i));
+            if unfold || !s.collapsed {
                 rows.extend(
-                    self.state
-                        .tasks
+                    s.tasks
                         .iter()
-                        .enumerate()
-                        .filter(|(_, task)| {
-                            task.agent.as_ref().is_some_and(|a| a.slug == agent.slug)
-                        })
-                        .map(|(i, _)| SideRow::Task(i)),
+                        .filter_map(|n| tasks.iter().position(|t| &t.name == n))
+                        .map(SideRow::Task),
                 );
             }
         }
         rows.extend(
-            self.state
-                .tasks
-                .iter()
-                .enumerate()
-                .filter(|(_, task)| {
-                    !task
-                        .agent
-                        .as_ref()
-                        .is_some_and(|a| self.state.agents.iter().any(|agent| agent.slug == a.slug))
-                })
-                .map(|(i, _)| SideRow::Task(i)),
+            (0..tasks.len())
+                .filter(|&ix| self.section_of(&tasks[ix].name).is_none())
+                .map(SideRow::Task),
         );
         rows.retain(|row| match row {
             SideRow::Task(ix) => {
-                let task = &self.state.tasks[*ix];
+                let task = &tasks[*ix];
                 // Global task search uses unfolded rows and keeps every repository reachable.
                 unfold
                     || (self.sidebar_task_matches(task)
                         && (!task.backlog || self.active.as_deref() == Some(&task.name)))
             }
-            SideRow::Agent(_) => true,
+            SideRow::Section(_) => true,
         });
         rows
     }
 
-    fn cursor_agent(&self) -> Option<usize> {
+    /// The section under the sidebar cursor, or the cursor task's section.
+    pub(super) fn cursor_section(&self) -> Option<usize> {
         match self.sel {
-            SideRow::Agent(i) => self.state.agents.get(i).map(|_| i),
-            SideRow::Task(i) => {
-                let slug = &self.state.tasks.get(i)?.agent.as_ref()?.slug;
-                self.state.agents.iter().position(|a| &a.slug == slug)
-            }
+            SideRow::Section(i) => (i < self.state.sections.len()).then_some(i),
+            SideRow::Task(ix) => self.section_of(&self.state.tasks.get(ix)?.name),
         }
     }
 
-    pub(super) fn set_agent_collapsed(
-        &mut self,
-        i: usize,
-        collapsed: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.state.agents.get(i) else {
-            return;
-        };
-        if collapsed {
-            self.collapsed_agents.insert(agent.slug.clone());
-        } else {
-            self.collapsed_agents.remove(&agent.slug);
+    pub(super) fn set_collapsed(&mut self, i: usize, collapsed: bool, cx: &mut Context<Self>) {
+        if let Some(s) = self.state.sections.get_mut(i)
+            && s.collapsed != collapsed
+        {
+            s.collapsed = collapsed;
+            let _ = self.state.save();
+            self.fix_sel();
+            cx.notify();
         }
-        self.fix_sel();
-        cx.notify();
+    }
+
+    pub(super) fn toggle_section(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(s) = self.state.sections.get(i) {
+            self.set_collapsed(i, !s.collapsed, cx);
+        }
     }
 
     /// Sidebar and home cursors before a task is removed; see [`Self::restore_cursors`].
     pub(super) fn cursors(&self, cx: &App) -> Cursors {
         Cursors {
             side: self.side_rows(false).iter().position(|r| *r == self.sel),
-            // The sidebar cursor follows its task, not its row number.
+            // The sidebar cursor follows its task or section, not its row number.
             ws: match self.sel {
                 SideRow::Task(ix) => self.state.tasks.get(ix).map(|w| w.name.clone()),
-                SideRow::Agent(_) => None,
+                SideRow::Section(_) => None,
+            },
+            section: match self.sel {
+                SideRow::Section(i) => self.state.sections.get(i).map(|s| s.name.clone()),
+                SideRow::Task(_) => None,
             },
             home: self.home_at(&self.home_rows(cx)),
         }
@@ -356,10 +357,12 @@ impl Shark {
     /// After `name` is removed: a cursor on its row stays at the same height, on whatever moved up into it.
     pub(super) fn restore_cursors(&mut self, name: &str, before: Cursors, cx: &App) {
         let rows = self.side_rows(false);
+        let section = (before.section.as_ref())
+            .and_then(|c| self.state.sections.iter().position(|s| &s.name == c));
         let moved = (before.ws.as_deref().filter(|c| *c != name))
             .and_then(|c| self.state.tasks.iter().position(|w| w.name == c));
-        self.sel = match (self.sel, moved) {
-            (SideRow::Agent(i), _) if i < self.state.agents.len() => SideRow::Agent(i),
+        self.sel = match (section, moved) {
+            (Some(i), _) => SideRow::Section(i),
             (_, Some(ix)) => SideRow::Task(ix),
             _ => before
                 .side
@@ -380,20 +383,20 @@ impl Shark {
             .into_iter()
             .filter_map(|r| match r {
                 SideRow::Task(ix) if unfold || !self.state.tasks[ix].backlog => Some(ix),
-                SideRow::Task(_) => None,
-                SideRow::Agent(_) => None,
+                SideRow::Task(_) | SideRow::Section(_) => None,
             })
             .collect()
     }
 
-    /// Keeps the cursor on a visible row; a task hidden by collapsing hands it to its header.
+    /// Keeps the cursor on a visible row; a task hidden by folding or filtering hands it to
+    /// its section's header.
     pub(super) fn fix_sel(&mut self) {
         let rows = self.side_rows(false);
         if rows.contains(&self.sel) {
             return;
         }
-        self.sel = (self.cursor_agent())
-            .map(SideRow::Agent)
+        self.sel = (self.cursor_section())
+            .map(SideRow::Section)
             .or(rows.first().copied())
             .unwrap_or(SideRow::Task(0));
     }
@@ -406,16 +409,22 @@ impl Shark {
         let at = rows.iter().position(|r| *r == self.sel).unwrap_or(0);
         let to = nav.to(at, rows.len(), 0);
         self.sel = rows[to];
-        // Child 0 of the scrolled list is the Agents header.
-        let other = matches!(self.sel, SideRow::Task(i) if self.state.tasks[i].agent.as_ref().is_none_or(|a| !self.state.agents.iter().any(|agent| agent.slug == a.slug)));
-        self.sidebar_scroll
-            .scroll_to_item(to + 1 + usize::from(other));
+        // Child 0 of the scrolled list is the Tasks header.
+        self.sidebar_scroll.scroll_to_item(to + 1);
         cx.notify();
     }
 
-    /// Group actions follow the same visible task as rename and archive actions.
+    /// Section actions hit the header under the sidebar cursor, else the section of the task
+    /// that rename and archive actions would hit.
     fn target_section(&self, window: &Window) -> Option<usize> {
-        self.section_of(&self.target(window)?.name)
+        match self.sel {
+            SideRow::Section(i)
+                if self.sidebar_focus.is_focused(window) && i < self.state.sections.len() =>
+            {
+                Some(i)
+            }
+            _ => self.section_of(&self.target(window)?.name),
+        }
     }
 
     pub(super) fn with_section(
@@ -429,25 +438,22 @@ impl Shark {
             None => notify_err(
                 window,
                 cx,
-                "Put the sidebar cursor on a task in a group first",
+                "Put the sidebar cursor on a section or one of its tasks first",
             ),
         }
     }
 
-    /// `h` folds the cursor's agent and parks the cursor on its header.
+    /// Left folds the cursor's section and parks the cursor on its header.
     fn collapse_at_cursor(&mut self, cx: &mut Context<Self>) {
-        if let Some(i) = self.cursor_agent() {
-            self.sel = SideRow::Agent(i);
-            self.set_agent_collapsed(i, true, cx);
+        if let Some(i) = self.cursor_section() {
+            self.sel = SideRow::Section(i);
+            self.set_collapsed(i, true, cx);
             cx.notify();
         }
     }
 
     pub(super) fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
-        if to.is_some_and(|i| self.state.sections.get(i).is_none_or(|s| s.agent.is_some())) {
-            return;
-        }
-        if self.section_of(ws) == to {
+        if to.is_some_and(|i| i >= self.state.sections.len()) || self.section_of(ws) == to {
             return;
         }
         self.state.move_to_section(ws, to);
@@ -457,39 +463,14 @@ impl Shark {
         cx.notify();
     }
 
-    /// Dragging changes order only, never group or agent membership.
-    pub(super) fn can_reorder_tasks(&self, from: &str, to: &str) -> bool {
-        let (Some(from_task), Some(to_task)) = (self.task(from), self.task(to)) else {
-            return false;
-        };
-        from_task.agent.as_ref().map(|a| &a.slug) == to_task.agent.as_ref().map(|a| &a.slug)
-            && self.section_of(from) == self.section_of(to)
-    }
-
+    /// Dropping a task on another takes its slot, in its section or among the ungrouped.
     pub(super) fn drop_task(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
-        if !self.can_reorder_tasks(ws, target) {
-            return;
-        }
         // The task under the cursor, so the reorder that shifts indices can put it back.
         let cursor = match self.sel {
             SideRow::Task(ix) => self.state.tasks.get(ix).map(|w| w.name.clone()),
-            SideRow::Agent(_) => None,
+            SideRow::Section(_) => None,
         };
-        if let (Some(from), Some(to)) = (
-            self.state.tasks.iter().position(|t| t.name == ws),
-            self.state.tasks.iter().position(|t| t.name == target),
-        ) {
-            move_item(&mut self.state.tasks, from, to);
-        }
-        if let Some(i) = self.section_of(ws) {
-            let tasks = &mut self.state.sections[i].tasks;
-            if let (Some(from), Some(to)) = (
-                tasks.iter().position(|n| n == ws),
-                tasks.iter().position(|n| n == target),
-            ) {
-                move_item(tasks, from, to);
-            }
-        }
+        self.state.drop_task(ws, target);
         if let Some(ix) = cursor.and_then(|n| self.state.tasks.iter().position(|w| w.name == n)) {
             self.sel = SideRow::Task(ix);
         }
@@ -498,21 +479,38 @@ impl Shark {
         cx.notify();
     }
 
+    pub(super) fn drop_section(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let n = self.state.sections.len();
+        if from == to || from >= n || to >= n {
+            return;
+        }
+        let cursor = match self.sel {
+            SideRow::Section(j) => self.state.sections.get(j).map(|s| s.name.clone()),
+            SideRow::Task(_) => None,
+        };
+        move_item(&mut self.state.sections, from, to);
+        if let Some(j) = cursor.and_then(|c| self.state.sections.iter().position(|s| s.name == c)) {
+            self.sel = SideRow::Section(j);
+        }
+        let _ = self.state.save();
+        cx.notify();
+    }
+
     pub(super) fn delete_section(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.sections.get(i).is_none_or(|s| s.agent.is_some()) {
+        if i >= self.state.sections.len() {
             return;
         }
         let s = self.state.sections.remove(i);
         let _ = self.state.save();
+        if let SideRow::Section(j) = self.sel {
+            self.sel = SideRow::Section(if j > i { j - 1 } else { j });
+        }
         self.fix_sel();
-        window.push_notification(
-            format!("Deleted task group {} (its tasks stay)", s.name),
-            cx,
-        );
+        window.push_notification(format!("Deleted section {} (its tasks stay)", s.name), cx);
         cx.notify();
     }
 
-    /// Manual groups are edited in a dialog; they never assign an agent.
+    /// Names a new section (`rename` is `None`) or renames one, in a dialog.
     pub(super) fn start_naming(
         &mut self,
         rename: Option<usize>,
@@ -520,7 +518,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if rename.is_some_and(|i| self.state.sections.get(i).is_none_or(|s| s.agent.is_some())) {
+        if rename.is_some_and(|i| i >= self.state.sections.len()) {
             return;
         }
         let original = rename
@@ -528,7 +526,7 @@ impl Shark {
             .map(|s| s.name.clone());
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Task group name")
+                .placeholder("Section name")
                 .default_value(original.clone().unwrap_or_default())
         });
         let field = input.clone();
@@ -542,9 +540,9 @@ impl Shark {
             );
             crate::ui::dialog(d)
                 .title(if original.is_some() {
-                    "Rename task group"
+                    "Rename section"
                 } else {
-                    "New task group"
+                    "New section"
                 })
                 .w(px(440.))
                 .child(Input::new(&input))
@@ -555,12 +553,9 @@ impl Shark {
                     }
                     shark
                         .update(cx, |s, cx| {
-                            // Resolve the original name again if groups changed while the dialog was open.
+                            // Resolve the original name again if sections changed while the dialog was open.
                             let index = original.as_ref().and_then(|name| {
-                                s.state
-                                    .sections
-                                    .iter()
-                                    .position(|g| g.agent.is_none() && &g.name == name)
+                                s.state.sections.iter().position(|g| &g.name == name)
                             });
                             if original.is_some() && index.is_none() {
                                 return true;
@@ -574,7 +569,7 @@ impl Shark {
                                 notify_err(
                                     window,
                                     cx,
-                                    format!("There is already a task group {name}"),
+                                    format!("There is already a section {name}"),
                                 );
                                 return false;
                             }
@@ -583,13 +578,14 @@ impl Shark {
                                 i
                             } else {
                                 s.state.sections.push(Section {
-                                    agent: None,
                                     name,
                                     icon: "folder".into(),
                                     collapsed: false,
                                     tasks: vec![],
                                 });
-                                s.state.sections.len() - 1
+                                let i = s.state.sections.len() - 1;
+                                s.sel = SideRow::Section(i);
+                                i
                             };
                             if let Some(task) = &then_move {
                                 s.move_to_section(task, Some(index), cx);
@@ -612,13 +608,12 @@ impl Shark {
         let Some(section) = self.state.sections.get(i) else {
             return;
         };
-        if section.agent.is_some() {
-            return;
-        }
+        // By name: sections may move while the picker is open.
+        let name = section.name.clone();
         self.pick_named_icon(
             section.icon.clone(),
             move |s, icon, cx| {
-                if let Some(section) = s.state.sections.get_mut(i) {
+                if let Some(section) = s.state.sections.iter_mut().find(|g| g.name == name) {
                     section.icon = icon;
                     let _ = s.state.save();
                     cx.notify();
@@ -660,24 +655,15 @@ impl Shark {
         );
     }
 
-    /// Sections, then "No task group" when it is in one, then "New task group".
+    /// Sections, then Ungrouped when it is in one, then "New section…".
     pub(super) fn pick_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_target(window, cx, |s, ws, window, cx| {
             let ws = ws.name;
             let current = s.section_of(&ws);
-            let indices: Vec<_> = s
-                .state
-                .sections
-                .iter()
-                .enumerate()
-                .filter(|(_, g)| g.agent.is_none())
-                .map(|(i, _)| i)
-                .collect();
-            let n = indices.len();
+            let n = s.state.sections.len();
             let mut items: Vec<CommandItem> = (s.state.sections)
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.agent.is_none())
                 .map(|(i, s)| {
                     CommandItem::new()
                         .label(s.name.clone())
@@ -688,26 +674,24 @@ impl Shark {
             if current.is_some() {
                 items.push(
                     CommandItem::new()
-                        .label("No task group")
+                        .label(UNGROUPED)
                         .icon(IconName::FolderOutput),
                 );
             }
             items.push(
                 CommandItem::new()
-                    .label("New task group")
+                    .label("New section…")
                     .icon(IconName::FolderPlus),
             );
             let last = items.len() - 1;
             open_menu(
                 cx.entity().downgrade(),
-                "Move to task group…",
+                "Move to section…",
                 items,
-                current
-                    .and_then(|i| indices.iter().position(|j| *j == i))
-                    .unwrap_or(0),
+                current.unwrap_or(0),
                 move |s, row, window, cx| match row {
                     _ if row == last => s.start_naming(None, Some(ws.clone()), window, cx),
-                    _ if row < n => s.move_to_section(&ws, Some(indices[row]), cx),
+                    _ if row < n => s.move_to_section(&ws, Some(row), cx),
                     _ => s.move_to_section(&ws, None, cx),
                 },
                 window,
@@ -750,8 +734,8 @@ impl Shark {
             .id(ix)
             .test_support()
             // One line; a task waiting on you adds what it waits on beneath, as Devin's
-            // sessions do. Agent tasks indent one step, so their status icon lines up with the
-            // agent's name.
+            // sessions do. Section tasks indent one step, so their status icon lines up with
+            // the section's name.
             .when(!rail && needs.is_some(), |d| d.h(px(44.)))
             .when(section.is_some() && !rail, |d| d.ml(px(32.)))
             .map(|d| cursor_row(d, active, selected, focused, theme))
@@ -836,49 +820,35 @@ impl Shark {
             .into_any_element()
     }
 
-    fn agent_row(&self, i: usize, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let agent = &self.state.agents[i];
+    /// A section's header: icon, name and fold chevron. Folded, it shows one fact on the right:
+    /// how many of its tasks need you, else how many it holds.
+    fn section_row(
+        &self,
+        i: usize,
+        sec: &Section,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let (theme, rail) = (cx.theme(), self.rail);
         let focused = self.sidebar_focus.is_focused(window);
-        let selected = self.sel == SideRow::Agent(i);
-        let active = self.home_shown()
-            && matches!(&self.home.destination,
-            home::Destination::Agent(slug) if slug == &agent.slug);
-        let collapsed = self.collapsed_agents.contains(&agent.slug);
-        let tasks: Vec<_> = self
-            .state
-            .tasks
-            .iter()
-            .filter(|t| !t.backlog && t.agent.as_ref().is_some_and(|a| a.slug == agent.slug))
-            .filter(|t| self.sidebar_task_matches(t))
+        let selected = self.sel == SideRow::Section(i);
+        let collapsed = sec.collapsed;
+        // Counts follow the rows a fold hides: no Backlog, only the filtered repository.
+        let tasks: Vec<_> = (sec.tasks.iter())
+            .filter_map(|n| self.task(n))
+            .filter(|t| !t.backlog && self.sidebar_task_matches(t))
             .collect();
-        let needs = tasks
-            .iter()
+        let needs = (tasks.iter())
             .filter(|t| matches!(self.attention_of(&t.name, cx), Attn::Needs(_)))
             .count();
-        let running = tasks
-            .iter()
-            .filter(|t| self.running_chats(&t.name, cx) > 0)
-            .count();
-        let slug = agent.slug.clone();
-        let (menu_slug, new_slug) = (slug.clone(), slug.clone());
-        let (icon_slug, drop_slug, anchor_slug) = (slug.clone(), slug.clone(), slug.clone());
-        let row_drop_slug = slug.clone();
-        let anchors = self.icon_anchors.clone();
-        let tip: SharedString = format!("{} · {} tasks", agent.name, tasks.len()).into();
-        let group = SharedString::from(format!("agent-row-{i}"));
-        let accent = theme.sidebar_accent;
-        let bright = active || (selected && focused);
-        let quiet = if bright {
-            theme.foreground
-        } else {
-            theme.sidebar_foreground
-        };
-        // One fact on the right, the most urgent: tasks waiting on you, else running ones,
-        // else (folded) how many it has.
-        let badge = match (needs, running) {
-            (1.., _) => Some(
+        let warning = collapsed && needs > 0;
+        let tip: SharedString = sec.name.clone().into();
+        let badge = match (collapsed, needs) {
+            (false, _) => None,
+            (true, 1..) => Some(
                 h_flex()
+                    .id(("section-needs", i))
+                    .test_support()
                     .gap_1()
                     .text_xs()
                     .text_color(theme.warning_foreground)
@@ -886,15 +856,7 @@ impl Shark {
                     .child(needs.to_string())
                     .into_any_element(),
             ),
-            (_, 1..) => Some(
-                h_flex()
-                    .gap_1()
-                    .text_xs()
-                    .child(Spinner::new().with_size(px(12.)).color(theme.primary))
-                    .child(running.to_string())
-                    .into_any_element(),
-            ),
-            _ if collapsed && !tasks.is_empty() => Some(
+            (true, 0) if !tasks.is_empty() => Some(
                 div()
                     .text_xs()
                     .child(tasks.len().to_string())
@@ -904,122 +866,39 @@ impl Shark {
         };
         sidebar_row(rail, theme)
             .relative()
-            .id(("agent", i))
-            .group(group.clone())
+            .id(("section", i))
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!(
-                "Open {} agent, {} tasks{}",
-                agent.name,
+                "{} section, {} tasks{}",
+                sec.name,
                 tasks.len(),
                 match needs {
                     0 => String::new(),
                     n => format!(", {n} need you"),
                 }
             ))
+            .aria_expanded(!collapsed)
             .test_support()
-            .map(|d| cursor_row(d, active, selected, focused, theme))
+            .map(|d| cursor_row(d, false, selected, focused, theme))
             .when(selected && focused, |d| d.text_color(theme.foreground))
-            .on_click(cx.listener(move |this, _, w, cx| {
-                this.sel = SideRow::Agent(i);
-                this.open_agent(&slug, w, cx);
+            .map(|d| self.reorder_source(d, reorder::Item::Section(i), sec.name.clone().into()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.sel = SideRow::Section(i);
+                this.toggle_section(i, cx)
             }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                    this.sel = SideRow::Agent(i);
-                    let entries = this.agent_menu(&menu_slug, cx);
+                    this.sel = SideRow::Section(i);
+                    let entries = section_menu(this, i, cx);
                     this.show_menu(e.position, entries, w, cx);
                 }),
             )
-            .when(
-                self.agent_icon_drop
-                    .as_ref()
-                    .is_some_and(|(slug, _)| slug == &agent.slug),
-                |d| d.bg(accent),
-            )
-            // Finder drags after typing do not set GPUI's hover state.
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
-                    if event.bounds.contains(&event.event.position) {
-                        let path = event.drag(cx).paths().first().filter(|path| {
-                            !path.is_dir()
-                                && crate::media::kind(&path.to_string_lossy())
-                                    == Some(crate::media::Kind::Image)
-                        });
-                        this.agent_icon_drop = path.map(|path| (drop_slug.clone(), path.clone()));
-                        cx.notify();
-                    } else if this
-                        .agent_icon_drop
-                        .as_ref()
-                        .is_some_and(|(slug, _)| slug == &drop_slug)
-                    {
-                        this.agent_icon_drop = None;
-                        cx.notify();
-                    }
-                }),
-            )
-            .on_file_drop_exit(cx.listener(|this, _, _, cx| {
-                this.agent_icon_drop = None;
-                cx.notify();
-            }))
-            .on_drop(cx.listener(move |this, paths: &ExternalPaths, w, cx| {
-                cx.stop_propagation();
-                this.agent_icon_drop = None;
-                if let Some(path) = paths.paths().first().filter(|path| {
-                    !path.is_dir()
-                        && crate::media::kind(&path.to_string_lossy())
-                            == Some(crate::media::Kind::Image)
-                }) {
-                    this.pick_agent_icon(&row_drop_slug, w, cx);
-                    if let Some(panel) = &this.icon_picker {
-                        panel
-                            .picker
-                            .clone()
-                            .update(cx, |p, cx| p.load_path(path, true, w, cx));
-                    }
-                } else {
-                    this.add_repo_paths(paths.paths(), w, cx);
-                }
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id(("agent-icon", i))
-                    .relative()
-                    .size(ISZ)
-                    .flex_none()
-                    .cursor_pointer()
-                    .role(gpui_kit::accesskit::Role::Button)
-                    .aria_label(format!("Change {} icon", agent.name))
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        cx.stop_propagation();
-                        this.sel = SideRow::Agent(i);
-                        this.pick_agent_icon(&icon_slug, w, cx);
-                    }))
-                    .child(
-                        div()
-                            .absolute()
-                            .inset(px(-2.))
-                            .rounded(px(4.))
-                            .hover(move |d| d.bg(accent)),
-                    )
-                    .child(agent_icon_view::agent_icon(&agent.icon))
-                    .child(
-                        canvas(
-                            move |bounds, _, _| {
-                                anchors.borrow_mut().insert(anchor_slug.clone(), bounds);
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    .test_support(),
-            )
-            .when(rail && needs > 0, |d| {
+            .child(Icon::new(section_icon(&sec.icon)).with_size(ISZ))
+            .when(rail && warning, |d| {
                 d.child(
                     div()
-                        .id(("agent-rail-warning", i))
+                        .id(("section-rail-warning", i))
                         .test_support()
                         .absolute()
                         .right(px(-8.))
@@ -1032,58 +911,21 @@ impl Shark {
             .when(!rail, |d| {
                 d.child(
                     div()
-                        .flex_1()
                         .min_w_0()
                         .truncate()
                         .font_weight(FontWeight::MEDIUM)
-                        .child(agent.name.clone()),
+                        .child(sec.name.clone()),
                 )
-                // Keep hover controls before the badge so its spacing and position stay fixed.
                 .child(
-                    div()
-                        .invisible()
-                        .group_hover(group.clone(), |s| s.visible())
-                        .child(
-                            Button::new(("new-agent-task", i))
-                                .accessibility_label(format!("New task for {}", agent.name))
-                                .ghost()
-                                .xsmall()
-                                .text_color(quiet)
-                                .icon(IconName::Plus)
-                                .tooltip("New task")
-                                .on_click(cx.listener(move |this, _, w, cx| {
-                                    cx.stop_propagation();
-                                    this.prefill_agent_task(&new_slug, w, cx);
-                                })),
-                        ),
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .with_size(px(12.)),
                 )
+                .child(div().flex_1())
                 .children(badge)
-                .child(
-                    Button::new(("collapse-agent", i))
-                        .accessibility_label(format!(
-                            "{} {} tasks",
-                            if collapsed { "Expand" } else { "Collapse" },
-                            agent.name
-                        ))
-                        .ghost()
-                        .xsmall()
-                        // The button's own foreground would outshine the label it belongs to.
-                        .text_color(quiet)
-                        .icon(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .tooltip(if collapsed {
-                            "Expand tasks"
-                        } else {
-                            "Collapse tasks"
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_agent_collapsed(i, !collapsed, cx);
-                        })),
-                )
             })
             .when(rail, |d| {
                 d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -1114,36 +956,36 @@ impl Shark {
         let order = self.ws_order(false);
         let accent = theme.sidebar_accent;
         let mut items: Vec<AnyElement> = vec![];
-        let mut other_header = false;
         for row in self.side_rows(false) {
             match row {
-                SideRow::Agent(i) => items.push(self.agent_row(i, window, cx)),
-                SideRow::Task(i) => {
-                    let task = &self.state.tasks[i];
-                    let agent = task.agent.as_ref().and_then(|a| {
-                        self.state
-                            .agents
-                            .iter()
-                            .position(|agent| agent.slug == a.slug)
-                    });
-                    if agent.is_none() && !other_header {
-                        items.push(header("Unassigned").into_any_element());
-                        other_header = true;
-                    }
+                SideRow::Section(i) => items.push(self.reorder_item(
+                    self.section_row(i, &self.state.sections[i], window, cx),
+                    reorder::Item::Section(i),
+                )),
+                SideRow::Task(ix) => {
+                    let task = &self.state.tasks[ix];
+                    let section = self.section_of(&task.name);
                     items.push(self.reorder_item(
-                        self.ws_row(i, task, agent, &order, window, cx),
+                        self.ws_row(ix, task, section, &order, window, cx),
                         reorder::Item::Task(task.name.clone()),
                     ));
                 }
             }
         }
-        let new_task_menu = |add_repo: bool| {
+        let new_section_menu = |add_repo: bool| {
             cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                let mut entries = vec![menu::item(
-                    IconName::Plus,
-                    "New task",
-                    on_shark(cx, |s, w, cx| s.new_empty_task(w, cx)),
-                )];
+                let mut entries = vec![
+                    menu::item(
+                        IconName::Plus,
+                        "New task",
+                        on_shark(cx, |s, w, cx| s.new_empty_task(w, cx)),
+                    ),
+                    menu::item(
+                        IconName::FolderPlus,
+                        "New section…",
+                        on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
+                    ),
+                ];
                 if add_repo {
                     entries.push(menu::item(
                         IconName::FolderGit2,
@@ -1154,23 +996,35 @@ impl Shark {
                 this.show_menu(e.position, entries, w, cx);
             })
         };
-        // "+" sits on the label's line, right-aligned with the agent rows' chevrons.
-        let agents_header = header("Agents")
-            .id("agents-header")
+        // Dropping a task here takes it out of its section.
+        let ws_header = h_flex()
+            .id("ws-header")
             .test_support()
-            .when(!rail, |d| d.flex())
+            .group("ws-header")
             .justify_between()
-            .items_center()
-            .child(
-                Button::new("new-agent")
-                    .accessibility_label("New agent")
-                    .ghost()
-                    .xsmall()
-                    .text_color(theme.sidebar_foreground)
-                    .icon(IconName::Plus)
-                    .tooltip("New agent")
-                    .on_click(cx.listener(|this, _, w, cx| this.new_agent_dialog(w, cx))),
-            );
+            .items_end()
+            .child(header("Tasks"))
+            .when(!rail, |d| {
+                d.child(
+                    div()
+                        .mr_3()
+                        .invisible()
+                        .group_hover("ws-header", |s| s.visible())
+                        .child(
+                            Button::new("new-section")
+                                .accessibility_label("New section")
+                                .ghost()
+                                .xsmall()
+                                .text_color(theme.sidebar_foreground)
+                                .icon(IconName::FolderPlus)
+                                .tooltip("New section")
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.start_naming(None, None, w, cx)
+                                })),
+                        ),
+                )
+            })
+            .on_mouse_down(MouseButton::Right, new_section_menu(false));
         let add_repo_row = sidebar_row(rail, theme)
             .id("add-repo-row")
             .hover(|d| d.bg(side_hover(theme)))
@@ -1204,17 +1058,13 @@ impl Shark {
                 }
                 match this.sel {
                     SideRow::Task(ix) => this.open_task(ix, window, cx),
-                    SideRow::Agent(i) => {
-                        if let Some(slug) = this.state.agents.get(i).map(|a| a.slug.clone()) {
-                            this.open_agent(&slug, window, cx);
-                        }
-                    }
+                    SideRow::Section(i) => this.toggle_section(i, cx),
                 }
             }))
             .on_action(cx.listener(|this, _: &CollapseDir, _, cx| this.collapse_at_cursor(cx)))
             .on_action(cx.listener(|this, _: &ExpandDir, _, cx| {
-                if let Some(i) = this.cursor_agent() {
-                    this.set_agent_collapsed(i, false, cx)
+                if let Some(i) = this.cursor_section() {
+                    this.set_collapsed(i, false, cx)
                 }
             }))
             .child(
@@ -1280,10 +1130,12 @@ impl Shark {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.sidebar_scroll)
-                    .child(agents_header)
+                    .child(
+                        self.reorder_item(ws_header.into_any_element(), reorder::Item::Ungrouped),
+                    )
                     .children(items)
                     .when(
-                        self.state.tasks.is_empty() && self.state.agents.is_empty(),
+                        self.state.tasks.is_empty() && self.state.sections.is_empty(),
                         |d| d.child(hint("cmd-n to create")),
                     )
                     .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))
@@ -1293,39 +1145,10 @@ impl Shark {
                             .id("sidebar-rest")
                             .flex_1()
                             .min_h(px(24.))
-                            .on_mouse_down(MouseButton::Right, new_task_menu(true)),
+                            .on_mouse_down(MouseButton::Right, new_section_menu(true)),
                     ),
             )
             .child(self.render_usage_footer(cx))
-            .child({
-                let owner = cx.entity().downgrade();
-                canvas(
-                    |_, _, _| {},
-                    move |_, _, window, _| {
-                        let owner = owner.clone();
-                        window.on_mouse_event(move |_: &MouseUpEvent, phase, w, cx| {
-                            if phase != DispatchPhase::Bubble {
-                                return;
-                            }
-                            owner
-                                .update(cx, |this, cx| {
-                                    if let Some((slug, path)) = this.agent_icon_drop.take() {
-                                        this.pick_agent_icon(&slug, w, cx);
-                                        if let Some(panel) = &this.icon_picker {
-                                            panel.picker.clone().update(cx, |p, cx| {
-                                                p.load_path(&path, true, w, cx)
-                                            });
-                                        }
-                                        cx.notify();
-                                    }
-                                })
-                                .ok();
-                        });
-                    },
-                )
-                .absolute()
-                .size_0()
-            })
             .test_support()
     }
 }

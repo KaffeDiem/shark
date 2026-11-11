@@ -99,9 +99,8 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let agent = self.draft_target();
-        self.sync_reference_completion(agent, cx);
-        if self.draft(agent).starting {
+        self.sync_reference_completion(cx);
+        if self.home.draft.starting {
             return;
         }
         let mut repos = self.state.repos.clone();
@@ -135,7 +134,8 @@ impl Shark {
             rows.extend(self.reference_hits().into_iter().map(Pick::Issue));
         }
         let agent_repos: Vec<_> = self
-            .draft(agent)
+            .home
+            .draft
             .repos
             .iter()
             .map(|r| r.repo.name.clone())
@@ -205,7 +205,6 @@ impl Shark {
                 query_seq: 0,
                 failure: None,
                 attaching: false,
-                destination: self.home.destination.clone(),
                 shark,
                 _keys: keys,
             }
@@ -421,7 +420,6 @@ struct AddPicker {
     query_seq: u64,
     failure: Option<String>,
     attaching: bool,
-    destination: home::Destination,
     shark: WeakEntity<Shark>,
     _keys: Subscription,
 }
@@ -633,7 +631,6 @@ impl AddPicker {
                 .filter(|r| self.marks.contains(&r.key()))
                 .collect()
         };
-        let destination = self.destination.clone();
         let targets: Vec<_> = picks.iter().filter_map(Pick::issue_target).collect();
         let request = (!targets.is_empty()).then(|| {
             self.shark.update(cx, |s, cx| {
@@ -668,9 +665,8 @@ impl AddPicker {
                 p.shark
                     .update(cx, |s, cx| {
                         let registered = s.state.repos.clone();
-                        if let Some(draft) =
-                            s.draft_at_mut(&destination).filter(|draft| !draft.starting)
-                        {
+                        let draft = &mut s.home.draft;
+                        if !draft.starting {
                             for pick in &picks {
                                 match pick {
                                     Pick::Repo(repo) => {
@@ -728,9 +724,7 @@ impl AddPicker {
                                 linear::keep(&mut draft.issues, &issue);
                             }
                         }
-                        if s.home.destination == destination {
-                            s.refresh_draft_sources(s.draft_target(), cx);
-                        }
+                        s.refresh_draft_sources(cx);
                         s.close_draft_picker(w, cx);
                         cx.notify();
                     })

@@ -560,10 +560,10 @@ fn agent_skill_refresh_preserves_links_on_scan_failure_and_reports_install_error
     fs::create_dir_all(source.join("deploy")).unwrap();
     fs::write(source.join("deploy/SKILL.md"), "Deploy").unwrap();
     let task = Task {
-        agent: Some(AgentLink {
+        agents: vec![AgentLink {
             slug,
             ..Default::default()
-        }),
+        }],
         ..Default::default()
     };
     write_root_docs(&task, &dir).unwrap();
@@ -1925,19 +1925,23 @@ fn find_attachment_tells_states_apart() {
 }
 
 #[test]
-fn root_headers_include_agent_instructions_with_and_without_repos() {
+fn agent_instructions_go_to_each_chat_not_the_shared_root_docs() {
     let mut task = Task {
         name: "design".into(),
         branch: "design/one".into(),
-        agent: Some(AgentLink {
+        agents: vec![AgentLink {
             slug: "designer".into(),
             name: "Designer".into(),
             instructions: "Always use Mobbin.".into(),
             ..Default::default()
-        }),
+        }],
         ..Default::default()
     };
-    assert!(header(&task).contains("## Agent: Designer\n\nAlways use Mobbin."));
+    task.migrate();
+    assert!(
+        !header(&task).contains("## Agent:"),
+        "every chat of the task reads the root docs"
+    );
     task.repos.push(TaskRepo {
         name: "api".into(),
         src: "/missing".into(),
@@ -1945,11 +1949,21 @@ fn root_headers_include_agent_instructions_with_and_without_repos() {
         branch: None,
     });
     let text = header(&task);
-    assert!(text.contains("## Agent: Designer\n\nAlways use Mobbin."));
-    assert!(text.find("- `api/`: worktree of ").unwrap() < text.find("## Agent:").unwrap());
+    assert!(!text.contains("## Agent:"));
     assert!(
         text.contains("Don't create more git worktrees"),
         "harnesses stay in the task Shark already isolated"
+    );
+    let mut chat = task.chats[0].clone();
+    assert_eq!(
+        agent_prompt(&task, &chat).as_deref(),
+        Some("## Agent: Designer\n\nAlways use Mobbin.")
+    );
+    chat.agent = None;
+    assert_eq!(
+        agent_prompt(&task, &chat),
+        None,
+        "a chat without an agent gets none"
     );
 }
 
@@ -1977,11 +1991,11 @@ fn agent_skills_reach_each_harness_and_survive_disabled_repo_skills() {
     .unwrap();
     git(&dir.join("api"), &["add", "."]).unwrap();
     commit(&dir.join("api"), &["-qm", "skills"]);
-    task.agent = Some(crate::state::AgentLink {
+    task.agents = vec![crate::state::AgentLink {
         slug,
         name: "Designer".into(),
         ..Default::default()
-    });
+    }];
 
     reconcile_skills(&task, &dir, true).unwrap();
     for folder in HARNESS_SKILL_DIRS {

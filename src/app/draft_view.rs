@@ -1,5 +1,5 @@
-//! Shared Home and agent-page draft controls. Pickers only change the draft.
-use super::home::{Destination, agent_prompt};
+//! Home's task draft controls. Pickers only change the draft.
+use super::home::agent_prompt;
 use super::task_draft::{BranchSpec, DraftRepo, TaskDraft};
 use super::*;
 use crate::models::{effort_label, efforts, model_label};
@@ -70,69 +70,33 @@ impl Shark {
             .unwrap_or_else(|| window.mouse_position())
     }
 
-    pub(super) fn draft(&self, agent: bool) -> &TaskDraft {
-        if agent {
-            &self.home.agent_draft
-        } else {
-            &self.home.draft
-        }
-    }
-
-    pub(super) fn draft_mut(&mut self, agent: bool) -> &mut TaskDraft {
-        if agent {
-            &mut self.home.agent_draft
-        } else {
-            &mut self.home.draft
-        }
-    }
-
-    pub(super) fn draft_slug(&self, agent: bool) -> Option<&str> {
-        if agent {
-            self.home.agent_prompt_for.as_deref()
-        } else {
-            self.home.draft_agent.as_deref()
-        }
-    }
-
-    pub(super) fn draft_target(&self) -> bool {
-        matches!(self.home.destination, Destination::Agent(_))
-    }
-
+    /// Agent `slug`'s saved repos, into the draft if it's for `slug` and its repos are unedited.
     pub(super) fn refresh_draft_defaults(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let defaults = TaskDraft::for_agent(&self.state, Some(slug));
-        let update = |draft: &mut TaskDraft| {
-            if !draft.repos_edited {
-                draft.repos = defaults
-                    .repos
-                    .iter()
-                    .map(|repo| {
-                        draft
-                            .repos
-                            .iter()
-                            .find(|r| r.repo.name == repo.repo.name)
-                            .unwrap_or(repo)
-                            .clone()
-                    })
-                    .collect();
-            }
-        };
-        if self.home.agent_prompt_for.as_deref() == Some(slug) {
-            update(&mut self.home.agent_draft);
-            self.refresh_draft_sources(true, cx);
+        let draft = &mut self.home.draft;
+        if self.home.draft_agent.as_deref() != Some(slug) {
+            return;
         }
-        if self.home.draft_agent.as_deref() == Some(slug) {
-            update(&mut self.home.draft);
-            self.refresh_draft_sources(false, cx);
+        if !draft.repos_edited {
+            let defaults = TaskDraft::for_agent(&self.state, Some(slug));
+            draft.repos = defaults
+                .repos
+                .iter()
+                .map(|repo| {
+                    (draft.repos.iter())
+                        .find(|r| r.repo.name == repo.repo.name)
+                        .unwrap_or(repo)
+                        .clone()
+                })
+                .collect();
         }
-        if let Some(draft) = self.home.agent_drafts.get_mut(slug) {
-            update(draft);
-        }
+        self.refresh_draft_sources(cx);
     }
 
-    pub(super) fn refresh_draft_sources(&mut self, agent: bool, cx: &mut Context<Self>) {
-        self.sync_reference_completion(agent, cx);
+    pub(super) fn refresh_draft_sources(&mut self, cx: &mut Context<Self>) {
+        self.sync_reference_completion(cx);
         let unresolved: Vec<_> = self
-            .draft(agent)
+            .home
+            .draft
             .repos
             .iter()
             .filter_map(|r| {
@@ -162,9 +126,12 @@ impl Shark {
             })
             .detach();
         }
-        let draft = self.draft(agent);
-        let codex =
-            crate::codex::is_codex(Some(&draft.defaults(&self.state, self.draft_slug(agent)).0));
+        let draft = &self.home.draft;
+        let codex = crate::codex::is_codex(Some(
+            &draft
+                .defaults(&self.state, self.home.draft_agent.as_deref())
+                .0,
+        ));
         let sources = draft
             .repos
             .iter()
@@ -184,117 +151,88 @@ impl Shark {
             })
             .collect();
         let skills = self
-            .draft_slug(agent)
+            .home
+            .draft_agent
+            .as_deref()
             .map(super::agent_settings::skill_names)
             .unwrap_or_default();
-        let composer = if agent {
-            self.home.agent_composer.clone()
-        } else {
-            self.home.composer.clone()
-        };
-        let home_agent = if agent {
-            None
-        } else {
-            self.home.draft_agent.clone()
-        };
-        composer.update(cx, |c, cx| {
+        let home_agent = self.home.draft_agent.clone();
+        self.home.composer.update(cx, |c, cx| {
             c.set_home_agent(home_agent, cx);
-            c.set_sources(sources, skills, !agent, codex, cx);
+            c.set_sources(sources, skills, true, codex, cx);
         });
     }
 
     pub(super) fn draft_composer_event(
         &mut self,
-        agent: bool,
         event: &ComposerEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
             ComposerEvent::AttachReference(reference) => {
-                self.attach_draft_reference(agent, reference.clone(), window, cx)
+                self.attach_draft_reference(reference.clone(), window, cx)
             }
             ComposerEvent::SearchIssues(query) => self.search_reference_issues(query.clone(), cx),
             ComposerEvent::PasteReference { id, text } => {
-                self.paste_draft_reference(agent, *id, text.clone(), window, cx)
+                self.paste_draft_reference(*id, text.clone(), window, cx)
             }
-            ComposerEvent::UndoReference { id, .. } => {
-                self.undo_draft_reference(agent, *id, window, cx)
-            }
+            ComposerEvent::UndoReference { id, .. } => self.undo_draft_reference(*id, window, cx),
             ComposerEvent::Submit => {
-                if agent {
-                    self.submit_task_draft(window, cx);
-                } else if !self.mentions(cx).is_empty() {
+                if !self.mentions(cx).is_empty() {
                     self.complete_mention(None, window, cx);
                 } else {
                     self.submit_prompt(window, cx);
                 }
             }
             ComposerEvent::Change => {
-                let input = if agent {
-                    &self.home.agent_prompt
-                } else {
-                    &self.home.prompt
-                };
-                let content = input.read(cx).content();
+                let content = self.home.prompt.read(cx).content();
                 let text = content.text().to_string();
-                if !agent {
-                    let slug = agent_prompt(text.trim(), &self.state.agents)
-                        .0
-                        .map(str::to_string);
-                    if self.home.draft_agent != slug {
-                        if !self.home.draft.repos_edited {
-                            self.home.draft.repos =
-                                TaskDraft::for_agent(&self.state, slug.as_deref()).repos;
-                        }
-                        self.home.draft_agent = slug;
-                        self.refresh_draft_sources(false, cx);
+                let slug = agent_prompt(text.trim(), &self.state.agents)
+                    .0
+                    .map(str::to_string);
+                if self.home.draft_agent != slug {
+                    if !self.home.draft.repos_edited {
+                        self.home.draft.repos =
+                            TaskDraft::for_agent(&self.state, slug.as_deref()).repos;
                     }
-                    self.home.mention = 0;
+                    self.home.draft_agent = slug;
+                    self.refresh_draft_sources(cx);
                 }
-                self.draft_mut(agent).text = text;
-                self.draft_mut(agent).content = Some(content);
+                self.home.mention = 0;
+                self.home.draft.text = text;
+                self.home.draft.content = Some(content);
                 cx.notify();
             }
             ComposerEvent::Escape => {
-                if !agent {
-                    self.cancel_ask(cx);
-                }
+                self.cancel_ask(cx);
                 self.home.focus.focus(window, cx);
                 cx.notify();
             }
-            ComposerEvent::ToggleAsk => {
-                if !agent {
-                    self.toggle_ask_mode(window, cx);
-                }
-            }
+            ComposerEvent::ToggleAsk => self.toggle_ask_mode(window, cx),
             ComposerEvent::TogglePlan => self.toggle_draft_plan(cx),
             ComposerEvent::ModelMenu => self.draft_model_menu(window, cx),
             ComposerEvent::AgentMove(by) => self.move_mention(*by, cx),
             ComposerEvent::Tray => {
-                if agent || !self.home.asking {
+                if !self.home.asking {
                     self.home.tray_stop = self.draft_stops().first().cloned();
                     self.home.tray_focus.focus(window, cx);
                     cx.notify();
                 }
             }
             ComposerEvent::Attach { paths, image } => {
-                self.attach_draft_files(agent, paths.clone(), image.clone(), window, cx)
+                self.attach_draft_files(paths.clone(), image.clone(), window, cx)
             }
         }
     }
 
-    pub(super) fn focus_draft(&mut self, agent: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = if agent {
-            self.home.agent_prompt.clone()
-        } else {
-            self.home.prompt.clone()
-        };
-        let placeholder = if !agent && self.home.asking {
+    pub(super) fn focus_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.home.prompt.clone();
+        let placeholder = if self.home.asking {
             "Ask how to do something in Shark".into()
-        } else if let Some(issue) = self.draft(agent).issues.first() {
+        } else if let Some(issue) = self.home.draft.issues.first() {
             format!("Add notes, or press Enter to plan {}", issue.identifier)
-        } else if let Some(a) = self.draft_slug(agent).and_then(|s| self.agent(s)) {
+        } else if let Some(a) = self.home.draft_agent.as_deref().and_then(|s| self.agent(s)) {
             format!("Describe a task for {}", a.name)
         } else {
             "Describe the work; enter starts a task".into()
@@ -303,45 +241,7 @@ impl Shark {
             p.set_placeholder(placeholder, window, cx);
             p.focus(window, cx);
         });
-        self.refresh_draft_sources(agent, cx);
-        cx.notify();
-    }
-
-    pub(super) fn draft_at_mut(&mut self, destination: &Destination) -> Option<&mut TaskDraft> {
-        match destination {
-            Destination::Home => Some(&mut self.home.draft),
-            Destination::Agent(slug) if self.home.agent_prompt_for.as_ref() == Some(slug) => {
-                Some(&mut self.home.agent_draft)
-            }
-            Destination::Agent(slug) => self.home.agent_drafts.get_mut(slug),
-        }
-    }
-
-    pub(super) fn add_draft_issues_to(
-        &mut self,
-        destination: &Destination,
-        issues: Vec<Snapshot>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(draft) = self.draft_at_mut(destination) else {
-            return;
-        };
-        if draft.starting {
-            return;
-        }
-        for issue in issues {
-            if !draft
-                .issues
-                .iter()
-                .any(|i| i.id == issue.id && i.org == issue.org)
-            {
-                draft.issues.push(issue);
-            }
-        }
-        if &self.home.destination == destination {
-            self.focus_draft(self.draft_target(), window, cx);
-        }
+        self.refresh_draft_sources(cx);
         cx.notify();
     }
 
@@ -351,7 +251,17 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.add_draft_issues_to(&self.home.destination.clone(), issues, window, cx);
+        let draft = &mut self.home.draft;
+        if draft.starting {
+            return;
+        }
+        for issue in issues {
+            if !(draft.issues.iter()).any(|i| i.id == issue.id && i.org == issue.org) {
+                draft.issues.push(issue);
+            }
+        }
+        self.focus_draft(window, cx);
+        cx.notify();
     }
 
     pub(super) fn pick_draft_branch(
@@ -360,11 +270,10 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let agent = self.draft_target();
-        if self.draft(agent).starting {
+        if self.home.draft.starting {
             return;
         }
-        let current = self.draft(agent).repos.clone();
+        let current = self.home.draft.repos.clone();
         let position = self.draft_control_position(
             &only
                 .as_ref()
@@ -372,19 +281,14 @@ impl Shark {
                 .unwrap_or_else(|| "draft-add".into()),
             window,
         );
-        let destination = self.home.destination.clone();
         self.pick_draft_repos_at(
             current,
             only,
             Rc::new(move |s, repos, w, cx| {
-                let Some(draft) = s.draft_at_mut(&destination) else {
-                    return;
-                };
+                let draft = &mut s.home.draft;
                 draft.repos = repos;
                 draft.repos_edited = true;
-                if s.home.destination == destination {
-                    s.focus_draft(agent, w, cx);
-                }
+                s.focus_draft(w, cx);
             }),
             position,
             window,
@@ -393,8 +297,7 @@ impl Shark {
     }
 
     fn draft_repo_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        let Some(current) = self.draft(agent).repos.get(index) else {
+        let Some(current) = self.home.draft.repos.get(index) else {
             return;
         };
         let name = current.repo.name.clone();
@@ -405,7 +308,8 @@ impl Shark {
             .filter(|repo| {
                 repo.name == name
                     || !self
-                        .draft(agent)
+                        .home
+                        .draft
                         .repos
                         .iter()
                         .any(|r| r.repo.name == repo.name)
@@ -417,18 +321,18 @@ impl Shark {
                     IconName::FolderGit2,
                     repo.name.clone(),
                     on_shark(cx, move |s, w, cx| {
-                        if s.draft(agent).starting {
+                        if s.home.draft.starting {
                             return;
                         }
-                        s.draft_mut(agent).repos[index] = DraftRepo {
+                        s.home.draft.repos[index] = DraftRepo {
                             repo: repo.clone(),
                             pr_label: None,
                             branch: BranchSpec::New {
                                 base: String::new(),
                             },
                         };
-                        s.draft_mut(agent).repos_edited = true;
-                        s.focus_draft(agent, w, cx);
+                        s.home.draft.repos_edited = true;
+                        s.focus_draft(w, cx);
                     }),
                 )
                 .checked(checked)
@@ -453,12 +357,12 @@ impl Shark {
             IconName::X,
             "Remove repository",
             on_shark(cx, move |s, w, cx| {
-                if s.draft(agent).starting {
+                if s.home.draft.starting {
                     return;
                 }
-                s.draft_mut(agent).repos.remove(index);
-                s.draft_mut(agent).repos_edited = true;
-                s.focus_draft(agent, w, cx);
+                s.home.draft.repos.remove(index);
+                s.home.draft.repos_edited = true;
+                s.focus_draft(w, cx);
             }),
         ));
         self.show_menu(
@@ -470,10 +374,7 @@ impl Shark {
     }
 
     pub(super) fn draft_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.home_shown()
-            || self.draft(self.draft_target()).starting
-            || (!self.draft_target() && self.home.asking)
-        {
+        if !self.home_shown() || self.home.draft.starting || self.home.asking {
             return;
         }
         self.draft_add_picker(self.draft_control_position("draft-add", window), window, cx);
@@ -488,13 +389,10 @@ impl Shark {
     }
 
     pub(super) fn change_draft_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.home_shown()
-            || self.draft(self.draft_target()).starting
-            || (!self.draft_target() && self.home.asking)
-        {
+        if !self.home_shown() || self.home.draft.starting || self.home.asking {
             return;
         }
-        let draft = self.draft(self.draft_target());
+        let draft = &self.home.draft;
         let index = match &self.home.tray_stop {
             Some(DraftStop::Repo(name)) if self.home.tray_focus.is_focused(window) => draft
                 .repos
@@ -511,12 +409,11 @@ impl Shark {
     }
 
     pub(super) fn reset_draft_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        if self.draft(agent).starting || self.draft_slug(agent).is_none() {
+        if self.home.draft.starting || self.home.draft_agent.as_deref().is_none() {
             return;
         }
-        let mut defaults = TaskDraft::for_agent(&self.state, self.draft_slug(agent));
-        let draft = self.draft_mut(agent);
+        let mut defaults = TaskDraft::for_agent(&self.state, self.home.draft_agent.as_deref());
+        let draft = &mut self.home.draft;
         for repo in &mut defaults.repos {
             if let Some(current) = draft.repos.iter().find(|r| r.repo.name == repo.repo.name) {
                 repo.branch = current.branch.clone();
@@ -528,29 +425,29 @@ impl Shark {
         draft.model = None;
         draft.effort = None;
         draft.follow_app = false;
-        self.focus_draft(agent, window, cx);
+        self.focus_draft(window, cx);
     }
 
     pub(super) fn save_draft_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        if self.draft(agent).starting {
+        if self.home.draft.starting {
             return;
         }
-        let Some(slug) = self.draft_slug(agent).map(str::to_owned) else {
+        let Some(slug) = self.home.draft_agent.as_deref().map(str::to_owned) else {
             return;
         };
         let Some(index) = self.state.agents.iter().position(|a| a.slug == slug) else {
             return;
         };
         let previous = self.state.agents[index].clone();
-        let (model, effort) = self.draft(agent).saved_settings(&previous);
+        let (model, effort) = self.home.draft.saved_settings(&previous);
         let repos = self
-            .draft(agent)
+            .home
+            .draft
             .repos
             .iter()
             .map(|r| r.repo.name.clone())
             .collect();
-        let effective = self.draft(agent).defaults(&self.state, Some(&slug)).0;
+        let effective = self.home.draft.defaults(&self.state, Some(&slug)).0;
         let effort = effort.filter(|e| efforts(&effective).contains(&e.as_str()));
         let a = &mut self.state.agents[index];
         a.repos = repos;
@@ -561,30 +458,33 @@ impl Shark {
             notify_err(window, cx, format!("Couldn't save agent defaults: {error}"));
             return;
         }
-        let draft = self.draft_mut(agent);
+        let draft = &mut self.home.draft;
         draft.model = None;
         draft.effort = None;
         draft.follow_app = false;
         draft.repos_edited = false;
         self.refresh_draft_defaults(&slug, cx);
-        self.focus_draft(agent, window, cx);
+        self.focus_draft(window, cx);
     }
 
     pub(super) fn toggle_draft_plan(&mut self, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        if self.home.asking && !agent {
+        if self.home.asking {
             return;
         }
-        let draft = self.draft_mut(agent);
+        let draft = &mut self.home.draft;
         if !draft.starting && !draft.repos.is_empty() {
             draft.plan = !draft.plan;
             cx.notify();
         }
     }
 
-    fn draft_settings_source(&self, agent: bool) -> String {
-        let draft = self.draft(agent);
-        let default_agent = self.draft_slug(agent).and_then(|slug| self.agent(slug));
+    fn draft_settings_source(&self) -> String {
+        let draft = &self.home.draft;
+        let default_agent = self
+            .home
+            .draft_agent
+            .as_deref()
+            .and_then(|slug| self.agent(slug));
         let source = |model: bool| {
             if if model {
                 draft.model.is_some()
@@ -620,13 +520,13 @@ impl Shark {
     }
 
     pub(super) fn draft_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        if self.draft(agent).starting || (!agent && self.home.asking) {
+        if self.home.draft.starting || self.home.asking {
             return;
         }
         let (model, effort) = self
-            .draft(agent)
-            .defaults(&self.state, self.draft_slug(agent));
+            .home
+            .draft
+            .defaults(&self.state, self.home.draft_agent.as_deref());
         let mut entries: Vec<_> = MODELS
             .iter()
             .map(|&id| {
@@ -634,7 +534,7 @@ impl Shark {
                     None,
                     model_label(id),
                     on_shark(cx, move |s, _, cx| {
-                        let draft = s.draft_mut(agent);
+                        let draft = &mut s.home.draft;
                         draft.model = Some(id.into());
                         if draft
                             .effort
@@ -643,7 +543,7 @@ impl Shark {
                         {
                             draft.effort = None;
                         }
-                        s.refresh_draft_sources(agent, cx);
+                        s.refresh_draft_sources(cx);
                         cx.notify();
                     }),
                 )
@@ -651,7 +551,7 @@ impl Shark {
             })
             .collect();
         let (inherited_model, inherited_effort) =
-            self.draft(agent).inherited_defaults(&self.state, None);
+            self.home.draft.inherited_defaults(&self.state, None);
         entries.insert(
             0,
             menu::item(
@@ -662,15 +562,15 @@ impl Shark {
                     effort_label(inherited_effort.as_deref().unwrap_or(crate::models::EFFORT))
                 ),
                 on_shark(cx, move |s, _, cx| {
-                    let draft = s.draft_mut(agent);
+                    let draft = &mut s.home.draft;
                     draft.model = None;
                     draft.effort = None;
                     draft.follow_app = true;
-                    s.refresh_draft_sources(agent, cx);
+                    s.refresh_draft_sources(cx);
                     cx.notify();
                 }),
             )
-            .checked(self.draft(agent).follow_app),
+            .checked(self.home.draft.follow_app),
         );
         entries.insert(1, Entry::Sep);
         entries.push(Entry::Sep);
@@ -679,19 +579,20 @@ impl Shark {
                 None,
                 effort_label(level),
                 on_shark(cx, move |s, _, cx| {
-                    s.draft_mut(agent).effort = Some(level.into());
+                    s.home.draft.effort = Some(level.into());
                     cx.notify();
                 }),
             )
             .checked(effort.as_deref().unwrap_or(crate::models::EFFORT) == level)
         }));
-        if self.draft(agent).model.is_some()
-            || self.draft(agent).effort.is_some()
-            || self.draft(agent).follow_app
+        if self.home.draft.model.is_some()
+            || self.home.draft.effort.is_some()
+            || self.home.draft.follow_app
         {
             let (model, effort) = self
-                .draft(agent)
-                .inherited_defaults(&self.state, self.draft_slug(agent));
+                .home
+                .draft
+                .inherited_defaults(&self.state, self.home.draft_agent.as_deref());
             entries.push(Entry::Sep);
             entries.push(menu::item(
                 None,
@@ -701,21 +602,21 @@ impl Shark {
                     effort_label(effort.as_deref().unwrap_or(crate::models::EFFORT))
                 ),
                 on_shark(cx, move |s, _, cx| {
-                    let draft = s.draft_mut(agent);
+                    let draft = &mut s.home.draft;
                     draft.model = None;
                     draft.effort = None;
                     draft.follow_app = false;
-                    s.refresh_draft_sources(agent, cx);
+                    s.refresh_draft_sources(cx);
                     cx.notify();
                 }),
             ));
         }
         if self.home.footer_density >= 2 {
             entries.push(Entry::Sep);
-            if self.draft(agent).repos.is_empty() {
+            if self.home.draft.repos.is_empty() {
                 entries.push(Entry::Heading(
                     "Plan only".into(),
-                    self.draft_plan_tooltip(agent).into(),
+                    self.draft_plan_tooltip().into(),
                 ));
             } else {
                 entries.push(
@@ -724,70 +625,44 @@ impl Shark {
                         "Plan before implementing",
                         on_shark(cx, |s, _, cx| s.toggle_draft_plan(cx)),
                     )
-                    .checked(self.draft(agent).plan)
+                    .checked(self.home.draft.plan)
                     .hint("⇧Tab"),
                 );
             }
         }
         entries[0] =
-            std::mem::replace(&mut entries[0], Entry::Sep).hint(self.draft_settings_source(agent));
+            std::mem::replace(&mut entries[0], Entry::Sep).hint(self.draft_settings_source());
         self.show_menu(window.mouse_position(), entries, window, cx);
     }
 
     pub(super) fn submit_task_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        if self.draft(agent).starting || self.draft(agent).staging > 0 {
+        if self.home.draft.starting || self.home.draft.staging > 0 {
             return;
         }
-        if !agent {
-            self.draft_composer_event(false, &ComposerEvent::Change, window, cx);
-        }
-        let input = if agent {
-            self.home.agent_prompt.clone()
-        } else {
-            self.home.prompt.clone()
-        };
-        let text = input.read(cx).value().to_string();
-        let mut draft = self.draft(agent).clone();
-        draft.text = if agent {
-            text
-        } else {
-            agent_prompt(text.trim(), &self.state.agents).1.to_string()
-        };
-        let link = self.selected_task_agent(cx);
-        let slug = link.as_ref().map(|a| a.slug.clone());
-        self.draft_mut(agent).starting = true;
-        let composer = if agent {
-            self.home.agent_composer.clone()
-        } else {
-            self.home.composer.clone()
-        };
+        self.draft_composer_event(&ComposerEvent::Change, window, cx);
+        let text = self.home.prompt.read(cx).value().to_string();
+        let mut draft = self.home.draft.clone();
+        draft.text = agent_prompt(text.trim(), &self.state.agents).1.to_string();
+        // Captured now: the prompt can change while the task is created.
+        let link = (self.home.draft_agent.as_deref())
+            .and_then(|slug| self.agent(slug))
+            .map(crate::state::AgentLink::from);
+        self.home.draft.starting = true;
+        let composer = self.home.composer.clone();
         composer.update(cx, |c, cx| c.set_read_only(true, cx));
         self.start_task_draft(
             draft,
             link,
             Rc::new(move |s, success, w, cx| {
-                let same = !agent || s.home.agent_prompt_for == slug;
-                let reset = TaskDraft::for_agent(&s.state, slug.as_deref());
-                if same {
-                    if success {
-                        *s.draft_mut(agent) = if agent { reset } else { TaskDraft::default() };
-                        if !agent {
-                            s.home.draft_agent = None;
-                        }
-                        input.update(cx, |p, cx| p.set_value("", w, cx));
-                    } else {
-                        s.draft_mut(agent).starting = false;
-                    }
-                    composer.update(cx, |c, cx| c.set_read_only(false, cx));
-                    s.refresh_draft_sources(agent, cx);
-                } else if let Some(slug) = &slug {
-                    if success {
-                        s.home.agent_drafts.insert(slug.clone(), reset);
-                    } else if let Some(draft) = s.home.agent_drafts.get_mut(slug) {
-                        draft.starting = false;
-                    }
+                if success {
+                    s.home.draft = TaskDraft::default();
+                    s.home.draft_agent = None;
+                    s.home.prompt.update(cx, |p, cx| p.set_value("", w, cx));
+                } else {
+                    s.home.draft.starting = false;
                 }
+                composer.update(cx, |c, cx| c.set_read_only(false, cx));
+                s.refresh_draft_sources(cx);
                 cx.notify();
             }),
             window,
@@ -797,7 +672,6 @@ impl Shark {
     }
 
     pub(super) fn pick_draft_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let destination = self.home.destination.clone();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -806,10 +680,8 @@ impl Shark {
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = paths.await {
-                this.update_in(cx, |s, w, cx| {
-                    s.attach_draft_files_to(&destination, paths, None, w, cx)
-                })
-                .ok();
+                this.update_in(cx, |s, w, cx| s.attach_draft_files(paths, None, w, cx))
+                    .ok();
             }
         })
         .detach();
@@ -817,50 +689,28 @@ impl Shark {
 
     fn attach_draft_files(
         &mut self,
-        _agent: bool,
         paths: Vec<PathBuf>,
         image: Option<(Vec<u8>, &'static str)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.attach_draft_files_to(&self.home.destination.clone(), paths, image, window, cx);
-    }
-
-    fn attach_draft_files_to(
-        &mut self,
-        destination: &Destination,
-        paths: Vec<PathBuf>,
-        image: Option<(Vec<u8>, &'static str)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(draft) = self.draft_at_mut(destination) else {
-            return;
-        };
+        let draft = &mut self.home.draft;
         if draft.starting {
             return;
         }
         draft.staging += 1;
-        let destination = destination.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { super::task_draft::stage_files(paths, image) })
                 .await;
             this.update_in(cx, |s, window, cx| {
-                let Some(draft) = s.draft_at_mut(&destination) else {
-                    if let Ok(files) = result {
-                        super::task_draft::discard_staged_files(&files);
-                    }
-                    return;
-                };
+                let draft = &mut s.home.draft;
                 draft.staging = draft.staging.saturating_sub(1);
                 match result {
                     Ok(files) => {
                         draft.files.extend(files);
-                        if s.home.destination == destination {
-                            s.focus_draft(s.draft_target(), window, cx);
-                        }
+                        s.focus_draft(window, cx);
                     }
                     Err(error) => notify_err(window, cx, error),
                 }
@@ -873,7 +723,7 @@ impl Shark {
     }
 
     fn draft_file_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.draft(self.draft_target()).files.get(index).cloned() else {
+        let Some(path) = self.home.draft.files.get(index).cloned() else {
             return;
         };
         let Ok(url) = url::Url::from_file_path(&path) else {
@@ -900,7 +750,7 @@ impl Shark {
     }
 
     fn draft_issue_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(issue) = self.draft(self.draft_target()).issues.get(index) else {
+        let Some(issue) = self.home.draft.issues.get(index) else {
             return;
         };
         let stop = DraftStop::Issue(issue.org.clone(), issue.id.clone());
@@ -962,11 +812,13 @@ impl Shark {
         )
     }
 
-    fn draft_plan_tooltip(&self, agent: bool) -> String {
-        if self.draft(agent).repos.is_empty() {
+    fn draft_plan_tooltip(&self) -> String {
+        if self.home.draft.repos.is_empty() {
             format!(
                 "Attach a repository to let {} implement",
-                self.draft_slug(agent)
+                self.home
+                    .draft_agent
+                    .as_deref()
                     .and_then(|slug| self.agent(slug))
                     .map_or("Shark", |a| a.name.as_str())
             )
@@ -976,9 +828,13 @@ impl Shark {
     }
 
     fn draft_edited_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        let draft = self.draft(agent);
-        let Some(default) = self.draft_slug(agent).and_then(|slug| self.agent(slug)) else {
+        let draft = &self.home.draft;
+        let Some(default) = self
+            .home
+            .draft_agent
+            .as_deref()
+            .and_then(|slug| self.agent(slug))
+        else {
             return;
         };
         if draft.starting {
@@ -998,7 +854,7 @@ impl Shark {
                 .map(|r| format!("Added {}", r.repo.name)),
         );
         if draft.saved_settings(default) != (default.model.clone(), default.effort.clone()) {
-            let (model, effort) = draft.defaults(&self.state, self.draft_slug(agent));
+            let (model, effort) = draft.defaults(&self.state, self.home.draft_agent.as_deref());
             changes.push(format!(
                 "Model {} · {}",
                 model_label(&model),
@@ -1030,10 +886,9 @@ impl Shark {
         );
     }
 
-    pub(super) fn draft_chip_stops(&self, agent: bool) -> Vec<DraftStop> {
-        let draft = self.draft(agent);
+    pub(super) fn draft_chip_stops(&self) -> Vec<DraftStop> {
+        let draft = &self.home.draft;
         std::iter::once(DraftStop::Agent)
-            .filter(|_| !agent)
             .chain(
                 draft
                     .repos
@@ -1051,16 +906,16 @@ impl Shark {
     }
 
     pub(super) fn draft_stops(&self) -> Vec<DraftStop> {
-        let agent = self.draft_target();
-        let chips = self.draft_chip_stops(agent);
+        let chips = self.draft_chip_stops();
         let mut visible: Vec<_> = chips.iter().take(self.home.tray_shown).cloned().collect();
         if visible.len() < chips.len() {
             visible.push(DraftStop::More);
         }
         visible.push(DraftStop::Attach);
         if self
-            .draft(agent)
-            .settings_edited(&self.state, self.draft_slug(agent))
+            .home
+            .draft
+            .settings_edited(&self.state, self.home.draft_agent.as_deref())
         {
             visible.push(DraftStop::Edited);
         }
@@ -1077,7 +932,7 @@ impl Shark {
             .is_some_and(|stop| !visible.contains(stop))
         {
             self.home.tray_stop = if self
-                .draft_chip_stops(self.draft_target())
+                .draft_chip_stops()
                 .iter()
                 .any(|stop| Some(stop) == self.home.tray_stop.as_ref())
             {
@@ -1090,7 +945,7 @@ impl Shark {
     }
 
     fn open_draft_stop(&mut self, stop: &DraftStop, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = self.draft(self.draft_target());
+        let draft = &self.home.draft;
         match stop {
             DraftStop::Agent => self.pick_home_agent(window, cx),
             DraftStop::Repo(name) => {
@@ -1119,16 +974,18 @@ impl Shark {
     }
 
     fn draft_overflow_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = self.draft(self.draft_target());
+        let draft = &self.home.draft;
         let entries = self
-            .draft_chip_stops(self.draft_target())
+            .draft_chip_stops()
             .into_iter()
             .skip(self.home.tray_shown)
             .filter_map(|stop| {
                 let (icon, label) = match &stop {
                     DraftStop::Agent => (
                         IconName::AtSign,
-                        self.draft_slug(false)
+                        self.home
+                            .draft_agent
+                            .as_deref()
                             .and_then(|slug| self.agent(slug))
                             .map_or("Agent", |a| a.name.as_str())
                             .to_string(),
@@ -1174,15 +1031,14 @@ impl Shark {
     }
 
     fn remove_draft_stop(&mut self, stop: &DraftStop, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self.draft_target();
-        if self.draft(agent).starting {
+        if self.home.draft.starting {
             return;
         }
         if matches!(stop, DraftStop::Agent) {
             self.set_home_agent(None, window, cx);
             return;
         }
-        let draft = self.draft_mut(agent);
+        let draft = &mut self.home.draft;
         match stop {
             DraftStop::Repo(name) => {
                 draft.repos.retain(|r| &r.repo.name != name);
@@ -1195,10 +1051,10 @@ impl Shark {
             }
             _ => return,
         }
-        self.refresh_draft_sources(agent, cx);
+        self.refresh_draft_sources(cx);
         self.fit_draft_stops(self.home.tray_shown, cx);
-        if self.draft_chip_stops(agent).is_empty() {
-            self.focus_draft(agent, window, cx);
+        if self.draft_chip_stops().is_empty() {
+            self.focus_draft(window, cx);
         }
     }
 
@@ -1208,9 +1064,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.home.tray_focus.is_focused(window)
-            || self.draft(self.draft_target()).starting
-            || (!self.draft_target() && self.home.asking)
+        if !self.home.tray_focus.is_focused(window) || self.home.draft.starting || self.home.asking
         {
             return;
         }
@@ -1227,7 +1081,7 @@ impl Shark {
             "right" => self.home.tray_stop = stops.get((index + 1).min(stops.len() - 1)).cloned(),
             "backspace" | "delete" => self.remove_draft_stop(&stops[index], window, cx),
             "enter" | "space" => self.open_draft_stop(&stops[index], window, cx),
-            "escape" | "down" | "tab" => self.focus_draft(self.draft_target(), window, cx),
+            "escape" | "down" | "tab" => self.focus_draft(window, cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -1236,7 +1090,6 @@ impl Shark {
 
     pub(super) fn render_task_composer(
         &self,
-        agent: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1249,42 +1102,39 @@ impl Shark {
                 .is_some_and(|stop| !self.draft_stops().contains(stop))
         {
             let target = cx.entity().downgrade();
-            let destination = self.home.destination.clone();
             cx.defer(move |cx| {
                 target
                     .update(cx, |s, cx| {
-                        if s.home.destination == destination {
-                            s.fit_draft_stops(s.home.tray_shown, cx);
-                        }
+                        s.fit_draft_stops(s.home.tray_shown, cx);
                     })
                     .ok();
             });
         }
         let theme = cx.theme();
-        let draft = self.draft(agent);
-        let asking = !agent && self.home.asking;
-        let input = if agent {
-            &self.home.agent_prompt
-        } else {
-            &self.home.prompt
-        };
-        let composer = if agent {
-            self.home.agent_composer.clone()
-        } else {
-            self.home.composer.clone()
-        };
+        let draft = &self.home.draft;
+        let asking = self.home.asking;
+        let input = &self.home.prompt;
+        let composer = self.home.composer.clone();
         let focused = input.read(cx).focus_handle(cx).is_focused(window);
         let empty = input.read(cx).value().is_empty();
-        let default_agent = self.draft_slug(agent).and_then(|slug| self.agent(slug));
-        let edited = draft.settings_edited(&self.state, self.draft_slug(agent));
+        let default_agent = self
+            .home
+            .draft_agent
+            .as_deref()
+            .and_then(|slug| self.agent(slug));
+        let edited = draft.settings_edited(&self.state, self.home.draft_agent.as_deref());
         let selected = |stop: &DraftStop| {
             self.home.tray_focus.is_focused(window) && self.home.tray_stop.as_ref() == Some(stop)
         };
         let quiet = self.menu.is_some() || self.draft_picker.is_some();
         let mut chips = Vec::new();
         let mut first_chip = None;
-        if !agent && !asking {
-            let picked = self.draft_slug(false).and_then(|slug| self.agent(slug));
+        if !asking {
+            let picked = self
+                .home
+                .draft_agent
+                .as_deref()
+                .and_then(|slug| self.agent(slug));
             let label = picked.map_or("Agent", |a| a.name.as_str()).to_string();
             first_chip = Some((IconName::AtSign, label.clone()));
             let button = match picked {
@@ -1432,7 +1282,7 @@ impl Shark {
                 ));
             }
         }
-        let (model, effort) = draft.defaults(&self.state, self.draft_slug(agent));
+        let (model, effort) = draft.defaults(&self.state, self.home.draft_agent.as_deref());
         let overridden = default_agent
             .is_some_and(|a| draft.saved_settings(a) != (a.model.clone(), a.effort.clone()));
         let short_model = format!(
@@ -1530,11 +1380,10 @@ impl Shark {
             let target = cx.entity().downgrade();
             let add_target = target.clone();
             let more_target = target.clone();
-            let destination = self.home.destination.clone();
-            let ids = self.draft_chip_stops(agent);
+            let ids = self.draft_chip_stops();
             let count = ids.len();
             let row = super::attach::AttachRow {
-                key: format!("draft-{:?}", destination).into(),
+                key: "draft-Home".into(),
                 attach_id: "draft-add".into(),
                 more_id: "draft-more".into(),
                 height: px(26.),
@@ -1576,8 +1425,7 @@ impl Shark {
                 on_fit: Some(Rc::new(move |shown, _, cx| {
                     target
                         .update(cx, |s, cx| {
-                            if s.home.destination == destination && s.draft_chip_stops(agent) == ids
-                            {
+                            if s.draft_chip_stops() == ids {
                                 s.fit_draft_stops(shown, cx);
                             }
                         })
@@ -1596,7 +1444,7 @@ impl Shark {
                     crate::ui::toolbar("draft-edited", button),
                 ));
             }
-            let source = self.draft_settings_source(agent);
+            let source = self.draft_settings_source();
             footer = footer.child(div().flex_1().min_w_0()).child(
                 model_button(
                     "draft-model",
@@ -1616,13 +1464,12 @@ impl Shark {
                 footer = footer.child(
                     plan_button("draft-plan")
                         .disabled(draft.starting || draft.repos.is_empty())
-                        .tooltip(self.draft_plan_tooltip(agent))
+                        .tooltip(self.draft_plan_tooltip())
                         .on_click(cx.listener(|s, _, _, cx| s.toggle_draft_plan(cx))),
                 );
             }
             // Measure canonical controls even when shortened, so resizing back cannot oscillate.
             let target = cx.entity().downgrade();
-            let destination = self.home.destination.clone();
             let attach_bounds = self.draft_anchors.clone();
             let probe = h_flex()
                 .absolute()
@@ -1677,13 +1524,10 @@ impl Shark {
                     };
                     if next != density {
                         let target = target.clone();
-                        let destination = destination.clone();
                         cx.defer(move |cx| {
                             target
                                 .update(cx, |s, cx| {
-                                    if s.home.destination == destination
-                                        && s.home.footer_density != next
-                                    {
+                                    if s.home.footer_density != next {
                                         s.home.footer_density = next;
                                         cx.notify();
                                     }
@@ -1699,15 +1543,9 @@ impl Shark {
         footer = footer.child(
             start_button("draft-start")
                 .disabled(draft.starting || draft.staging > 0)
-                .on_click(cx.listener(move |s, _, w, cx| {
-                    if agent {
-                        s.submit_task_draft(w, cx)
-                    } else {
-                        s.submit_prompt(w, cx)
-                    }
-                })),
+                .on_click(cx.listener(|s, _, w, cx| s.submit_prompt(w, cx))),
         );
-        let hits = if agent { vec![] } else { self.mentions(cx) };
+        let hits = self.mentions(cx);
         let at = self.home.mention.min(hits.len().saturating_sub(1));
         let suggestions = (!hits.is_empty()).then(|| {
             v_flex()
@@ -1737,11 +1575,7 @@ impl Shark {
             .w_full()
             .child(
                 v_flex()
-                    .id(if agent {
-                        "agent-composer"
-                    } else {
-                        "home-composer"
-                    })
+                    .id("home-composer")
                     .test_support()
                     .key_context("HomePrompt")
                     .on_action(cx.listener(|s, _: &PickModel, w, cx| s.draft_model_menu(w, cx)))
@@ -1772,19 +1606,14 @@ impl Shark {
                         .text_color(theme.muted_foreground)
                         .child(crate::ui::hint("shift-enter", "new line"))
                         .when(!asking, |d| {
-                            d.child(crate::ui::hint(
-                                "@",
-                                if agent { "file" } else { "agent / file" },
-                            ))
-                            .child(crate::ui::hint("#", "issue or PR"))
-                            .child(crate::ui::hint("/", "skill"))
+                            d.child(crate::ui::hint("@", "agent / file"))
+                                .child(crate::ui::hint("#", "issue or PR"))
+                                .child(crate::ui::hint("/", "skill"))
                         })
-                        .when(!agent, |d| {
-                            d.child(crate::ui::hint(
-                                "tab",
-                                if asking { "new task" } else { "ask Shark" },
-                            ))
-                        }),
+                        .child(crate::ui::hint(
+                            "tab",
+                            if asking { "new task" } else { "ask Shark" },
+                        )),
                 )
             })
             .into_any_element()

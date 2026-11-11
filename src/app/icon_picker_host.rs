@@ -103,15 +103,16 @@ impl Shark {
     }
 
     pub(super) fn publish_agent_identity(&mut self, slug: &str, cx: &mut Context<Self>) {
+        // Its chats' buttons and tabs read the snapshot; handoff bars name it as the next agent.
+        let _ = self.sync_agent(slug, false, cx);
         let tasks: Vec<_> = self
             .state
             .tasks
             .iter()
             .filter(|task| {
-                task.agent
-                    .as_ref()
-                    .and_then(|a| self.agent(&a.slug))
-                    .is_some_and(|a| a.next.as_deref() == Some(slug))
+                (task.agents.iter())
+                    .filter_map(|a| self.agent(&a.slug))
+                    .any(|a| a.next.as_deref() == Some(slug))
             })
             .map(|task| task.name.clone())
             .collect();

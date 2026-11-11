@@ -3,10 +3,9 @@
 Git follows the Diff artifact lifecycle: it starts closed, opens once per task,
 participates in the saved tab order, and supports closing, reordering, shortcuts,
 pane navigation, the command palette, and the View menu. `cmd-shift-g` opens it.
-An agent can have several tasks, each with separate Git state and drafts. Open a
-task before running Git actions from an agent page or All tasks; saving from an
-overview never posts a hidden draft. The task Git controls own push, PR creation,
-readiness, merge and archive. See the [manual](manual.md) for the agent-to-task
+Each task has separate Git state and drafts. Open a task before running Git
+actions from Home; saving from an overview never posts a hidden draft. The task Git controls own push, PR creation,
+readiness, merge and archive. See the [manual](manual.md) for the task
 workflow.
 
 ## Conversation layout

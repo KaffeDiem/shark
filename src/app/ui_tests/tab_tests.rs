@@ -34,7 +34,7 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
     press(cx, &["cmd-t", "cmd-t"]);
     on(cx, &|s, _, _cx| {
         s.active_task_mut().unwrap().closed = ["picked", "retained", "latest"]
-            .map(|id| s.state.new_chat(&Task::default(), id.into()))
+            .map(|id| s.state.new_chat(&Task::default(), id.into(), None))
             .to_vec();
     });
     for (key, restored) in [
@@ -686,7 +686,7 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     // Home ends Zen; coming back doesn't restore it.
     press(cx, &["cmd-.", "cmd-0", "cmd-0"]);
     zen(cx, false, Tab::Chat);
-    // Naming a task group uses a focused dialog without leaving Zen.
+    // Naming a section uses a focused dialog without leaving Zen.
     press(cx, &["cmd-."]);
     on(cx, &|s, w, cx| s.start_naming(None, None, w, cx));
     zen(cx, true, Tab::Chat);

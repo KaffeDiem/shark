@@ -10,7 +10,6 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 mod agent_handoff_tests;
-mod agent_icon_review_tests;
 mod agent_icon_tests;
 mod agent_navigation_tests;
 mod agent_pixels;
@@ -1107,7 +1106,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert_eq!(s.state.last_repos, ["web"]);
     });
 
-    // Manual task groups are named in a dialog and do not hide sidebar tasks.
+    // Sections: name in a dialog, move with `m`, fold with h/l, delete keeps the task.
     press(cx, &["ctrl-w", "h"]);
     run(cx, &NewSection);
     cx.run_until_parked();
@@ -1116,11 +1115,27 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     let sections = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.sections.clone());
     assert_eq!(sections(cx)[0].name, "Later");
-    run(cx, &MoveToSection);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
+    })
+    .unwrap();
+    press(cx, &["j", "m"]);
     cx.run_until_parked();
     press(cx, &["enter"]);
     assert_eq!(sections(cx)[0].tasks, ["kb"]);
-    cx.update(|cx| assert_eq!(shark.read(cx).ws_order(false).len(), 1));
+    press(cx, &["j", "h"]);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.state.sections[0].collapsed && s.sel == SideRow::Section(0));
+        assert!(
+            s.ws_order(false).is_empty(),
+            "cmd-N skips folded workspaces"
+        );
+    });
+    press(cx, &["l"]);
+    cx.update(|cx| assert!(!shark.read(cx).state.sections[0].collapsed));
+    // The cursor is on the header, so section actions hit it.
     run(cx, &DeleteSection);
     assert!(sections(cx).is_empty());
     cx.update(|cx| assert_eq!(shark.read(cx).state.tasks.len(), 1));
@@ -3260,7 +3275,7 @@ async fn task_menu_backlog_actions(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn task_menu_repository_filters(cx: &mut TestAppContext) {
-    use super::home::{Destination, RepoFilter};
+    use super::home::RepoFilter;
     use crate::state::TaskRepo;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
@@ -3325,7 +3340,6 @@ async fn task_menu_repository_filters(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.home.destination, Destination::Home);
         assert_eq!(s.home.repo_filter, Some(RepoFilter::Repo("api".into())));
         assert_eq!(s.home_rows(cx).len(), 2);
     });

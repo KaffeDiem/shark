@@ -213,15 +213,21 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
     if chat.is_codex() {
         return codex::spawn(ws, chat);
     }
+    // The chat's agent rides on every start, so a resumed session keeps it too.
+    let prompt = crate::git::agent_prompt(ws, chat);
     let skills = crate::git::claude_skill_args(ws);
     let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
     // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
     let prompts = ["--permission-prompt-tool", "stdio"];
+    let agent = prompt
+        .iter()
+        .flat_map(|p| ["--append-system-prompt", p.as_str()]);
     run(
         &ws.dir(),
         chat.model(),
         &chat.id,
         (prompts.into_iter().chain(effort(chat)).chain(resume))
+            .chain(agent)
             .chain(skills.iter().map(String::as_str)),
         Some(transcript_path(&chat.id)),
     )

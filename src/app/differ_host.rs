@@ -253,7 +253,7 @@ impl Shark {
                         let meta = ChatMeta {
                             model: pick.model.clone(),
                             effort: pick.effort.clone(),
-                            ..self.state.new_chat(&ws, id)
+                            ..self.state.new_chat(&ws, id, None)
                         };
                         self.active_task_mut().unwrap().push_chat(meta.clone());
                         let _ = self.state.save();

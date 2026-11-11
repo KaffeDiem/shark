@@ -52,7 +52,12 @@ async fn skill_import_skills_entry_and_cancelled_picker_leave_agent_unchanged(
         );
         w.render_frame(cx);
         w.click("skill-cancel", cx);
-        assert!(!w.has_active_dialog(cx));
+        w.render_frame(cx);
+        assert!(w.try_find("skill-import").is_none());
+        assert!(
+            w.try_find("agent-editor").is_some(),
+            "the agent dialog stays under it"
+        );
         assert!(!crate::state::agent_skills_dir("designer").exists());
         assert!(shark.read(cx).state.agents[0].instructions.is_empty());
     })
@@ -198,7 +203,9 @@ async fn skill_import_copies_selected_resources_and_refreshes_only_its_agent(
     until(cx, window, |_, cx| !panel.read(cx).busy).await;
     cx.update_window(window, |_, w, cx| {
         assert!(panel.read(cx).error.is_none(), "{:?}", panel.read(cx).error);
-        assert!(!w.has_active_dialog(cx));
+        w.render_frame(cx);
+        assert!(w.try_find("skill-import").is_none());
+        assert!(w.try_find("agent-editor").is_some());
         let target = crate::state::agent_skills_dir("designer").join("spacing");
         assert_eq!(
             fs::read_to_string(target.join("references/spacing.md")).unwrap(),
@@ -222,8 +229,14 @@ async fn skill_import_copies_selected_resources_and_refreshes_only_its_agent(
                     .exists()
             );
         }
-        let header = shark.read(cx).home.agent_header.clone().unwrap();
-        assert_eq!(header.read(cx).skills, ["spacing"]);
+        let editor = shark
+            .read(cx)
+            .agent_editor
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert_eq!(editor.read(cx).skills, ["spacing"]);
         assert!(spacing.join("SKILL.md").exists(), "the source is kept");
     })
     .unwrap();

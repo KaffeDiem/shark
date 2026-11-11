@@ -62,7 +62,7 @@ async fn anchored_branch_from_accepts_a_local_only_base(cx: &mut TestAppContext)
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
     press_in(window)(cx, &["up"]);
-    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["right", "enter"]); // past the agent chip
     press_in(window)(cx, &["down", "enter"]);
     until(cx, window, |w, cx| {
         w.render_frame(cx);
@@ -76,7 +76,7 @@ async fn anchored_branch_from_accepts_a_local_only_base(cx: &mut TestAppContext)
     cx.read(|cx| {
         let s = shark.read(cx);
         assert!(s.draft_picker.is_none(), "local bases do not require a pushed stacking parent");
-        assert!(matches!(&s.home.agent_draft.repos[0].branch, BranchSpec::New { base } if base == "local-base"));
+        assert!(matches!(&s.home.draft.repos[0].branch, BranchSpec::New { base } if base == "local-base"));
         assert!(s.state.tasks.is_empty());
     });
 }
@@ -111,7 +111,7 @@ async fn grouped_branch_picker_enter_checks_out_and_alt_enter_uses_base(cx: &mut
     on_app(window, shark.clone())(cx, &|s, w, cx| s.prefill_agent_task("designer", w, cx));
     // The repository is one stop; its first menu action opens the branch picker.
     press_in(window)(cx, &["up"]);
-    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["right", "enter"]); // past the agent chip
     press_in(window)(cx, &["down", "enter"]);
     until(cx, window, |w, cx| {
         w.render_frame(cx);
@@ -122,12 +122,18 @@ async fn grouped_branch_picker_enter_checks_out_and_alt_enter_uses_base(cx: &mut
         .unwrap();
     press_in(window)(cx, &["enter"]);
     until(cx, window, |_, cx| shark.read(cx).draft_picker.is_none()).await;
-    cx.update_window(window,|_,w,cx|{
-        let s=shark.read(cx);
-        assert!(matches!(&s.home.agent_draft.repos[0].branch,BranchSpec::Existing(name) if name=="feature"));
-        assert!(s.home.tray_focus.is_focused(w),"branch selection restores its opening control");
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert!(
+            matches!(&s.home.draft.repos[0].branch,BranchSpec::Existing(name) if name=="feature")
+        );
+        assert!(
+            s.home.tray_focus.is_focused(w),
+            "branch selection restores its opening control"
+        );
         assert!(s.state.tasks.is_empty());
-    }).unwrap();
+    })
+    .unwrap();
     press_in(window)(cx, &["enter"]);
     press_in(window)(cx, &["down", "enter"]);
     until(cx, window, |w, cx| {
@@ -141,9 +147,7 @@ async fn grouped_branch_picker_enter_checks_out_and_alt_enter_uses_base(cx: &mut
     until(cx, window, |_, cx| shark.read(cx).draft_picker.is_none()).await;
     cx.read(|cx| {
         let s = shark.read(cx);
-        assert!(
-            matches!(&s.home.agent_draft.repos[0].branch,BranchSpec::New{base} if base=="feature")
-        );
+        assert!(matches!(&s.home.draft.repos[0].branch,BranchSpec::New{base} if base=="feature"));
         assert!(
             s.state.tasks.is_empty(),
             "branch-from changes only draft context"
@@ -164,8 +168,11 @@ async fn grouped_branch_picker_enter_checks_out_and_alt_enter_uses_base(cx: &mut
     .unwrap();
     press_in(window)(cx, &["enter"]);
     cx.read(|cx| {
-        let s=shark.read(cx);
-        assert!(matches!(&s.home.agent_draft.repos[0].branch,BranchSpec::New{base} if base=="local-base"),"the base submenu accepts a local-only branch without requiring it to be pushed");
+        let s = shark.read(cx);
+        assert!(
+            matches!(&s.home.draft.repos[0].branch,BranchSpec::New{base} if base=="local-base"),
+            "the base submenu accepts a local-only branch without requiring it to be pushed"
+        );
         assert!(s.draft_picker.is_none());
         assert!(s.state.tasks.is_empty());
     });
@@ -200,7 +207,7 @@ async fn narrow_draft_keyboard_visits_overflow_and_removes_only_a_chosen_hidden_
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(0.), px(0.)),
-                size(px(900.), px(600.)),
+                size(px(1100.), px(600.)),
             ))),
             ..Default::default()
         },
@@ -219,7 +226,7 @@ async fn narrow_draft_keyboard_visits_overflow_and_removes_only_a_chosen_hidden_
                 .iter()
                 .filter(|stop| matches!(stop, DraftStop::Repo(_)))
                 .count()
-                < s.draft_chip_stops(true).len(),
+                < s.draft_chip_stops().len(),
             "narrow row hides some chips"
         );
         visible
@@ -235,7 +242,7 @@ async fn narrow_draft_keyboard_visits_overflow_and_removes_only_a_chosen_hidden_
     press_in(window)(cx, &["backspace"]);
     cx.read(|cx| {
         assert_eq!(
-            shark.read(cx).home.agent_draft.repos.len(),
+            shark.read(cx).home.draft.repos.len(),
             4,
             "Backspace on overflow removes nothing"
         )
@@ -251,15 +258,15 @@ async fn narrow_draft_keyboard_visits_overflow_and_removes_only_a_chosen_hidden_
         };
         let index = s
             .home
-            .agent_draft
+            .draft
             .repos
             .iter()
             .position(|repo| &repo.repo.name == name)
             .unwrap();
-        let last = s.home.agent_draft.repos.len() - 1;
+        let last = s.home.draft.repos.len() - 1;
         s.home.tray_stop = Some(focused);
         s.home.tray_focus.focus(w, cx);
-        s.home.agent_draft.repos.swap(index, last);
+        s.home.draft.repos.swap(index, last);
         cx.notify();
     });
     for _ in 0..4 {
@@ -277,7 +284,7 @@ async fn narrow_draft_keyboard_visits_overflow_and_removes_only_a_chosen_hidden_
     press_in(window)(cx, &["backspace"]);
     cx.read(|cx| {
         assert_eq!(
-            shark.read(cx).home.agent_draft.repos.len(),
+            shark.read(cx).home.draft.repos.len(),
             4,
             "reordering cannot make Backspace delete a different visible repository"
         )
@@ -306,7 +313,7 @@ async fn narrow_draft_keyboard_visits_overflow_and_removes_only_a_chosen_hidden_
     press_in(window)(cx, &["r", "enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.home.agent_draft.repos.len(), 3);
+        assert_eq!(s.home.draft.repos.len(), 3);
         assert!(s.state.tasks.is_empty());
     });
 }

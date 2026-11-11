@@ -106,6 +106,14 @@ async fn handoff_menu_prefers_next_and_unsaved_editor_cancel_preserves_task(
     });
     let path = tasks[0].dir().join("notes.md");
     fs::write(&path, "original").unwrap();
+    // An empty chat has nothing to hand off.
+    let transcript = crate::transcript::transcript_path(&tasks[1].chats[0].id);
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":"Design"}}"#,
+    )
+    .unwrap();
     let (window, shark) = boot(
         cx,
         State {
@@ -117,12 +125,34 @@ async fn handoff_menu_prefers_next_and_unsaved_editor_cancel_preserves_task(
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         let ws = s.task("handoff").unwrap();
-        let Entry::Sub { entries, .. } = super::super::menus::handoff_submenu(s, ws, cx).unwrap()
-        else {
-            panic!("submenu expected")
+        let labels = |chat: Option<&ChatMeta>| {
+            let Some(Entry::Sub { entries, .. }) =
+                super::super::menus::handoff_submenu(s, ws, chat, cx)
+            else {
+                panic!("submenu expected")
+            };
+            (entries.iter())
+                .map(|e| match e {
+                    Entry::Item { label, hint, .. } => {
+                        format!("{label}|{}", hint.clone().unwrap_or_default())
+                    }
+                    _ => panic!("agents only"),
+                })
+                .collect::<Vec<_>>()
         };
-        assert!(
-            matches!(&entries[0], Entry::Item { label,hint,.. } if label.as_ref()=="Planner" && hint.as_deref()==Some("next"))
+        assert_eq!(
+            labels(None),
+            ["Planner|next"],
+            "the shown chat's: Designer's next"
+        );
+        let planner = ChatMeta {
+            agent: Some("planner".into()),
+            ..ws.chats[0].clone()
+        };
+        assert_eq!(
+            labels(Some(&planner)),
+            ["Designer|"],
+            "per chat: Planner's others"
         );
         s.open_task_named("editing", w, cx);
         s.open_path(path.to_string_lossy().into_owned(), w, cx);
@@ -148,57 +178,23 @@ async fn handoff_menu_prefers_next_and_unsaved_editor_cancel_preserves_task(
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.active.as_deref(), Some("editing"));
-        assert_eq!(
-            s.task("handoff").unwrap().agent.as_ref().unwrap().slug,
-            "designer"
-        );
+        let task = s.task("handoff").unwrap();
+        assert_eq!(task.chats.len(), 1, "a cancelled handoff opens no chat");
+        assert_eq!(task.agents.len(), 1);
         assert!(s.editor.as_ref().unwrap().read(cx).dirty);
     });
-    assert_eq!(fs::read_to_string(path).unwrap(), "original");
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn handoff_save_failure_restores_agent_chats_and_instructions(cx: &mut TestAppContext) {
-    let quiet = quiet_claude();
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _claude = ClaudeGuard::set(&quiet);
-    test_home();
-    let agents = agents();
-    let task = git::create_empty_task(
-        &tasks_dir().join("handoff-save"),
-        "handoff-save",
-        "Save",
-        Some(AgentLink::from(&agents[0])),
-    )
-    .unwrap();
-    let docs = task.dir().join("CLAUDE.md");
-    let original_docs = fs::read(&docs).unwrap();
-    let original_chats = task.chats.len();
-    let (window, shark) = boot(
-        cx,
-        State {
-            agents,
-            tasks: vec![task],
-            ..Default::default()
-        },
-        WindowOptions::default(),
+    let saved = State::load();
+    assert_eq!(
+        saved
+            .tasks
+            .iter()
+            .find(|t| t.name == "handoff")
+            .unwrap()
+            .chats
+            .len(),
+        1
     );
-    on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.open_task_named("handoff-save", w, cx);
-        s.state.read_only = true;
-        s.hand_off("handoff-save", "planner", None, w, cx);
-    });
-    until(cx, window, |_, cx| {
-        shark.read(cx).state.save_error.borrow().is_some()
-    })
-    .await;
-    cx.read(|cx| {
-        let task = &shark.read(cx).state.tasks[0];
-        assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
-        assert_eq!(task.chats.len(), original_chats);
-    });
-    assert_eq!(fs::read(docs).unwrap(), original_docs);
+    assert_eq!(fs::read_to_string(path).unwrap(), "original");
 }
 
 #[gpui_kit::test]
@@ -228,14 +224,19 @@ async fn handoff_target_follows_receiver_name_and_icon_edits(cx: &mut TestAppCon
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.open_task_named("target-edits", w, cx);
-        s.rename_agent("planner", w, cx);
+        s.open_agent("planner", w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.input("Implementation planner", cx);
+        w.click("agent-name", cx);
     })
     .unwrap();
-    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["cmd-a"]);
+    cx.update_window(window, |_, w, cx| w.input("Implementation planner", cx))
+        .unwrap();
+    cx.update_window(window, |_, w, cx| w.click("agent-done", cx))
+        .unwrap();
+    cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);
         let target = s

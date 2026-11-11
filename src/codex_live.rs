@@ -682,13 +682,14 @@ fn agent_skills_live(tag: &str, model: &str) {
     let mut env = Env::new(tag, model);
     let slug = format!("skill-probe-{}-{tag}", std::process::id());
     let source = crate::state::agent_skills_dir(&slug);
-    env.ws.agent = Some(crate::state::AgentLink {
+    env.ws.chats[0].agent = Some(slug.clone());
+    env.ws.agents = vec![crate::state::AgentLink {
         slug,
         name: "Skill probe".into(),
         instructions: "For verification requests, include the marker SHARK_ROOT_INSTRUCTIONS."
             .into(),
         ..Default::default()
-    });
+    }];
     let skill = |name: &str, word: &str| {
         let dir = source.join(name);
         fs::create_dir_all(&dir).unwrap();
