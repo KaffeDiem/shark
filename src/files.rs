@@ -214,11 +214,10 @@ pub fn rows(paths: &[String], collapsed: &HashSet<String>) -> Vec<Row> {
         for (name, mut child) in &d.dirs {
             let mut name = name.clone();
             let mut path = format!("{prefix}{name}");
-            // A repo (depth 0) shows as "repo / dir".
-            let sep = if depth == 0 { " / " } else { "/" };
-            while child.files.is_empty() && child.dirs.len() == 1 {
+            // Repos keep their own row; only compact folders beneath them.
+            while depth > 0 && child.files.is_empty() && child.dirs.len() == 1 {
                 let (n, c) = child.dirs.iter().next().unwrap();
-                name = format!("{name}{sep}{n}");
+                name = format!("{name}/{n}");
                 path = format!("{path}/{n}");
                 child = c;
             }
@@ -308,10 +307,11 @@ mod tests {
                 "    deep/only/x.rs",
                 "    a.rs",
                 "  README.md",
-                "shark / src",
-                "  app/sidebar.rs",
-                "  app.rs",
-                "  chat.rs",
+                "shark",
+                "  src",
+                "    app/sidebar.rs",
+                "    app.rs",
+                "    chat.rs",
                 "web",
                 "  index.ts"
             ]
@@ -320,13 +320,28 @@ mod tests {
             (r[2].path.as_str(), r[2].file),
             ("api/src/deep/only/x.rs", Some(1))
         );
-        assert_eq!(r[5].path, "shark/src");
+        assert_eq!(r[5].path, "shark");
+        assert_eq!(r[6].path, "shark/src");
         assert_eq!(tree_order(&p), [1, 2, 0, 4, 5, 6, 3]);
 
         let collapsed = HashSet::from(["api/src".to_string()]);
         assert_eq!(
             show(&rows(&p[..4], &collapsed)),
             ["api", "  src", "  README.md", "web", "  index.ts"]
+        );
+        let p = paths(&["repo/a/b/one.rs", "repo/a/b/two.rs"]);
+        assert_eq!(
+            show(&rows(&p, &HashSet::new())),
+            ["repo", "  a/b", "    one.rs", "    two.rs"]
+        );
+        assert_eq!(show(&rows(&p, &HashSet::from(["repo".into()]))), ["repo"]);
+        assert_eq!(
+            show(&rows(&p, &HashSet::from(["repo/a/b".into()]))),
+            ["repo", "  a/b"]
+        );
+        assert_eq!(
+            show(&rows(&p[..1], &HashSet::new())),
+            ["repo", "  a/b/one.rs"]
         );
     }
 

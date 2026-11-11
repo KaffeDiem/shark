@@ -325,6 +325,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             "focus",
             "hover",
             "compact-focus",
+            "compact-hover",
+            "long-path-244",
+            "long-path-324",
+            "long-name-244",
+            "long-name-324",
             "viewed",
             "changed",
             "open",
@@ -337,7 +342,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             let mut state = State::default();
             state.appearance.mode = mode;
             state.save().unwrap();
-            let width = if case == "narrow" { 200. } else { 400. };
+            let width = match case {
+                "narrow" => 200.,
+                "long-path-244" | "long-name-244" => 244.,
+                "long-path-324" | "long-name-324" => 324.,
+                _ => 400.,
+            };
             let (window, preview) = cx
                 .update(|cx| {
                     gpui_kit::open_window(
@@ -364,9 +374,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.state.tasks = vec![Task { name: "tree".into(), ..Default::default() }];
                     s.active = Some("tree".into());
                     let mut paths: Vec<String> = [
-                        "api/src/app/sidebar.rs", "api/src/deep/a.rs", "api/src/deep/b.rs",
+                        "api/src/app/sidebar.rs", "api/src/deep/nested/a.rs", "api/src/deep/nested/b.rs",
                         "api/src/main.rs", "api/README.md", "web/index.ts", "ROOT.md",
                     ].map(String::from).to_vec();
+                    if case.starts_with("long-path-") {
+                        paths[0] = "api/src/a_very_long_compacted_directory/another_long_directory/sidebar.rs".into();
+                    }
+                    if case.starts_with("long-name-") {
+                        paths[0] = "api/src/app/a_basename_that_is_far_too_long_to_fit_even_without_any_directory_prefix.rs".into();
+                    }
                     paths.extend((0..40).map(|i| format!("zz/long/f{i:02}.rs")));
                     s.differ.update(cx, |d, _| {
                     *d.diff_files_mut() = paths.iter().map(|p| {
@@ -413,8 +429,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 });
                 w.pointer_move(point(px(width - 1.), px(719.)), None, cx);
                 w.render_frame(cx);
-                if case == "hover" {
-                    w.hover(("tree-row", 2usize), cx);
+                if matches!(case, "hover" | "compact-hover") {
+                    let ix = if case == "compact-hover" {
+                        shark.read(cx).differ.read(cx).tree_rows().iter()
+                            .position(|r| r.path == "api/src/app/sidebar.rs").unwrap()
+                    } else { 1 };
+                    w.hover(("tree-row", ix), cx);
                     w.render_frame(cx);
                 }
             }).unwrap();
@@ -448,7 +468,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         assert_eq!(b.size.height, px(30.));
                         let focused = ix == s.differ.read(cx).tree_sel()
                             && s.differ.read(cx).tree_focus().is_focused(w);
-                        let label = w.find(("tree-label", ix)).bounds();
+                        let label = w.find(("tree-label", ix));
+                        assert_eq!(label.label(), Some(row.path.as_str()));
+                        let label = label.bounds();
                         assert!(
                             label.right() < b.right() - px(20.),
                             "label must leave room for the checkbox"
@@ -487,8 +509,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 ));
                             }
                         }
+                        let hovered = (case == "hover" && ix == 1)
+                            || (case == "compact-hover" && row.path == "api/src/app/sidebar.rs");
+                        let secondary_color = if focused || hovered {
+                            theme.foreground
+                        } else {
+                            theme.sidebar_foreground
+                        };
                         if row.file.is_none() {
-                            let color = theme.foreground;
+                            let color = secondary_color;
                             checks.push(("folder label", label, color));
                             checks.push((
                                 "folder chevron",
@@ -510,20 +539,71 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             } else {
                                 theme.foreground
                             };
-                            if row.name.starts_with("app/") {
-                                checks.push((
-                                    "compact prefix",
-                                    Bounds::new(label.origin, size(px(24.), label.size.height)),
-                                    theme.foreground,
-                                ));
-                                checks.push((
-                                    "filename",
-                                    Bounds::new(
-                                        point(label.left() + px(32.), label.top()),
-                                        size(label.size.width - px(32.), label.size.height),
-                                    ),
-                                    color,
-                                ));
+                            let name = w.find(("tree-name", ix)).bounds();
+                            if row.name.contains('/') {
+                                let path = w.find(("tree-path", ix)).bounds();
+                                assert!(path.right() <= name.left(), "path precedes filename");
+                                assert!(
+                                    name.right() <= label.right(),
+                                    "filename stays inside label"
+                                );
+                                if case.starts_with("long-path-")
+                                    && row.path.ends_with("sidebar.rs")
+                                {
+                                    let text: SharedString = "sidebar.rs".into();
+                                    let mut style = w.text_style();
+                                    style.font_family = theme.font_family.clone();
+                                    let natural = w
+                                        .text_system()
+                                        .shape_line(
+                                            text.clone(),
+                                            rems(0.875).to_pixels(w.rem_size()),
+                                            &[style.to_run(text.len())],
+                                            None,
+                                        )
+                                        .width;
+                                    assert!(
+                                        name.size.width >= natural.floor(),
+                                        "basename keeps its natural width {natural:?}: {name:?}"
+                                    );
+                                    assert!(
+                                        path.size.width < px(200.),
+                                        "long path yields space: {path:?}"
+                                    );
+                                }
+                                if case.starts_with("long-name-")
+                                    && row.path.contains("a_basename_")
+                                {
+                                    assert!(
+                                        path.size.width <= px(1.),
+                                        "path shrinks before filename: {path:?}"
+                                    );
+                                    assert!(
+                                        name.size.width > px(50.),
+                                        "filename keeps available room"
+                                    );
+                                    let text: SharedString =
+                                        row.name.rsplit('/').next().unwrap().to_owned().into();
+                                    let mut style = w.text_style();
+                                    style.font_family = theme.font_family.clone();
+                                    let natural = w
+                                        .text_system()
+                                        .shape_line(
+                                            text.clone(),
+                                            rems(0.875).to_pixels(w.rem_size()),
+                                            &[style.to_run(text.len())],
+                                            None,
+                                        )
+                                        .width;
+                                    assert!(
+                                        name.size.width < natural,
+                                        "long filename must overflow into its fade"
+                                    );
+                                }
+                                if path.size.width > px(2.) {
+                                    checks.push(("compact prefix", path, secondary_color));
+                                }
+                                checks.push(("filename", name, color));
                                 checks.push((
                                     "uncommitted dot",
                                     w.find(("uncommitted", ix)).bounds(),
@@ -543,7 +623,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     ));
                                 }
                             } else {
-                                checks.push(("filename", label, color));
+                                checks.push(("filename", name, color));
                             }
                             checks.push(("additions", b, theme.success_foreground));
                             checks.push(("deletions", b, theme.danger_foreground));

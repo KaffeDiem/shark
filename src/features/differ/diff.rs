@@ -982,10 +982,61 @@ impl Differ {
         let depth = r.depth;
         let next_depth = self.tree_rows.get(ix + 1).map_or(0, |r| r.depth);
         let guide = theme.border;
-        let folder_color = theme.foreground;
+        let folder_color = if selected && focused {
+            theme.foreground
+        } else {
+            theme.sidebar_foreground
+        };
+        let background = theme.background.blend(if selected && focused {
+            theme.list_active
+        } else if selected {
+            theme.list_hover
+        } else {
+            theme.transparent
+        });
+        let hover_background = theme.background.blend(theme.list_hover);
+        let (path, name) = r
+            .name
+            .split_at(r.name.rfind('/').map_or(0, |slash| slash + 1));
+        let full_path = r.path.clone();
+        let label = h_flex()
+            .id(("tree-label", ix))
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .aria_label(full_path.clone())
+            .tooltip(move |w, cx| Tooltip::new(full_path.clone()).build(w, cx))
+            .when(!path.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id(("tree-path", ix))
+                        .test_support()
+                        // shortcut: ellipsis may split a folder name; measure text if whole-folder cuts are needed.
+                        .flex_shrink(1e9)
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_start()
+                        .text_color(folder_color)
+                        .group_hover("tree-row", |d| d.text_color(theme.foreground))
+                        .child(path.to_string()),
+                )
+            })
+            .child(
+                crate::overflow_fade::label(
+                    name.to_string().into(),
+                    background,
+                    Some(("tree-row", hover_background)),
+                )
+                .id(("tree-name", ix))
+                .test_support()
+                .flex_initial(),
+            );
         // `uniform_list` rows: no margin, so the 30px height is the pitch.
         let row = side_row(theme)
             .id(("tree-row", ix))
+            .group("tree-row")
             .test_support()
             .w_full()
             .mx_0()
@@ -1055,23 +1106,23 @@ impl Differ {
                 // A 14px chevron in a 16px slot, so folder and file names line up.
                 .child(
                     h_flex().size(px(16.)).flex_none().justify_center().child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .with_size(px(14.))
-                        .text_color(folder_color),
+                        // Icon captures inherited color before group-hover styles are applied.
+                        svg()
+                            .path(if open {
+                                IconName::ChevronDown.path()
+                            } else {
+                                IconName::ChevronRight.path()
+                            })
+                            .size(px(14.))
+                            .flex_none()
+                            .text_color(folder_color)
+                            .group_hover("tree-row", |d| d.text_color(theme.foreground)),
                     ),
                 )
                 .child(
-                    div()
-                        .id(("tree-label", ix))
-                        .test_support()
-                        .flex_1()
-                        .truncate()
+                    label
                         .text_color(folder_color)
-                        .child(r.name.clone()),
+                        .group_hover("tree-row", |d| d.text_color(theme.foreground)),
                 )
                 .child(self.dir_viewed_box(ix, &r.path, cx))
                 .into_any_element();
@@ -1091,29 +1142,12 @@ impl Differ {
                     .text_color(theme.muted_foreground),
             )
             .child(
-                div()
-                    .id(("tree-label", ix))
-                    .test_support()
-                    .flex_1()
-                    .truncate()
+                label
                     .text_color(match state {
                         Viewed::Yes => theme.muted_foreground,
                         _ => theme.foreground,
                     })
-                    .when(is_open, |d| d.font_weight(FontWeight::MEDIUM))
-                    .child(
-                        StyledText::new(r.name.clone()).with_highlights(r.name.rfind('/').map(
-                            |slash| {
-                                (
-                                    0..slash + 1,
-                                    HighlightStyle {
-                                        color: Some(theme.foreground),
-                                        ..Default::default()
-                                    },
-                                )
-                            },
-                        )),
-                    ),
+                    .when(is_open, |d| d.font_weight(FontWeight::MEDIUM)),
             )
             .when(self.uncommitted.contains(f.path().as_str()), |d| {
                 d.child(
