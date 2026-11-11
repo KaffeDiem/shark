@@ -224,14 +224,19 @@ async fn handoff_target_follows_receiver_name_and_icon_edits(cx: &mut TestAppCon
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.open_task_named("target-edits", w, cx);
-        s.rename_agent("planner", w, cx);
+        s.open_agent("planner", w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.input("Implementation planner", cx);
+        w.click("agent-name", cx);
     })
     .unwrap();
-    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["cmd-a"]);
+    cx.update_window(window, |_, w, cx| w.input("Implementation planner", cx))
+        .unwrap();
+    cx.update_window(window, |_, w, cx| w.click("agent-done", cx))
+        .unwrap();
+    cx.run_until_parked();
     cx.read(|cx| {
         let s = shark.read(cx);
         let target = s

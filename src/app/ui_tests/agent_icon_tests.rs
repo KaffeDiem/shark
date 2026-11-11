@@ -101,27 +101,47 @@ async fn replacing_open_icon_picker_restores_original_focus(cx: &mut TestAppCont
     .unwrap();
 }
 
+/// The dialog's avatar opens the picker above the dialog: a pick, Escape or a click outside the
+/// picker closes only the picker.
 #[gpui_kit::test]
-async fn agent_page_icon_opens_the_picker_on_the_page(cx: &mut TestAppContext) {
+async fn agent_dialog_icon_opens_the_picker_above_the_dialog(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, agents(), WindowOptions::default());
+    let shown = |w: &mut Window, cx: &mut App| {
+        w.render_frame(cx);
+        w.try_find("agent-editor").is_some()
+    };
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("agent-page-icon", cx);
+        w.click("agent-icon", cx);
+        assert!(shark.read(cx).icon_picker.is_some());
+        w.render_frame(cx);
+        w.click(("agent-icon-choice", 1usize), cx);
     })
     .unwrap();
-    cx.read(|cx| {
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
-        assert!(s.icon_picker.is_some());
-        assert_eq!(
-            s.home.destination,
-            home::Destination::Agent("designer".into())
-        );
-    });
+        assert!(s.icon_picker.is_none());
+        assert_ne!(s.agent("designer").unwrap().icon, AgentIcon::default());
+        assert!(shown(w, cx), "a pick keeps the dialog");
+        w.click("agent-icon", cx);
+    })
+    .unwrap();
     press_in(window)(cx, &["escape"]);
-    cx.read(|cx| assert!(shark.read(cx).icon_picker.is_none()));
+    cx.update_window(window, |_, w, cx| {
+        assert!(shark.read(cx).icon_picker.is_none());
+        assert!(shown(w, cx), "Escape closes only the picker");
+        w.click("agent-icon", cx);
+        w.pointer_down(point(px(4.), px(4.)), MouseButton::Left, cx);
+        w.pointer_up(point(px(4.), px(4.)), MouseButton::Left, cx);
+        assert!(shark.read(cx).icon_picker.is_none());
+        assert!(shown(w, cx), "a click outside closes only the picker");
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

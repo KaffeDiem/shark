@@ -1,15 +1,39 @@
 use super::*;
 use crate::state::{Agent, AgentLink};
 
+/// Clicks the open menu's row labelled `label`.
+fn click_menu_row(w: &mut Window, label: &str, cx: &mut App) {
+    w.render_frame(cx);
+    let row = w.within("menu-parent").find_by_label(label);
+    let id = row.path().last().unwrap().clone();
+    w.within("menu-parent").click(id, cx);
+}
+
+/// Whether the agent dialog is on screen.
+fn dialog_shown(w: &mut Window, cx: &mut App) -> bool {
+    w.render_frame(cx);
+    w.try_find("agent-editor").is_some()
+}
+
+fn designer() -> Agent {
+    Agent {
+        slug: "designer".into(),
+        name: "Designer".into(),
+        ..Default::default()
+    }
+}
+
+/// A new agent exists once Create (or Enter in its name) makes it, with the instructions typed
+/// before; an empty name is refused with the dialog and its text kept; Cancel and Escape make
+/// nothing.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppContext) {
+async fn new_agent_dialog_creates_on_create_or_enter_and_cancels_cleanly(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let home = test_home();
+    test_home();
     let (window, shark) = boot(
         cx,
         State {
-            repos: repos(&home, &["api"]),
             sections: vec![Section {
                 name: "Designer".into(),
                 icon: "star".into(),
@@ -20,105 +44,330 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         },
         WindowOptions::default(),
     );
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
+    let (on, press) = (on_app(window, shark.clone()), press_in(window));
+    let agents = |cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            (shark.read(cx).state.agents.iter())
+                .map(|a| (a.slug.clone(), a.name.clone(), a.instructions.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    on(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
+        assert_eq!(w.find("agent-create").disabled(), Some(true));
+        for id in ["agent-icon", "agent-skills", "agent-next", "agent-delete"] {
+            assert!(w.try_find(id).is_none(), "{id} waits for the agent");
+        }
+        w.click("agent-instructions", cx);
+        w.input("Always use Mobbin", cx);
+        w.click("agent-name", cx);
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    assert!(agents(cx).is_empty(), "an empty name makes no agent");
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx), "a refused Enter keeps the dialog");
+        let editor = shark
+            .read(cx)
+            .agent_editor
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let instructions = editor.read(cx).instructions.read(cx).value();
+        assert_eq!(instructions, "Always use Mobbin", "and what was typed");
+        w.input("Designer", cx);
+        w.render_frame(cx);
+        assert_ne!(w.find("agent-create").disabled(), Some(true));
+        w.click("agent-create", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        agents(cx),
+        [(
+            "designer".into(),
+            "Designer".into(),
+            "Always use Mobbin".into()
+        )]
+    );
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
+    on(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
+    cx.update_window(window, |_, w, cx| w.input("Planner", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    assert_eq!(
+        agents(cx)[1],
+        ("planner".into(), "Planner".into(), "".into())
+    );
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
+    for close in ["agent-cancel", "escape"] {
+        on(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
+        cx.update_window(window, |_, w, cx| {
+            w.input("Writer", cx);
+            if close == "agent-cancel" {
+                w.click(close, cx);
+            }
+        })
+        .unwrap();
+        if close == "escape" {
+            press(cx, &["escape"]);
+        }
+        cx.update_window(window, |_, w, cx| {
+            assert!(!w.has_active_dialog(cx), "{close} closes the dialog")
+        })
+        .unwrap();
+    }
+    assert_eq!(agents(cx).len(), 2, "Cancel and Escape make nothing");
+    cx.read(|cx| {
+        let sections = &shark.read(cx).state.sections;
+        assert_eq!(sections.len(), 1, "agents leave task groups alone");
+        assert_eq!(sections[0].name, "Designer");
+    });
+    assert_eq!(State::load().agents[0].instructions, "Always use Mobbin");
+}
+
+/// The edit dialog saves the name and instructions as they change. An emptied name keeps the
+/// saved one, the slug never changes, Enter in the name moves to the instructions, and only Done
+/// closes.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn edit_agent_dialog_saves_at_once_and_done_closes(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![Agent {
+                instructions: "Old instructions".into(),
+                ..designer()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let press = press_in(window);
+    let saved = |cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            let a = &shark.read(cx).state.agents[0];
+            (a.slug.clone(), a.name.clone(), a.instructions.clone())
+        })
+    };
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
+        assert_eq!(w.find("agent-icon").bounds().size, size(px(40.), px(40.)));
+        for id in [
+            "agent-create",
+            "agent-model",
+            "agent-effort",
+            "agent-attach",
+        ] {
+            assert!(w.try_find(id).is_none(), "{id} in the edit dialog");
+        }
+        assert_eq!(w.find("agent-skills").label(), Some("0 skills"));
+        assert_eq!(w.find("agent-next").label(), Some("Hands off to nobody"));
+        w.click("agent-name", cx);
+    })
+    .unwrap();
+    press(cx, &["cmd-a", "backspace"]);
+    assert_eq!(saved(cx).1, "Designer", "an empty name keeps the saved one");
+    cx.update_window(window, |_, w, cx| w.input("Design team", cx))
+        .unwrap();
+    assert_eq!(
+        saved(cx),
+        (
+            "designer".into(),
+            "Design team".into(),
+            "Old instructions".into()
+        )
+    );
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx), "Enter in the name doesn't close");
+        let editor = shark
+            .read(cx)
+            .agent_editor
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let instructions = editor.read(cx).instructions.clone();
+        assert!(instructions.read(cx).focus_handle(cx).is_focused(w));
+    })
+    .unwrap();
+    press(cx, &["cmd-a"]);
+    cx.update_window(window, |_, w, cx| w.input("New instructions", cx))
+        .unwrap();
+    assert_eq!(saved(cx).2, "New instructions");
+    cx.update_window(window, |_, w, cx| {
+        w.click("agent-done", cx);
+        assert!(!w.has_active_dialog(cx));
+    })
+    .unwrap();
+    let agent = &State::load().agents[0];
+    assert_eq!(
+        (
+            agent.slug.as_str(),
+            agent.name.as_str(),
+            agent.instructions.as_str()
+        ),
+        ("designer", "Design team", "New instructions")
+    );
+}
+
+/// The skills and handoff menus open above the agent dialog: clicking their rows, or dismissing
+/// them, leaves the dialog open.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_dialog_menus_keep_the_dialog_open(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let planner = Agent {
+        slug: "planner".into(),
+        name: "Planner".into(),
+        ..Default::default()
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![designer(), planner],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let press = press_in(window);
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        w.click("agent-next", cx);
+        click_menu_row(w, "Planner", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert_eq!(
+            shark.read(cx).state.agents[0].next.as_deref(),
+            Some("planner")
+        );
+        assert!(dialog_shown(w, cx), "a menu row click keeps the dialog");
+        assert!(w.try_find("menu-parent").is_none());
+        assert_eq!(w.find("agent-next").label(), Some("Hands off to Planner"));
+        let skill = crate::state::agent_skills_dir("designer").join("research");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "# Research").unwrap();
+        w.click("agent-skills", cx);
+        click_menu_row(w, "Refresh skills", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
+        assert_eq!(w.find("agent-skills").label(), Some("1 skill"));
+        w.click("agent-skills", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("menu-parent").is_some());
+    })
+    .unwrap();
+    press(cx, &["escape"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.try_find("menu-parent").is_none());
+        assert!(dialog_shown(w, cx), "Escape closes only the menu");
+    })
+    .unwrap();
+}
+
+/// "New agent…" in an unstarted chat's agent menu makes the agent and puts it on that chat.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn new_agent_from_a_chat_menu_goes_on_that_chat(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let task = git::create_empty_task(&tasks_dir().join("pick"), "pick", "Pick", None).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_named("pick", w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("chat-agent", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| click_menu_row(w, "New agent…", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
         w.input("Designer", cx);
     })
     .unwrap();
     press_in(window)(cx, &["enter"]);
-    cx.run_until_parked();
     cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(w.try_find("agent-settings").is_some());
-        w.click("agent-instructions", cx);
-        w.input("Always use Mobbin to ground your research", cx);
-        assert!(w.try_find("agent-repos").is_none());
-    })
-    .unwrap();
-    cx.read(|cx| {
-        let s = shark.read(cx);
-        let a = &s.state.agents[0];
-        assert_eq!(a.slug, "designer");
-        assert!(a.repos.is_empty());
-        assert_eq!(a.instructions, "Always use Mobbin to ground your research");
-        assert_eq!(
-            s.state.sections.len(),
-            1,
-            "agent creation leaves task groups alone"
-        );
-    });
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        w.click("agent-name", cx)
-    })
-    .unwrap();
-    press_in(window)(cx, &["cmd-a"]);
-    cx.update_window(window, |_, w, cx| w.input("Design team", cx))
-        .unwrap();
-    cx.read(|cx| {
+        assert!(!w.has_active_dialog(cx));
         let s = shark.read(cx);
         assert_eq!(s.state.agents[0].slug, "designer");
-        assert_eq!(s.state.agents[0].name, "Design team");
-        assert_eq!(
-            s.state.sections[0].name, "Designer",
-            "agent edits leave task groups alone"
-        );
+        let chat = s.active_chat().unwrap().read(cx);
+        assert_eq!(chat.meta.agent.as_deref(), Some("designer"));
+        assert_eq!(s.task("pick").unwrap().agents[0].slug, "designer");
+        w.render_frame(cx);
+        assert_eq!(w.find("chat-agent").label(), Some("Agent: Designer"));
+    })
+    .unwrap();
+}
+
+/// "New agent…" in Home's agent picker makes the agent and picks it for Home's task.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn new_agent_from_home_picker_is_picked_on_home(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![designer()],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.enter_home(w, cx);
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("fix spacing", w, cx));
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        assert!(!w.has_active_dialog(cx), "creation opens no second dialog");
-        assert!(
-            w.try_find("agent-page").is_some(),
-            "settings are edited on the agent's page"
-        );
-        assert!(w.try_find("agent-skills").is_some());
-        assert_eq!(
-            w.find("agent-page-icon").bounds().size,
-            size(px(40.), px(40.))
-        );
-        assert!(w.try_find("agent-attach").is_none());
-        assert!(w.try_find("agent-model").is_none());
-        assert!(w.try_find("agent-effort").is_none());
-        assert!(w.try_find("agent-defaults-label").is_none());
-        assert_eq!(w.find("agent-skills").label().as_deref(), Some("0 skills"));
-        assert_eq!(
-            w.find("agent-next").label().as_deref(),
-            Some("Hands off to nobody")
-        );
-        assert!(
-            w.try_find("agent-settings").is_some(),
-            "settings sit in the header"
-        );
+        w.click("home-agent-picker", cx);
+        w.input("New agent", cx);
     })
     .unwrap();
-    on_app(window, shark.clone())(cx, &|s, _, cx| {
-        let labels = s
-            .agent_identity_menu("designer", cx)
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Entry::Item { label, .. } => Some(label.to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            [
-                "Rename",
-                "Change icon…",
-                "Paste Image as Icon",
-                "Edit instructions",
-                "Delete agent…"
-            ]
-        );
-    });
-    let saved = State::load();
-    assert_eq!(
-        saved.agents[0].instructions,
-        "Always use Mobbin to ground your research"
-    );
+    press_in(window)(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
+        w.input("Planner", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(!w.has_active_dialog(cx));
+        let s = shark.read(cx);
+        assert_eq!(s.state.agents[1].slug, "planner");
+        assert_eq!(s.home.prompt.read(cx).value(), "@planner fix spacing");
+    })
+    .unwrap();
 }
 
+/// Delete agent… in the dialog asks, then removes the agent and closes every dialog. A chat
+/// using it doesn't block deletion and goes on without it.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn agents_do_not_create_sections_and_deleting_one_a_chat_uses_succeeds(
@@ -158,26 +407,23 @@ async fn agents_do_not_create_sections_and_deleting_one_a_chat_uses_succeeds(
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("agent-more", cx);
+        w.click("agent-delete", cx);
+        assert!(w.has_active_dialog(cx));
     })
     .unwrap();
-    press_in(window)(cx, &["d", "enter"]);
+    cx.read(|cx| assert_eq!(shark.read(cx).state.agents.len(), 2, "asks first"));
     press_in(window)(cx, &["enter"]);
-    cx.read(|cx| {
+    cx.update_window(window, |_, w, cx| {
+        assert!(!w.has_active_dialog(cx), "no dialog outlives the agent");
         let s = shark.read(cx);
         assert_eq!(s.state.agents.len(), 1);
         assert_eq!(s.state.agents[0].slug, "designer-2");
-        assert_eq!(s.home.destination, super::super::home::Destination::Home);
         let task = &s.state.tasks[0];
         assert!(task.agents.is_empty(), "its snapshot goes with it");
         assert_eq!(task.chats[0].agent.as_deref(), Some("designer"));
-    });
-    on(cx, &|s, w, cx| s.leave_home(w, cx));
-    cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        let agent = w.find("chat-agent");
         assert_eq!(
-            agent.label().as_deref(),
+            w.find("chat-agent").label(),
             Some("Agent: none"),
             "the chat goes on without it"
         );
@@ -232,49 +478,6 @@ async fn agents_do_not_create_sections_and_deleting_one_a_chat_uses_succeeds(
     });
 }
 
-/// An agent's page is its settings: no composer, task list or history below the header.
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn agent_page_shows_only_its_settings(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let link = AgentLink {
-        slug: "designer".into(),
-        name: "Designer".into(),
-        ..Default::default()
-    };
-    let task = git::create_empty_task(&tasks_dir().join("one"), "one", "One", Some(link)).unwrap();
-    let (window, shark) = boot(
-        cx,
-        State {
-            agents: vec![Agent {
-                slug: "designer".into(),
-                name: "Designer".into(),
-                ..Default::default()
-            }],
-            tasks: vec![task],
-            ..Default::default()
-        },
-        WindowOptions::default(),
-    );
-    on_app(window, shark)(cx, &|s, w, cx| s.open_agent("designer", w, cx));
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(w.try_find("agent-settings").is_some());
-        for id in [
-            "home-composer",
-            "agent-composer",
-            "home-list",
-            "agent-history",
-            "agent-empty-tasks",
-        ] {
-            assert!(w.try_find(id).is_none(), "{id} on the agent page");
-        }
-        assert!(w.try_find(("home-ws", 0usize)).is_none());
-    })
-    .unwrap();
-}
-
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn refreshing_skills_links_them_into_tasks_whose_chats_use_the_agent(
@@ -315,16 +518,16 @@ async fn refreshing_skills_links_them_into_tasks_whose_chats_use_the_agent(
         s.open_agent("designer", w, cx);
     });
     cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(!w.has_active_dialog(cx), "agent is a page, not a dialog");
+        assert!(dialog_shown(w, cx));
         let skill = crate::state::agent_skills_dir("designer").join("research");
         fs::create_dir_all(&skill).unwrap();
         fs::write(skill.join("SKILL.md"), "# Research").unwrap();
+        // The skills chip's menu: Refresh skills links the new skill into the agent's tasks.
         w.click("agent-skills", cx);
+        click_menu_row(w, "Refresh skills", cx);
     })
     .unwrap();
-    // The skills chip's menu: Refresh skills links the new skill into the agent's tasks.
-    press_in(window)(cx, &["r", "enter"]);
+    cx.run_until_parked();
     cx.update_window(window, |_, w, cx| {
         let skill = crate::state::agent_skills_dir("designer").join("research");
         for folder in [".agents/skills", ".claude/skills"] {
@@ -340,9 +543,15 @@ async fn refreshing_skills_links_them_into_tasks_whose_chats_use_the_agent(
                     .exists()
             );
         }
-        let header = shark.read(cx).home.agent_header.clone().unwrap();
-        assert_eq!(header.read(cx).skills, ["research"]);
-        w.render_frame(cx);
+        let editor = shark
+            .read(cx)
+            .agent_editor
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert_eq!(editor.read(cx).skills, ["research"]);
+        assert!(dialog_shown(w, cx), "a menu pick keeps the dialog");
         assert_eq!(w.find("agent-skills").label().as_deref(), Some("1 skill"));
     })
     .unwrap();
@@ -403,7 +612,7 @@ async fn failed_agent_doc_refresh_still_updates_instruction_snapshots(cx: &mut T
     });
 }
 
-/// Typing in the header's instructions reaches the chats of open tasks once typing pauses.
+/// Typing in the dialog's instructions reaches the chats of open tasks once typing pauses.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn inline_instruction_edits_reach_open_tasks_after_a_pause(cx: &mut TestAppContext) {
@@ -428,9 +637,13 @@ async fn inline_instruction_edits_reach_open_tasks_after_a_pause(cx: &mut TestAp
         },
         WindowOptions::default(),
     );
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.edit_agent("designer", w, cx));
-    cx.update_window(window, |_, w, cx| w.input("Use tokens", cx))
-        .unwrap();
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("agent-instructions", cx);
+        w.input("Use tokens", cx);
+    })
+    .unwrap();
     let synced = |cx: &mut TestAppContext| {
         cx.read(|cx| shark.read(cx).state.tasks[0].agents[0].instructions.clone())
     };

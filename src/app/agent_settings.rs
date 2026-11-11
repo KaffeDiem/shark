@@ -188,9 +188,11 @@ impl Shark {
         window.open_dialog(cx, move |d, _, cx| {
             let new = shown.read(cx).slug.is_none();
             let footer = shown.update(cx, |e, cx| e.footer(cx));
+            // Enter belongs to the fields and footer: a refused Create must not close it.
             crate::ui::dialog(d)
                 .title(if new { "New agent" } else { "Edit agent" })
                 .w(px(560.))
+                .on_ok(|_, _, _| false)
                 .child(shown.clone())
                 .footer(footer)
         });
@@ -705,10 +707,13 @@ impl AgentEditor {
             }
             Some(slug) => {
                 let shark = self.shark.clone();
+                // Red text only: `.danger()` would replace ghost with a filled pill beside Done.
+                // Pulled left like the chips, so its text lines up with the fields.
                 row.child(
                     Button::new("agent-delete")
                         .ghost()
-                        .danger()
+                        .ml(px(-8.))
+                        .text_color(cx.theme().button_danger_foreground)
                         .label("Delete agent…")
                         .on_click(move |_, w, cx| {
                             shark.update(cx, |s, cx| s.delete_agent(&slug, w, cx)).ok();

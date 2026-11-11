@@ -1,5 +1,4 @@
-//! Home starts tasks and lists every task; an agent's page holds its settings. Neither leaves
-//! the open task.
+//! Home starts tasks and lists every task. It shows over the open task without leaving it.
 use super::ask::Ask;
 use super::task_draft::TaskDraft;
 use super::*;

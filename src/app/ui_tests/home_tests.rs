@@ -613,15 +613,9 @@ async fn home_agent_picker_preserves_draft_and_standalone_choice(cx: &mut TestAp
         let task = &shark.read(cx).state.tasks[0];
         assert!(task.agents.is_empty() && task.chats[0].agent.is_none());
     });
-    on(cx, &|s, w, cx| s.open_agent("designer", w, cx));
-    press(cx, &["cmd-n"]);
+    pick(cx, "Designer");
     cx.read(|cx| {
         let s = shark.read(cx);
-        assert_eq!(
-            s.home.destination,
-            super::super::home::Destination::Home,
-            "cmd-n on an agent page starts a task for it on Home"
-        );
         assert_eq!(s.home.prompt.read(cx).value(), "@designer ");
         assert_eq!(s.state.tasks.len(), 1);
     });
@@ -711,13 +705,6 @@ async fn home_sections_keep_ungrouped_separate_and_mirror_sidebar(cx: &mut TestA
         s.move_to_section("legacy", None, cx);
         assert_eq!(s.section_of("legacy"), None);
         assert_eq!(s.home_rows(cx).len(), 4);
-    });
-    press_in(window)(cx, &["escape"]);
-    cx.read(|cx| {
-        assert_eq!(
-            shark.read(cx).home.destination,
-            super::super::home::Destination::Home
-        )
     });
     fs::remove_dir_all(home).ok();
 }
@@ -816,12 +803,15 @@ async fn staged_files_stay_with_their_draft_and_block_early_start(cx: &mut TestA
         assert_eq!(
             s.home.draft.files.len(),
             1,
-            "leaving for an agent's page keeps the copy in Home's draft"
+            "an agent dialog over Home keeps the copy in Home's draft"
         );
         s.home.draft.files[0].clone()
     });
     assert_eq!(fs::read_to_string(&staged).unwrap(), "local-only notes");
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.enter_home(w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        w.close_all_dialogs(cx);
+        s.enter_home(w, cx)
+    });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click(("draft-file", 0usize), cx);

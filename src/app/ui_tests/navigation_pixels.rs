@@ -255,7 +255,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.rail = false;
                     s.home.on = true;
                     s.state.home_checklist_dismissed = true;
-                    s.home.destination = home::Destination::Home;
                     s.state.tasks[2].backlog = true;
                     s.state.tasks[1].repos.clear();
                     s.home.waiting.insert("Inactive".into(), "Plan to approve");

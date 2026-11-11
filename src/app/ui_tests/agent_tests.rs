@@ -944,57 +944,6 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn agent_pages_do_not_target_hidden_tasks(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let link = AgentLink {
-        slug: "designer".into(),
-        name: "Designer".into(),
-        ..Default::default()
-    };
-    let tasks = [("design", Some(link)), ("other", None)]
-        .into_iter()
-        .map(|(name, agent)| {
-            git::create_empty_task(&tasks_dir().join(name), name, name, agent).unwrap()
-        })
-        .collect();
-    let (window, shark) = boot(
-        cx,
-        State {
-            tasks,
-            agents: vec![crate::state::Agent {
-                slug: "designer".into(),
-                name: "Designer".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        WindowOptions::default(),
-    );
-    on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.open_task_now(1, w, cx);
-        s.open_agent("designer", w, cx);
-        assert!(
-            s.target(w).is_none(),
-            "the agent page lists no tasks, so row actions have none to hit"
-        );
-        s.sidebar_focus.focus(w, cx);
-        s.sel = SideRow::Task(1);
-        assert_eq!(
-            s.target(w).unwrap().name,
-            "other",
-            "explicit sidebar selection wins"
-        );
-        s.open_task_then("other", None, w, cx, |_, _, _| {});
-        assert!(
-            !s.home_shown(),
-            "opening the active task leaves the agent page"
-        );
-    });
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
 async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());

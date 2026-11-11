@@ -38,6 +38,48 @@ fn avatar_identities(s: &mut Shark) {
     });
 }
 
+/// The 560px agent dialog: avatar left of the name, every control and footer button visible and
+/// inside the dialog's content width.
+fn check_dialog_layout(w: &Window, new: bool) {
+    let body = w.find("agent-editor").bounds();
+    assert!(body.size.width <= px(520.), "560px less padding: {body:?}");
+    let name = w.find("agent-name").bounds();
+    assert!(
+        name.left() >= body.left() + px(40.),
+        "the avatar sits left of the name"
+    );
+    let mut ids = vec!["agent-name", "agent-instructions"];
+    if new {
+        ids.extend(["agent-cancel", "agent-create"]);
+    } else {
+        let avatar = w.find("agent-icon").bounds();
+        assert!(avatar.right() <= name.left() && avatar.top() <= name.bottom());
+        ids.extend([
+            "agent-icon",
+            "agent-skills",
+            "agent-next",
+            "agent-delete",
+            "agent-done",
+        ]);
+    }
+    for id in ids {
+        let b = w.find(id);
+        assert!(b.visible(), "{id} is visible");
+        let b = b.bounds();
+        assert!(
+            b.left() >= body.left() - px(8.) && b.right() <= body.right() + px(1.),
+            "{id} {b:?} is clipped by the dialog {body:?}"
+        );
+    }
+    let (left, right) = if new {
+        ("agent-cancel", "agent-create")
+    } else {
+        ("agent-delete", "agent-done")
+    };
+    assert!(w.find(left).bounds().right() < w.find(right).bounds().left());
+    assert!(w.find("agent-instructions").bounds().bottom() < w.find(right).bounds().top());
+}
+
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
@@ -265,13 +307,23 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 cx.notify();
             });
         }),
-        // The agent page is its settings header only.
-        ("agent-page", |s, w, cx| s.open_agent("designer", w, cx)),
-        ("rail", |s, w, cx| {
-            s.rail = true;
+        // An emoji avatar, two skills and a next agent: every row of the edit dialog filled.
+        ("agent-dialog-edit", |s, w, cx| {
+            s.state.agents[0].icon = crate::state::AgentIcon::Emoji {
+                value: "🐧".into()
+            };
+            for name in ["review", "spacing"] {
+                let skill = crate::state::agent_skills_dir("designer").join(name);
+                fs::create_dir_all(&skill).unwrap();
+                fs::write(skill.join("SKILL.md"), "# Skill").unwrap();
+            }
             s.open_agent("designer", w, cx);
         }),
-        ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
+        ("agent-dialog-new", |s, w, cx| {
+            s.enter_home(w, cx);
+            s.new_agent_dialog(w, cx);
+        }),
+        ("rail", |s, _, _| s.rail = true),
         ("agent-add-skills", |s, w, cx| {
             s.open_agent("designer", w, cx);
             s.add_agent_skills("designer", w, cx);
@@ -296,7 +348,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 p.inspect(w, cx);
             });
         }),
-        ("agent-rename", |s, w, cx| s.rename_agent("designer", w, cx)),
         ("home", |s, w, cx| s.enter_home(w, cx)),
         ("home-agent", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx)
@@ -313,10 +364,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 p.insert("@d", w, cx);
                 p.focus(w, cx)
             });
-        }),
-        ("new-agent", |s, w, cx| {
-            s.enter_home(w, cx);
-            s.new_agent_dialog(w, cx);
         }),
     ];
     for (mode, label) in [
@@ -376,14 +423,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     .unwrap();
                 cx.run_until_parked();
             }
-            if case == "agent-page" {
-                cx.update_window(window, |_, w, _| {
-                    assert!(w.try_find("agent-settings").is_some());
-                    assert!(
-                        w.try_find("home-composer").is_none() && w.try_find("home-list").is_none()
-                    );
-                })
-                .unwrap();
+            if let Some(kind) = case.strip_prefix("agent-dialog-") {
+                cx.update_window(window, |_, w, _| check_dialog_layout(w, kind == "new"))
+                    .unwrap();
             }
             if matches!(case, "draft-file-completion" | "draft-pr-completion") {
                 cx.update(|cx| {
@@ -417,9 +459,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
                 let dir = PathBuf::from(dir);
                 fs::create_dir_all(&dir).unwrap();
-                screenshot
-                    .save(dir.join(format!("{case}-{label}.png")))
-                    .unwrap();
+                let name = match case.strip_prefix("agent-dialog-") {
+                    Some(kind) => format!("agent-dialog-{label}-{kind}.png"),
+                    None => format!("{case}-{label}.png"),
+                };
+                screenshot.save(dir.join(name)).unwrap();
             }
             cx.update_window(window, |_, w, _| w.remove_window())
                 .unwrap();
