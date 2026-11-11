@@ -24,7 +24,7 @@ Skills have one harness-neutral source: `support_dir()/agents/<slug>/skills/<ski
 
 Skill import accepts GitHub sources and local skill files or folders. Preview and selection happen before copying complete skill folders into the agent's existing storage; import never executes bundled code, installs plugin hooks, connects services or silently replaces an existing skill. Record source provenance with the imported copy. Refresh task links automatically after import and distinguish refresh failure from import failure. Keep manual folder access and Refresh skills available. Installing a skill makes it available; persistent activation belongs in the agent's instructions. Do not grow this importer into a marketplace or plugin manager.
 
-Sibling notes describe the other open tasks with a chat on the same agent, their directories and changed files, including the empty state. Background refreshes must ignore removed or archiving tasks, avoid publishing unchanged results and preserve known file lists when another task starts. These notes support coordination; they are not locks or read-only permissions.
+Tasks are encapsulated: no context note, root doc or instruction tells a chat about other tasks.
 
 Keep existing installs readable: serialized legacy names, the `NEW_TASK` stored sentinel, `~/shark/workspaces` paths, old root-document attachment parsing and `SHARK_WORKSPACE` environment variables remain compatible. New task environment aliases supplement the old names. Renaming Rust or UI vocabulary is not permission to move worktrees or rewrite the storage contract.
 

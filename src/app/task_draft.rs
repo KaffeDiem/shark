@@ -334,7 +334,6 @@ impl Shark {
                     if let Err(e) = s.sync_agent(&agent.slug, docs, cx) {
                         notify_err(window, cx, e);
                     }
-                    s.refresh_agent_files(&agent.slug, cx);
                 }
                 s.record_interaction(&ws.name, cx);
                 if let Some(text) = &titling {

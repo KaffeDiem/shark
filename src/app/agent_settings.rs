@@ -650,7 +650,8 @@ impl AgentEditor {
             }
             shark
                 .update_in(cx, |s, window, cx| {
-                    if let Err(e) = s.sync_agent(&slug, true, cx) {
+                    // Root docs carry no instructions: the snapshot alone reaches the chats.
+                    if let Err(e) = s.sync_agent(&slug, false, cx) {
                         let e = format!("Couldn't refresh agent instructions: {e}");
                         notify_err(window, cx, e);
                     }

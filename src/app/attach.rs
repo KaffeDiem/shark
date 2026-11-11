@@ -908,14 +908,6 @@ impl Shark {
     /// Everything reading the repo list picks up a new one.
     fn repos_published(&mut self, ws: &Task, window: &mut Window, cx: &mut Context<Self>) {
         self.publish_task(&ws.name, cx);
-        for agent in &ws.agents {
-            if let Err(e) = self.sync_agent(&agent.slug, false, cx) {
-                notify_err(window, cx, e);
-            }
-        }
-        if !ws.agents.is_empty() {
-            self.refresh_sibling_files(&ws.name, cx);
-        }
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_task(ws.clone(), cx));
         }

@@ -242,20 +242,12 @@ impl Shark {
         let slot = ws.chats.iter_mut().find(|c| c.id == meta.id);
         let agent = slot.as_ref().is_some_and(|s| s.agent != meta.agent);
         let changed = slot.filter(|s| **s != meta).map(|s| *s = meta).is_some();
-        // A new title names the task in its siblings' notes.
-        let slugs: Vec<_> = (ws.agents.iter())
-            .filter(|_| untitled)
-            .map(|a| a.slug.clone())
-            .collect();
         let name = ws.name.clone();
         if changed || untitled {
             let _ = self.state.save();
         }
         if agent && let Err(e) = self.relink_agents(&name, cx) {
             eprintln!("relinking agents of {name}: {e}");
-        }
-        for slug in slugs {
-            let _ = self.sync_agent(&slug, false, cx);
         }
     }
 

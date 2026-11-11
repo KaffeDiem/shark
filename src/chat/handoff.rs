@@ -1,6 +1,6 @@
 //! The chat's agent: its context notes, its button in the composer, and the handoff bar.
 use super::*;
-use crate::state::{AGENT_CONTEXT, ContextNote, SIBLINGS_CONTEXT};
+use crate::state::{AGENT_CONTEXT, ContextNote};
 use std::collections::BTreeMap;
 
 pub(crate) struct HandoffTarget {
@@ -14,8 +14,7 @@ impl Chat {
     pub(crate) fn context(&self) -> BTreeMap<String, ContextNote> {
         let mut notes = self.ws.context();
         notes.retain(|key, _| {
-            key.strip_prefix(AGENT_CONTEXT)
-                .or_else(|| key.strip_prefix(SIBLINGS_CONTEXT))
+            (key.strip_prefix(AGENT_CONTEXT))
                 .is_none_or(|slug| Some(slug) == self.meta.agent.as_deref())
         });
         notes

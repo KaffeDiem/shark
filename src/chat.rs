@@ -4055,9 +4055,7 @@ done
                 assert_eq!(c.meta.model.as_deref(), Some(crate::models::MODELS[1]));
                 assert_eq!(c.meta.effort.as_deref(), Some("low"));
                 let notes = c.context();
-                assert!(
-                    notes.contains_key("agent:planner") && notes.contains_key("siblings:planner")
-                );
+                assert!(notes.contains_key("agent:planner"));
                 let prompt = crate::git::agent_prompt(&c.ws, &c.meta).unwrap();
                 assert!(prompt.contains("Planner") && prompt.contains("Plan carefully"));
                 assert!(!c.set_agent(Some("planner".into()), None, cx), "unchanged");

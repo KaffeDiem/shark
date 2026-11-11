@@ -295,8 +295,6 @@ pub struct AgentLink {
     #[serde(default)]
     pub icon: AgentIcon,
     pub instructions: String,
-    #[serde(default)]
-    pub siblings: Vec<Sibling>,
 }
 
 impl From<&Agent> for AgentLink {
@@ -306,17 +304,8 @@ impl From<&Agent> for AgentLink {
             name: agent.name.clone(),
             icon: agent.icon.clone(),
             instructions: agent.instructions.clone(),
-            siblings: Vec::new(),
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Sibling {
-    pub title: String,
-    pub branch: String,
-    pub dirs: Vec<String>,
-    pub files: Vec<String>,
 }
 
 pub fn agent_skills_dir(slug: &str) -> PathBuf {
@@ -592,7 +581,6 @@ pub const NEW_TASK: &str = "New agent";
 /// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
 pub const REPO_CONTEXT: &str = "repo:";
 pub const AGENT_CONTEXT: &str = "agent:";
-pub const SIBLINGS_CONTEXT: &str = "siblings:";
 
 /// The key prefix of a Linear issue in `Task::context`, before its UUID. Unlike repositories
 /// these are in no root doc, so every session gets them with its first normal turn.
@@ -909,45 +897,6 @@ impl Task {
                 format!("{AGENT_CONTEXT}{}", agent.slug),
                 ContextNote {
                     fingerprint: crate::files::fingerprint(&agent.instructions),
-                    text,
-                },
-            );
-            let text = if agent.siblings.is_empty() {
-                format!("[shark] As {} you have no other open tasks.", agent.name)
-            } else {
-                let mut text = format!(
-                    "[shark] As {} you also have these open tasks:\n",
-                    agent.name
-                );
-                for sibling in &agent.siblings {
-                    let dirs = sibling
-                        .dirs
-                        .iter()
-                        .map(|p| format!("`{p}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let files = if sibling.files.is_empty() {
-                        "none reported".into()
-                    } else {
-                        sibling
-                            .files
-                            .iter()
-                            .map(|p| format!("`{p}`"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    text += &format!(
-                        "- \"{}\" on `{}` ({}), changed: {}\n",
-                        sibling.title, sibling.branch, dirs, files
-                    );
-                }
-                text += "\nThese tasks use separate worktrees. Their changed files do not restrict edits in this task.";
-                text
-            };
-            notes.insert(
-                format!("{SIBLINGS_CONTEXT}{}", agent.slug),
-                ContextNote {
-                    fingerprint: crate::files::fingerprint(&text),
                     text,
                 },
             );
@@ -1707,43 +1656,6 @@ mod tests {
         );
         assert_eq!(slug("  Design / UI! "), "design-ui");
         assert_eq!(slug("!!!"), "");
-    }
-
-    #[test]
-    fn sibling_context_includes_empty_state_and_tracks_only_content_changes() {
-        let mut task = Task {
-            agents: vec![AgentLink {
-                slug: "designer".into(),
-                name: "Designer".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let empty = task.context()["siblings:designer"].clone();
-        assert!(empty.text.contains("no other open tasks"));
-        task.agents[0].siblings.push(Sibling {
-            title: "Spacing".into(),
-            branch: "designer/spacing-marlin".into(),
-            dirs: vec!["/tasks/spacing/api".into()],
-            files: vec!["api/src/ui.rs".into()],
-        });
-        let note = task.context()["siblings:designer"].clone();
-        assert_ne!(note.fingerprint, empty.fingerprint);
-        assert!(note.text.contains("api/src/ui.rs"));
-        assert!(note.text.contains("do not restrict edits in this task"));
-        assert!(!note.text.contains("Avoid editing"));
-        assert_eq!(task.context()["siblings:designer"], note);
-        task.agents[0].instructions = "New instructions".into();
-        assert_eq!(task.context()["siblings:designer"], note);
-        task.agents[0].siblings[0]
-            .files
-            .push("api/src/tokens.rs".into());
-        assert_ne!(
-            task.context()["siblings:designer"].fingerprint,
-            note.fingerprint
-        );
-        task.agents[0].siblings.clear();
-        assert_eq!(task.context()["siblings:designer"], empty);
     }
 
     #[test]

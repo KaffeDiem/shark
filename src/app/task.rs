@@ -1,7 +1,7 @@
 //! Creating, opening, growing and deleting tasks.
 use super::new_task::NewTaskForm;
 use super::*;
-use crate::state::{AgentLink, AttachStage, Sibling};
+use crate::state::{AgentLink, AttachStage};
 
 impl Shark {
     pub(super) fn can_backlog(&self, name: &str, cx: &App) -> bool {
@@ -42,60 +42,32 @@ impl Shark {
         cx.notify();
     }
 
-    /// Refreshes agent `slug`'s snapshot in every task whose chats use it: identity,
-    /// instructions and the other tasks it works in. `docs` also rewrites root docs and skill links.
+    /// Refreshes agent `slug`'s snapshot (identity and instructions) in every task whose chats
+    /// use it. `docs` also rewrites those tasks' root docs and skill links.
     pub(crate) fn sync_agent(
         &mut self,
         slug: &str,
         docs: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
+        let Some(agent) = self.agent(slug).map(AgentLink::from) else {
             return Ok(());
         };
         let tasks: Vec<_> = (self.state.tasks.iter())
             .filter(|t| t.agent_link(slug).is_some())
-            .cloned()
+            .map(|t| t.name.clone())
             .collect();
         let mut errors = vec![];
-        for task in &tasks {
-            let siblings = tasks
-                .iter()
-                .filter(|other| other.name != task.name)
-                .map(|other| {
-                    let dirs: Vec<_> = other
-                        .repos
-                        .iter()
-                        .map(|r| other.dir().join(&r.name).to_string_lossy().into_owned())
-                        .collect();
-                    let known = |t: &Task| {
-                        t.agent_link(slug)?
-                            .siblings
-                            .iter()
-                            .find(|s| s.branch == other.branch && s.dirs == dirs)
-                            .map(|s| s.files.clone())
-                    };
-                    Sibling {
-                        title: other.display_title().into(),
-                        branch: other.branch.clone(),
-                        files: known(task)
-                            .or_else(|| tasks.iter().find_map(known))
-                            .unwrap_or_default(),
-                        dirs,
-                    }
-                })
-                .collect();
-            let mut current = task.clone();
-            let link = current.agents.iter_mut().find(|a| a.slug == slug).unwrap();
-            link.name = agent.name.clone();
-            link.icon = agent.icon.clone();
-            link.instructions = agent.instructions.clone();
-            link.siblings = siblings;
-            if docs && let Err(e) = git::write_claude_md(&current) {
-                errors.push(format!("{}: {e}", task.display_title()));
+        for name in &tasks {
+            let ws = self.task_mut(name).unwrap();
+            if let Some(link) = ws.agents.iter_mut().find(|a| a.slug == slug) {
+                *link = agent.clone();
             }
-            self.task_mut(&task.name).unwrap().agents = current.agents;
-            self.publish_task(&task.name, cx);
+            let ws = ws.clone();
+            if docs && let Err(e) = git::write_claude_md(&ws) {
+                errors.push(format!("{}: {e}", ws.display_title()));
+            }
+            self.publish_task(name, cx);
         }
         if let Err(e) = self.state.save() {
             errors.push(e.to_string());
@@ -107,8 +79,8 @@ impl Shark {
         }
     }
 
-    /// After a chat of `task` changed agent: snapshots for the agents its chats now use, their
-    /// skills linked, and every task sharing an agent told of the change.
+    /// After a chat of `task` changed agent: one snapshot per agent its chats use, and their
+    /// skills linked. Tasks don't see each other.
     pub(crate) fn relink_agents(
         &mut self,
         task: &str,
@@ -118,22 +90,13 @@ impl Shark {
         let Some(ws) = self.task_mut(task) else {
             return Ok(());
         };
-        let mut slugs: Vec<String> = ws.agents.iter().map(|a| a.slug.clone()).collect();
         if !ws.link_agents(&agents) {
             return Ok(());
         }
-        slugs.extend(ws.agents.iter().map(|a| a.slug.clone()));
         let ws = ws.clone();
         let mut errors = vec![];
         if let Err(e) = git::link_skills(&ws, &ws.dir()) {
             errors.push(format!("Couldn't link skills: {e}"));
-        }
-        slugs.sort();
-        slugs.dedup();
-        for slug in slugs {
-            if let Err(e) = self.sync_agent(&slug, false, cx) {
-                errors.push(e);
-            }
         }
         if let Err(e) = self.state.save() {
             errors.push(e.to_string());
@@ -458,10 +421,6 @@ impl Shark {
             crate::linear::delete_snapshots(&name);
             return notify_err(window, cx, format!("Couldn't save the new task: {e}"));
         }
-        if let Some(agent) = ws.agents.first() {
-            let _ = self.sync_agent(&agent.slug, false, cx);
-            self.refresh_agent_files(&agent.slug, cx);
-        }
         self.open_task_now(self.state.tasks.len() - 1, window, cx);
         self.record_interaction(&name, cx);
         self.home_prompt_used(
@@ -519,10 +478,6 @@ impl Shark {
         let edited = |w: &&mut Task| !title.is_empty() && title != w.display_title();
         if let Some(ws) = self.task_mut(name).filter(edited) {
             ws.title = title;
-            let slugs: Vec<_> = ws.agents.iter().map(|a| a.slug.clone()).collect();
-            for slug in slugs {
-                let _ = self.sync_agent(&slug, false, cx);
-            }
             let _ = self.state.save();
             cx.notify();
         }
@@ -778,9 +733,7 @@ impl Shark {
                                     format!("Couldn't refresh agent instructions: {e}"),
                                 );
                             }
-                            let current = s.task(&name).unwrap().clone();
-                            s.refresh_agent_files(&agent.slug, cx);
-                            ws = current;
+                            ws = s.task(&name).unwrap().clone();
                         }
                         let _ = s.state.save();
                         if let Some(p) = &prompt {
@@ -1542,7 +1495,6 @@ impl Shark {
                 crate::plan::delete(&c.id);
             }
         }
-        self.sibling_refreshes.remove(name);
         self.syncs.remove(name);
         self.parked_sessions.remove(name);
         self.git_features.remove(name);
@@ -1570,13 +1522,7 @@ impl Shark {
                 let repoless = self.task(name).is_some_and(|w| w.repos.is_empty());
                 let before = self.cursors(cx);
                 self.forget_task_views(name, cx);
-                let slugs: Vec<_> = (self.task(name).into_iter())
-                    .flat_map(|t| t.agents.iter().map(|a| a.slug.clone()))
-                    .collect();
                 self.state.remove_task(name);
-                for slug in slugs {
-                    let _ = self.sync_agent(&slug, false, cx);
-                }
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));
                 // Names come back around, and a later agent must not find these.
