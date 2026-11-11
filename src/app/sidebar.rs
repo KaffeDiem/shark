@@ -922,7 +922,7 @@ impl Shark {
         };
         let ws = w.clone();
         let name = w.name.clone();
-        let row = sidebar_row(rail, theme)
+        sidebar_row(rail, theme)
             .id(ix)
             .relative()
             .test_support()
@@ -962,6 +962,29 @@ impl Shark {
                     reorder::Item::Task(w.name.clone()),
                     w.display_title().into_owned().into(),
                 )
+            })
+            .when(self.peek.row.as_deref() == Some(&w.name) && !bright, |d| {
+                let hover = side_hover(theme);
+                if cx.reduce_motion() {
+                    d.bg(hover)
+                } else {
+                    // Animate a child so pointer-down state stays on the same row element.
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .rounded(if rail { px(8.) } else { theme.radius })
+                            .with_animation(
+                                "row-hover",
+                                Animation::new(Duration::from_millis(120)).with_easing(
+                                    gpui_kit::base::animation::cubic_bezier(0.25, 0.1, 0.25, 1.),
+                                ),
+                                move |d, p| d.bg(hover.opacity(p)),
+                            ),
+                    )
+                }
             })
             .child(if rail {
                 icon
@@ -1010,22 +1033,8 @@ impl Shark {
                         ),
                     )),
                 )
-            });
-        if self.peek.row.as_deref() == Some(&w.name) && !bright && !cx.reduce_motion() {
-            let hover = side_hover(theme);
-            row.with_animation(
-                "row-hover",
-                Animation::new(Duration::from_millis(120))
-                    .with_easing(gpui_kit::base::animation::cubic_bezier(0.25, 0.1, 0.25, 1.)),
-                move |d, p| d.bg(hover.opacity(p)),
-            )
-            .into_any_element()
-        } else {
-            row.when(self.peek.row.as_deref() == Some(&w.name) && !bright, |d| {
-                d.bg(side_hover(theme))
             })
             .into_any_element()
-        }
     }
 
     /// A section's header: icon, name and fold chevron. Folded, it shows one fact on the right:

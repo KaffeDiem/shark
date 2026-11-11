@@ -2,6 +2,27 @@
 use super::*;
 use crate::state::{Section, TaskRepo};
 use crate::sync::{Checks, Pr, PrState};
+use gpui_kit::test::TestEventExt;
+
+#[gpui_kit::test]
+fn hovered_task_opens_on_first_click_across_frames(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    cx.run_until_parked();
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task(0, w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let target = w.within("sidebar").find(1_usize).bounds().center();
+        w.pointer_move(target, None, cx);
+        w.render_frame(cx);
+        assert_eq!(shark.read(cx).peek.row.as_deref(), Some("two"));
+        w.pointer_down(target, MouseButton::Left, cx);
+        w.render_frame(cx);
+        w.pointer_up(target, MouseButton::Left, cx);
+        assert_eq!(shark.read(cx).active_task().unwrap().name, "two");
+    })
+    .unwrap();
+}
 
 fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
     test_home();
