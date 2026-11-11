@@ -221,7 +221,8 @@ def build(name, mode, pal):
         "sidebar.background": p["sidebar"],
         "sidebar.foreground": lift(
             mix(mfg, p["sidebar"], 0.3),
-            navigation_surfaces(p["sidebar"], fg, sidebar_accent, dark), 4.5, dark, wcag,
+            navigation_surfaces(p["sidebar"], fg, sidebar_accent, dark)
+            + [p["background"], list_hover], 4.5, dark, wcag,
         ),
         "sidebar.border": p["sidebar"],
         "sidebar.accent.background": sidebar_accent,
@@ -297,6 +298,7 @@ if __name__ == "__main__":
             surfaces = navigation_surfaces(
                 c["sidebar.background"], c["foreground"], c["sidebar.accent.background"], dark,
             )
+            surfaces += [c["background"], c["list.hover.background"]]
             lowest = min(wcag(c["sidebar.foreground"], bg) for bg in surfaces)
             assert lowest >= 4.5, f"{theme['name']}: navigation contrast {lowest:.2f}:1 < 4.5:1"
             print(f"{theme['name']}: navigation minimum {lowest:.2f}:1")
