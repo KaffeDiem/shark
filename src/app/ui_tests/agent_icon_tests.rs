@@ -1,6 +1,5 @@
 use super::*;
 use crate::state::{Agent, AgentIcon};
-use gpui_kit::InputEvent as _;
 
 fn agents() -> State {
     State {
@@ -49,10 +48,7 @@ async fn paste_icon_shortcut_opens_without_image_or_toast(cx: &mut TestAppContex
     test_home();
     let (window, shark) = boot(cx, agents(), WindowOptions::default());
     cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("no image".into())));
-    on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.sel = SideRow::Agent(0);
-        s.sidebar_focus.focus(w, cx);
-    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
     press_in(window)(cx, &["cmd-d"]);
     cx.update_window(window, |_, w, cx| {
         assert!(shark.read(cx).icon_picker.is_some());
@@ -106,77 +102,26 @@ async fn replacing_open_icon_picker_restores_original_focus(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
-async fn image_drop_after_keyboard_input_applies_square_image(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let home = test_home();
-    fs::create_dir_all(&home).unwrap();
-    let path = home.join("avatar.png");
-    image::RgbaImage::from_pixel(32, 32, image::Rgba([20, 80, 180, 255]))
-        .save(&path)
-        .unwrap();
-    let (window, shark) = boot(cx, agents(), WindowOptions::default());
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.sidebar_focus.focus(w, cx));
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        let position = w.find(("agent", 0usize)).bounds().center();
-        w.dispatch_keystroke(Keystroke::parse("down").unwrap(), cx);
-        w.dispatch_event(
-            FileDropEvent::Entered {
-                position,
-                paths: ExternalPaths(vec![path.clone()].into()),
-            }
-            .to_platform_input(),
-            cx,
-        );
-        w.dispatch_event(FileDropEvent::Pending { position }.to_platform_input(), cx);
-        w.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.read(|cx| {
-        assert!(matches!(
-            shark.read(cx).agent("designer").unwrap().icon,
-            AgentIcon::Image { .. }
-        ))
-    });
-}
-
-#[gpui_kit::test]
-async fn icon_click_is_separate_from_agent_navigation(cx: &mut TestAppContext) {
+async fn agent_page_icon_opens_the_picker_on_the_page(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, agents(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click(("agent-icon", 0usize), cx);
+        w.click("agent-page-icon", cx);
     })
     .unwrap();
     cx.read(|cx| {
         let s = shark.read(cx);
         assert!(s.icon_picker.is_some());
-        assert_eq!(s.home.destination, home::Destination::Home);
-    });
-    press_in(window)(cx, &["escape"]);
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        w.click(("agent", 0usize), cx);
-    })
-    .unwrap();
-    cx.read(|cx| {
-        let s = shark.read(cx);
-        assert!(s.icon_picker.is_none());
         assert_eq!(
             s.home.destination,
             home::Destination::Agent("designer".into())
         );
     });
-    press_in(window)(cx, &["cmd-d"]);
-    cx.read(|cx| {
-        assert!(
-            shark.read(cx).icon_picker.is_some(),
-            "Selecting an agent row must leave the paste shortcut available"
-        )
-    });
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| assert!(shark.read(cx).icon_picker.is_none()));
 }
 
 #[gpui_kit::test]
@@ -197,11 +142,7 @@ async fn paste_image_bytes_and_finder_file_reach_crop_then_persist(cx: &mut Test
         ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())).into(),
     ] {
         cx.update(|cx| cx.write_to_clipboard(item));
-        on_app(window, shark.clone())(cx, &|s, w, cx| {
-            s.sel = SideRow::Agent(0);
-            s.sidebar_focus.focus(w, cx);
-        });
-        press_in(window)(cx, &["cmd-d"]);
+        on_app(window, shark.clone())(cx, &|s, w, cx| s.paste_agent_icon("designer", w, cx));
         cx.run_until_parked();
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);

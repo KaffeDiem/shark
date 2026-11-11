@@ -104,8 +104,6 @@ enum Pane {
 pub struct Shark {
     pub(crate) state: State,
     sel: SideRow,
-    /// Agent navigation folds independently of optional task groups.
-    collapsed_agents: HashSet<String>,
     sidebar_repo_filter: Option<home::RepoFilter>,
     pub(crate) active: Option<String>,
     /// By chat id; created when a chat is first shown.
@@ -162,13 +160,14 @@ pub struct Shark {
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
     icon_picker: Option<icon_picker_host::Panel>,
+    /// The open agent dialog, whose skill count follows imports and refreshes.
+    agent_editor: Option<WeakEntity<agent_settings::AgentEditor>>,
     draft_picker: Option<draft_picker::DraftPickerHost>,
     draft_suggestions: Option<draft_picker::SuggestionCache>,
     reference_completion: reference_completion::ReferenceCompletion,
     icon_anchors: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     draft_anchors: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     draft_bases: HashMap<PathBuf, String>,
-    agent_icon_drop: Option<(String, PathBuf)>,
     usage: Vec<crate::usage::Snapshot>,
     #[cfg(test)]
     usage_queries: Vec<usize>,
@@ -215,15 +214,28 @@ impl Shark {
         let differ = cx.new(|cx| Differ::new(differ::Preferences::from(&state), window, cx));
         cx.defer_in(window, move |s, window, cx| {
             s.reconcile_attachments(window, cx);
-            // Settings save while typing; a quit before dialog close can leave older task docs.
+            // Settings save while typing: a quit can leave older snapshots in the tasks.
             let changed_agents: Vec<_> = s.state.agents.iter().filter(|agent| {
-                s.state.tasks.iter().any(|task| task.agent.as_ref().is_some_and(|link| {
-                    link.slug == agent.slug && (link.name != agent.name || link.instructions != agent.instructions)
+                s.state.tasks.iter().any(|task| task.agent_link(&agent.slug).is_some_and(|link| {
+                    link.name != agent.name || link.instructions != agent.instructions || link.icon != agent.icon
                 }))
             }).map(|agent| agent.slug.clone()).collect();
             for slug in changed_agents {
-                if let Err(e) = s.sync_agent(&slug, true, cx) {
+                if let Err(e) = s.sync_agent(&slug, false, cx) {
                     notify_err(window, cx, format!("Couldn't refresh agent instructions: {e}"));
+                }
+            }
+            // ponytail: one read per task at launch, until no install has root docs with an agent.
+            let legacy: Vec<_> = (s.state.tasks.iter())
+                .filter(|t| {
+                    std::fs::read_to_string(t.dir().join("CLAUDE.md"))
+                        .is_ok_and(|doc| doc.contains("\n## Agent: "))
+                })
+                .cloned()
+                .collect();
+            for task in legacy {
+                if let Err(e) = git::write_claude_md(&task) {
+                    notify_err(window, cx, format!("Couldn't update {}: {e}", task.display_title()));
                 }
             }
             s.restore_last_open(window, cx);
@@ -299,7 +311,6 @@ impl Shark {
         Shark {
             state,
             sel: SideRow::Task(0),
-            collapsed_agents: HashSet::new(),
             sidebar_repo_filter: None,
             active: None,
             chats: HashMap::new(),
@@ -340,13 +351,13 @@ impl Shark {
             app_switcher: None,
             usage_panel: None,
             icon_picker: None,
+            agent_editor: None,
             draft_picker: None,
             draft_suggestions: None,
             reference_completion: Default::default(),
             icon_anchors: Rc::default(),
             draft_anchors: Rc::default(),
             draft_bases: HashMap::new(),
-            agent_icon_drop: None,
             usage: vec![Default::default(); crate::usage::Provider::ALL.len()],
             #[cfg(test)]
             usage_queries: vec![0; crate::usage::Provider::ALL.len()],
@@ -440,9 +451,6 @@ impl Shark {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut GitSync, &mut Window, &mut Context<GitSync>),
     ) {
-        if self.home_shown() && self.home.destination != home::Destination::Home {
-            return notify_err(window, cx, "Open a task before running a Git action");
-        }
         match self.active_sync().cloned() {
             _ if self.no_repos() => notify_err(window, cx, task::NO_REPO),
             Some(sync) => sync.update(cx, |g, cx| f(g, window, cx)),
@@ -777,13 +785,6 @@ impl Shark {
         let has_controls = controls.is_some();
         let no_repos = self.no_repos();
         let attachments = self.render_attachments(window, cx);
-        let agent = self.active_task().and_then(|task| {
-            let link = task.agent.as_ref()?;
-            let agent = self.state.agents.iter().find(|a| a.slug == link.slug);
-            let name = agent.map_or_else(|| link.name.clone(), |a| a.name.clone());
-            let icon = agent.map(|a| a.icon.clone()).unwrap_or_default();
-            Some((link.slug.clone(), name, icon))
-        });
         let theme = cx.theme();
         v_flex()
             .flex_1()
@@ -798,28 +799,6 @@ impl Shark {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(self.render_run(cx))
-                    .when_some(agent, |d, (slug, name, icon)| {
-                        d.child(
-                            Button::new("task-agent")
-                                .ghost()
-                                .flex_none()
-                                .accessibility_label(name.clone())
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .min_w_0()
-                                        .child(agent_icon_view::agent_icon(&icon))
-                                        .child(div().min_w_0().truncate().child(name.clone())),
-                                )
-                                .max_w(px(160.))
-                                .flex_shrink_1()
-                                .tooltip(format!("Open {name}"))
-                                .on_click(
-                                    cx.listener(move |s, _, w, cx| s.open_agent(&slug, w, cx)),
-                                )
-                                .map(|b| crate::ui::toolbar("task-agent", b)),
-                        )
-                    })
                     .child(attachments)
                     .child(
                         div()
@@ -1079,22 +1058,6 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_action(cx.listener(|this, _: &PasteAgentIcon, w, cx| {
-                let slug = if this.sidebar_focus.is_focused(w) {
-                    match this.sel {
-                        SideRow::Agent(i) => this.state.agents.get(i).map(|a| a.slug.clone()),
-                        SideRow::Task(_) => None,
-                    }
-                } else {
-                    match &this.home.destination {
-                        home::Destination::Agent(slug) => Some(slug.clone()),
-                        home::Destination::Home => None,
-                    }
-                };
-                if let Some(slug) = slug {
-                    this.paste_agent_icon(&slug, w, cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &ToggleZen, w, cx| this.toggle_zen(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))

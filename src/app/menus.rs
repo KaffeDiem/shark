@@ -183,7 +183,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Vec<Entry
         ));
     }
 
-    entries.extend(handoff_submenu(this, ws, cx));
+    entries.extend(handoff_submenu(this, ws, None, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
         .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
         .map(|r| {
@@ -783,22 +783,21 @@ pub(super) fn on_task(
     on_shark(cx, move |s, w, cx| f(s, name.clone(), w, cx))
 }
 
-/// The next stage leads the same explicit agent choices everywhere.
-pub(super) fn handoff_submenu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> Option<Entry> {
-    let next = ws
-        .agent
-        .as_ref()
-        .and_then(|a| this.agent(&a.slug))
+/// Hand off to…: the other agents, the chat's next one first, each taking `chat` (the task's
+/// shown chat when `None`) over in a new tab.
+pub(super) fn handoff_submenu(
+    this: &Shark,
+    ws: &Task,
+    chat: Option<&ChatMeta>,
+    cx: &Context<Shark>,
+) -> Option<Entry> {
+    let chat = chat.or_else(|| ws.chats.get(ws.active_chat))?;
+    let current = chat.agent.as_deref();
+    let next = current
+        .and_then(|a| this.agent(a))
         .and_then(|a| a.next.as_deref());
-    let mut agents: Vec<_> = this
-        .state
-        .agents
-        .iter()
-        .filter(|a| {
-            ws.agent
-                .as_ref()
-                .is_none_or(|current| current.slug != a.slug)
-        })
+    let mut agents: Vec<_> = (this.state.agents.iter())
+        .filter(|a| current != Some(a.slug.as_str()))
         .collect();
     agents.sort_by_key(|a| Some(a.slug.as_str()) != next);
     if agents.is_empty() {
@@ -807,12 +806,12 @@ pub(super) fn handoff_submenu(this: &Shark, ws: &Task, cx: &Context<Shark>) -> O
     let entries = agents
         .into_iter()
         .map(|a| {
-            let to = a.slug.clone();
+            let (to, from) = (a.slug.clone(), chat.id.clone());
             let entry = menu::item(
                 None,
                 a.name.clone(),
                 on_task(cx, &ws.name, move |s, n, w, cx| {
-                    s.hand_off(&n, &to, None, w, cx)
+                    s.hand_off(&n, &to, Some(from.clone()), w, cx)
                 }),
             );
             let entry = entry.agent_icon(a.icon.clone());

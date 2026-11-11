@@ -1268,11 +1268,8 @@ impl Shark {
         if !self.home_shown() {
             self.enter_home(window, cx);
         }
-        let destination = self.home.destination.clone();
         self.pick_draft_issues(
-            Rc::new(move |s, issues, window, cx| {
-                s.add_draft_issues_to(&destination, issues, window, cx)
-            }),
+            Rc::new(|s, issues, window, cx| s.add_draft_issues(issues, window, cx)),
             window,
             cx,
         )

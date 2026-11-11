@@ -292,7 +292,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w h", FocusLeft, Some("Vim")),
         KeyBinding::new("ctrl-w l", FocusRight, Some("Vim")),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
-        KeyBinding::new("cmd-d", PasteAgentIcon, Some("Sidebar || (Home && !Input)")),
+        KeyBinding::new("cmd-d", PasteAgentIcon, Some("AgentEditor")),
         KeyBinding::new("b", ToggleBacklog, Some("Sidebar || (Home && !Input)")),
         KeyBinding::new("cmd-.", ToggleZen, None),
         KeyBinding::new("cmd-alt-b", ToggleFileTree, None),

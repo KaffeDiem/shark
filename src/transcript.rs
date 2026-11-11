@@ -177,21 +177,57 @@ pub fn read_history(path: &Path, len: u64) -> Vec<Ev> {
     read_range(path, 0, len, true)
 }
 
-/// Assistant text after the last user message, without repeated result summaries.
-pub fn last_reply(path: &Path) -> String {
+/// The whole conversation as Markdown, for another chat to read when it's handed off: messages
+/// and replies in order, each tool call one line, tool output left out. `None` when nothing could
+/// be read.
+pub fn markdown(path: &Path, title: &str, plan: Option<&str>) -> Option<String> {
     let events = read_history(path, u64::MAX);
-    let after = events
-        .iter()
-        .rposition(|ev| matches!(ev, Ev::User(_)))
-        .map_or(0, |i| i + 1);
-    events[after..]
-        .iter()
-        .filter_map(|ev| match ev {
-            Ev::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    if events.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "# Transcript: {title}\n\nAn earlier chat of this task, handed off to you. The files it changed are in the task folder. Continue from where it ends.\n"
+    );
+    let mut role = "";
+    let mut heading = |out: &mut String, to: &'static str| {
+        if role != to {
+            role = to;
+            *out += &format!("\n## {to}\n\n");
+        }
+    };
+    for ev in events {
+        match ev {
+            Ev::User(text) => {
+                heading(&mut out, "User");
+                out += &format!("{}\n", text.trim());
+            }
+            Ev::Text(text) if !text.trim().is_empty() => {
+                heading(&mut out, "Assistant");
+                out += &format!("{}\n\n", text.trim());
+            }
+            Ev::ToolUse { name, input, .. } => {
+                heading(&mut out, "Assistant");
+                let about = ["file_path", "command", "pattern", "description", "url"]
+                    .iter()
+                    .find_map(|k| input[k].as_str())
+                    .map(|v| {
+                        v.lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(120)
+                            .collect()
+                    })
+                    .map_or(String::new(), |v: String| format!(": `{v}`"));
+                out += &format!("- {name}{about}\n");
+            }
+            _ => {}
+        }
+    }
+    if let Some(plan) = plan {
+        out += &format!("\n## Plan\n\n{}\n", plan.trim());
+    }
+    Some(out)
 }
 
 fn read_range(path: &Path, mut start: u64, end: u64, include_completed_answers: bool) -> Vec<Ev> {
@@ -524,30 +560,44 @@ mod tests {
     }
 
     #[test]
-    fn last_reply_uses_only_the_last_turn() {
+    fn markdown_keeps_the_conversation_and_drops_tool_output() {
         let path =
-            std::env::temp_dir().join(format!("shark-handoff-reply-{}.jsonl", std::process::id()));
+            std::env::temp_dir().join(format!("shark-handoff-md-{}.jsonl", std::process::id()));
         let fixture = [
-            json!({"type":"user","message":{"content":"First"}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Old reply"}]}}),
-            json!({"type":"user","message":{"content":"Second"}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"New reply"}]}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"More detail"}]}}),
-            json!({"type":"result","result":"New reply\nMore detail","is_error":false}),
+            json!({"type":"user","message":{"content":"Fix the login"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Looking."}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"web/login.ts"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"SECRET OUTPUT"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Fixed it."}]}}),
+            json!({"type":"result","result":"Fixed it.","is_error":false}),
         ];
-        fs::write(
-            &path,
-            fixture
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .unwrap();
-        assert_eq!(last_reply(&path), "New reply\nMore detail");
+        let lines: Vec<_> = fixture.iter().map(ToString::to_string).collect();
+        fs::write(&path, lines.join("\n")).unwrap();
+        let md = markdown(&path, "Login", Some("# Plan\nStep one")).unwrap();
         fs::write(&path, "").unwrap();
-        assert_eq!(last_reply(&path), "");
+        assert_eq!(
+            markdown(&path, "Login", None),
+            None,
+            "an unreadable transcript is no handoff"
+        );
         fs::remove_file(path).unwrap();
+        assert!(md.starts_with("# Transcript: Login"));
+        let (user, assistant) = (
+            md.find("## User").unwrap(),
+            md.find("## Assistant").unwrap(),
+        );
+        assert!(user < assistant);
+        assert!(
+            md.contains("Fix the login") && md.contains("Looking.") && md.contains("Fixed it.")
+        );
+        assert!(md.contains("- Read: `web/login.ts`"));
+        assert!(!md.contains("SECRET OUTPUT"), "tool output stays out");
+        assert_eq!(
+            md.matches("## Assistant").count(),
+            1,
+            "one heading per turn"
+        );
+        assert!(md.ends_with("## Plan\n\n# Plan\nStep one\n"));
     }
 
     #[test]

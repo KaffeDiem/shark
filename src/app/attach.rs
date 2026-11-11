@@ -720,7 +720,7 @@ impl Shark {
             return;
         };
         for chat in self.started_chats(name) {
-            let next = self.handoff_target(&ws, &chat.read(cx).meta);
+            let next = self.handoff_target(&chat.read(cx).meta);
             chat.update(cx, |c, cx| {
                 c.next_agent = next;
                 c.task_changed(&ws, cx);
@@ -908,10 +908,12 @@ impl Shark {
     /// Everything reading the repo list picks up a new one.
     fn repos_published(&mut self, ws: &Task, window: &mut Window, cx: &mut Context<Self>) {
         self.publish_task(&ws.name, cx);
-        if let Some(agent) = &ws.agent {
+        for agent in &ws.agents {
             if let Err(e) = self.sync_agent(&agent.slug, false, cx) {
                 notify_err(window, cx, e);
             }
+        }
+        if !ws.agents.is_empty() {
             self.refresh_sibling_files(&ws.name, cx);
         }
         if let Some(sync) = self.syncs.get(&ws.name) {

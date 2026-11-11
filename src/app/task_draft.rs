@@ -83,13 +83,8 @@ impl TaskDraft {
         slug: Option<&str>,
         overrides: bool,
     ) -> (String, Option<String>) {
+        let agent = slug.filter(|_| !(overrides && self.follow_app));
         let task = Task {
-            agent: slug
-                .filter(|_| !(overrides && self.follow_app))
-                .map(|slug| AgentLink {
-                    slug: slug.into(),
-                    ..Default::default()
-                }),
             repos: self
                 .repos
                 .iter()
@@ -102,7 +97,7 @@ impl TaskDraft {
                 .collect(),
             ..Default::default()
         };
-        let (model, effort) = state.defaults_for(&task);
+        let (model, effort) = state.defaults_for(&task, agent);
         let model = self.model.clone().filter(|_| overrides).unwrap_or(model);
         let effort = self.effort.clone().filter(|_| overrides).or(effort);
         let resolved = crate::models::effort_of(&ChatMeta {
@@ -327,7 +322,7 @@ impl Shark {
                     cx.notify();
                     return;
                 }
-                if let Some(agent) = &ws.agent {
+                if let Some(agent) = ws.agents.first() {
                     let docs = s
                         .state
                         .agents
@@ -745,14 +740,15 @@ mod tests {
         cx.read(|cx| {
             let s = shark.read(cx);
             let task = &s.state.tasks[0];
-            let link = task.agent.as_ref().unwrap();
+            let link = &task.agents[0];
             assert_eq!(link.name, "Current name");
             assert_eq!(link.instructions, "Current instructions");
-            let docs = std::fs::read_to_string(task.dir().join("CLAUDE.md")).unwrap();
-            assert!(docs.contains("Current name") && docs.contains("Current instructions"));
+            assert_eq!(task.chats[0].agent.as_deref(), Some("worker"));
+            let prompt = git::agent_prompt(task, &task.chats[0]).unwrap();
+            assert!(prompt.contains("Current name") && prompt.contains("Current instructions"));
             let saved = State::load();
             assert_eq!(
-                saved.tasks[0].agent.as_ref().unwrap().instructions,
+                saved.tasks[0].agents[0].instructions,
                 "Current instructions"
             );
         });

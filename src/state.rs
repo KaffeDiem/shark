@@ -142,9 +142,8 @@ impl RepoSettings {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+/// Older installs also saved an agent on some sections; serde drops it and they load as plain ones.
 pub struct Section {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
     pub name: String,
     /// Lucide icon name from `app::sidebar::SECTION_ICONS`, e.g. `folder`.
     pub icon: String,
@@ -287,10 +286,14 @@ pub struct TaskRecord {
     pub at: u64,
 }
 
+/// What a task's chats know of one agent they use: harness startup and context notes read this
+/// snapshot, not global `State`.
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct AgentLink {
     pub slug: String,
     pub name: String,
+    #[serde(default)]
+    pub icon: AgentIcon,
     pub instructions: String,
     #[serde(default)]
     pub siblings: Vec<Sibling>,
@@ -301,6 +304,7 @@ impl From<&Agent> for AgentLink {
         Self {
             slug: agent.slug.clone(),
             name: agent.name.clone(),
+            icon: agent.icon.clone(),
             instructions: agent.instructions.clone(),
             siblings: Vec::new(),
         }
@@ -321,8 +325,12 @@ pub fn agent_skills_dir(slug: &str) -> PathBuf {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Task {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Before agents were per chat, a task belonged to one; `State::load` moves it into `agents`.
+    #[serde(default, skip_serializing)]
     pub agent: Option<AgentLink>,
+    /// The agents its chats use (`ChatMeta::agent`), one snapshot each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentLink>,
     /// Distinguishes this task from later tasks that reuse its name.
     #[serde(default)]
     pub instance_id: String,
@@ -417,6 +425,7 @@ impl Default for Task {
     fn default() -> Self {
         Self {
             agent: None,
+            agents: Vec::new(),
             instance_id: task_instance_id(),
             last_interacted_at: None,
             backlog: false,
@@ -449,8 +458,6 @@ pub struct ChatMeta {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handoff: Option<Handoff>,
     /// First line of the first message; empty until then.
     #[serde(default)]
     pub title: String,
@@ -474,13 +481,6 @@ pub struct ChatMeta {
     /// fingerprints. Anything else goes out with its next normal message.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivered: BTreeMap<String, u64>,
-}
-
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct Handoff {
-    pub from: String,
-    pub title: String,
-    pub text: String,
 }
 
 /// A repository on its way into an agent. The stage says how far it got, so a restart can
@@ -900,7 +900,7 @@ impl Task {
             })
             .chain(crate::linear::context_notes(&self.linear, &self.issues))
             .collect();
-        if let Some(agent) = &self.agent {
+        for agent in &self.agents {
             let text = format!(
                 "[shark] Your instructions as {} changed: {}",
                 agent.name, agent.instructions
@@ -955,6 +955,40 @@ impl Task {
         notes
     }
 
+    /// The snapshot of agent `slug`, if one of its chats uses it.
+    pub fn agent_link(&self, slug: &str) -> Option<&AgentLink> {
+        self.agents.iter().find(|a| a.slug == slug)
+    }
+
+    /// The agents its open and closed chats use, first use first.
+    pub fn chat_agents(&self) -> Vec<&str> {
+        let mut slugs: Vec<&str> = Vec::new();
+        for slug in (self.chats.iter().chain(&self.closed)).filter_map(|c| c.agent.as_deref()) {
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+            }
+        }
+        slugs
+    }
+
+    /// Keeps one snapshot per agent its chats use: known ones stay as they are, new ones are taken
+    /// from `agents`, unused or deleted ones go. Whether anything changed.
+    pub fn link_agents(&mut self, agents: &[Agent]) -> bool {
+        let used = self.chat_agents();
+        let links: Vec<AgentLink> = used
+            .iter()
+            .filter(|slug| agents.iter().any(|a| &a.slug == *slug))
+            .filter_map(|slug| {
+                self.agent_link(slug)
+                    .cloned()
+                    .or_else(|| agents.iter().find(|a| a.slug == *slug).map(AgentLink::from))
+            })
+            .collect();
+        let changed = links != self.agents;
+        self.agents = links;
+        changed
+    }
+
     /// Its repos as (name, worktree path).
     pub fn repo_paths(&self) -> Vec<(String, PathBuf)> {
         (self.repos.iter())
@@ -975,7 +1009,7 @@ impl Task {
         if self.chats.is_empty() {
             self.chats.push(ChatMeta {
                 id: self.name.clone(),
-                agent: self.agent.as_ref().map(|a| a.slug.clone()),
+                agent: (self.agent.as_ref().or(self.agents.first())).map(|a| a.slug.clone()),
                 session_id: self.session_id.take(),
                 model: self.model.take(),
                 ..Default::default()
@@ -1255,6 +1289,8 @@ impl State {
         let migrate_agents = !state.chat_agents_migrated;
         let migrated_instances = state.tasks.iter().any(|ws| ws.instance_id.is_empty());
         let (model, effort) = (state.new_model(), state.last_effort.clone());
+        let agents = state.agents.clone();
+        let mut linked = false;
         for ws in &mut state.tasks {
             ws.migrate();
             ws.fill_models(&model, effort.as_ref());
@@ -1265,27 +1301,31 @@ impl State {
                     }
                 }
             }
+            // A task-wide agent becomes the snapshot of the agent its chats use.
+            if let Some(agent) = ws.agent.take() {
+                ws.agents.retain(|a| a.slug != agent.slug);
+                ws.agents.insert(0, agent);
+                linked = true;
+            }
+            linked |= ws.link_agents(&agents);
             if ws.linear.primary().is_some() {
                 // Unreadable shows as missing snapshots; `put_snapshot` still won't overwrite it.
                 ws.issues = crate::linear::read_snapshots(&ws.name).unwrap_or_default();
             }
         }
         state.chat_agents_migrated = true;
-        if migrated_instances || migrate_agents {
+        if migrated_instances || migrate_agents || linked {
             let _ = state.save_at(path);
         }
         state
     }
 
-    /// The model and level a new chat in `ws` starts on: each from the first of its repos that
-    /// sets it, else the last picked.
-    pub fn defaults_for(&self, ws: &Task) -> (String, Option<String>) {
+    /// The model and level a new chat in `ws` starts on: each from its agent, else the first of
+    /// its repos that sets it, else the last picked.
+    pub fn defaults_for(&self, ws: &Task, agent: Option<&str>) -> (String, Option<String>) {
         let valid = |m: &String| crate::models::MODELS.contains(&m.as_str());
         let mut settings = (ws.repos.iter()).filter_map(|r| self.repo_settings.get(&r.name));
-        let agent = ws
-            .agent
-            .as_ref()
-            .and_then(|link| self.agents.iter().find(|a| a.slug == link.slug));
+        let agent = agent.and_then(|slug| self.agents.iter().find(|a| a.slug == slug));
         let model = agent
             .and_then(|a| a.model.clone().filter(valid))
             .or_else(|| settings.clone().find_map(|s| s.model.clone().filter(valid)));
@@ -1305,12 +1345,13 @@ impl State {
         last.unwrap_or(models[0]).into()
     }
 
-    /// A new chat `id` in `ws` on its repos' default model, else the last picked.
-    pub fn new_chat(&self, ws: &Task, id: String) -> ChatMeta {
-        let (model, effort) = self.defaults_for(ws);
+    /// A new chat `id` in `ws` for `agent`, on its defaults (`defaults_for`).
+    pub fn new_chat(&self, ws: &Task, id: String, agent: Option<String>) -> ChatMeta {
+        let agent = agent.filter(|slug| self.agents.iter().any(|a| &a.slug == slug));
+        let (model, effort) = self.defaults_for(ws, agent.as_deref());
         ChatMeta {
             id,
-            agent: ws.agent.as_ref().map(|a| a.slug.clone()),
+            agent,
             model: Some(model),
             effort,
             ..Default::default()
@@ -1338,6 +1379,49 @@ impl State {
         }
         if let Some(s) = to.and_then(|i| self.sections.get_mut(i)) {
             s.tasks.push(ws.to_string());
+        }
+    }
+
+    /// Drag-and-drop of task `ws` onto task `target`: `ws` takes the target's slot in the
+    /// target's section (or among the ungrouped), like a list reorder.
+    pub fn drop_task(&mut self, ws: &str, target: &str) {
+        let section_of =
+            |st: &State, n: &str| (st.sections.iter()).position(|s| s.tasks.iter().any(|w| w == n));
+        let (from, to) = (section_of(self, ws), section_of(self, target));
+        let pos = |v: &[String], n: &str| v.iter().position(|w| w == n);
+        let task = |st: &State, n: &str| st.tasks.iter().position(|w| w.name == n);
+        if ws == target || task(self, ws).is_none() || task(self, target).is_none() {
+            return;
+        }
+        if let Some(i) = to
+            && from == to
+        {
+            let v = &mut self.sections[i].tasks;
+            if let (Some(f), Some(t)) = (pos(v, ws), pos(v, target)) {
+                move_item(v, f, t);
+            }
+            return;
+        }
+        for s in &mut self.sections {
+            s.tasks.retain(|w| w != ws);
+        }
+        match to {
+            Some(i) => {
+                let v = &mut self.sections[i].tasks;
+                let t = pos(v, target).unwrap_or(v.len());
+                v.insert(t, ws.to_string());
+            }
+            None => {
+                let (Some(f), Some(t)) = (task(self, ws), task(self, target)) else {
+                    return;
+                };
+                // Coming from a section it lands before the target; within the list it takes the slot.
+                let t = match from {
+                    Some(_) if f < t => t - 1,
+                    _ => t,
+                };
+                move_item(&mut self.tasks, f, t);
+            }
         }
     }
 
@@ -1428,16 +1512,15 @@ mod tests {
         let agent: Agent = serde_json::from_str(r#"{"slug":"designer","name":"Designer","icon":"Palette","instructions":"Design","repos":[],"model":null,"effort":null}"#).unwrap();
         assert!(agent.next.is_none());
         assert!(serde_json::to_value(&agent).unwrap().get("next").is_none());
-        let mut chat: ChatMeta = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
-        assert!(chat.agent.is_none() && chat.handoff.is_none());
+        // A quote from the handoff before transcripts were attached is dropped.
+        let mut chat: ChatMeta = serde_json::from_str(
+            r#"{"id":"legacy","handoff":{"from":"Designer","title":"Ideas","text":"Build"}}"#,
+        )
+        .unwrap();
+        assert!(chat.agent.is_none());
         let value = serde_json::to_value(&chat).unwrap();
         assert!(value.get("agent").is_none() && value.get("handoff").is_none());
         chat.agent = Some("planner".into());
-        chat.handoff = Some(Handoff {
-            from: "Designer".into(),
-            title: "Ideas".into(),
-            text: "Build this".into(),
-        });
         assert_eq!(
             serde_json::from_value::<ChatMeta>(serde_json::to_value(&chat).unwrap()).unwrap(),
             chat
@@ -1449,19 +1532,67 @@ mod tests {
             agent
         );
         let task = Task {
-            agent: Some(AgentLink::from(&agent)),
+            agents: vec![AgentLink::from(&agent)],
             ..Default::default()
         };
         let mut initial = task.clone();
         initial.migrate();
         assert_eq!(initial.chats[0].agent.as_deref(), Some("designer"));
-        assert_eq!(
-            State::default()
-                .new_chat(&task, "new".into())
-                .agent
-                .as_deref(),
-            Some("designer")
+        let state = State {
+            agents: vec![agent],
+            ..Default::default()
+        };
+        let pick = |a: Option<&str>| state.new_chat(&task, "new".into(), a.map(Into::into)).agent;
+        assert_eq!(pick(Some("designer")).as_deref(), Some("designer"));
+        assert_eq!(pick(None), None, "a task has no agent of its own");
+        assert_eq!(pick(Some("deleted")), None);
+    }
+
+    #[test]
+    fn legacy_task_agent_becomes_the_snapshot_of_its_chats_agents() {
+        let path = std::env::temp_dir().join(format!("shark-agents-{}.json", std::process::id()));
+        let designer = Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            instructions: "Use Mobbin".into(),
+            ..Default::default()
+        };
+        let coder = Agent {
+            slug: "coder".into(),
+            name: "Coder".into(),
+            ..Default::default()
+        };
+        let legacy = serde_json::json!({
+            "repos": [], "chat_agents_migrated": true,
+            "agents": [designer, coder],
+            "workspaces": [{
+                "name": "t", "branch": "t", "repos": [],
+                "agent": {"slug": "designer", "name": "Designer", "instructions": "Use Mobbin"},
+                "chats": [{"id": "t", "agent": "designer"}, {"id": "t-2", "agent": "coder"}],
+            }],
+        });
+        fs::write(&path, legacy.to_string()).unwrap();
+        let loaded = State::load_at(&path);
+        let slugs: Vec<_> = loaded.tasks[0]
+            .agents
+            .iter()
+            .map(|a| a.slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["designer", "coder"]);
+        assert!(loaded.tasks[0].agent.is_none());
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved["workspaces"][0].get("agent").is_none(),
+            "only `agents` is written"
         );
+        let mut task = loaded.tasks[0].clone();
+        task.chats
+            .retain(|c| c.agent.as_deref() == Some("designer"));
+        assert!(task.link_agents(&loaded.agents));
+        assert_eq!(task.agents.len(), 1, "an unused agent's snapshot goes");
+        assert!(task.link_agents(&[]), "so does a deleted one's");
+        assert!(task.agents.is_empty());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1493,14 +1624,18 @@ mod tests {
         task.name = "plain".into();
         task.agent = None;
         state.tasks.push(task);
-        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        // Only installs from before agents were per chat wrote a task's agent.
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved["workspaces"][0]["agent"] =
+            serde_json::json!({"slug": "designer", "name": "", "instructions": ""});
+        fs::write(&path, saved.to_string()).unwrap();
         let mut loaded = State::load_at(&path);
         assert_eq!(loaded.tasks[0].chats[0].agent.as_deref(), Some("designer"));
         assert_eq!(loaded.tasks[0].closed[0].agent.as_deref(), Some("designer"));
         assert_eq!(loaded.tasks[0].chats[1].agent.as_deref(), Some("previous"));
         assert!(loaded.tasks[1].chats[0].agent.is_none());
         assert!(loaded.tasks[1].closed[0].agent.is_none());
-        loaded.tasks[1].agent = loaded.tasks[0].agent.clone();
+        loaded.tasks[1].agents = loaded.tasks[0].agents.clone();
         loaded.save_at(&path).unwrap();
         let reloaded = State::load_at(&path);
         assert!(
@@ -1529,12 +1664,12 @@ mod tests {
             ..Default::default()
         });
         let mut task = Task {
-            agent: Some(AgentLink {
+            agents: vec![AgentLink {
                 slug: "designer".into(),
                 name: "Designer".into(),
                 instructions: "Use Mobbin".into(),
                 ..Default::default()
-            }),
+            }],
             repos: vec![TaskRepo {
                 name: "api".into(),
                 src: "/missing".into(),
@@ -1544,23 +1679,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            state.defaults_for(&task),
+            state.defaults_for(&task, Some("designer")),
             (crate::models::MODELS[0].into(), Some("high".into()))
+        );
+        assert_eq!(
+            state.defaults_for(&task, None),
+            (crate::models::MODELS[1].into(), Some("low".into())),
+            "without an agent the repo's defaults apply"
         );
         state.agents[0].model = Some("invalid model".into());
         state.agents[0].effort = None;
         assert_eq!(
-            state.defaults_for(&task),
+            state.defaults_for(&task, Some("designer")),
             (crate::models::MODELS[1].into(), Some("low".into()))
         );
         let before = task.context()["agent:designer"].clone();
         assert!(before.text.contains("Use Mobbin"));
-        task.agent.as_mut().unwrap().name = "Design".into();
+        task.agents[0].name = "Design".into();
         assert_eq!(
             task.context()["agent:designer"].fingerprint,
             before.fingerprint
         );
-        task.agent.as_mut().unwrap().instructions = "Read the manual".into();
+        task.agents[0].instructions = "Read the manual".into();
         assert_ne!(
             task.context()["agent:designer"].fingerprint,
             before.fingerprint
@@ -1572,16 +1712,16 @@ mod tests {
     #[test]
     fn sibling_context_includes_empty_state_and_tracks_only_content_changes() {
         let mut task = Task {
-            agent: Some(AgentLink {
+            agents: vec![AgentLink {
                 slug: "designer".into(),
                 name: "Designer".into(),
                 ..Default::default()
-            }),
+            }],
             ..Default::default()
         };
         let empty = task.context()["siblings:designer"].clone();
         assert!(empty.text.contains("no other open tasks"));
-        task.agent.as_mut().unwrap().siblings.push(Sibling {
+        task.agents[0].siblings.push(Sibling {
             title: "Spacing".into(),
             branch: "designer/spacing-marlin".into(),
             dirs: vec!["/tasks/spacing/api".into()],
@@ -1593,16 +1733,16 @@ mod tests {
         assert!(note.text.contains("do not restrict edits in this task"));
         assert!(!note.text.contains("Avoid editing"));
         assert_eq!(task.context()["siblings:designer"], note);
-        task.agent.as_mut().unwrap().instructions = "New instructions".into();
+        task.agents[0].instructions = "New instructions".into();
         assert_eq!(task.context()["siblings:designer"], note);
-        task.agent.as_mut().unwrap().siblings[0]
+        task.agents[0].siblings[0]
             .files
             .push("api/src/tokens.rs".into());
         assert_ne!(
             task.context()["siblings:designer"].fingerprint,
             note.fingerprint
         );
-        task.agent.as_mut().unwrap().siblings.clear();
+        task.agents[0].siblings.clear();
         assert_eq!(task.context()["siblings:designer"], empty);
     }
 
@@ -2030,7 +2170,7 @@ mod tests {
         fs::write(&path, json(r#","last_model":"haiku","last_effort":"max""#)).unwrap();
         let st = State::load_at(&path);
         assert_eq!(models(&st)[0], m("haiku", Some("max")));
-        let new = st.new_chat(&st.tasks[0], "x".into());
+        let new = st.new_chat(&st.tasks[0], "x".into(), None);
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("haiku"), Some("max"))
@@ -2050,7 +2190,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let new = st.new_chat(&st.tasks[0], "y".into());
+        let new = st.new_chat(&st.tasks[0], "y".into(), None);
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("opus"), Some("max"))
@@ -2068,7 +2208,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let new = st.new_chat(&st.tasks[0], "z".into());
+        let new = st.new_chat(&st.tasks[0], "z".into(), None);
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("opus"), Some("low"))
@@ -2194,7 +2334,6 @@ mod tests {
         let mut st = State {
             tasks: vec![task("a"), task("b")],
             sections: vec![Section {
-                agent: None,
                 name: "S".into(),
                 icon: "folder".into(),
                 collapsed: false,
@@ -2299,9 +2438,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_agent_sections_load_as_plain_sections() {
+        let section: Section = serde_json::from_str(
+            r#"{"agent":"designer","name":"Design","icon":"folder","workspaces":["a"]}"#,
+        )
+        .unwrap();
+        assert_eq!((section.name.as_str(), section.tasks.len()), ("Design", 1));
+        assert!(
+            serde_json::to_value(&section)
+                .unwrap()
+                .get("agent")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn move_to_section_is_idempotent_and_ungroups() {
         let section = |n: &str, ws: &[&str]| Section {
-            agent: None,
             name: n.into(),
             icon: "folder".into(),
             collapsed: false,
@@ -2318,5 +2471,42 @@ mod tests {
         assert_eq!(st.sections[1].tasks, ["x"]);
         st.move_to_section("x", None);
         assert!(st.sections[1].tasks.is_empty());
+    }
+
+    #[test]
+    fn drop_task_reorders_and_regroups() {
+        let task = |name: &str| Task {
+            name: name.into(),
+            branch: name.into(),
+            ..Default::default()
+        };
+        let mut st = State {
+            tasks: ["a", "b", "c", "d"].map(task).into(),
+            sections: vec![Section {
+                name: "S".into(),
+                icon: "folder".into(),
+                collapsed: false,
+                tasks: vec!["c".into(), "d".into()],
+            }],
+            ..Default::default()
+        };
+        let names = |st: &State| st.tasks.iter().map(|w| w.name.clone()).collect::<Vec<_>>();
+        st.drop_task("a", "b"); // down within the ungrouped: takes b's slot
+        assert_eq!(names(&st), ["b", "a", "c", "d"]);
+        st.drop_task("a", "b"); // and back up
+        assert_eq!(names(&st), ["a", "b", "c", "d"]);
+        st.drop_task("d", "c"); // within a section
+        assert_eq!(st.sections[0].tasks, ["d", "c"]);
+        st.drop_task("a", "c"); // into a section, before the target
+        assert_eq!(st.sections[0].tasks, ["d", "a", "c"]);
+        st.drop_task("d", "b"); // out to the ungrouped, before the target
+        assert_eq!(st.sections[0].tasks, ["a", "c"]);
+        let ungrouped: Vec<_> = names(&st)
+            .into_iter()
+            .filter(|n| !st.sections[0].tasks.contains(n))
+            .collect();
+        assert_eq!(ungrouped, ["d", "b"]);
+        st.drop_task("gone", "b"); // a stale drag changes nothing
+        assert_eq!(st.sections[0].tasks, ["a", "c"]);
     }
 }

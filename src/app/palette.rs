@@ -75,11 +75,18 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.pick_agent(true, w, cx)),
     ),
     Row(
-        "Open agent…",
+        "Edit agent…",
         IconName::Bot,
         None,
-        "instructions tasks history",
+        "open instructions skills settings",
         Some(|s, w, cx| s.pick_agent(false, w, cx)),
+    ),
+    Row(
+        "Choose chat agent…",
+        IconName::AtSign,
+        None,
+        "agent preset chat persona",
+        Some(|s, w, cx| s.pick_chat_agent(w, cx)),
     ),
     Row(
         "New agent…",
@@ -642,32 +649,29 @@ pub(super) const COMMANDS: &[Row] = &[
         "setting",
         Some(|s, _, cx| s.set_delete_remote(!s.state.delete_remote_branches, cx)),
     ),
+    Row::key("New section…", IconName::FolderPlus, &NewSection, "group"),
     Row::key(
-        "New task group",
-        IconName::FolderPlus,
-        &NewSection,
-        "section",
-    ),
-    Row::key(
-        "Move task to group…",
+        "Move task to section…",
         IconName::FolderInput,
         &MoveToSection,
         "group",
     ),
+    Row::key("Rename section…", IconName::Pencil, &RenameSection, "group"),
     Row::key(
-        "Rename task group",
-        IconName::Pencil,
-        &RenameSection,
-        "section",
-    ),
-    Row::key(
-        "Change task group icon…",
+        "Change section icon…",
         IconName::Shapes,
         &SectionIcon,
         "group",
     ),
+    Row(
+        "Toggle section folded",
+        IconName::ChevronsUpDown,
+        None,
+        "fold collapse expand group",
+        Some(|s, w, cx| s.with_section(w, cx, |s, i, _, cx| s.toggle_section(i, cx))),
+    ),
     Row::key(
-        "Delete task group",
+        "Delete section",
         IconName::Trash,
         &DeleteSection,
         "group remove tasks stay",
@@ -857,7 +861,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("Plan", "Toggle plan mode"),
     ("Files and diff", "Open file…"),
     ("Git", "Run next git step"),
-    ("Task groups", "New task group"),
+    ("Sections", "New section…"),
     ("View", "Go to Home"),
     ("Shark", "Settings"),
 ];
@@ -1030,13 +1034,13 @@ impl Shark {
                     "Save task settings as agent default",
                 ]
                 .contains(label)
-                    && (!self.home_shown() || (self.home.asking && !self.draft_target())))
+                    && (!self.home_shown() || self.home.asking))
                 || ([
                     "Reset task to agent defaults",
                     "Save task settings as agent default",
                 ]
                 .contains(label)
-                    && self.draft_slug(self.draft_target()).is_none())
+                    && self.home.draft_agent.is_none())
                 || (*label == "Show or hide diff files"
                     && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
             {

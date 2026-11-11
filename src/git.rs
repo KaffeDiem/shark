@@ -253,7 +253,7 @@ pub fn create_task_with_sources(
             .collect::<Result<Vec<_>, _>>()?;
         let mut ws = Task {
             title: title.into(),
-            agent,
+            agents: agent.into_iter().collect(),
             name: name.into(),
             branch: branch.into(),
             repos: done,
@@ -290,7 +290,7 @@ pub fn create_empty_task(
     fs::create_dir_all(dir.parent().ok_or("Task has no parent")?).map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut ws = Task {
-        agent,
+        agents: agent.into_iter().collect(),
         name: name.into(),
         title: title.into(),
         branch: name.into(),
@@ -1249,8 +1249,9 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) -> std:
         let name = skill_link_name(&skill, prefix, &mut used);
         want.insert(name, target);
     };
-    // Agent skills claim plain names before repo skills, even when repo skills are disabled.
-    if let Some(agent) = &ws.agent {
+    // Agent skills claim plain names before repo skills, even when repo skills are disabled. Every
+    // agent its chats use is linked: discovery folders belong to the task, not to one chat.
+    for agent in &ws.agents {
         for entry in skill_entries(&crate::state::agent_skills_dir(&agent.slug))? {
             add(
                 entry.file_name().to_string_lossy().into_owned(),
@@ -1402,7 +1403,7 @@ fn listed(repo: &str) -> String {
 }
 
 fn header(ws: &Task) -> String {
-    let mut s = if ws.repos.is_empty() {
+    if ws.repos.is_empty() {
         format!(
             "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
             ws.name
@@ -1439,11 +1440,16 @@ fn header(ws: &Task) -> String {
         }
         s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\nThis task is already an isolated worktree managed by Shark. Don't create more git worktrees (no `isolation: \"worktree\"`, `--worktree` or EnterWorktree); split parallel work by file instead.\n\n";
         s
-    };
-    if let Some(agent) = &ws.agent {
-        s += &format!("## Agent: {}\n\n{}\n\n", agent.name, agent.instructions);
     }
-    s
+}
+
+/// What a chat's agent adds to the harness's system prompt; root docs are shared by every chat.
+pub fn agent_prompt(ws: &Task, chat: &crate::state::ChatMeta) -> Option<String> {
+    let agent = ws.agent_link(chat.agent.as_deref()?)?;
+    Some(format!(
+        "## Agent: {}\n\n{}",
+        agent.name, agent.instructions
+    ))
 }
 
 /// Why `git worktree remove` would refuse this worktree even when it's clean: `locked` (needs

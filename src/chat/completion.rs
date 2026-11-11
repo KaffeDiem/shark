@@ -299,6 +299,17 @@ impl Chat {
         self.insert_mention(item.insert, label, window, cx);
     }
 
+    /// Attaches the task file at `path` as a chip, as a pasted file is.
+    pub fn attach_mention(
+        &mut self,
+        path: &str,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_mention(complete::mention(path), label, window, cx);
+    }
+
     /// Puts `@path` in place of the selection as a chip, plus a space to keep typing.
     fn insert_mention(
         &mut self,

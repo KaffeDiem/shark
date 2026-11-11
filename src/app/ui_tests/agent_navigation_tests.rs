@@ -9,12 +9,11 @@ async fn agent_pages_do_not_mutate_hidden_chats_or_run_hidden_tasks(cx: &mut Tes
     let mut task = Task {
         name: "work".into(),
         branch: "main".into(),
-        agent: Some(AgentLink {
+        agents: vec![AgentLink {
             slug: "designer".into(),
             name: "Designer".into(),
-            instructions: String::new(),
-            siblings: vec![],
-        }),
+            ..Default::default()
+        }],
         repos: vec![TaskRepo {
             name: "api".into(),
             src: home.join("api"),
@@ -23,6 +22,7 @@ async fn agent_pages_do_not_mutate_hidden_chats_or_run_hidden_tasks(cx: &mut Tes
         }],
         chats: vec![ChatMeta {
             id: "work-chat".into(),
+            agent: Some("designer".into()),
             model: Some(MODELS[0].into()),
             ..Default::default()
         }],
@@ -92,7 +92,7 @@ async fn agent_pages_do_not_mutate_hidden_chats_or_run_hidden_tasks(cx: &mut Tes
         s.open_agent("designer", w, cx);
         blocked_chat_commands(s, w, cx);
         s.open_agent("empty", w, cx);
-        // Even stale selection cannot make an empty agent target another agent's task.
+        // Even a stale list selection cannot make an agent's page target a task.
         s.home.sel = Some("work".into());
         blocked_chat_commands(s, w, cx);
         s.toggle_run(w, cx);
@@ -110,9 +110,10 @@ async fn agent_pages_do_not_mutate_hidden_chats_or_run_hidden_tasks(cx: &mut Tes
     });
 }
 
+/// An agent's page has no composer: a new task from a branch goes to Home's, the agent picked.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppContext) {
+async fn branch_task_from_an_agent_page_starts_on_home_with_the_agent(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _claude = ClaudeGuard::set(&quiet);
@@ -139,10 +140,15 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
             .update(cx, |p, cx| p.set_value("Keep this draft", w, cx));
         s.open_agent("designer", w, cx);
         s.new_task_default(w, cx);
+        assert_eq!(s.home.destination, home::Destination::Home);
+        assert_eq!(
+            s.home.prompt.read(cx).value().as_ref(),
+            "@designer Keep this draft"
+        );
     });
     press_in(window)(cx, &["enter"]);
     until(cx, window, |_, cx| shark.read(cx).draft_picker.is_none()).await;
-    on(cx, &|s, w, cx| s.focus_draft(true, w, cx));
+    on(cx, &|s, w, cx| s.focus_draft(w, cx));
     press_in(window)(cx, &["cmd-shift-b"]);
     until(cx, window, |w, cx| {
         w.render_frame(cx);
@@ -156,27 +162,26 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
     cx.read(|cx| {
         let s = shark.read(cx);
         assert!(s.state.tasks.is_empty(), "branch selection only adds context");
-        assert!(matches!(&s.home.agent_draft.repos[0].branch, task_draft::BranchSpec::Existing(b) if b == "from-agent"));
+        assert!(matches!(&s.home.draft.repos[0].branch, task_draft::BranchSpec::Existing(b) if b == "from-agent"));
     });
     cx.update_window(window, |_, w, cx| w.click("draft-start", cx))
         .unwrap();
     until(cx, window, |_, cx| {
         let s = shark.read(cx);
-        s.state.tasks.len() == 1 && !s.home.agent_draft.starting
+        s.state.tasks.len() == 1 && !s.home.draft.starting
     })
     .await;
     cx.read(|cx| {
         let s = shark.read(cx);
         let task = &s.state.tasks[0];
-        assert_eq!(s.home.prompt.read(cx).value().as_ref(), "Keep this draft");
-        assert!(s.chats[&task.chats[0].id].read(cx).sent_texts().is_empty());
-        assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
+        assert_eq!(task.chats[0].agent.as_deref(), Some("designer"));
+        assert_eq!(task.agents[0].slug, "designer");
         assert_eq!(task.repos[0].branch.as_deref(), Some("from-agent"));
         assert_eq!(
-            s.home.destination,
-            home::Destination::Agent("designer".into())
+            s.chats[&task.chats[0].id].read(cx).sent_texts(),
+            ["Keep this draft"]
         );
-        assert!(s.active.is_none(), "starting keeps the agent page visible");
+        assert_eq!(s.home.prompt.read(cx).value(), "");
     });
 }
 
@@ -214,7 +219,7 @@ async fn branch_task_captures_selected_agent_and_repository_defaults(cx: &mut Te
         s.home
             .prompt
             .update(cx, |p, cx| p.set_value("@designer Initial notes", w, cx));
-        s.draft_composer_event(false, &crate::task_composer::Event::Change, w, cx);
+        s.draft_composer_event(&crate::task_composer::Event::Change, w, cx);
     });
     cx.run_until_parked();
     on(cx, &|s, w, cx| {
@@ -260,11 +265,9 @@ async fn branch_task_captures_selected_agent_and_repository_defaults(cx: &mut Te
     cx.read(|cx| {
         let s = shark.read(cx);
         let task = &s.state.tasks[0];
-        assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
-        assert_eq!(
-            task.agent.as_ref().unwrap().instructions,
-            "Keep spacing consistent"
-        );
+        assert_eq!(task.chats[0].agent.as_deref(), Some("designer"));
+        assert_eq!(task.agents[0].slug, "designer");
+        assert_eq!(task.agents[0].instructions, "Keep spacing consistent");
         assert_eq!(
             task.repos
                 .iter()

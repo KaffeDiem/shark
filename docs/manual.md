@@ -1,8 +1,8 @@
 # Shark manual
 
-Shark is a native macOS app for working with reusable coding agents. Give an agent a name, instructions, skills and repository defaults; start an isolated task when you have work for it; review the result and take it through to merge. You choose when tasks start and which changes ship.
+Shark is a native macOS app for running coding agents in isolated tasks. Start a task when you have work, guide its chats, review the result and take it through to merge. You choose when tasks start and which changes ship.
 
-An **agent** lasts across tasks. A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. A **task group** organizes Home's task list; it never changes a task's agent or instructions. Claude and Codex are the **harnesses** that run a chat.
+A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. An **agent** is a preset for a chat: a name, icon, instructions, skills and default model settings. Each chat has at most one agent. **Sections** group tasks in the sidebar and on Home; they never change a chat's agent. Claude and Codex are the **harnesses** that run a chat.
 
 Use `cmd-k` for the complete command list and current shortcuts. This guide covers the workflow and behaviors that matter when using it. See the [README](../README.md) for installation, [Git workflows](git-feature.md) for the Git artifact, and [Language intelligence](language-intelligence.md) for editor tooling.
 
@@ -10,47 +10,45 @@ Use `cmd-k` for the complete command list and current shortcuts. This guide cove
 
 Shark needs `git`, `gh` logged into GitHub, and `claude` on your login shell's PATH. Codex models also need `codex`, logged in with `codex login`. Home shows missing tools and a setup checklist.
 
-1. **Add repo** from `cmd-k` or Settings › Repositories. Repositories are registered once and can serve many agents and tasks.
-2. Choose **New agent** in the sidebar and give it a name. Its page opens with editable instructions and a **Defaults** row for repositories and other settings. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
-3. On Home, choose the agent, describe the work and press `enter`. The first line becomes the task's title. `@designer fix the onboarding spacing` selects the same agent.
+1. **Add repo** from `cmd-k` or Settings › Repositories. Repositories are registered once and can serve many tasks.
+2. Optionally make an agent: **New agent…** in a composer's agent menu or in `cmd-k`. Give it a name and instructions. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
+3. On Home, describe the work and press `enter`. The first line becomes the task's title. Pick an agent for its first chat with the **@ Agent** chip, or type `@designer fix the onboarding spacing`.
 4. Plan or work in its chat, review the changes with **Differ**, and use the git button to commit, open PRs and merge.
-5. Delete the completed task when you no longer need its worktrees and conversations. The agent remains ready for its next task, with the completed task in History.
+5. Delete the completed task when you no longer need its worktrees and conversations. Agents stay ready for the next chat.
 
-Choose **No agent** on Home to start a standalone task. No repository is required to begin planning; attach one before building. Unknown `@names` remain ordinary prompt text. Home's `tab` switches to **Ask Shark**, a one-off answer about using the app; that mode never starts an agent task.
+Choose **No agent** to start without one. No repository is required to begin planning; attach one before building. Unknown `@names` remain ordinary prompt text. Home's `tab` switches to **Ask Shark**, a one-off answer about using the app; that mode never starts a task.
 
 Worktrees isolate branches, not the filesystem. Coding sessions can write outside their worktrees. Review the work and use plan mode when you want to approve an approach before building.
 
-## Agents and navigation
+## Agents
 
-The sidebar gives direct access to Home and each agent. An agent's header is its settings: click the icon to change it, click the name to rename it, and type into the instructions under the name. The quiet **Defaults** row sets repositories, model, thinking level, skills and the next agent under **Then**. **Repos** includes **Add repository…**; **Skills** includes **Add skills…**. **Inherit** uses repository or app settings. These controls save defaults for future tasks; controls inside the composer affect only its draft. Each change saves immediately. The header's **…** and a right-click on the agent in the sidebar offer New task, Rename, Change icon, Edit instructions, Add skills, Open skills folder, Refresh skills, Open in… and Delete agent. Its slug is stable even when its name changes. Below the header are the task prompt, the agent's tasks and its history.
+An agent is a preset for chats. Pick it with the agent button that starts a chat composer's row, the way you pick a model. Before the first message, picking an agent gives the chat that agent's instructions, model and thinking level; **No agent** removes it. After the first message the agent is fixed: to continue with another agent, hand the chat off. `cmd-t` opens a chat with the current chat's agent. Chat tabs show their agent's icon.
 
-Type into an agent page's composer and press `enter` or `cmd-enter` to start; `shift-enter` adds a line. `cmd-n`, `i` and `a` focus that composer. Each agent keeps its text, attachments, model overrides and Plan setting as a draft. Elsewhere `cmd-n` opens an empty standalone task. Home uses the same composer, with an agent picker first in its footer. The picker and leading `@slug` share the same selection and preserve the prompt's body. A leading `@` on Home lists agents; `@` elsewhere lists committed files, `#` lists PRs and `/` lists skills. `up`/`down` move through completions and `tab` or `enter` picks one. A cancelled or failed creation keeps the draft.
+The agent menu also offers **Edit <agent>…** and **New agent…**; Home's agent picker ends with **New agent…**, and `cmd-k` has **Edit agent…**, **New agent…** and **Choose chat agent…**. Both open the same dialog. A new agent needs a name; instructions are optional, and **Create agent** (or `enter` in the name) makes it and picks it in the composer you came from. Editing an agent shows its icon (click to change it, `cmd-d` pastes an image), name, instructions, **Skills** and **Hands off to**. Each change saves immediately; **Done** closes the dialog and **Delete agent…** removes it. Its slug is stable even when its name changes.
 
-Use the composer's **+** to add Linear issues, repositories, a branch or PR, or files. These choices add removable pills without starting the task, so an issue and an existing branch or PR can be combined. Repository pills begin with the agent's defaults; edit their branch or remove them for this task. The model chip shows the value that will run and offers a reset after an override. `cmd-/` opens its menu, and `shift-tab` toggles Plan. Without repositories, Plan stays on. **Start** also works with empty text: an attached issue supplies its planning request; otherwise the new task opens an empty chat. Home's `tab` still toggles Ask Shark when no completion is open; Ask hides the task controls.
+Home's composer starts tasks; `enter` or `cmd-enter` starts and `shift-enter` adds a line. Its agent chip and a leading `@slug` pick the first chat's agent, share the same selection and preserve the prompt's body. Repository, model and thinking chips start from the agent's defaults; **Edited** resets them or saves them to the agent. `cmd-n` opens an empty standalone task. A leading `@` on Home lists agents; `@` elsewhere lists committed files, `#` lists PRs and `/` lists skills. `up`/`down` move through completions and `tab` or `enter` picks one. A cancelled or failed creation keeps the draft.
 
-Several tasks can run for one agent, including in the same repository. Each has separate worktrees. Chats receive a sibling note listing the agent's other open tasks and their changed files, refreshed after turns. The note lists at most 20 files per task, plus a count of others. It is context: each task can freely edit its own copies of those files.
+Use the composer's **+** (`cmd-i`) to add Linear issues, repositories, a branch or PR, or files. These choices add removable pills without starting the task, so an issue and an existing branch or PR can be combined. Repository pills begin with the agent's defaults; edit their branch or remove them for this task. The model chip shows the value that will run and offers a reset after an override. `cmd-/` opens its menu, and `shift-tab` toggles Plan. Without repositories, Plan stays on. **Start** also works with empty text: an attached issue supplies its planning request; otherwise the new task opens an empty chat. Home's `tab` still toggles Ask Shark when no completion is open; Ask hides the task controls.
 
-Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through `AGENTS.md`. Open tasks refresh shortly after you stop typing the instructions; existing chats receive changed instructions with their next normal message. A failed refresh is reported so you can retry. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
+Several tasks can use one agent, including in the same repository. Each has separate worktrees. A chat with an agent receives a sibling note listing the other open tasks with a chat on the same agent and their changed files, refreshed after turns. The note lists at most 20 files per task, plus a count of others. It is context: each task can freely edit its own copies of those files.
 
-History keeps the latest 100 deleted tasks, with their titles, PR links, merge status and dates. **PR state unknown** means Shark lacked enough reliable status to determine the result for the whole task, even if some repositories had known PR states. Deleting an agent requires finishing or deleting its open tasks first; confirmation then removes its instructions, history and skills folder.
+A chat's agent instructions reach Claude as an addition to its system prompt and Codex as developer instructions, on every start and resume. The task's `CLAUDE.md` and `AGENTS.md` describe only the task and its repositories, because every chat of the task reads them. Existing chats receive changed instructions with their next normal message. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
 
-### Handing a task to another agent
+Deleting an agent removes its instructions and skills folder after confirmation. Chats that used it keep their transcripts and go on without its instructions.
 
-Set an agent's **Then** chip to its usual next agent. When its current chat finishes a turn, **Hand off to <agent>** appears above the composer; click it or press `cmd-alt-enter`. **Other…**, the task and chat-tab **Hand off to…** menus, and the command palette let you choose another agent. Dismiss the bar with ×; it returns after the next turn.
+### Handing a chat to another agent
 
-The task keeps its folder, branches, worktrees, issues and earlier chats. It moves to the receiving agent's sidebar group, updates root instructions and skill links, and opens a focused chat using that agent's model and thinking defaults. Missing default repositories attach in the background. Finish any existing repository attachment before handing off. Plan mode is still a separate toggle.
+Once a chat has started, its agent button lists the other agents under **Hand off to**. The chat tab and task menus and `cmd-k` offer **Hand off to…** as well. Set an agent's **Hands off to** to its usual next agent: when its chat finishes a turn, **Hand off to <agent>** appears above the composer; click it or press `cmd-alt-enter`. **Other…** picks another agent. Dismiss the bar with ×; it returns after the next turn.
 
-The new chat shows a removable quote of the source chat's approved plan, latest plan, or last assistant reply. Expand it to read more, remove it with ×, or send your instructions. Sending an empty composer with a quote continues from that result. The quote survives a restart and accompanies the first delivered message, including one queued while repositories attach.
-
-Earlier chats keep their agent identity, model and thinking level. They receive a note that the task moved on instead of the new agent's instruction updates. The task folder has one set of instructions and skill links, so a restarted earlier chat can read the receiving agent's root instructions and no longer has its previous agent's skill links. Home's task tooltip shows the agent chain; History remains for deleted tasks.
+Handing off opens a new chat tab, as `cmd-t` does, on the receiving agent with its model and thinking defaults. The source chat's full transcript, and its plan if it has one, is attached to the new composer as a file, the way a pasted image is: `.context/attachments/<chat title> transcript.md`. Add your instructions and send, or remove the chip to start without it. Tool output is left out of the transcript; the changed files are in the task folder. The task, its repositories and its other chats stay as they are.
 
 ### Skills
 
-Choose **Skills › Add skills…** in the agent header to import skills:
+Choose **Skills › Add skills…** in the agent dialog to import skills:
 
 1. Paste a GitHub repository or skill URL, or choose a local skill folder or `SKILL.md` file.
 2. Inspect the discovered skills, select the ones to add, and review their instructions and requirements. Selecting `SKILL.md` imports its containing folder, including scripts, references and other supporting files; put loose downloaded files in a dedicated skill folder first.
-3. Add the selected skills. Shark copies them into this agent's storage and refreshes its open tasks. Existing skills are never silently overwritten.
+3. Add the selected skills. Shark copies them into this agent's storage and refreshes the tasks whose chats use it. Existing skills are never silently overwritten.
 
 For example, paste `https://github.com/DietrichGebert/ponytail`, select `ponytail`, and add it. This imports the skill instructions; plugin hooks require the plugin's own installation. Importing does not execute scripts or connect external accounts. Skills that require tools or services still need those available in the chosen harness.
 
@@ -62,7 +60,7 @@ Adding a skill makes it available to the agent; it does not force the agent to u
 ~/Library/Application Support/shark/agents/<slug>/skills/
 ```
 
-Each skill has a `<skill>/SKILL.md` file. After manual changes, choose **Refresh skills** to refresh every open task. Shark exposes agent skills to both harnesses through links in the task root. The original skill files remain in the agent's folder when a task is deleted. Imported skills record their source and, for GitHub imports, the resolved revision; they do not update automatically. A failed task refresh is reported separately from a successful import so you can retry without importing again.
+Each skill has a `<skill>/SKILL.md` file. After manual changes, choose **Refresh skills** to refresh every open task. Shark exposes agent skills to both harnesses through links in the task root: a task links the skills of every agent its chats use, so all of its chats can find them, and each agent's instructions decide when to use them. The original skill files remain in the agent's folder when a task is deleted. Imported skills record their source and, for GitHub imports, the resolved revision; they do not update automatically. A failed task refresh is reported separately from a successful import so you can retry without importing again.
 
 **Skills from repos** in Settings › General controls repository skills only; agent skills stay enabled. Claude discovers repository skills and commands through its added repository directories. Codex receives links to repository skills from `.agents/skills` or `.claude/skills`. Agent skills get the plain names first; collisions from repositories use prefixed names. Turning repository skills off removes only Shark's recorded repository links. Skill refresh preserves user files and links it does not own.
 
@@ -70,13 +68,13 @@ Each skill has a `<skill>/SKILL.md` file. After manual changes, choose **Refresh
 
 Home starts tasks and lists every task, grouped by **Needs you**, **Running**, **Unread** and **Idle**. Needs you includes questions, plan approvals, attachment problems and actionable git status. The sidebar and Dock badge also mark work needing attention; notifications announce completed turns and tasks that need you.
 
-Use **Move to backlog** in a task menu, the palette, or `b` in a task list to park work. Home and agent pages keep it in the trailing **Backlog N** section, collapsed by default. Parked tasks leave the sidebar except for the open task and stop raising attention or notifications. Starting a turn returns a task to active; **Move to active** or `b` does the same explicitly. Running tasks, tasks being deleted and unanswered questions cannot be parked. Backlog survives restart; expansion does not. The task picker still finds parked tasks, while `cmd-1…9` skip them.
+Use **Move to backlog** in a task menu, the palette, or `b` in a task list to park work. Home keeps it in the trailing **Backlog N** section, collapsed by default. Parked tasks leave the sidebar except for the open task and stop raising attention or notifications. Starting a turn returns a task to active; **Move to active** or `b` does the same explicitly. Running tasks, tasks being deleted and unanswered questions cannot be parked. Backlog survives restart; expansion does not. The task picker still finds parked tasks, while `cmd-1…9` skip them.
 
-The **All repositories** control on the first group heading filters Home to one repository or **No repository**, including repositories being attached. The picker shows task and needs-you counts; the footer counts tasks elsewhere and **Show all** clears the filter. The filter resets on restart and does not affect agent pages, the sidebar, Dock badge, cmd-j or task picker. Right-click a task and choose **Show tasks in…** to open its repository on Home.
+The **All repositories** control on the first group heading filters Home to one repository or **No repository**, including repositories being attached. The picker shows task and needs-you counts; the footer counts tasks elsewhere and **Show all** clears the filter. The filter resets on restart and does not affect the sidebar, Dock badge, cmd-j or task picker. Right-click a task and choose **Show tasks in…** to open its repository on Home.
 
-The filter icon beside Home in the expanded sidebar opens a repository menu with **All repositories** and **No repository**. This independent filter narrows agent and unassigned task rows, agent counts and `cmd-1…9` shortcuts. Global task search still finds every task. The sidebar filter resets on restart.
+The filter icon beside Home in the expanded sidebar opens a repository menu with **All repositories** and **No repository**. This independent filter narrows task rows, section counts and `cmd-1…9` shortcuts; section headers stay. Global task search still finds every task. The sidebar filter resets on restart.
 
-The **Status** control switches grouping between status and task group. **Task groups…** creates and manages groups, including empty ones; task menus move tasks between groups. Deleting a group leaves its tasks intact. Agent membership remains independent of all group operations.
+The sidebar lists Home, then your sections with their tasks, then ungrouped tasks. Hover **Tasks** and choose **+**, or right-click empty sidebar space, to add a section. A section's right-click menu folds it, renames it, changes its icon or deletes it; deleting a section leaves its tasks intact. Drag tasks into and out of sections and drag sections to reorder them; task menus also offer **Move to section**. `left` and `right` fold and unfold the section at the cursor, and `cmd-1…9` skip folded sections. A folded section shows its task count, or a warning when a hidden task needs you. Home's grouping control switches between status and section, in the sidebar's order. Sections never change a chat's agent.
 
 `cmd-0` opens Home; from Home it returns to the active task. `esc` leaves an overview for the active task, or returns to Home if none is active. The task picker (`cmd-shift-o`) searches task titles and repositories. With no query it selects the most recent task from Home, or the most recent other task while a task is open. The app switcher (`cmd-o`, held) cycles tasks until you release Command.
 
@@ -90,7 +88,7 @@ A task can span several repositories, normally on one shared branch name:
 
 Each repository gets its own git worktree. The combined diff, PR links and merge order let you treat the change as one task. Renaming a task changes its display title only; directory and branch names remain stable.
 
-Use **+ › Branch or pull request…** on Home or an agent page to choose repositories and a branch or PR for the draft. In the branch/PR picker, `enter` selects the highlighted entry and `alt-enter` uses it as the base of a new branch; only **Start** creates the task. **New task from branch or PR…** in the command palette uses the visible composer when one is open. New branches already checked out elsewhere are refused; Shark does not reuse another task's worktree. Gitignored files matching `.worktreeinclude` are copied into new worktrees; the default pattern is `.env*`.
+Use **+ › Branch or pull request…** on Home to choose repositories and a branch or PR for the draft. In the branch/PR picker, `enter` selects the highlighted entry and `alt-enter` uses it as the base of a new branch; only **Start** creates the task. **New task from branch or PR…** in the command palette uses the visible composer when one is open. New branches already checked out elsewhere are refused; Shark does not reuse another task's worktree. Gitignored files matching `.worktreeinclude` are copied into new worktrees; the default pattern is `.env*`.
 
 Repository chips in the task header show branch and attachment state. Hover for the path, base and stack position. Their menus contain PR and branch actions, **Reveal in Finder**, **Open in** and path copying. The available external apps come from those installed on your Mac; multiple repositories or projects get a picker.
 
@@ -116,7 +114,7 @@ Scripts receive `SHARK_TASK` and `SHARK_TASK_PATH`. Existing `SHARK_WORKSPACE` a
 
 Mermaid diagrams render in Markdown replies and panes once their code fence closes; use Copy for the source or Open for the full-size image.
 
-A task can have several chat tabs, each with its own session, model, transcript and queue. Chats within the same task share its worktrees; tasks of the same agent do not. `cmd-t` starts another chat. Closing a running chat asks before stopping it. **Reopen closed chat…** or `cmd-shift-t` restores a recent session; Shark keeps the latest 20 closed chats. **Start a new conversation** resets the shown chat's model session.
+A task can have several chat tabs, each with its own session, model, transcript and queue. Chats within the same task share its worktrees; each chat can have its own agent. `cmd-t` starts another chat. Closing a running chat asks before stopping it. **Reopen closed chat…** or `cmd-shift-t` restores a recent session; Shark keeps the latest 20 closed chats. **Start a new conversation** resets the shown chat's model session.
 
 Choose a model and thinking level with the composer button or `cmd-/`. Defaults apply to new chats; changing one chat does not replace the others. Changes take effect with the next message, restarting and resuming a Claude process where necessary. Codex's **Fast** mode (`cmd-shift-f`) selects its priority service tier and uses more of your plan's allowance.
 
@@ -200,7 +198,7 @@ The first issue is primary. Its chip menu offers **Open in Linear**, **Refresh**
 
 Every chat receives changed issue text with its next normal message. It is marked as external reference material, not instructions or permission to attach repositories. Slash commands and mid-turn messages leave the update pending. Removing an issue stops including it in future context; earlier transcript entries remain.
 
-**+ › Linear issue…**, from Home or an agent page, adds issue pills to the draft. The first issue names the task; all selected issues attach before its first turn. Keep or change the repository pills to combine an issue with new branches, existing branches or PRs. Start sends the notes you typed; with no notes it sends the issue's planning request. With no repositories, Plan stays on. Switching Linear organizations or disconnecting keeps snapshots readable but prevents refreshing issues from the previous connection. Task deletion removes local snapshots only.
+**+ › Linear issue…** on Home adds issue pills to the draft. The first issue names the task; all selected issues attach before its first turn. Keep or change the repository pills to combine an issue with new branches, existing branches or PRs. Start sends the notes you typed; with no notes it sends the issue's planning request. With no repositories, Plan stays on. Switching Linear organizations or disconnecting keeps snapshots readable but prevents refreshing issues from the previous connection. Task deletion removes local snapshots only.
 
 ## Settings, shortcuts and local data
 
@@ -212,7 +210,7 @@ The footer's **Usage** panel shows Claude and Codex allowance and reset times. G
 |---|---|
 | Commands and current shortcuts | `cmd-k` |
 | Home / return to active task | `cmd-0` |
-| New task; on an agent page, focus its prompt | `cmd-n` |
+| New task | `cmd-n` |
 | Find task / cycle recent tasks | `cmd-shift-o` / hold `cmd-o` |
 | New chat / close tab / reopen chat | `cmd-t` / `cmd-w` / `cmd-shift-t` |
 | Next or previous tab | `ctrl-tab` / `ctrl-shift-tab` |
@@ -223,7 +221,7 @@ The footer's **Usage** panel shows Claude and Codex allowance and reset times. G
 | Move task to Backlog / active (task lists) | `b` |
 | Sidebar rail / Zen mode | `cmd-b` / `cmd-.` |
 
-Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home and agent task lists use `i`/`a` to reach a prompt; `b` parks or resumes the selected task in these lists and the sidebar. Expand Backlog to navigate its rows with the same list keys. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, artifact and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
+Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home's task list uses `i`/`a` to reach the prompt; `b` parks or resumes the selected task there and in the sidebar. Expand Backlog to navigate its rows with the same list keys. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, artifact and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
 
 Shark stores state, transcripts, plans, comments and Linear snapshots under `~/Library/Application Support/shark/`. Agent skills live there too. Worktrees remain under `~/shark/workspaces/`; the older directory name and serialized `workspaces` fields are retained for existing installations. Do not move worktrees manually: their git metadata refers to their locations.
 

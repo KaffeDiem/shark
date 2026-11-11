@@ -109,7 +109,7 @@ impl Shark {
         let chat = cx.new(|cx| {
             let mut c = Chat::new(ws.clone(), meta.clone(), vim, window, cx);
             c.archiving = archiving;
-            c.next_agent = self.handoff_target(ws, meta);
+            c.next_agent = self.handoff_target(meta);
             c
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
@@ -155,6 +155,7 @@ impl Shark {
                         Some(to) => this.hand_off(&name, to, Some(id.clone()), window, cx),
                         None => this.hand_off_picker(&name, Some(id.clone()), window, cx),
                     },
+                    ChatEvent::AgentMenu => this.chat_agent_menu(chat.clone(), window, cx),
                     ChatEvent::NeedsRepo => this.offer_attach(&name, window, cx),
                     ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                     ChatEvent::Picked => {
@@ -221,7 +222,7 @@ impl Shark {
             sync.update(cx, |g, cx| g.add_chat(chat.clone(), cx));
         }
         self.chats.insert(meta.id.clone(), chat.clone());
-        self.sync_reference_completion(self.draft_target(), cx);
+        self.sync_reference_completion(cx);
         self.save_meta(&chat, true, cx); // a persisted chat may already have a title
         chat
     }
@@ -239,14 +240,22 @@ impl Shark {
             ws.title = meta.title.clone();
         }
         let slot = ws.chats.iter_mut().find(|c| c.id == meta.id);
+        let agent = slot.as_ref().is_some_and(|s| s.agent != meta.agent);
         let changed = slot.filter(|s| **s != meta).map(|s| *s = meta).is_some();
-        let agent = untitled
-            .then(|| ws.agent.as_ref().map(|a| a.slug.clone()))
-            .flatten();
-        if let Some(slug) = agent {
-            let _ = self.sync_agent(&slug, false, cx);
-        } else if changed || untitled {
+        // A new title names the task in its siblings' notes.
+        let slugs: Vec<_> = (ws.agents.iter())
+            .filter(|_| untitled)
+            .map(|a| a.slug.clone())
+            .collect();
+        let name = ws.name.clone();
+        if changed || untitled {
             let _ = self.state.save();
+        }
+        if agent && let Err(e) = self.relink_agents(&name, cx) {
+            eprintln!("relinking agents of {name}: {e}");
+        }
+        for slug in slugs {
+            let _ = self.sync_agent(&slug, false, cx);
         }
     }
 
@@ -392,16 +401,16 @@ impl Shark {
     /// cmd-t: a new tab at the end of the strip, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.chat_actions_available() {
-            return notify_err(window, cx, "Open a task first");
-        }
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
+        let agent = self
+            .active_chat()
+            .and_then(|c| c.read(cx).meta.agent.clone());
         let Some(id) = self.active_task_mut().map(Task::next_chat_id) else {
             return notify_err(window, cx, "Open a task first");
         };
         let meta = ChatMeta {
             fast,
-            ..self.state.new_chat(self.active_task().unwrap(), id)
+            ..self.state.new_chat(self.active_task().unwrap(), id, agent)
         };
         let at = self.active_task_mut().unwrap().push_chat(meta);
         let _ = self.state.save();
@@ -515,7 +524,7 @@ impl Shark {
         let Some(ws) = self.task(task) else {
             return;
         };
-        let fresh = self.state.new_chat(ws, String::new());
+        let fresh = self.state.new_chat(ws, String::new(), None);
         let Some(ws) = self.task_mut(task) else {
             return;
         };
@@ -529,9 +538,7 @@ impl Shark {
             evicted,
         }) = ws.remove_chat(id, fresh, |meta| {
             // No session can also mean one just dropped (a backend switch): the transcript tells.
-            meta.handoff.is_none()
-                && meta.session_id.is_none()
-                && !crate::transcript::transcript_path(&meta.id).exists()
+            meta.session_id.is_none() && !crate::transcript::transcript_path(&meta.id).exists()
         })
         else {
             return;
@@ -580,9 +587,6 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.chat_actions_available() {
-            return notify_err(window, cx, "Open a task first");
-        }
         let Some(ws) = self.active_task_mut() else {
             return notify_err(window, cx, "Open a task first");
         };
@@ -597,9 +601,6 @@ impl Shark {
     }
 
     pub(super) fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.chat_actions_available() {
-            return notify_err(window, cx, "Open a task first");
-        }
         let Some(ws) = self.active_task() else {
             return notify_err(window, cx, "Open a task first");
         };
@@ -631,17 +632,9 @@ impl Shark {
         );
     }
 
-    // The legacy Home can resume its open chat. Agent and All tasks pages have no shown chat.
-    fn chat_actions_available(&self) -> bool {
-        !self.home_shown() || self.home.destination == home::Destination::Home
-    }
-
     /// The shown task's chat, or a toast saying to open one.
     pub(super) fn chat_or_err(&self, window: &mut Window, cx: &mut App) -> Option<Entity<Chat>> {
-        let chat = self
-            .chat_actions_available()
-            .then(|| self.active_chat().cloned())
-            .flatten();
+        let chat = self.active_chat().cloned();
         if chat.is_none() {
             notify_err(window, cx, "Open a task first");
         }
@@ -1154,7 +1147,7 @@ impl Shark {
             "New chat",
             on_shark(cx, |s, w, cx| s.new_chat(w, cx)),
         )];
-        entries.extend(super::menus::handoff_submenu(self, ws, cx));
+        entries.extend(super::menus::handoff_submenu(self, ws, Some(meta), cx));
         if !ws.closed.is_empty() {
             entries.push(menu::item(
                 IconName::RotateCcw,

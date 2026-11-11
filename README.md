@@ -12,17 +12,17 @@
   <a href="#install">Install</a> · <a href="#quick-start">Quick start</a> · <a href="docs/manual.md">Manual</a>
 </p>
 
-## Choose an agent. Give it a task. Review and merge.
+## Start a task. Pick an agent for each chat. Review and merge.
 
 | Concept | What it does |
 |---|---|
-| **Agent** | Keeps a name, instructions, skills, default repositories and model settings across tasks. Lives in the sidebar, with its own task list and history. |
-| **Task** | One piece of work, with separate branches, worktrees, conversations and review state. Several tasks can run under the same agent. |
-| **Task group** | Optional organization of Home's task list. Moving a task between groups never changes its agent or instructions. |
+| **Task** | One piece of work, with separate branches, worktrees, conversations and review state. |
+| **Agent** | A preset for a chat: name, icon, instructions, skills and default model settings. Pick one per chat, the way you pick a model. |
+| **Section** | Optional grouping of tasks in the sidebar and on Home. Moving a task between sections never changes its chats' agents. |
 
-You start each task and decide what ships. Tasks of the same agent share instructions and sibling activity notes; conversations stay separate. Shark does not schedule or automatically start work.
+You start each task and decide what ships. Chats of one task share its worktrees; each chat can have its own agent. Shark does not schedule or automatically start work.
 
-Hand tasks from Designer to Planner to Coder while keeping the same folder, branches and earlier chats; the next agent receives the previous result in a new chat.
+Hand a chat from Designer to Planner to Coder: the next agent opens in a new chat tab with the full transcript attached, in the same task folder.
 
 Claude and Codex work across a task's repositories. Shark brings versioned plans, editable diffs, review comments, linked PRs and stacked branches into one native, keyboard-driven app.
 
@@ -39,13 +39,13 @@ Needs `git`, signed-in `gh` and `claude` on your login shell's PATH. For Codex m
 
 ## Quick start
 
-1. **Set up an agent.** Add your repositories through **Add repo** in `cmd-k`. Click **+** beside Agents, name your agent, and set its instructions and default repositories.
-2. **Start a task.** Choose the agent on Home (`cmd-0`), describe the work and press Enter. `@designer fix onboarding spacing` does the same. Choose **Repository defaults** for a standalone task and attach repositories as needed.
+1. **Add a repository.** Use **Add repo** in `cmd-k`. Optionally choose **New agent…** there and set its instructions and default repositories.
+2. **Start a task.** Describe the work on Home (`cmd-0`) and press Enter. Pick an agent for its first chat with **@ Agent**, or type `@designer fix onboarding spacing`. Attach repositories as needed.
 3. **Guide the work.** Use `shift-tab` for plan mode. Review the plan and approve it when ready; a task needs a repository before building.
 4. **Review and ship.** Open **Differ** (`cmd-shift-d`) to inspect changes and send comments back to a chat. Use **Git** (`cmd-shift-g`) for PR discussions and the git menu to create, update and merge PRs.
-5. **Finish the task.** Delete it when done; this removes its conversations, plans and worktrees. The agent stays available and records the task in History.
+5. **Finish the task.** Delete it when done; this removes its conversations, plans and worktrees. Agents stay available for the next chat.
 
-For existing branches or PRs, use **New task from branch or PR…** in `cmd-k`. A selected agent carries through to that task. Every command and its shortcut is discoverable in `cmd-k`.
+For existing branches or PRs, use **New task from branch or PR…** in `cmd-k`. A selected agent carries through to its first chat. Every command and its shortcut is discoverable in `cmd-k`.
 
 ## Documentation
 

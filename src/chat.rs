@@ -104,6 +104,8 @@ pub enum ChatEvent {
     HandOff {
         to: Option<String>,
     },
+    /// The agent button: the app lists agents to pick, or to hand off to once the chat started.
+    AgentMenu,
     GitReviewsSent(Vec<String>),
     /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
     Asking,
@@ -127,7 +129,6 @@ pub struct Chat {
     pub meta: ChatMeta,
     pub(crate) next_agent: Option<HandoffTarget>,
     handoff_dismissed: bool,
-    handoff_expanded: bool,
     blocks: Vec<Block>,
     /// What the list shows, derived from `blocks`; see `sync_rows`.
     rows: Vec<Row>,
@@ -163,12 +164,16 @@ pub struct Chat {
     /// The model menu, opening upward from the model button, whose bounds the last paint kept.
     model_menu: Option<(Entity<crate::menu::Menu>, Subscription)>,
     model_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// The agent button's bounds, where the app anchors its menu.
+    pub(crate) agent_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Model and (claude) thinking level the running process was started with; a mismatch
     /// respawns it on the next send.
     harness_model: Option<String>,
     harness_effort: &'static str,
     /// Repo directories passed to the running Claude (`git::claude_skill_args`).
     harness_skills: Vec<String>,
+    /// The agent prompt the process started with (`git::agent_prompt`).
+    harness_agent: Option<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
@@ -277,14 +282,8 @@ impl Chat {
         // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
         meta.plan |= ws.repos.is_empty();
         let composer = cx.new(|cx| {
-            crate::task_composer::textarea(window, cx, 1).placeholder(if meta.handoff.is_some() {
-                format!(
-                    "Tell {} what to do with it…",
-                    ws.agent.as_ref().map_or("the agent", |a| a.name.as_str())
-                )
-            } else {
-                "Message the agent (@ to add files, / for skills)".into()
-            })
+            crate::task_composer::textarea(window, cx, 1)
+                .placeholder("Message the agent (@ to add files, / for skills)")
         });
         let _sub =
             cx.subscribe_in(
@@ -329,7 +328,6 @@ impl Chat {
             meta,
             next_agent: None,
             handoff_dismissed: false,
-            handoff_expanded: false,
             blocks: vec![],
             rows: vec![],
             sel: 0,
@@ -352,9 +350,11 @@ impl Chat {
             vim_took: None,
             model_menu: None,
             model_at: Default::default(),
+            agent_at: Default::default(),
             harness_model: None,
             harness_effort: EFFORT,
             harness_skills: Vec::new(),
+            harness_agent: None,
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -627,13 +627,6 @@ impl Chat {
     /// Enter: sends, or queues while a turn or git step runs. `now` (cmd-enter) steers the
     /// running turn instead; claude reads it at its next tool call.
     fn send(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer.read(cx).value().trim().is_empty()
-            && self.editing.is_none()
-            && self.pending_handoff()
-        {
-            self.composer
-                .update(cx, |c, cx| c.set_value("Continue from here.", window, cx));
-        }
         let content = self.composer.read(cx).content();
         let text = content.text().trim().to_string();
         if text.is_empty() {
@@ -751,7 +744,9 @@ impl Chat {
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
         let skills = crate::git::claude_skill_args(&self.ws);
+        let agent = crate::git::agent_prompt(&self.ws, &self.meta);
         let stale = self.harness_model != self.meta.model
+            || self.harness_agent != agent
             || (!self.codex()
                 && (self.harness_effort != self.effort() || self.harness_skills != skills));
         if self.harness.is_some() && stale && !self.busy && !self.steered {
@@ -759,7 +754,8 @@ impl Chat {
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
         if self.harness.is_none() {
-            // A session starting now reads the repos from the root docs, and has nothing else.
+            // A session starting now reads the repos from the root docs and its agent from the
+            // system prompt (`git::agent_prompt`), and has nothing else.
             if self.meta.session_id.is_none() {
                 let mut context = self.context();
                 context.retain(|k, _| {
@@ -783,6 +779,7 @@ impl Chat {
                     self.harness_model = self.meta.model.clone();
                     self.harness_effort = self.effort();
                     self.harness_skills = skills;
+                    self.harness_agent = agent;
                     self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
@@ -1210,9 +1207,6 @@ impl Chat {
                 self.remeasure(bi);
                 if let Some(i) = self.told.iter().position(|(b, ..)| *b == bi) {
                     self.meta.delivered = self.told.remove(i).1;
-                    if !self.pending_handoff() {
-                        self.meta.handoff = None;
-                    }
                     cx.emit(ChatEvent::Meta);
                 }
                 // codex reads a steer into the running turn, with no new init after.
@@ -1773,7 +1767,6 @@ impl Chat {
             .pt_1()
             .children(self.render_side(window, cx))
             .children(self.render_handoff(cx))
-            .children(self.render_handoff_quote(cx))
             .children(asked_card)
             .child(
                 v_flex()
@@ -1894,6 +1887,7 @@ impl Chat {
                             .gap_2()
                             .text_xs()
                             .text_color(muted)
+                            .child(self.render_agent_chip(cx))
                             .child(
                                 Button::new("plan-mode")
                                     .ghost()
@@ -3434,6 +3428,92 @@ exec cat >>"$0.stdin"
         }
     }
 
+    /// The composer's agent button with no agent, with one, and once the chat started, in both
+    /// modes; `SHARK_RENDER_DIR` keeps the screenshots.
+    pub(crate) fn render_agent_chip_pixels(cx: &mut HeadlessAppContext) {
+        let ws = Task {
+            name: "agent-chip".into(),
+            agents: vec![crate::state::AgentLink {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                icon: crate::state::AgentIcon::Emoji {
+                    value: "🎨".into()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (mode, label) in [
+            (crate::state::Mode::Dark, "dark"),
+            (crate::state::Mode::Light, "light"),
+        ] {
+            cx.update(|cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            for case in ["none", "agent", "started"] {
+                let ws = ws.clone();
+                let (window, chat) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(760.), px(260.)),
+                                ))),
+                                focus: false,
+                                show: false,
+                                ..Default::default()
+                            },
+                            cx,
+                            move |w, cx| {
+                                let meta = ChatMeta {
+                                    agent: (case != "none").then(|| "designer".into()),
+                                    model: Some(crate::models::MODELS[0].into()),
+                                    ..Default::default()
+                                };
+                                cx.new(|cx| Chat::new(ws, meta, false, w, cx))
+                            },
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
+                    chat.update(cx, |c, cx| {
+                        if case == "started" {
+                            c.apply(Ev::User("Sketch the onboarding".into()), cx);
+                            c.apply(Ev::Text("Here are three directions.".into()), cx);
+                        }
+                    });
+                    w.render_frame(cx);
+                    let chip = w.find("chat-agent");
+                    let model = w.find("model");
+                    assert!(chip.visible() && model.visible(), "{case}");
+                    assert!(
+                        chip.bounds().right() <= model.bounds().left(),
+                        "agent comes first"
+                    );
+                    assert_eq!(chip.bounds().top(), model.bounds().top(), "one row");
+                })
+                .unwrap();
+                if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                    let dir = PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    cx.capture_screenshot(window)
+                        .expect("real agent chip renderer")
+                        .save(dir.join(format!("agent-chip-{label}-{case}.png")))
+                        .unwrap();
+                }
+                cx.update_window(window, |_, w, _| w.remove_window())
+                    .unwrap();
+            }
+        }
+    }
+
     pub(crate) fn render_info_pixels(cx: &mut HeadlessAppContext) {
         for (mode, label) in [
             (crate::state::Mode::Dark, "dark"),
@@ -3954,81 +4034,42 @@ done
     }
 
     #[gpui_kit::test]
-    fn handoff_context_is_per_chat_and_cleared_on_echo(cx: &mut TestAppContext) {
-        for agent in [Some("designer".to_string()), None] {
-            let chat = open_chat("handoff-context", cx);
-            cx.update(|cx| {
-                chat.update(cx, |c, cx| {
-                    c.meta.agent = agent;
-                    assert!(c.ws.agent.is_none());
-                    assert!(!c.context().keys().any(|key| key.starts_with("stage:")));
-                    c.ws.agent = Some(crate::state::AgentLink {
-                        slug: "planner".into(),
-                        name: "Planner".into(),
-                        instructions: "Plan carefully".into(),
-                        ..Default::default()
-                    });
-                    let notes = c.context();
-                    assert!(!notes.contains_key("agent:planner"));
-                    assert!(!notes.contains_key("siblings:planner"));
-                    assert!(notes.contains_key("stage:planner"));
-                    assert_eq!(c.pending_context().len(), 1);
-                    c.meta.handoff = Some(crate::state::Handoff {
-                        from: "Designer".into(),
-                        title: "Ideas".into(),
-                        text: "Build three steps".into(),
-                    });
-                    assert!(c.pending_handoff());
-                    c.blocks
-                        .push(Block::User("Continue from here.".into(), true));
-                    c.unread.push_back(0);
-                    c.told
-                        .push((0, context_record(&c.context()), "wire".into()));
-                    c.on_echo("wire".into(), cx);
-                    assert!(c.meta.handoff.is_none());
-                    assert!(c.pending_context().is_empty());
-                })
-            });
-        }
-    }
-
-    #[gpui_kit::test]
-    fn handoff_empty_send_queues_default_message_while_held(cx: &mut TestAppContext) {
-        let _turn = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        fake_claude();
-        let chat = open_chat("handoff-held", cx);
-        let window = cx.windows()[0];
-        cx.update_window(window, |_, w, cx| {
+    fn agent_notes_are_per_chat_and_its_pick_locks_once_started(cx: &mut TestAppContext) {
+        let chat = open_chat("chat-agent", cx);
+        cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.attach_hold = true;
-                c.meta.handoff = Some(crate::state::Handoff {
-                    from: "Designer".into(),
-                    title: "Ideas".into(),
-                    text: "Three steps".into(),
-                });
-                c.send(false, w, cx);
-                assert_eq!(c.queue.len(), 1);
-                assert_eq!(c.queue[0].text(), "Continue from here.");
-                assert!(c.pending_handoff());
-                assert!(c.meta.handoff.is_some());
-                std::fs::create_dir_all(c.ws.dir()).unwrap();
-                c.attach_hold = false;
-                c.drain(cx);
-                assert!(c.queue.is_empty());
-                assert!(c.pending_handoff(), "sending alone is not delivery");
-                let wire = c.told.last().unwrap().2.clone();
-                assert!(wire.contains("Three steps"));
-                assert!(wire.ends_with("Continue from here."));
-                c.on_echo(wire, cx);
-                assert!(c.meta.handoff.is_none());
-                assert!(c.pending_context().is_empty());
-                c.drop_process(cx);
-                std::fs::remove_dir_all(c.ws.dir()).unwrap();
+                c.meta.session_id = None;
+                c.ws.agents = vec![crate::state::AgentLink {
+                    slug: "planner".into(),
+                    name: "Planner".into(),
+                    instructions: "Plan carefully".into(),
+                    ..Default::default()
+                }];
+                assert!(
+                    !c.context().contains_key("agent:planner"),
+                    "another chat's agent"
+                );
+                assert!(crate::git::agent_prompt(&c.ws, &c.meta).is_none());
+                let defaults = Some((crate::models::MODELS[1].to_string(), Some("low".into())));
+                assert!(c.set_agent(Some("planner".into()), defaults, cx));
+                assert_eq!(c.meta.model.as_deref(), Some(crate::models::MODELS[1]));
+                assert_eq!(c.meta.effort.as_deref(), Some("low"));
+                let notes = c.context();
+                assert!(
+                    notes.contains_key("agent:planner") && notes.contains_key("siblings:planner")
+                );
+                let prompt = crate::git::agent_prompt(&c.ws, &c.meta).unwrap();
+                assert!(prompt.contains("Planner") && prompt.contains("Plan carefully"));
+                assert!(!c.set_agent(Some("planner".into()), None, cx), "unchanged");
+                c.blocks.push(Block::User("Go".into(), false));
+                assert!(!c.agent_open());
+                assert!(
+                    !c.set_agent(None, None, cx),
+                    "a started chat keeps its agent"
+                );
+                assert_eq!(c.meta.agent.as_deref(), Some("planner"));
             })
-        })
-        .unwrap();
+        });
     }
 
     /// A message the agent never read leaves its context pending: only an echo records it.

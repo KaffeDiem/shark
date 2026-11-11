@@ -251,7 +251,7 @@ impl Shark {
             .state
             .tasks
             .iter()
-            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == slug))
+            .filter(|t| t.agent_link(slug).is_some())
             .map(|t| t.name.clone())
             .collect();
         for name in names {
@@ -266,16 +266,14 @@ impl Shark {
         let Some(task) = self.state.tasks.iter().find(|t| t.name == name).cloned() else {
             return;
         };
-        let Some(agent) = task.agent.as_ref() else {
-            return;
-        };
-        let slug = agent.slug.clone();
-        if !self
-            .state
-            .tasks
-            .iter()
-            .any(|t| t.name != name && t.agent.as_ref().is_some_and(|a| a.slug == slug))
-        {
+        // The agents of its chats that other tasks' chats use too.
+        let slugs: Vec<String> = (task.agents.iter())
+            .map(|a| a.slug.clone())
+            .filter(|slug| {
+                (self.state.tasks.iter()).any(|t| t.name != name && t.agent_link(slug).is_some())
+            })
+            .collect();
+        if slugs.is_empty() {
             return;
         }
         let name = name.to_string();
@@ -294,10 +292,7 @@ impl Shark {
                 let Some(current) = s.state.tasks.iter().find(|t| t.name == name) else {
                     return;
                 };
-                if current.branch != task.branch
-                    || current.repos != task.repos
-                    || current.agent.as_ref().is_none_or(|a| a.slug != slug)
-                {
+                if current.branch != task.branch || current.repos != task.repos {
                     return;
                 }
                 let sibling = crate::state::Sibling {
@@ -310,11 +305,13 @@ impl Shark {
                         .collect(),
                     files,
                 };
-                let mut changed = false;
-                for other in s.state.tasks.iter_mut().filter(|t| t.name != name) {
-                    let Some(agent) = other.agent.as_mut().filter(|a| a.slug == slug) else {
+                let mut changed = vec![];
+                let others = s.state.tasks.iter_mut().filter(|t| t.name != name);
+                for agent in others.flat_map(|t| t.agents.iter_mut()) {
+                    if !slugs.contains(&agent.slug) {
                         continue;
-                    };
+                    }
+                    let slug = agent.slug.clone();
                     match agent
                         .siblings
                         .iter_mut()
@@ -322,16 +319,18 @@ impl Shark {
                     {
                         Some(old) if *old != sibling => {
                             *old = sibling.clone();
-                            changed = true;
+                            changed.push(slug);
                         }
                         None => {
                             agent.siblings.push(sibling.clone());
-                            changed = true;
+                            changed.push(slug);
                         }
                         _ => {}
                     }
                 }
-                if changed {
+                changed.sort();
+                changed.dedup();
+                for slug in changed {
                     let _ = s.sync_agent(&slug, false, cx);
                 }
             })

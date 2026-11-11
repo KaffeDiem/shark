@@ -329,6 +329,10 @@ pub(crate) fn render_pixels() {
         super::agent_pixels::render_pixels(&mut cx);
         return;
     }
+    if std::env::var_os("SHARK_RENDER_AGENT_CHIP_ONLY").is_some() {
+        crate::chat::ui_tests::render_agent_chip_pixels(&mut cx);
+        return;
+    }
     if std::env::var_os("SHARK_RENDER_INFO_ONLY").is_some() {
         crate::chat::ui_tests::render_info_pixels(&mut cx);
         return;
@@ -340,6 +344,7 @@ pub(crate) fn render_pixels() {
     crate::ui::toolbar_pixels::render_pixels(&mut cx);
     crate::chat::ui_tests::render_activity_pixels(&mut cx);
     cx.update(|cx| cx.set_reduce_motion(true));
+    crate::chat::ui_tests::render_agent_chip_pixels(&mut cx);
     if std::env::var_os("SHARK_RENDER_ACTIVITY_ONLY").is_some() {
         return;
     }

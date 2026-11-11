@@ -3,7 +3,7 @@
 //!   SHARK_RENDER_AGENTS_ONLY=1 SHARK_RENDER_DIR=/tmp/agent-shots \
 //!     cargo test --features test-support --test rendering
 use super::*;
-use crate::state::{Agent, AgentLink, TaskRecord, TaskRepo};
+use crate::state::{Agent, AgentLink, TaskRepo};
 
 type Setup = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
@@ -62,11 +62,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         name: name.into(),
         ..Default::default()
     };
+    // Loading gives each task a first chat on its agent.
     let task = |name: &str, title: &str, agent: Option<AgentLink>, repo: &str| Task {
         name: name.into(),
         title: title.into(),
         branch: format!("designer/{name}"),
-        agent,
+        agents: agent.into_iter().collect(),
         repos: vec![TaskRepo {
             name: repo.into(),
             src: home.join(repo),
@@ -103,22 +104,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "Always use Mobbin to ground your research.\n\nPrefer theme tokens over raw colors."
                     .into(),
             repos: vec!["web".into()],
-            history: vec![
-                TaskRecord {
-                    title: "Settings page polish".into(),
-                    at: 1_730_000_000_000,
-                    merged: Some(true),
-                    branch: "designer/settings".into(),
-                    prs: vec![("web".into(), "https://github.com/acme/web/pull/12".into())],
-                },
-                TaskRecord {
-                    title: "Dark mode contrast".into(),
-                    at: 1_729_000_000_000,
-                    merged: Some(false),
-                    branch: "designer/contrast".into(),
-                    prs: vec![],
-                },
-            ],
             ..Default::default()
         },
         Agent {
@@ -168,82 +153,74 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             avatar_identities(s);
             s.open_agent("reviewer", w, cx);
         }),
-        ("task-agent-chip", |s, w, cx| s.open_task_now(0, w, cx)),
-        ("task-agent-chip-narrow", |s, w, cx| {
-            s.state.agents[0].name = "An agent with a very long descriptive name".into();
-            s.open_task_now(0, w, cx);
-        }),
+        // Home's composer with an agent picked: `prefill_agent_task` leaves `@slug ` typed, so
+        // text goes in after it.
         ("draft-file-completion", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.insert("Review @", w, cx);
-                p.set_selected_range(8..8, cx);
-            });
+            s.home
+                .prompt
+                .update(cx, |p, cx| p.insert("Review @", w, cx));
         }),
         ("draft-pr-completion", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.insert("Review #89", w, cx);
-                p.set_selected_range(10..10, cx);
-            });
+            s.home
+                .prompt
+                .update(cx, |p, cx| p.insert("Review #89", w, cx));
         }),
         ("draft-issue-pr", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_draft.issues.push(draft_issue());
-            s.home.agent_draft.repos[0].pr_label =
-                Some("#89 Preserve selected skills · Open".into());
-            s.home.agent_draft.repos[0].branch =
+            s.home.draft.issues.push(draft_issue());
+            s.home.draft.repos[0].pr_label = Some("#89 Preserve selected skills · Open".into());
+            s.home.draft.repos[0].branch =
                 super::super::task_draft::BranchSpec::Pr(git::PullRequest {
                     number: 89,
                     url: "https://github.com/acme/web/pull/89".into(),
                     base: "main".into(),
                 });
-            s.home.agent_prompt.update(cx, |p, cx| p.set_value("Keep the selected skill when changing repositories.\nCheck the keyboard flow too.", w, cx));
+            s.home.prompt.update(cx, |p, cx| p.insert("Keep the selected skill when changing repositories.\nCheck the keyboard flow too.", w, cx));
         }),
         ("draft-issue-plan", |s, w, cx| {
-            s.prefill_agent_task("planner", w, cx);
-            s.home.agent_draft.issues.push(draft_issue());
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.set_placeholder("Add notes, or press Enter to plan ENG-412", w, cx)
-            });
+            s.enter_home(w, cx);
+            s.home.draft.issues.push(draft_issue());
+            s.focus_draft(w, cx);
         }),
         ("draft-model-override", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_draft.model = Some("sonnet".into());
-            s.home.agent_draft.effort = Some("medium".into());
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.set_value("Tighten the onboarding spacing", w, cx)
+            s.home.draft.model = Some("sonnet".into());
+            s.home.draft.effort = Some("medium".into());
+            s.home.prompt.update(cx, |p, cx| {
+                p.insert("Tighten the onboarding spacing", w, cx)
             });
         }),
         ("draft-composer-narrow", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_draft.issues.push(draft_issue());
-            s.home.agent_draft.files = vec![
+            s.home.draft.issues.push(draft_issue());
+            s.home.draft.files = vec![
                 PathBuf::from("/tmp/design-review-notes.md"),
                 PathBuf::from("/tmp/long-composer-layout-reference.png"),
             ];
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.set_value("Keep every attachment reachable in a narrow window", w, cx)
+            s.home.prompt.update(cx, |p, cx| {
+                p.insert("Keep every attachment reachable in a narrow window", w, cx)
             });
         }),
         ("draft-composer-narrow-edited", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_draft.model = Some("long-custom-model-name".into());
-            s.home.agent_draft.issues.push(draft_issue());
+            s.home.draft.model = Some("long-custom-model-name".into());
+            s.home.draft.issues.push(draft_issue());
         }),
         ("draft-removed-default", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_draft.repos.clear();
-            s.home.agent_draft.repos_edited = true;
+            s.home.draft.repos.clear();
+            s.home.draft.repos_edited = true;
         }),
         ("draft-starting", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.set_value("Tighten the onboarding spacing", w, cx)
+            s.home.prompt.update(cx, |p, cx| {
+                p.insert("Tighten the onboarding spacing", w, cx)
             });
-            s.home.agent_draft.starting = true;
+            s.home.draft.starting = true;
             s.home
-                .agent_composer
+                .composer
                 .update(cx, |c, cx| c.set_read_only(true, cx));
         }),
         ("draft-no-repositories", |s, w, cx| {
@@ -257,8 +234,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         }),
         ("draft-branch-fetch-failure", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.agent_prompt.update(cx, |p, cx| {
-                p.set_value("Keep these notes if refreshing fails", w, cx)
+            s.home.prompt.update(cx, |p, cx| {
+                p.insert("Keep these notes if refreshing fails", w, cx)
             });
             s.pick_draft_branch(Some(("web".into(), false)), w, cx);
         }),
@@ -288,16 +265,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 cx.notify();
             });
         }),
-        ("handoff-quote", |s, w, cx| s.open_task_now(0, w, cx)),
-        ("agent-tasks", |s, w, cx| s.open_agent("designer", w, cx)),
-        ("agent-empty", |s, w, cx| s.open_agent("planner", w, cx)),
+        // The agent page is its settings header only.
+        ("agent-page", |s, w, cx| s.open_agent("designer", w, cx)),
         ("rail", |s, w, cx| {
             s.rail = true;
             s.open_agent("designer", w, cx);
-        }),
-        ("agent-collapsed", |s, w, cx| {
-            s.open_agent("planner", w, cx);
-            s.set_agent_collapsed(0, true, cx);
         }),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
         ("agent-add-skills", |s, w, cx| {
@@ -325,11 +297,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             });
         }),
         ("agent-rename", |s, w, cx| s.rename_agent("designer", w, cx)),
-        ("agent-menu", |s, w, cx| {
-            s.open_agent("designer", w, cx);
-            let entries = s.agent_menu("designer", cx);
-            s.show_menu(point(px(120.), px(250.)), entries, w, cx);
-        }),
         ("home", |s, w, cx| s.enter_home(w, cx)),
         ("home-agent", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx)
@@ -363,20 +330,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 agents: agents.clone(),
                 ..Default::default()
             };
-            if case == "handoff-quote" {
-                state.tasks[0].migrate();
-                state.tasks[0].chats[0].title = "Onboarding ideas".into();
-                state.tasks[0].agent = Some(AgentLink::from(&state.agents[1]));
-                let id = state.tasks[0].next_chat_id();
-                let mut meta = state.new_chat(&state.tasks[0], id);
-                meta.handoff = Some(crate::state::Handoff {
-                    from: "Designer".into(),
-                    title: "Onboarding ideas".into(),
-                    text: "Three-step flow, skip on step 2.\nUse Card and Stepper components.\nKeep keyboard navigation available throughout.".into(),
-                });
-                let at = state.tasks[0].push_chat(meta);
-                state.tasks[0].active_chat = at;
-            }
             state.appearance.mode = mode;
             state.save().unwrap();
             let (window, shark) = cx
@@ -389,8 +342,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     px(
                                         if matches!(
                                             case,
-                                            "task-agent-chip-narrow"
-                                                | "draft-composer-narrow"
+                                            "draft-composer-narrow"
                                                 | "draft-composer-narrow-edited"
                                         ) {
                                             800.
@@ -424,22 +376,19 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     .unwrap();
                 cx.run_until_parked();
             }
-            if case.starts_with("task-agent-chip") {
+            if case == "agent-page" {
                 cx.update_window(window, |_, w, _| {
-                    let agent = w.find("task-agent").bounds();
-                    let attach = w.find("header-attach").bounds();
-                    assert_eq!(agent.center().y, attach.center().y);
-                    assert!(agent.size.width <= px(160.));
-                    assert!(agent.right() <= attach.left());
-                    assert!(attach.right() <= w.viewport_size().width);
-                    assert!(w.try_find("task-identity").is_none());
+                    assert!(w.try_find("agent-settings").is_some());
+                    assert!(
+                        w.try_find("home-composer").is_none() && w.try_find("home-list").is_none()
+                    );
                 })
                 .unwrap();
             }
             if matches!(case, "draft-file-completion" | "draft-pr-completion") {
                 cx.update(|cx| {
                     assert!(
-                        shark.read(cx).home.agent_composer.read(cx).has_menu(),
+                        shark.read(cx).home.composer.read(cx).has_menu(),
                         "{case} must show its completion menu"
                     )
                 });
