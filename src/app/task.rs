@@ -350,7 +350,7 @@ impl Shark {
     /// and gives the title instead. Unsaved edits are asked about before anything exists, so
     /// cancelling leaves nothing behind. Users start tasks from Home's composer
     /// (`start_task_draft`); this shortcut remains for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(super) fn new_task(
         &mut self,
         first: Option<String>,
@@ -367,7 +367,7 @@ impl Shark {
 
     /// Saved before any provider starts: a failed save leaves neither agent nor directory. A
     /// failed first send leaves the agent, with the message back in its composer (`Chat::ask`).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     fn create_task(
         &mut self,
         first: Option<String>,

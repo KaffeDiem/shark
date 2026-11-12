@@ -890,25 +890,35 @@ async fn new_task_command_focuses_home_prompt_and_keeps_draft(cx: &mut TestAppCo
         },
         WindowOptions::default(),
     );
+    blank_task(cx, window, &shark);
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| {
-        s.home
-            .prompt
-            .update(cx, |p, cx| p.set_value("half a thought", w, cx));
-        s.toggle_ask_mode(w, cx);
-        s.leave_home(w, cx);
-    });
-    cx.update_window(window, |_, w, cx| w.dispatch_action(Box::new(NewTask), cx))
+    for go in ["cmd-n", "pen"] {
+        on(cx, &|s, w, cx| {
+            s.home
+                .prompt
+                .update(cx, |p, cx| p.set_value("half a thought", w, cx));
+            s.toggle_ask_mode(w, cx);
+            s.leave_home(w, cx);
+            assert!(!s.home_shown());
+        });
+        cx.update_window(window, |_, w, cx| match go {
+            "cmd-n" => w.dispatch_action(Box::new(NewTask), cx),
+            _ => w.click("new-workspace", cx),
+        })
         .unwrap();
-    cx.run_until_parked();
-    cx.update_window(window, |_, w, cx| {
-        let s = shark.read(cx);
-        assert!(s.state.tasks.is_empty(), "no blank task is created");
-        assert!(s.home_shown() && !s.home.asking);
-        assert!(s.home.prompt.read(cx).focus_handle(cx).is_focused(w));
-        assert_eq!(s.home.prompt.read(cx).value(), "half a thought");
-    })
-    .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            assert_eq!(s.state.tasks.len(), 1, "{go} creates no task");
+            assert!(s.home_shown() && !s.home.asking, "{go}");
+            assert!(
+                s.home.prompt.read(cx).focus_handle(cx).is_focused(w),
+                "{go}"
+            );
+            assert_eq!(s.home.prompt.read(cx).value(), "half a thought");
+        })
+        .unwrap();
+    }
 }
 
 #[gpui_kit::test]

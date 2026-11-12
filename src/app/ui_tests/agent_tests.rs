@@ -196,8 +196,8 @@ async fn home_agent_starts_a_task_on_that_agent(cx: &mut TestAppContext) {
     });
 }
 
-/// An empty task has no conversation, also with repos registered, and no provider runs yet;
-/// the first message titles it, and a second doesn't. The + button goes to Home's composer.
+/// An empty task sends nothing, also with repos registered, and no provider runs yet; the
+/// first message titles it, and a second doesn't.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
@@ -215,19 +215,8 @@ async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     );
     cx.run_until_parked();
     blank_task(cx, window, &shark);
-    cx.update_window(window, |_, w, cx| {
-        assert!(!w.has_active_dialog(cx));
-        w.click("new-workspace", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(window, |_, w, cx| {
-        let s = shark.read(cx);
-        assert_eq!(s.state.tasks.len(), 1, "the + button starts no task");
-        assert!(s.home_shown() && s.home.prompt.read(cx).focus_handle(cx).is_focused(w));
-    })
-    .unwrap();
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.leave_home(w, cx));
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
     let ws = active_task(cx, &shark);
     let shown = ws.display_title().into_owned();
     assert_eq!(shown.to_lowercase(), ws.name);

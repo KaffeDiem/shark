@@ -1373,7 +1373,7 @@ impl Shark {
                     .children(items)
                     .when(
                         self.state.tasks.is_empty() && self.state.sections.is_empty(),
-                        |d| d.child(hint("cmd-n to create")),
+                        |d| d.child(hint("cmd-n to start one")),
                     )
                     .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))
                     // The empty space below takes a right-click too.
