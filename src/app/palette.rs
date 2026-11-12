@@ -38,7 +38,7 @@ impl Row {
 
 /// Grouped the way people reach for them; `GROUPS` names each group by its first row.
 pub(super) const COMMANDS: &[Row] = &[
-    Row::key("New task", IconName::Plus, &NewTask, "create start chat"),
+    Row::key("New task", IconName::Plus, &NewTask, "create start"),
     Row(
         "Add to task…",
         IconName::Plus,
