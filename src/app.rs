@@ -719,7 +719,7 @@ impl Shark {
 
     fn render_new_task(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("new-workspace", IconName::SquarePen, "New task (cmd-n)")
-            .on_click(cx.listener(|this, _, window, cx| this.new_empty_task(window, cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.new_task_prompt(window, cx)))
             .map(|b| quiet_toolbar("new-workspace", b))
     }
 
@@ -972,7 +972,7 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewTask, w, cx| this.new_empty_task(w, cx)))
+            .on_action(cx.listener(|this, _: &NewTask, w, cx| this.new_task_prompt(w, cx)))
             .on_action(
                 cx.listener(|this, _: &NewTaskFromBranch, w, cx| this.new_task_default(w, cx)),
             )

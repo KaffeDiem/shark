@@ -51,7 +51,7 @@ pub(super) fn agent(
         WindowOptions::default(),
     );
     cx.run_until_parked();
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     (window, shark, repos)
 }
 
@@ -2233,8 +2233,8 @@ async fn new_task_from_branch_keeps_its_keys(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     let press = press_in(window);
-    // The explicit branch creation dialog remains available inside an open task.
-    press(cx, &["cmd-n"]);
+    // The branch dialog, from repo and stack menus, keeps its form inside an open task.
+    blank_task(cx, window, &shark);
     branch_dialog(cx, window, &shark);
     assert!(shows(cx, window, ("repo-prs", 0usize)));
     assert!(!shows(cx, window, "attach-summary"));

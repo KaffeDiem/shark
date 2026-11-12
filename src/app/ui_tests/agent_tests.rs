@@ -78,7 +78,7 @@ async fn planned_agent(
     cx: &mut TestAppContext,
 ) -> (AnyWindowHandle, Entity<Shark>, Entity<crate::chat::Chat>) {
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let chat = active_chat(cx, &shark);
     cx.update(|cx| {
         chat.update(cx, |c, cx| {
@@ -196,8 +196,8 @@ async fn home_agent_starts_a_task_on_that_agent(cx: &mut TestAppContext) {
     });
 }
 
-/// cmd-n opens an empty conversation, also with repos registered, and no provider runs yet;
-/// the first message titles it, and a second doesn't.
+/// An empty task sends nothing, also with repos registered, and no provider runs yet; the
+/// first message titles it, and a second doesn't.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
@@ -214,15 +214,9 @@ async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     cx.run_until_parked();
-    let press = press_in(window);
-    press(cx, &["cmd-n"]);
-    cx.update_window(window, |_, w, cx| {
-        assert!(!w.has_active_dialog(cx));
-        w.click("new-workspace", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update(|cx| assert_eq!(shark.read(cx).state.tasks.len(), 2, "the + button too"));
+    blank_task(cx, window, &shark);
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
     let ws = active_task(cx, &shark);
     let shown = ws.display_title().into_owned();
     assert_eq!(shown.to_lowercase(), ws.name);
@@ -241,7 +235,7 @@ async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     assert_eq!(active_task(cx, &shark).title, "plan the rollout");
-    assert_eq!(State::load().tasks[1].title, "plan the rollout");
+    assert_eq!(State::load().tasks[0].title, "plan the rollout");
 
     // The name as a title, once it is one, is the user's: a later save doesn't undo it.
     shark.update(cx, |s, cx| s.set_title(&ws.name, shown.clone(), cx));
@@ -252,7 +246,7 @@ async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn first_prompt_after_cmd_n_gets_generated_title(cx: &mut TestAppContext) {
+async fn first_prompt_in_blank_task_gets_generated_title(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _claude = ClaudeGuard::set(&quiet);
@@ -261,7 +255,7 @@ async fn first_prompt_after_cmd_n_gets_generated_title(cx: &mut TestAppContext) 
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.run_until_parked();
     shark.update(cx, |s, _| s.openrouter_key = Some(Some("test-key".into())));
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let chat = active_chat(cx, &shark);
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| {
@@ -291,7 +285,7 @@ async fn short_prompt_gets_generated_title(cx: &mut TestAppContext) {
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.run_until_parked();
     shark.update(cx, |s, _| s.openrouter_key = Some(Some("test-key".into())));
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let chat = active_chat(cx, &shark);
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| {
@@ -700,7 +694,7 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
     let (window, shark) = empty_app(cx);
     let press = press_in(window);
     let on = on_app(window, shark.clone());
-    press(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     press(cx, &["cmd-t"]);
     let chat = active_chat(cx, &shark);
     cx.update(|cx| assert!(chat.read(cx).meta.plan && chat.read(cx).plan_open));
@@ -805,7 +799,7 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
     test_home();
     let (window, shark) = empty_app(cx);
     let on = on_app(window, shark.clone());
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     for feature in Feature::ALL {
         on(cx, &|s, w, cx| s.show(Tab::Feature(feature), w, cx));
         cx.update_window(window, |_, w, cx| {
@@ -1213,7 +1207,7 @@ async fn generated_chat_titles_preserve_task_rename_and_surface_errors(cx: &mut 
     let home = test_home();
     let _curl = TitleCurlPath::set(&home);
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let name = active_task(cx, &shark).name;
     on_app(window, shark.clone())(cx, &|s, _, cx| {
         s.openrouter_key = Some(Some("test-key".into()));
@@ -1382,7 +1376,7 @@ async fn generated_task_title_goes_to_the_prompting_chat(cx: &mut TestAppContext
     let _curl = TitleCurlPath::set(&home);
     scripted_curl(&home);
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     on_app(window, shark.clone())(cx, &|s, _, _| {
         s.openrouter_key = Some(Some("test-key".into()))
     });
@@ -1436,7 +1430,7 @@ async fn generated_title_keeps_a_tab_changed_meanwhile(cx: &mut TestAppContext) 
     let _curl = TitleCurlPath::set(&home);
     scripted_curl(&home);
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let chat = active_chat(cx, &shark);
     assert_eq!(cx.read(|cx| chat.read(cx).meta.title.clone()), "");
     let name = active_task(cx, &shark).name;
@@ -1468,7 +1462,7 @@ async fn regenerate_title_uses_the_original_prompt(cx: &mut TestAppContext) {
     let _curl = TitleCurlPath::set(&home);
     scripted_curl(&home);
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let chat = active_chat(cx, &shark);
     let id = cx.read(|cx| chat.read(cx).meta.id.clone());
     on_app(window, shark.clone())(cx, &|s, _, _| {
@@ -1513,7 +1507,7 @@ async fn regenerate_title_without_a_transcript_falls_back_to_the_task(cx: &mut T
     let _curl = TitleCurlPath::set(&home);
     scripted_curl(&home);
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let name = active_task(cx, &shark).name;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.openrouter_key = Some(Some("test-key".into()));
@@ -1536,7 +1530,7 @@ async fn chat_title_failure_is_not_the_tasks(cx: &mut TestAppContext) {
     let _curl = TitleCurlPath::set(&home);
     scripted_curl(&home);
     let (window, shark) = empty_app(cx);
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let name = active_task(cx, &shark).name;
     on_app(window, shark.clone())(cx, &|s, _, _| {
         s.openrouter_key = Some(Some("test-key".into()))

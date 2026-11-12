@@ -1210,7 +1210,7 @@ impl Shark {
                     menu::item(
                         IconName::Plus,
                         "New task",
-                        on_shark(cx, |s, w, cx| s.new_empty_task(w, cx)),
+                        on_shark(cx, |s, w, cx| s.new_task_prompt(w, cx)),
                     ),
                     menu::item(
                         IconName::FolderPlus,
@@ -1373,7 +1373,7 @@ impl Shark {
                     .children(items)
                     .when(
                         self.state.tasks.is_empty() && self.state.sections.is_empty(),
-                        |d| d.child(hint("cmd-n to create")),
+                        |d| d.child(hint("cmd-n to start one")),
                     )
                     .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))
                     // The empty space below takes a right-click too.

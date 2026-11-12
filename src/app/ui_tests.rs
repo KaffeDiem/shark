@@ -114,8 +114,17 @@ pub(super) fn boot(
     open(cx, options)
 }
 
-/// Opens the explicit creation dialog for tests of its branch/PR behavior. Home's action
-/// now selects draft context; composer tests exercise that separate entry point.
+/// An empty task, open, no repository: the fixture most tests build on. Users reach this
+/// through Home's composer; tests take the shortcut.
+fn blank_task(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.new_task(None, None, None, w, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// Opens the standalone creation dialog for tests of its branch/PR behavior.
 fn branch_dialog(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
