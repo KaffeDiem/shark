@@ -251,21 +251,20 @@ pub(super) struct HomeRow {
 }
 
 impl Shark {
-    /// cmd-n: an empty task.
-    pub(super) fn new_empty_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_task(None, None, None, window, cx)
+    /// cmd-n: Home's composer, ready to type. Tasks start from one place; a draft in progress
+    /// is kept.
+    pub(super) fn new_task_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.enter_home(window, cx);
+        if self.home.asking {
+            self.toggle_ask_mode(window, cx);
+        }
+        self.home.prompt.update(cx, |p, cx| p.focus(window, cx));
     }
 
-    /// Overview commands add draft context; an open task keeps the standalone branch dialog.
+    /// "New task from branch or PR…": Home's composer with its branch picker open.
     pub(super) fn new_task_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home_shown() {
-            if self.home.asking {
-                self.toggle_ask_mode(window, cx);
-            }
-            self.change_draft_branch(window, cx);
-        } else {
-            self.new_task_from_repos(self.state.last_repos.clone(), None, window, cx);
-        }
+        self.new_task_prompt(window, cx);
+        self.change_draft_branch(window, cx);
     }
 
     /// Home is on screen: asked for, or nothing else to show.
@@ -1186,7 +1185,7 @@ impl Shark {
             .children(items.iter().enumerate().map(|(i, (label, done))| {
                 let (btn, keys, go): (_, _, Go) = match i {
                     1 => ("Add repo", "cmd-k", Shark::add_repo),
-                    2 => ("New task", "cmd-n", Shark::new_empty_task),
+                    2 => ("New task", "cmd-n", Shark::new_task_prompt),
                     3 => ("Use plan mode", "shift-tab", Shark::try_plan_mode),
                     _ => ("Create PRs", "cmd-k", Shark::toggle_palette),
                 };
@@ -1481,7 +1480,7 @@ impl Shark {
         let add = Button::new("home-add-repo").label("Add repo");
         let add = add.on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
         let new = Button::new("home-new-ws").label("New task").primary();
-        let new = key_button(new, "cmd-n", Shark::new_empty_task, cx);
+        let new = key_button(new, "cmd-n", Shark::new_task_prompt, cx);
         list.py_8()
             .items_center()
             .gap_3()

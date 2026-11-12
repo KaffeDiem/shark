@@ -348,7 +348,9 @@ impl Shark {
     /// New task: an empty conversation, no dialog, no repository. `first`, when set, titles it
     /// and goes out as its first message. `issue`, a title and a snapshot, is attached before that
     /// and gives the title instead. Unsaved edits are asked about before anything exists, so
-    /// cancelling leaves nothing behind.
+    /// cancelling leaves nothing behind. Users start tasks from Home's composer
+    /// (`start_task_draft`); this shortcut remains for tests.
+    #[cfg(test)]
     pub(super) fn new_task(
         &mut self,
         first: Option<String>,
@@ -365,6 +367,7 @@ impl Shark {
 
     /// Saved before any provider starts: a failed save leaves neither agent nor directory. A
     /// failed first send leaves the agent, with the message back in its composer (`Chat::ask`).
+    #[cfg(test)]
     fn create_task(
         &mut self,
         first: Option<String>,

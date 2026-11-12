@@ -7,7 +7,7 @@ async fn failed_plan_save_blocks_close_and_archive_until_retry(cx: &mut TestAppC
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.run_until_parked();
-    press_in(window)(cx, &["cmd-n"]);
+    blank_task(cx, window, &shark);
     let (task, id, plan) = cx.update(|cx| {
         let s = shark.read(cx);
         let chat = s.active_chat().unwrap().read(cx);

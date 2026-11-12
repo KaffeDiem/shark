@@ -1210,7 +1210,7 @@ impl Shark {
                     menu::item(
                         IconName::Plus,
                         "New task",
-                        on_shark(cx, |s, w, cx| s.new_empty_task(w, cx)),
+                        on_shark(cx, |s, w, cx| s.new_task_prompt(w, cx)),
                     ),
                     menu::item(
                         IconName::FolderPlus,
