@@ -34,7 +34,7 @@ pub(crate) fn kind(path: &str) -> Option<Kind> {
 }
 
 /// What gpui decodes itself; the rest goes through `sips` (ImageIO) first.
-fn native(ext: &str) -> bool {
+pub(crate) fn native(ext: &str) -> bool {
     matches!(
         ext,
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg"

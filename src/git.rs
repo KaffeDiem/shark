@@ -1312,7 +1312,7 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) -> std:
 }
 
 /// What Shark itself leaves in a task root: its docs, Finder litter, the `.context` folder
-/// of attachments and the skill links.
+/// (plans, scratch and attachments) and the skill links.
 fn root_owned() -> impl Iterator<Item = &'static str> {
     let [claude, agents] = ROOT_DOCS;
     [claude, agents, ".DS_Store", attachments_parts().0]
@@ -1330,15 +1330,11 @@ fn attachments_parts() -> (&'static str, &'static str) {
         .unwrap_or((crate::complete::ATTACHMENTS, ""))
 }
 
-/// Whether `name` in the root is Shark's, not the user's: `.context` only counts while it
-/// holds nothing but attachments and harness folders nothing but skill links (unreadable, or a file,
+/// Whether `name` in the root is Shark's, not the user's: `.context` is whatever it holds, and
+/// harness folders count only while they hold nothing but skill links (unreadable, or a file,
 /// is unexpected: refuse before removing).
 fn shark_owned(dir: &Path, name: &str) -> bool {
-    let (context, attachments) = attachments_parts();
     root_owned().any(|owned| owned == name)
-        && (name != context
-            || fs::read_dir(dir.join(name))
-                .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == attachments))))
         && HARNESS_SKILL_DIRS.iter().all(|folder| {
             folder.split_once('/').unwrap().0 != name || only_skill_links(dir, folder)
         })
@@ -1402,10 +1398,13 @@ fn listed(repo: &str) -> String {
     format!("- `{repo}/`: worktree of ")
 }
 
+/// Where agents put what isn't code. Claude's plan files go there too (`plansDirectory`).
+const CONTEXT_NOTE: &str = "Keep plans, notes, research and temporary files in `.context/` inside this directory: plans in `.context/plans/`, everything else in `.context/scratch/`. Never write them elsewhere, including your home folder. `.context` is deleted with the task and never committed. Files the user attaches are in `.context/attachments/`.\n\n";
+
 fn header(ws: &Task) -> String {
     if ws.repos.is_empty() {
         format!(
-            "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
+            "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n{CONTEXT_NOTE}",
             ws.name
         )
     } else {
@@ -1439,6 +1438,7 @@ fn header(ws: &Task) -> String {
             );
         }
         s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\nThis task is already an isolated worktree managed by Shark. Don't create more git worktrees (no `isolation: \"worktree\"`, `--worktree` or EnterWorktree); split parallel work by file instead.\n\n";
+        s += CONTEXT_NOTE;
         s
     }
 }

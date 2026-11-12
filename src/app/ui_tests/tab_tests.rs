@@ -821,3 +821,80 @@ async fn build_plan_in_new_chat_refuses_stale_plans(cx: &mut TestAppContext) {
     crate::plan::delete(&id);
     fs::remove_dir_all(&home).ok();
 }
+
+/// Approving a plan keeps a readable copy of the approved text in the task's `.context/plans`.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn plan_approved_saves_the_approved_plan_into_context(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_task_for_test(
+            "plan-copy".into(),
+            git::on_branch(&repos, "plan-copy"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let (plan, dir) = cx.update(|cx| {
+        let c = chat.read(cx);
+        (c.plan.clone(), c.ws.dir())
+    });
+    let copies = || -> Vec<(String, String)> {
+        let Ok(rd) = fs::read_dir(dir.join(".context/plans")) else {
+            return vec![];
+        };
+        rd.map(|e| {
+            let p = e.unwrap().path();
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read_to_string(&p).unwrap(),
+            )
+        })
+        .collect()
+    };
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.add("t1".into(), "# One\n\nfirst\n".into(), cx);
+            p.add("t2".into(), "# One\n\nsecond\n".into(), cx);
+        })
+    });
+    assert!(copies().is_empty(), "nothing is saved before approval");
+    cx.update(|cx| chat.update(cx, |c, cx| c.plan_approved(cx)));
+    let got = copies();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].0.ends_with(" plan.md"), "{got:?}");
+    assert_eq!(got[0].1, "# One\n\nsecond\n", "the approved text");
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.add("t3".into(), "# One\n\nthird\n".into(), cx);
+        })
+    });
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| p.approve(cx));
+        chat.update(cx, |c, cx| c.plan_approved(cx))
+    });
+    let got = copies();
+    assert_eq!(got.len(), 1, "re-approval replaces the copy: {got:?}");
+    assert_eq!(got[0].1, "# One\n\nthird\n");
+    let id = cx.update(|cx| chat.read(cx).meta.id.clone());
+    crate::plan::delete(&id);
+    fs::remove_dir_all(&home).ok();
+}

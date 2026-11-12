@@ -132,6 +132,56 @@ impl Shark {
         self.differ.update(cx, |d, cx| d.file_menu(path, cx))
     }
 
+    /// Artifacts' requests; paths are task-relative.
+    pub(super) fn artifacts_event(
+        &mut self,
+        event: &artifacts::ArtifactsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use artifacts::ArtifactsEvent::*;
+        match event {
+            OpenEditor(path) => self.open_path(path.to_string_lossy().into_owned(), window, cx),
+            AttachToChat(path) => {
+                self.show(Tab::Chat, window, cx);
+                if let Some(chat) = self.active_chat().cloned() {
+                    let label = path
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into());
+                    chat.update(cx, |c, cx| {
+                        c.attach_mention(&path.to_string_lossy(), label, window, cx);
+                        c.focus_composer(window, cx);
+                    });
+                }
+            }
+            Width(width) => {
+                self.state.artifacts_width = Some(*width);
+                let _ = self.state.save();
+            }
+            Pins(pins) => {
+                if let Some(ws) = self.active_task_mut() {
+                    ws.artifacts_pinned = pins.clone();
+                    let _ = self.state.save();
+                }
+            }
+            ShowPlanInChat(id) => {
+                let ix =
+                    (self.active_task()).and_then(|ws| ws.chats.iter().position(|c| &c.id == id));
+                if let Some(ix) = ix {
+                    self.select_chat(ix, window, cx);
+                    self.show(Tab::Chat, window, cx);
+                    if let Some(chat) = self.active_chat().cloned() {
+                        chat.update(cx, |c, cx| {
+                            if !c.plan_open {
+                                c.toggle_plan(window, cx);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn differ_event(
         &mut self,
         event: &DifferEvent,

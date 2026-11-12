@@ -530,11 +530,11 @@ impl Chat {
         if self.indexing.is_some() {
             return;
         }
-        let repos = self.ws.repo_paths();
+        let (task, repos) = (self.ws.dir(), self.ws.repo_paths());
         self.indexing = Some(cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { complete::files(&repos) })
+                .spawn(async move { complete::files(&task, &repos) })
                 .await;
             this.update(cx, |c, cx| {
                 c.indexing = None;

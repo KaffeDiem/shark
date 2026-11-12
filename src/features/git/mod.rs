@@ -1040,6 +1040,7 @@ impl GitFeature {
                 "https://{}/{}/{}",
                 d.target.host, d.target.owner, d.target.repo
             )),
+            on_disk: false,
         })
     }
 

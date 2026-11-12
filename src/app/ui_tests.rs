@@ -16,6 +16,8 @@ mod agent_pixels;
 mod agent_settings_tests;
 mod agent_tests;
 mod app_switcher_tests;
+mod artifacts_preview_tests;
+mod artifacts_tests;
 mod attach_tests;
 mod attention_tests;
 mod audit_tests;

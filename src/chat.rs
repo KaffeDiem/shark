@@ -5102,7 +5102,7 @@ done
         cx.run_until_parked();
         cx.update(|cx| {
             chat.update(cx, |c, _| {
-                c.files = complete::files(&repos);
+                c.files = complete::files(&c.ws.dir(), &repos);
                 c.indexing = Some(gpui_kit::Task::ready(())); // the workspace dir doesn't exist; keep these
             })
         });

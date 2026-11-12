@@ -51,14 +51,65 @@ pub struct Item {
 
 /// Every tracked and untracked-but-not-ignored path in each repo, plus their folders.
 /// Paths are task-relative (`api/src/a.rs`), which is how Claude Code resolves `@`.
-pub fn files(repos: &[(String, PathBuf)]) -> Vec<Item> {
-    let lists = crate::proc::par_map(repos, |(name, dir)| {
-        // -z: unquoted names; --deduplicate: one line per conflicted file, not per stage.
+/// `task` is the task dir; its `.context` completes as `@.context/...`, with or without repos.
+pub fn files(task: &Path, repos: &[(String, PathBuf)]) -> Vec<Item> {
+    // -z: unquoted names; --deduplicate: one line per conflicted file, not per stage.
+    let mut lists = crate::proc::par_map(repos, |(name, dir)| {
         let out = crate::git::ls_files(dir, &["-co", "--exclude-standard", "--deduplicate"])
             .unwrap_or_default();
         (name.clone(), out)
     });
+    lists.push((".context".into(), context_paths(task)));
     file_items(&lists)
+}
+
+/// The most files a `.context` walk returns.
+pub const CONTEXT_LIMIT: usize = 2000;
+
+/// The visible files under `root` (a `.context`), for completion and the Artifacts list.
+/// Dotfiles and dot-dirs (an agent's cloned `.git`) are skipped, symlinks aren't followed,
+/// nothing else is ignored.
+// ponytail: stops at CONTEXT_LIMIT in walk order; prune repo-like dirs if a clone in scratch fills it.
+pub fn context_files(root: &Path) -> impl Iterator<Item = ignore::DirEntry> + use<> {
+    ignore::WalkBuilder::new(root)
+        .standard_filters(false)
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .take(CONTEXT_LIMIT)
+}
+
+/// Every visible file under `<task>/.context`, relative to it.
+fn context_paths(task: &Path) -> Vec<String> {
+    let root = task.join(".context");
+    context_files(&root)
+        .filter_map(|e| Some(e.path().strip_prefix(&root).ok()?.to_str()?.to_string()))
+        .collect()
+}
+
+/// `title` as a file name: path separators become `-`, control characters spaces, no leading dots or spaces (the
+/// Artifacts list hides dotfiles), at most 200 bytes (room for a suffix under the 255 limit).
+pub fn file_name(title: &str) -> String {
+    let name: String = (title.chars())
+        .map(|c| {
+            if matches!(c, '/' | ':' | '\\') {
+                '-'
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut name = name.trim_start_matches(|c: char| c == '.' || c.is_whitespace());
+    if name.len() > 200 {
+        name = &name[..name.floor_char_boundary(200)];
+    }
+    match name.trim_end() {
+        "" => "Untitled".into(),
+        n => n.into(),
+    }
 }
 
 /// Committed paths only: a new worktree never contains the checkout's local-only files.
@@ -242,7 +293,7 @@ pub fn mention(path: &str) -> String {
 }
 
 /// Where dropped and pasted files land. The task root isn't a repo, so they stay out of
-/// diffs, and archive removes them with the task.
+/// diffs, and archive removes them with the task (with the rest of `.context`).
 pub const ATTACHMENTS: &str = ".context/attachments";
 
 /// The path to mention for a dropped or pasted path. A file inside the task is referenced
@@ -699,6 +750,85 @@ mod tests {
     }
 
     #[test]
+    fn file_name_replaces_separators_and_caps_length() {
+        assert_eq!(file_name("a/b:c\\d"), "a-b-c-d");
+        assert_eq!(file_name(&"x".repeat(300)).len(), 200);
+    }
+
+    #[test]
+    fn file_name_is_never_hidden_and_never_empty() {
+        assert_eq!(file_name("..env: setup"), "env- setup");
+        assert_eq!(file_name("  . x"), "x");
+        assert_eq!(file_name(""), "Untitled");
+        assert_eq!(file_name(" ..  "), "Untitled");
+    }
+
+    #[test]
+    fn file_name_caps_bytes_on_a_char_boundary() {
+        let n = file_name(&"\u{65e5}".repeat(80));
+        assert!(
+            n.len() <= 200 && n.chars().all(|c| c == '\u{65e5}'),
+            "{}",
+            n.len()
+        );
+        assert!(file_name(&"\u{1f988}".repeat(80)).len() <= 200);
+    }
+
+    #[test]
+    fn context_walk_skips_dotfiles_and_dot_dirs() {
+        let root = std::env::temp_dir().join(format!("shark-ctx-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".context/plans")).unwrap();
+        fs::create_dir_all(root.join(".context/scratch/.git/objects")).unwrap();
+        fs::write(root.join(".context/plans/a plan.md"), "x").unwrap();
+        fs::write(root.join(".context/.hidden"), "x").unwrap();
+        fs::write(root.join(".context/scratch/readme.md"), "x").unwrap();
+        fs::write(root.join(".context/scratch/.git/objects/ab"), "x").unwrap();
+        let mut got = context_paths(&root);
+        got.sort();
+        assert_eq!(got, ["plans/a plan.md", "scratch/readme.md"]);
+        let items = files(&root, &[("api".into(), root.join("api"))]);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.insert == "@\".context/plans/a plan.md\"")
+        );
+        assert!(context_paths(&root.join("none")).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_name_drops_control_characters() {
+        assert_eq!(file_name("Fix\nlogin\0now\t"), "Fix login now");
+    }
+
+    /// A cloned repo or `node_modules` in scratch can't make the walk unbounded.
+    #[test]
+    fn context_walk_stops_at_its_limit() {
+        let root = std::env::temp_dir().join(format!("shark-ctx-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join(".context/scratch/clone");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..CONTEXT_LIMIT + 5 {
+            fs::write(dir.join(format!("{i}.txt")), "").unwrap();
+        }
+        let n = context_paths(&root).len();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(n, CONTEXT_LIMIT);
+    }
+
+    #[test]
+    fn context_completes_for_a_task_without_repos() {
+        let root = std::env::temp_dir().join(format!("shark-ctx-norepo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".context")).unwrap();
+        fs::write(root.join(".context/notes.md"), "x").unwrap();
+        let items = files(&root, &[]);
+        assert!(items.iter().any(|i| i.insert == "@.context/notes.md"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn attach_copies_dedupes_and_references_in_place() {
         let root = std::env::temp_dir().join(format!("shark-attach-{}", std::process::id()));
         let (ws, out) = (root.join("ws"), root.join("out"));
@@ -759,7 +889,7 @@ mod tests {
             crate::git::git(&dir, &["init", "-q"]).unwrap();
             repos.push((name.to_string(), dir));
         }
-        let items = files(&repos);
+        let items = files(&root, &repos);
         assert!(
             !items.iter().any(|i| i.insert.contains("target")),
             "gitignored"

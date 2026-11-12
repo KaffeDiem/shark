@@ -1,7 +1,7 @@
 # Task features and host boundaries
 
 An agent defines reusable instructions and defaults; each task owns its isolated
-work and review state. Diff and Git are task artifacts. Home, All tasks and agent
+work and review state. Diff, Git and Artifacts are task tabs. Home, All tasks and agent
 pages are overview destinations, not another task or a shared agent worktree.
 See the [manual](manual.md) for the user workflow.
 
@@ -10,7 +10,7 @@ confirmation dialogs. A feature owns its GPUI entity, private implementation sta
 rendering, controls, focus targets and local actions. It receives explicit context
 and sends typed requests for work outside that boundary.
 
-Feature implementations live in `src/features/differ/` and `src/features/git/`.
+Feature implementations live in `src/features/differ/`, `src/features/git/` and `src/features/artifacts/`.
 `src/app/features.rs` owns the rail, tabs, activation and focus dispatch;
 `src/app/differ_host.rs` handles Differ's task integration. Shared styling,
 dialogs and clipboard helpers live in `src/ui.rs`. Features import their
@@ -45,7 +45,7 @@ and owns its header/menu workflow.
    Keep task/editor coordination in the host. Tests should cover navigation,
    retention, stale asynchronous work and rejection of destructive operations.
 
-## Differ and Git lifetimes
+## Differ, Git and Artifacts lifetimes
 
 `src/features/differ/mod.rs` owns one long-lived Differ entity. Its child modules
 own diff loading and refresh generations, tree/filter/layout, inline editing, review UI,
@@ -60,6 +60,11 @@ comparison bases as Differ (`Shark::effective_task`) through
 Its Conversation and Commits views keep their state while the other is shown. Closing
 its tab keeps drafts and pending writes. Quit and archive guards inspect retained Git entities even when another
 task or feature is visible. Corrupt draft files remain protected from writes.
+
+Artifacts lists and previews the task's `.context` folder. It is lazy and re-lists
+on show, task switch, finished turns and a short poll while visible. It holds no unsaved
+data, so it needs no storage, pending-write or archive guards. Closing its tab keeps
+nothing that must be saved.
 
 ## Integration and safety
 

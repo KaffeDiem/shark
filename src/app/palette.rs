@@ -441,6 +441,19 @@ pub(super) const COMMANDS: &[Row] = &[
         &ShowGit,
         "pull request description comments review resolve tab",
     ),
+    Row::key(
+        "Show Artifacts",
+        IconName::FolderDot,
+        &ShowArtifacts,
+        "context files plans attachments scratch",
+    ),
+    Row(
+        "Reveal artifacts in Finder",
+        IconName::FolderOpen,
+        None,
+        "context files plans attachments scratch folder",
+        Some(|s, w, cx| s.with_target(w, cx, |_, ws, w, cx| artifacts::reveal(&ws.dir(), w, cx))),
+    ),
     Row(
         "Edit pull request description",
         IconName::Pencil,

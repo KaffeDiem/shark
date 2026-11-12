@@ -17,6 +17,16 @@ pub(super) const ATTACHING: &str = "A repository is still attaching or needs a d
 pub(super) const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
     have none of that chat's context: read the code it touches before you change it.";
 
+/// The approved plan as `.context/plans/<title> plan.md` in the task, replacing an earlier copy.
+fn write_plan_copy(task: &std::path::Path, title: &str, text: &str) -> std::io::Result<()> {
+    let dir = task.join(".context/plans");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join(format!("{} plan.md", crate::complete::file_name(title))),
+        text,
+    )
+}
+
 impl Chat {
     /// Plan mode on or off. A running process switches at once, mid-turn too; a new one
     /// switches as it starts.
@@ -108,6 +118,19 @@ impl Chat {
     /// Marks the latest plan approved and closes the pane: there is nothing left to review.
     pub fn plan_approved(&mut self, cx: &mut Context<Self>) {
         self.plan.update(cx, |p, cx| p.approve(cx));
+        // Codex can't write in plan mode, and claude's draft has a slug name: keep a readable copy.
+        if let Some(text) = crate::plan::handoff_text(&self.meta.id) {
+            let title = match self.meta.title.trim() {
+                "" => self.ws.display_title().to_string(),
+                t => t.to_string(),
+            };
+            if let Err(e) = write_plan_copy(&self.ws.dir(), &title, &text) {
+                self.push(
+                    Block::Info(format!("Couldn't save the plan to .context/plans: {e}")),
+                    cx,
+                );
+            }
+        }
         self.plan_open = false;
         cx.notify();
     }
@@ -142,5 +165,23 @@ impl Chat {
             self.plan.update(cx, |p, cx| p.add(id, text, cx));
             self.plan_open = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn plan_copy_lands_in_context_plans_and_is_overwritten() {
+        let dir = std::env::temp_dir().join(format!("shark-plan-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join(".context/plans/Fix a-b plan.md");
+        write_plan_copy(&dir, "Fix a/b", "# One").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "# One");
+        write_plan_copy(&dir, "Fix a/b", "# Two").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "# Two");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

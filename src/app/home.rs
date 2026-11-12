@@ -1342,7 +1342,7 @@ impl Shark {
         {
             return list
                 .child(h_flex().justify_end().children(grouping.take()))
-                .child(super::agent_settings::empty_state(
+                .child(crate::ui::empty_state(
                     theme,
                     "repo-empty-tasks",
                     IconName::FolderGit2,

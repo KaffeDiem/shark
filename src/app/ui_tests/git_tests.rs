@@ -1728,7 +1728,9 @@ async fn feature_rail_keys_clamp_and_focus_walks_feature_columns(cx: &mut TestAp
         assert_eq!(shark.read(cx).feature_sel, 0);
     })
     .unwrap();
-    press(cx, &["down", "down", "enter"]);
+    press(cx, &["down", "down", "down"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).feature_sel, 2, "clamps at the last feature"));
+    press(cx, &["up", "enter"]);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Git));

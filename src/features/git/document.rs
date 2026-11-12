@@ -28,6 +28,8 @@ pub(crate) struct DocContext {
     pub(crate) dir: String,
     /// `https://github.com/owner/repo`, for opening what can't be shown here.
     pub(crate) web: Option<String>,
+    /// A plain file on disk: `repo` is the root links must stay inside, `dir` is relative to it.
+    pub(crate) on_disk: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1267,6 +1269,42 @@ pub(crate) fn repo_path(dir: &str, url: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// A relative image next to a plain file: read from disk, never outside the root.
+pub(crate) fn on_disk(
+    ctx: &DocContext,
+    path: String,
+    kind: media::Kind,
+) -> Result<MediaFile, String> {
+    let root = ctx.repo.canonicalize().map_err(|e| e.to_string())?;
+    let file = root.join(&path).canonicalize().map_err(|_| "not found")?;
+    if !file.starts_with(&root) {
+        return Err("the link leaves the folder".into());
+    }
+    // Hashing and preparing read the whole file.
+    if std::fs::metadata(&file).map_err(|e| e.to_string())?.len() > media::MAX_MEDIA {
+        return Err("the file is too large to preview".into());
+    }
+    // `prepare` drops the first path segment before hashing, so it gets a dummy one.
+    let sha = crate::git::git(
+        &root,
+        &[
+            "hash-object",
+            &format!("--path={path}"),
+            &file.to_string_lossy(),
+        ],
+    )?;
+    Ok(MediaFile {
+        path: format!("_/{path}").into(),
+        kind,
+        old: None,
+        new: Some(Side {
+            sha,
+            repo: root,
+            source: Source::Working(file),
+        }),
+    })
+}
+
 /// What one media block shows.
 fn resolve(url: &str, ctx: Option<&DocContext>) -> Result<MediaFile, String> {
     if url.contains("://") || url.starts_with("//") {
@@ -1281,6 +1319,9 @@ fn resolve(url: &str, ctx: Option<&DocContext>) -> Result<MediaFile, String> {
     let ctx = ctx.ok_or("relative links need a repository")?;
     let path = repo_path(&ctx.dir, url).ok_or("the link leaves the repository")?;
     let kind = media::kind(&path).ok_or("not an image or video")?;
+    if ctx.on_disk {
+        return on_disk(ctx, path, kind);
+    }
     let rev = ctx
         .rev
         .as_deref()
@@ -1919,6 +1960,75 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn resolves_images_beside_a_plain_file() {
+        let root = std::env::temp_dir().join(format!("shark-doc-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+        std::fs::write(root.join("plans/a.png"), b"png").unwrap();
+        std::fs::write(root.join("top.png"), b"png").unwrap();
+        let ctx = DocContext {
+            repo: root.clone(),
+            rev: None,
+            dir: "plans".into(),
+            web: None,
+            on_disk: true,
+        };
+        let ok = resolve("a.png", Some(&ctx)).unwrap();
+        assert!(matches!(ok.new.unwrap().source, Source::Working(p) if p.ends_with("plans/a.png")));
+        assert!(resolve("../top.png", Some(&ctx)).is_ok());
+        assert!(resolve("../../x.png", Some(&ctx)).is_err());
+        assert!(resolve("missing.png", Some(&ctx)).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A plan embedding a huge image must not hash and copy it in full.
+    #[::core::prelude::v1::test]
+    fn plain_file_images_over_the_media_cap_are_refused() {
+        let root = std::env::temp_dir().join(format!("shark-doc-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let big = std::fs::File::create(root.join("big.png")).unwrap();
+        big.set_len(media::MAX_MEDIA + 1).unwrap(); // sparse: no real disk use
+        let ctx = DocContext {
+            repo: root.clone(),
+            rev: None,
+            dir: String::new(),
+            web: None,
+            on_disk: true,
+        };
+        let got = resolve("big.png", Some(&ctx));
+        std::fs::remove_dir_all(root).ok();
+        assert!(got.is_err_and(|e| e.contains("too large")));
+    }
+
+    #[::core::prelude::v1::test]
+    fn plain_file_images_cannot_escape_the_root() {
+        let base = std::env::temp_dir().join(format!("shark-doc-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("ctx");
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+        std::fs::write(base.join("secret.png"), b"png").unwrap();
+        std::os::unix::fs::symlink(base.join("secret.png"), root.join("plans/link.png")).unwrap();
+        std::os::unix::fs::symlink(&base, root.join("plans/up")).unwrap();
+        let ctx = DocContext {
+            repo: root.clone(),
+            rev: None,
+            dir: "plans".into(),
+            web: None,
+            on_disk: true,
+        };
+        for url in [
+            "../../etc/passwd.png",
+            "../../secret.png",
+            "link.png",
+            "up/secret.png",
+            "/etc/passwd.png",
+        ] {
+            assert!(resolve(url, Some(&ctx)).is_err(), "{url} must be rejected");
+        }
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[::core::prelude::v1::test]
     fn splits_fences_media_and_long_text() {
         let src = "Intro\n\n```mermaid\nflowchart TD\n A-->B\n```\n\n![shot](docs/a.png)\n\
                    <img width=\"300\" alt=\"demo\" src=\"https://github.com/user-attachments/assets/abc\">\n\
@@ -2526,6 +2636,7 @@ mod tests {
             rev: Some("abc".into()),
             dir: "docs".into(),
             web: Some("https://github.com/o/r".into()),
+            on_disk: false,
         };
         assert_eq!(
             web_link("a.png", Some(&ctx)).as_deref(),

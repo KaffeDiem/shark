@@ -211,16 +211,7 @@ impl Shark {
         };
         let (dir, task, to, fast) = (ws.dir(), task.to_string(), to.to_string(), source.fast);
         let instance = ws.instance_id.clone();
-        let file: String = (title.chars())
-            .map(|c| {
-                if matches!(c, '/' | ':' | '\\') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .take(80)
-            .collect();
+        let file = crate::complete::file_name(&title);
         let written = cx.background_executor().spawn(async move {
             let plan = crate::plan::handoff_text(&source.id);
             let md = crate::transcript::markdown(
@@ -307,10 +298,7 @@ impl Shark {
         if agents.is_empty() {
             return notify_err(window, cx, "Create another agent first");
         }
-        let items = agents
-            .iter()
-            .map(|a| super::agent_icon_view::command(a))
-            .collect();
+        let items = agents.iter().map(super::agent_icon_view::command).collect();
         let task = task.to_string();
         open_menu(
             cx.entity().downgrade(),

@@ -32,6 +32,8 @@ fn fixture(home: &Path) -> State {
         ws.open_tab(TabId::File("api/b.txt".into()));
         ws.git_closed = false;
         ws.open_tab(TabId::Git);
+        ws.artifacts_closed = false;
+        ws.open_tab(TabId::Artifacts);
         state.tasks.push(ws);
     }
     state.last_open = Some(("mixed".into(), "chat".into()));
@@ -43,6 +45,7 @@ fn element(id: &TabId) -> SharedString {
         TabId::Chat(id) => format!("chat-tab-{id}"),
         TabId::Diff => "diff-tab".into(),
         TabId::Git => "git-tab".into(),
+        TabId::Artifacts => "artifacts-tab".into(),
         TabId::File(path) => format!("file-tab-{path}"),
     }
     .into()
@@ -60,7 +63,7 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
             app_owns_titlebar_drag: true,
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(0.), px(0.)),
-                size(px(1440.), px(820.)),
+                size(px(1800.), px(820.)),
             ))),
             ..Default::default()
         },
@@ -99,6 +102,7 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
         TabId::Diff,
         TabId::File("api/a.txt".into()),
         TabId::Git,
+        TabId::Artifacts,
     ];
     // Every kind is both source and target, using actual pointer drags.
     for (from, to) in (0..ids.len()).flat_map(|from| {
@@ -669,6 +673,7 @@ async fn closing_shows_the_strip_neighbor(cx: &mut TestAppContext) {
             TabId::Diff,
             TabId::File("api/b.txt".into()),
             TabId::Git,
+            TabId::Artifacts,
             second.clone(),
         ]
     );
@@ -738,6 +743,7 @@ async fn middle_click_closes_the_tab_under_the_pointer(cx: &mut TestAppContext) 
         TabId::File("api/a.txt".into()),
         TabId::Diff,
         TabId::Git,
+        TabId::Artifacts,
         TabId::File("api/b.txt".into()),
     ] {
         click(cx, &id, MouseButton::Middle);
@@ -772,7 +778,7 @@ async fn replacement_chat_keeps_the_slot(cx: &mut TestAppContext) {
         assert_ne!(fresh, TabId::Chat("mixed".into()));
         let strip = s.visible_tab_ids(ws, cx);
         assert_eq!(strip[0], fresh);
-        assert_eq!(strip.len(), 5);
+        assert_eq!(strip.len(), 6);
         assert_eq!(s.active_tab_index(cx), Some(0));
     });
 }

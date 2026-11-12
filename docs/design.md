@@ -8,11 +8,11 @@ Read this before changing UI. This document defines design constraints; [the man
 
 An **agent** is a preset for chats: a reusable name, icon, instructions, skills and defaults. It has a stable slug and survives completed work. Agents are not navigation: they have no sidebar rows and own no tasks. Each chat has at most one agent (`ChatMeta.agent`), picked in the chat composer the way the model is. The agent button starts the composer row, before Plan and the model: the agent's icon and name, or **@ Agent**. Before the first message its menu lists the agents (the current one checked) and **No agent**; picking one applies the agent's model and thinking defaults to that chat. After the first message the agent is fixed and the menu lists the other agents under **Hand off to**. Both states end with **Edit <agent>…** and **New agent…**. `cmd-t` opens a chat on the current chat's agent. One dialog creates and edits an agent; it is not a destination, so closing it leaves the user where they were. Editing shows the 40px avatar (click to change it, ⌘D pastes an image), the name and instructions as inputs, the `@slug`, and a quiet line with **1 skill** (or the plural count) and **Hands off to nobody** (or the next agent's name), each opening an anchored menu. Edits save at once; the footer has **Delete agent…** and **Done**. A new agent shows the same name and instructions with **Cancel** and **Create agent**; it exists only after Create, and the composer that asked for it (a chat's agent menu or Home's agent picker) picks it. The composer menus, **Edit agent…** and **New agent…** in the palette open it. Repository, model and thinking defaults appear as the untouched state of Home's composer. Its controls affect only the draft until **Save as default**, which writes repositories, model and thinking to the agent. Branch, PR, issue and file choices are never saved as defaults. A single **Edited** control appears whenever repository, model or thinking settings differ; its menu names removed repositories and provides **Reset** and **Save**. **Reset** restores the agent defaults without clearing the prompt, issues or files. The composer model menu offers **Follow app default**; saving it stores unset model and thinking values, retaining repository or app inheritance.
 
-A **task** is one isolated piece of work, with its own branches, worktrees, chats and artifacts. `Task.name` is immutable internal identity; `Task.title` is editable display text. A task has no agent; its chats do, and different chats of one task may use different agents. `Task.agents` holds a snapshot of each agent its chats use. A **harness** is the Claude or Codex process serving a chat, not the agent.
+A **task** is one isolated piece of work, with its own branches, worktrees, chats and tabs. `Task.name` is immutable internal identity; `Task.title` is editable display text. A task has no agent; its chats do, and different chats of one task may use different agents. `Task.agents` holds a snapshot of each agent its chats use. A **harness** is the Claude or Codex process serving a chat, not the agent.
 
 A **section** groups tasks in the sidebar and on Home. It does not assign instructions or change any chat's agent. `State.sections` holds them in order; legacy agent-bound sections load as plain sections.
 
-The shell owns destinations, task navigation, artifact tabs and feature launchers. Artifacts own their controls and view state: chats own transcripts, composers and plans; Diff owns its changed-files tree; Git owns PR conversation and commits; file editors own buffers. The Features rail has **Differ and Git**. Each opens or focuses one artifact per task. Browsing either must not require a running model. Reuse this lifecycle when adding a feature; do not introduce a plugin architecture or persistence format for ordinary UI work.
+The shell owns destinations, task navigation, tabs and feature launchers. Tabs own their controls and view state: chats own transcripts, composers and plans; Diff owns its changed-files tree; Git owns PR conversation and commits; Artifacts owns the listing and preview of `.context`; file editors own buffers. The Features rail has **Differ, Git and Artifacts**. Each opens or focuses one tab per task. Browsing either must not require a running model. Reuse this lifecycle when adding a feature; do not introduce a plugin architecture or persistence format for ordinary UI work.
 
 ### Persistent state and delivery
 
@@ -124,17 +124,17 @@ Home's task list uses one 36px line per task: status icon, title, what it waits 
 
 Task headers expose repository/issue attachments and Git controls; chat tabs and composers carry agent identity. Keep controls reachable when narrow: truncate names, let labels yield before essential actions and wrap toolbar rows where needed. A hover card may explain branch, base, path or status, but clicking or keyboard activation must expose the same facts. Failure-first overflow keeps hidden attachment problems reachable.
 
-### Artifact tabs and feature panes
+### Tabs and feature panes
 
-Chats, Diff, Git and file editors share the persisted mixed tab strip. New or explicitly reopened artifacts append; replacing a file preserves its slot. Feature launchers focus an existing artifact or reopen it without duplicates. Closed feature tabs stay closed across restart until explicitly reopened. Tab navigation counts only visible tabs.
+Chats, Diff, Git and file editors share the persisted mixed tab strip. New or explicitly reopened tabs append; replacing a file preserves its slot. Feature launchers focus an existing tab or reopen it without duplicates. Closed feature tabs stay closed across restart until explicitly reopened. Tab navigation counts only visible tabs.
 
-Tabs are 28px tall, up to 200px wide, shrinking to 100px before scrolling. Use `secondary` and `foreground` for the active tab; inactive labels use `sidebar_foreground`, with `foreground` on hover. Long labels fade over their final 24px only when overflowing, with the full value in a tooltip. Reserve stable close/copy hit areas: hover must not move text. File tabs show unsaved state; chat tabs show activity or unread state. Background closure preserves the current artifact and focus.
+Tabs are 28px tall, up to 200px wide, shrinking to 100px before scrolling. Use `secondary` and `foreground` for the active tab; inactive labels use `sidebar_foreground`, with `foreground` on hover. Long labels fade over their final 24px only when overflowing, with the full value in a tooltip. Reserve stable close/copy hit areas: hover must not move text. File tabs show unsaved state; chat tabs show activity or unread state. Background closure preserves the current tab and focus.
 
-The 72px Features rail is present beside task artifacts and absent from overview destinations and Zen. Differ and Git have named, keyboard-reachable launchers; the active artifact has the pill. Feature-specific controls belong inside their artifact, not the rail. Pane navigation includes only visible panes.
+The 72px Features rail is present beside task tabs and absent from overview destinations and Zen. Differ, Git and Artifacts have named, keyboard-reachable launchers; the active tab has the pill. Feature-specific controls belong inside their tab, not the rail. Artifacts shows a dot on its launcher while files are new since last previewed. Pane navigation includes only visible panes.
 
-Diff's comparison toolbar spans its artifact and wraps when narrow. Its file tree lives on the right, below that toolbar, on the island background. It is shown by default, resizes from 200–560px with a 244px default, and retains its saved width. Hiding it returns tree/filter focus to Diff and removes it from pane navigation. Files uses the shared list cursor treatment, 30px rows, 12px indentation and folder-first ordering; compact single-child folders and decorative guides must remain correct after filtering and folding. Repos keep their own row above compact folder chains. Path prefixes shorten from the start before names fade over their final 24px; accessible labels and tooltips retain the full path. Repo and folder labels, chevrons and file path prefixes use `sidebar_foreground`, brightening to `foreground` on row hover or the selected keyboard cursor while the tree has focus; filenames preserve viewed/open state. File icons, guides, status dots and checkboxes retain their colors. Never dim a whole row.
+Diff's comparison toolbar spans its tab and wraps when narrow. Its file tree lives on the right, below that toolbar, on the island background. It is shown by default, resizes from 200–560px with a 244px default, and retains its saved width. Hiding it returns tree/filter focus to Diff and removes it from pane navigation. Files uses the shared list cursor treatment, 30px rows, 12px indentation and folder-first ordering; compact single-child folders and decorative guides must remain correct after filtering and folding. Repos keep their own row above compact folder chains. Path prefixes shorten from the start before names fade over their final 24px; accessible labels and tooltips retain the full path. Repo and folder labels, chevrons and file path prefixes use `sidebar_foreground`, brightening to `foreground` on row hover or the selected keyboard cursor while the tree has focus; filenames preserve viewed/open state. File icons, guides, status dots and checkboxes retain their colors. Never dim a whole row.
 
-Zen is session-only and shows the current artifact on the island background, with a 44px bar protecting traffic lights. It hides navigation, task header, tabs and Features rail while preserving shortcuts and artifact controls. Asking for Home or the sidebar leaves Zen. File operations must preserve the user's existing sidebar mode.
+Zen is session-only and shows the current tab on the island background, with a 44px bar protecting traffic lights. It hides navigation, task header, tabs and Features rail while preserving shortcuts and tab controls. Asking for Home or the sidebar leaves Zen. File operations must preserve the user's existing sidebar mode.
 
 ### Task quick open
 
@@ -164,7 +164,11 @@ Settings is an 800px dialog with a 168px navigation column and shared `section()
 
 Dialogs use `ui::dialog` / `ui::alert_dialog`: 14px corners, 20px form padding and compact 14px text, with `inter_features()`. Menu dialogs retain the menu's smaller inset. Native 180ms fades must keep hit targets still and respect reduced motion. Prefer an existing small `Render` entity for a form over custom overlay infrastructure.
 
-## Artifact content
+### Task `.context`
+
+Each task root has a `.context` folder. Agents and the user write there; nothing else in the task root is for scratch files. Plans go in `.context/plans`, other agent files in `.context/scratch`, and attached files in `.context/attachments`. It is deleted with the task and never committed. Claude's plan files land in `.context/plans` through `plansDirectory`. When a plan is approved, Shark mirrors it to `.context/plans/<chat title> plan.md` for both harnesses. Artifacts (`cmd-shift-a`) lists and previews these files; it holds no unsaved data, so quit and archive guards ignore it. It works on tasks without repositories.
+
+## Tab content
 
 ### Chat, plans and questions
 
@@ -184,7 +188,7 @@ Plan mode owns a pane inside Chat, not a global sidebar: 48% width, minimum 340p
 
 ### Git, attachments and integrations
 
-Git (`src/features/git/mod.rs`) is the PR artifact, with Conversation/Commits, repository selection when needed, local drafts and Refresh. Reuse the centered reading column and house virtual list. PR title, state, branch and author metadata precede the timeline. Comments and threads use `secondary` cards with a 1px border; event-only and collapsed rows stay compact. Review state and resolution always have text as well as icons. Long paths give way from the folder prefix so `file:line` remains visible.
+Git (`src/features/git/mod.rs`) is the PR view, with Conversation/Commits, repository selection when needed, local drafts and Refresh. Reuse the centered reading column and house virtual list. PR title, state, branch and author metadata precede the timeline. Comments and threads use `secondary` cards with a 1px border; event-only and collapsed rows stay compact. Review state and resolution always have text as well as icons. Long paths give way from the folder prefix so `file:line` remains visible.
 
 Reading and editing share `edit_box` geometry so focus does not move surrounding content. Local drafts remain distinct from submitted comments. Save/Comment/Reply are explicit; Keep draft and Discard state their effect. Timeline keyboard selection is shown only after keyboard navigation in the focused pane. Source links and copy actions reserve a stable slot.
 
@@ -255,7 +259,7 @@ Use the gpui spacing scale and established geometry: `radius` for rows/inputs/co
 
 For a UI change, verify these five things:
 
-1. It preserves chat, task and section identity and uses the existing artifact lifecycle and controls.
+1. It preserves chat, task and section identity and uses the existing tab lifecycle and controls.
 2. All text pairs meet the contrast rules on normal, hovered and selected surfaces; colors come from tokens and typography remains readable.
 3. Keyboard navigation, named controls, focus restoration, clipping and narrow-window behavior work without a mouse.
 4. Appropriate state and headless UI tests pass, including `cargo test --features test-support -- --test-threads=1`; exercise cancellation and failure paths when data is involved.

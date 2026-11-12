@@ -28,6 +28,7 @@
       "active_chat": 0,
       "diff_closed": true,
       "git_closed": true,
+      "artifacts_closed": true,
       "viewed": {},
       "tab_order": [
         {

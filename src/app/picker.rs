@@ -15,6 +15,7 @@ pub(super) struct FilePicker {
 
 impl FilePicker {
     fn new(
+        task: PathBuf,
         repos: Vec<(String, PathBuf)>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
@@ -25,7 +26,7 @@ impl FilePicker {
         let _load = cx.spawn_in(window, async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { complete::files(&repos) })
+                .spawn(async move { complete::files(&task, &repos) })
                 .await;
             this.update_in(cx, |p, window, cx| {
                 p.files = files.into_iter().filter(|i| i.kind == Kind::File).collect();
@@ -104,9 +105,9 @@ impl Shark {
         let Some(ws) = self.active_task() else {
             return notify_err(window, cx, "Open a task first");
         };
-        let repos = ws.repo_paths();
+        let (task, repos) = (ws.dir(), ws.repo_paths());
         let shark = cx.entity().downgrade();
-        let picker = cx.new(|cx| FilePicker::new(repos, shark, window, cx));
+        let picker = cx.new(|cx| FilePicker::new(task, repos, shark, window, cx));
         let state = picker.read(cx).state.clone();
         window.open_dialog(cx, move |d, _, cx| menu_dialog(d, cx).child(picker.clone()));
         state.update(cx, |p, cx| p.focus(window, cx));

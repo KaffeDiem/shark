@@ -67,6 +67,7 @@ impl Shark {
                 TabId::Chat(id) => ws.chats.iter().any(|c| &c.id == id),
                 TabId::Diff => Feature::Diff.is_open(ws),
                 TabId::Git => Feature::Git.is_open(ws),
+                TabId::Artifacts => Feature::Artifacts.is_open(ws),
                 TabId::File(path) => self.file_tab_ix(path, cx).is_some(),
             })
             .cloned()
@@ -177,6 +178,10 @@ impl Shark {
                     ChatEvent::TurnDone => {
                         if this.active.as_ref() == Some(&name) {
                             this.refresh_diff(cx);
+                        }
+                        if let Some(artifacts) = this.artifacts.get(&name).cloned() {
+                            artifacts.update(cx, |a, cx| a.refresh(window, cx));
+                            this.sync_artifact_chats(&name, cx);
                         }
                         if this.home_shown() || this.active_chat() != Some(chat) {
                             this.unread.insert(id.clone());
@@ -367,6 +372,7 @@ impl Shark {
             (TabId::Chat(_), Some(ix)) => self.select_chat(ix, window, cx),
             (TabId::Diff, _) => self.show(Tab::Feature(Feature::Diff), window, cx),
             (TabId::Git, _) => self.show(Tab::Feature(Feature::Git), window, cx),
+            (TabId::Artifacts, _) => self.show(Tab::Feature(Feature::Artifacts), window, cx),
             (TabId::File(path), _) => {
                 if let Some(ix) = self.file_tab_ix(&path, cx) {
                     self.select_file(ix, window, cx);
@@ -450,6 +456,7 @@ impl Shark {
                 }
                 TabId::Diff => this.close_feature(Feature::Diff, w, cx),
                 TabId::Git => this.close_feature(Feature::Git, w, cx),
+                TabId::Artifacts => this.close_feature(Feature::Artifacts, w, cx),
                 TabId::File(path) => {
                     let tab = (this.file_tabs.iter()).find(|t| t.editor.read(cx).path == *path);
                     if let Some(editor) = tab.map(|t| t.editor.clone()) {
