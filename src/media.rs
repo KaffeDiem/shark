@@ -33,9 +33,39 @@ const KEEP: usize = 32;
 /// including their GPU textures. gpui's own caches keep everything forever.
 pub(crate) struct Lru(VecDeque<(u64, ImageCacheItem)>);
 
+/// Local images and video above this are not prepared for a preview.
+pub(crate) const MAX_MEDIA: u64 = 50 * 1024 * 1024;
+
+fn key(resource: &Resource) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    resource.hash(&mut h);
+    h.finish()
+}
+
 impl Lru {
     pub(crate) fn new(cx: &mut App) -> Entity<Lru> {
         cx.new(|_| Lru(VecDeque::new()))
+    }
+
+    /// Frees `resource`, so a file rewritten in place is decoded afresh.
+    pub(crate) fn forget(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) {
+        let key = key(resource);
+        self.0.retain(|(k, item)| {
+            if *k == key
+                && let Some(Ok(image)) = item.get()
+            {
+                cx.drop_image(image, Some(window));
+            }
+            *k != key
+        });
+    }
+
+    /// The decoded image cached for `resource`, if any.
+    #[cfg(test)]
+    pub(crate) fn image(&self, resource: &Resource) -> Option<Arc<RenderImage>> {
+        let (_, item) = self.0.iter().find(|(k, _)| *k == key(resource))?;
+        item.get()?.ok()
     }
 }
 
@@ -46,10 +76,7 @@ impl ImageCache for Lru {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        resource.hash(&mut h);
-        let key = h.finish();
+        let key = key(resource);
         match self.0.iter().position(|(k, _)| *k == key) {
             Some(at) => {
                 let item = self.0.remove(at).unwrap();

@@ -78,6 +78,8 @@ pub(crate) struct Artifacts {
     width: f32,
     scroll: UniformListScrollHandle,
     generation: u64,
+    /// A scan is running; the poll waits for it rather than overtaking it.
+    scanning: bool,
     loaded: bool,
     started: Instant,
     /// The tab is on screen; set by the host. Only then does the list poll.
@@ -98,6 +100,10 @@ impl Artifacts {
 
     pub(crate) fn preview(&self) -> &Entity<Preview> {
         &self.preview
+    }
+
+    pub(crate) fn lru(&self) -> &Entity<Lru> {
+        &self.lru
     }
 }
 
@@ -127,18 +133,10 @@ fn scan(root: &Path) -> Result<Vec<Item>, String> {
     }
     let now = SystemTime::now();
     let mut items = vec![];
-    let walk = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .standard_filters(false)
-        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
-        .build();
-    for entry in walk.flatten() {
+    for entry in crate::complete::context_files(root) {
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
         let Ok(meta) = entry.metadata() else { continue };
         let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if now.duration_since(modified).is_ok_and(|d| d < SETTLE) {
@@ -224,7 +222,7 @@ impl Artifacts {
             loop {
                 cx.background_executor().timer(POLL).await;
                 let tick = this.update_in(cx, |s, w, cx| {
-                    if s.visible {
+                    if s.visible && !s.scanning {
                         s.refresh(w, cx);
                     }
                 });
@@ -255,6 +253,7 @@ impl Artifacts {
             width: width.unwrap_or(DEFAULT_WIDTH),
             scroll: UniformListScrollHandle::new(),
             generation: 0,
+            scanning: false,
             loaded: false,
             started: Instant::now(),
             visible: false,
@@ -372,6 +371,7 @@ impl Artifacts {
     /// newer one overtook are dropped.
     pub(crate) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generation += 1;
+        self.scanning = true;
         let generation = self.generation;
         let root = self.dir.join(".context");
         if !self.loaded {
@@ -388,6 +388,7 @@ impl Artifacts {
                 .await;
             this.update_in(cx, |s, window, cx| {
                 if s.generation == generation {
+                    s.scanning = false;
                     s.apply(result, window, cx);
                 }
             })
@@ -424,6 +425,16 @@ impl Artifacts {
         let mut changed = first || self.error.take().is_some() || new != self.items;
         let before = (self.selected.clone(), self.removed);
         let old = std::mem::replace(&mut self.items, new);
+        if changed {
+            let before: HashMap<&str, SystemTime> =
+                (old.iter()).map(|i| (i.rel.as_str(), i.modified)).collect();
+            for i in &self.items {
+                if before.get(i.rel.as_str()).is_some_and(|m| *m != i.modified) {
+                    let res = Resource::Path(self.abs(&i.rel).into());
+                    self.lru.update(cx, |l, cx| l.forget(&res, window, cx));
+                }
+            }
+        }
         match self.selected.clone() {
             _ if self.items.is_empty() => {
                 self.selected = None;
@@ -457,8 +468,8 @@ impl Artifacts {
                 .map(|i| (i.rel.clone(), i.modified))
                 .collect();
         }
-        if let (Some(rel), false) = (self.selected.clone(), self.removed) {
-            // The previewed file reloads in place, so its change is seen.
+        if let (Some(rel), false, true) = (self.selected.clone(), self.removed, self.visible) {
+            // The previewed file reloads in place, so its change is seen, if on screen.
             if self.previewed.as_ref() == Some(&rel) {
                 self.mark_seen(&rel);
             }
@@ -595,6 +606,9 @@ impl Artifacts {
         if let Err(e) = trash(&abs) {
             return notify_err(window, cx, format!("Couldn't delete {rel}: {e}"));
         }
+        // A scan in flight read the folder before the trash and would bring the file back.
+        self.generation += 1;
+        self.scanning = false;
         let old = self.items.clone();
         self.items.retain(|i| i.rel != rel);
         if self.pins.iter().any(|p| p == rel) {

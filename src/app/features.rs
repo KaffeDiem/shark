@@ -309,9 +309,9 @@ impl Shark {
             .any(|(name, a)| a.read(cx).visible() != (shown && self.active.as_ref() == Some(name)))
     }
 
-    /// Tells Artifacts the task's chats, so a plan copy can name its chat.
-    pub(super) fn sync_artifact_chats(&mut self, cx: &mut Context<Self>) {
-        let (Some(ws), Some(artifacts)) = (self.active_task(), self.active_artifacts().cloned())
+    /// Tells the task's Artifacts its chats, so a plan copy can name its chat.
+    pub(super) fn sync_artifact_chats(&mut self, name: &str, cx: &mut Context<Self>) {
+        let (Some(ws), Some(artifacts)) = (self.task(name), self.artifacts.get(name).cloned())
         else {
             return;
         };
@@ -328,7 +328,7 @@ impl Shark {
     ) -> Option<Entity<artifacts::Artifacts>> {
         let name = self.active_task()?.name.clone();
         if let Some(entity) = self.artifacts.get(&name).cloned() {
-            self.sync_artifact_chats(cx);
+            self.sync_artifact_chats(&name, cx);
             return Some(entity);
         }
         let dir = self.active_task()?.dir();
@@ -343,8 +343,8 @@ impl Shark {
                 }
             }));
         self._subs.push(cx.observe(&entity, |_, _, cx| cx.notify()));
-        self.artifacts.insert(name, entity.clone());
-        self.sync_artifact_chats(cx);
+        self.artifacts.insert(name.clone(), entity.clone());
+        self.sync_artifact_chats(&name, cx);
         Some(entity)
     }
 

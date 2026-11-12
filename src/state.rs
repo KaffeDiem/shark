@@ -368,13 +368,13 @@ pub struct Task {
     #[serde(default)]
     pub active_chat: usize,
     /// Closed by default, until an explicit Diff action opens it.
-    #[serde(default = "diff_closed_by_default")]
+    #[serde(default = "closed_by_default")]
     pub diff_closed: bool,
     /// Closed until the Git feature is explicitly opened.
-    #[serde(default = "diff_closed_by_default")]
+    #[serde(default = "closed_by_default")]
     pub git_closed: bool,
     /// Closed until the Artifacts feature is explicitly opened.
-    #[serde(default = "diff_closed_by_default")]
+    #[serde(default = "closed_by_default")]
     pub artifacts_closed: bool,
     /// Artifacts pinned to the top of the list, newest pin first; paths inside `.context`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -410,7 +410,7 @@ pub struct RemovedChat {
     pub evicted: Vec<ChatMeta>,
 }
 
-fn diff_closed_by_default() -> bool {
+fn closed_by_default() -> bool {
     true
 }
 
@@ -441,7 +441,7 @@ impl Default for Task {
             closed: Vec::new(),
             chat_sequence: 0,
             active_chat: 0,
-            diff_closed: diff_closed_by_default(),
+            diff_closed: closed_by_default(),
             git_closed: true,
             artifacts_closed: true,
             artifacts_pinned: Vec::new(),

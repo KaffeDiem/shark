@@ -633,7 +633,12 @@ mod tests {
             ]
         );
         // The filter applies to pinned rows; a group with no match leaves.
-        let some = rows(&items, "b.md", &HashSet::new(), &pins(&["loose.txt", "plans/b.md"]));
+        let some = rows(
+            &items,
+            "b.md",
+            &HashSet::new(),
+            &pins(&["loose.txt", "plans/b.md"]),
+        );
         assert_eq!(shape(&items, &some), ["[pinned 2 true]", "plans/b.md"]);
         // Folding works like any group; a group emptied by pins is gone.
         let folded = HashSet::from([PINNED.to_string()]);
@@ -643,8 +648,10 @@ mod tests {
             ["[pinned 2 false]", "[scratch 1 true]"]
         );
         // Only missing pins: no group.
-        assert!(rows(&items, "", &HashSet::new(), &pins(&["gone.md"]))
-            .iter()
-            .all(|r| !matches!(r, Row::Group { key, .. } if key == PINNED)));
+        assert!(
+            rows(&items, "", &HashSet::new(), &pins(&["gone.md"]))
+                .iter()
+                .all(|r| !matches!(r, Row::Group { key, .. } if key == PINNED))
+        );
     }
 }

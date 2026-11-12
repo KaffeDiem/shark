@@ -646,10 +646,78 @@ async fn artifacts_a_new_file_the_filter_hides_is_not_selected(cx: &mut TestAppC
     assert_eq!(selected(cx, &shark), None);
     write_artifact(&dir, "plans/n.md", b"# Fresh\n", 5);
     let artifacts = cx.update(|cx| shark.read(cx).active_artifacts().unwrap().clone());
-    cx.update_window(window, |_, w, cx| artifacts.update(cx, |a, cx| a.refresh(w, cx)))
-        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        artifacts.update(cx, |a, cx| a.refresh(w, cx))
+    })
+    .unwrap();
     frame(cx, window);
     frame(cx, window);
     assert_eq!(selected(cx, &shark), None, "the filter hides plans/n.md");
     assert!(preview_source(cx, &shark).is_none());
+}
+
+fn refresh(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entity<Shark>) {
+    let a = cx.update(|cx| shark.read(cx).active_artifacts().unwrap().clone());
+    cx.update_window(window, |_, w, cx| a.update(cx, |a, cx| a.refresh(w, cx)))
+        .unwrap();
+}
+
+/// A scan that read the folder before a delete lands after it: the file must stay gone.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn artifacts_a_scan_started_before_a_delete_does_not_bring_it_back(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark, dir) = with_files(cx);
+    press_in(window)(cx, &["down", "cmd-backspace"]);
+    refresh(cx, window, &shark);
+    // Start the scan and let it read the folder, but not land.
+    cx.dispatcher.tick(false);
+    while cx.dispatcher.tick(true) {}
+    cx.update_window(window, |_, w, cx| w.press("enter", cx))
+        .unwrap();
+    assert!(!dir.join(".context/attachments/b.png").exists());
+    cx.run_until_parked();
+    frame(cx, window);
+    assert!(!present(cx, window, "artifact-row-attachments/b.png"));
+    assert_eq!(selected(cx, &shark).as_deref(), Some("plans/a.md"));
+}
+
+/// A turn that rewrites the previewed plan while another tab shows still counts as news.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn artifacts_a_change_while_hidden_stays_new(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark, dir) = with_files(cx);
+    assert_eq!(selected(cx, &shark).as_deref(), Some("plans/a.md"));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    write_artifact(&dir, "plans/a.md", b"# Plan\n\nRewritten\n", 5);
+    refresh(cx, window, &shark);
+    cx.run_until_parked();
+    frame(cx, window);
+    assert!(present(cx, window, "feature-artifacts-badge"));
+}
+
+/// A rewritten screenshot redraws its thumbnail instead of the cached old one.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn artifacts_a_rewritten_image_drops_its_cached_thumbnail(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const RED: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90\x77\x53\xde\x00\x00\x00\x0c\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    const BLUE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90\x77\x53\xde\x00\x00\x00\x0c\x49\x44\x41\x54\x78\x9c\x63\x60\x60\xf8\x0f\x00\x01\x03\x01\x00\x08\x89\xc2\xec\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    let (window, shark, dir) = open_with(cx, &[("attachments/b.png", RED, 40)]);
+    let res = Resource::Path(dir.join(".context/attachments/b.png").into());
+    let image = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let a = shark.read(cx).active_artifacts().unwrap().read(cx);
+            a.lru().read(cx).image(&res)
+        })
+    };
+    frame(cx, window);
+    let red = image(cx).expect("the list decoded its thumbnail");
+    write_artifact(&dir, "attachments/b.png", BLUE, 5);
+    refresh(cx, window, &shark);
+    cx.run_until_parked();
+    frame(cx, window);
+    let now = image(cx).expect("the list decoded it again");
+    assert!(!Arc::ptr_eq(&red, &now), "the thumbnail is the old decode");
 }

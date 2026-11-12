@@ -298,10 +298,7 @@ impl Shark {
         if agents.is_empty() {
             return notify_err(window, cx, "Create another agent first");
         }
-        let items = agents
-            .iter()
-            .map(super::agent_icon_view::command)
-            .collect();
+        let items = agents.iter().map(super::agent_icon_view::command).collect();
         let task = task.to_string();
         open_menu(
             cx.entity().downgrade(),

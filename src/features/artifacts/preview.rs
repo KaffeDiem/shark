@@ -2,7 +2,7 @@
 use crate::editor::language;
 use crate::features::git::commits::{markdown, text_of};
 use crate::features::git::document::{DocContext, RichDoc, on_disk};
-use crate::media::{self, Lru, MediaView, human_bytes};
+use crate::media::{self, Lru, MAX_MEDIA, MediaView, human_bytes};
 use crate::ui::{faint, toolbar};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -17,8 +17,6 @@ use std::time::SystemTime;
 
 /// Text above this is not read for a preview.
 const MAX_TEXT: u64 = 1024 * 1024;
-/// Images and video above this are not prepared for a preview.
-const MAX_MEDIA: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Kind {

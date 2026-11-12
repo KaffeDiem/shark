@@ -177,7 +177,7 @@ mod tests {
     fn plan_copy_lands_in_context_plans_and_is_overwritten() {
         let dir = std::env::temp_dir().join(format!("shark-plan-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let file = dir.join(".context/plans/Fix a/b plan.md".replace("a/b", "a-b"));
+        let file = dir.join(".context/plans/Fix a-b plan.md");
         write_plan_copy(&dir, "Fix a/b", "# One").unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "# One");
         write_plan_copy(&dir, "Fix a/b", "# Two").unwrap();

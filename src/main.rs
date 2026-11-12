@@ -451,8 +451,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("a", AttachArtifact, Some("ArtifactsFeature && !Input")),
         KeyBinding::new("p", PinArtifact, Some("ArtifactsFeature && !Input")),
         KeyBinding::new("r", RefreshArtifacts, Some("ArtifactsFeature && !Input")),
-        KeyBinding::new("cmd-c", CopyArtifactPath, Some("ArtifactsFeature && !Input")),
-        KeyBinding::new("cmd-backspace", DeleteArtifact, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new(
+            "cmd-c",
+            CopyArtifactPath,
+            Some("ArtifactsFeature && !Input"),
+        ),
+        KeyBinding::new(
+            "cmd-backspace",
+            DeleteArtifact,
+            Some("ArtifactsFeature && !Input"),
+        ),
         KeyBinding::new("cmd-f", FilterArtifacts, Some("ArtifactsFeature")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
@@ -672,7 +680,10 @@ mod tests {
         assert!(hit("left", "Sidebar", &CollapseDir) && hit("right", "FileTree", &ExpandDir));
         assert!(hit("enter", "GitFeature", &Confirm) && hit("e", "GitFeature", &EditDescription));
         assert!(hit("r", "GitFeature", &ReplyToThread) && hit("c", "GitFeature", &CommentOnPr));
-        assert!(hit("a", "ArtifactsFeature", &AttachArtifact) && hit("r", "ArtifactsFeature", &RefreshArtifacts));
+        assert!(
+            hit("a", "ArtifactsFeature", &AttachArtifact)
+                && hit("r", "ArtifactsFeature", &RefreshArtifacts)
+        );
         assert!(hit("cmd-backspace", "ArtifactsFeature", &DeleteArtifact));
         assert!(hit("c", "DiffPane", &AddComment) && hit("r", "DiffPane", &ResolveThread));
     }

@@ -181,7 +181,7 @@ impl Shark {
                         }
                         if let Some(artifacts) = this.artifacts.get(&name).cloned() {
                             artifacts.update(cx, |a, cx| a.refresh(window, cx));
-                            this.sync_artifact_chats(cx);
+                            this.sync_artifact_chats(&name, cx);
                         }
                         if this.home_shown() || this.active_chat() != Some(chat) {
                             this.unread.insert(id.clone());

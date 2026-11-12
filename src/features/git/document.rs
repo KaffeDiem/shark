@@ -1280,6 +1280,10 @@ pub(crate) fn on_disk(
     if !file.starts_with(&root) {
         return Err("the link leaves the folder".into());
     }
+    // Hashing and preparing read the whole file.
+    if std::fs::metadata(&file).map_err(|e| e.to_string())?.len() > media::MAX_MEDIA {
+        return Err("the file is too large to preview".into());
+    }
     // `prepare` drops the first path segment before hashing, so it gets a dummy one.
     let sha = crate::git::git(
         &root,
@@ -1976,6 +1980,26 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A plan embedding a huge image must not hash and copy it in full.
+    #[::core::prelude::v1::test]
+    fn plain_file_images_over_the_media_cap_are_refused() {
+        let root = std::env::temp_dir().join(format!("shark-doc-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let big = std::fs::File::create(root.join("big.png")).unwrap();
+        big.set_len(media::MAX_MEDIA + 1).unwrap(); // sparse: no real disk use
+        let ctx = DocContext {
+            repo: root.clone(),
+            rev: None,
+            dir: String::new(),
+            web: None,
+            on_disk: true,
+        };
+        let got = resolve("big.png", Some(&ctx));
+        std::fs::remove_dir_all(root).ok();
+        assert!(got.is_err_and(|e| e.contains("too large")));
+    }
+
     #[::core::prelude::v1::test]
     fn plain_file_images_cannot_escape_the_root() {
         let base = std::env::temp_dir().join(format!("shark-doc-esc-{}", std::process::id()));
@@ -1993,7 +2017,7 @@ mod tests {
             on_disk: true,
         };
         for url in [
-            "../../etc/passwd",
+            "../../etc/passwd.png",
             "../../secret.png",
             "link.png",
             "up/secret.png",

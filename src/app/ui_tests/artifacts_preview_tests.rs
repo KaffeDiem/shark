@@ -39,6 +39,12 @@ fn rig(cx: &mut TestAppContext, name: &str) -> Rig {
     }
 }
 
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 impl Rig {
     fn frames(&mut self) {
         for _ in 0..6 {

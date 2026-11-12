@@ -63,27 +63,40 @@ pub fn files(task: &Path, repos: &[(String, PathBuf)]) -> Vec<Item> {
     file_items(&lists)
 }
 
-/// Every visible file under `<task>/.context`, relative to it. Dotfiles and dot-dirs (an
-/// agent's cloned `.git`) are skipped, like the Artifacts list; nothing else is ignored.
-fn context_paths(task: &Path) -> Vec<String> {
-    let root = task.join(".context");
-    ignore::WalkBuilder::new(&root)
+/// The most files a `.context` walk returns.
+pub const CONTEXT_LIMIT: usize = 2000;
+
+/// The visible files under `root` (a `.context`), for completion and the Artifacts list.
+/// Dotfiles and dot-dirs (an agent's cloned `.git`) are skipped, symlinks aren't followed,
+/// nothing else is ignored.
+// ponytail: stops at CONTEXT_LIMIT in walk order; prune repo-like dirs if a clone in scratch fills it.
+pub fn context_files(root: &Path) -> impl Iterator<Item = ignore::DirEntry> + use<> {
+    ignore::WalkBuilder::new(root)
         .standard_filters(false)
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
         .build()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .take(CONTEXT_LIMIT)
+}
+
+/// Every visible file under `<task>/.context`, relative to it.
+fn context_paths(task: &Path) -> Vec<String> {
+    let root = task.join(".context");
+    context_files(&root)
         .filter_map(|e| Some(e.path().strip_prefix(&root).ok()?.to_str()?.to_string()))
         .collect()
 }
 
-/// `title` as a file name: path separators become `-`, no leading dots or spaces (the
+/// `title` as a file name: path separators become `-`, control characters spaces, no leading dots or spaces (the
 /// Artifacts list hides dotfiles), at most 200 bytes (room for a suffix under the 255 limit).
 pub fn file_name(title: &str) -> String {
     let name: String = (title.chars())
         .map(|c| {
             if matches!(c, '/' | ':' | '\\') {
                 '-'
+            } else if c.is_control() {
+                ' '
             } else {
                 c
             }
@@ -753,7 +766,11 @@ mod tests {
     #[test]
     fn file_name_caps_bytes_on_a_char_boundary() {
         let n = file_name(&"\u{65e5}".repeat(80));
-        assert!(n.len() <= 200 && n.chars().all(|c| c == '\u{65e5}'), "{}", n.len());
+        assert!(
+            n.len() <= 200 && n.chars().all(|c| c == '\u{65e5}'),
+            "{}",
+            n.len()
+        );
         assert!(file_name(&"\u{1f988}".repeat(80)).len() <= 200);
     }
 
@@ -778,6 +795,26 @@ mod tests {
         );
         assert!(context_paths(&root.join("none")).is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_name_drops_control_characters() {
+        assert_eq!(file_name("Fix\nlogin\0now\t"), "Fix login now");
+    }
+
+    /// A cloned repo or `node_modules` in scratch can't make the walk unbounded.
+    #[test]
+    fn context_walk_stops_at_its_limit() {
+        let root = std::env::temp_dir().join(format!("shark-ctx-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join(".context/scratch/clone");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..CONTEXT_LIMIT + 5 {
+            fs::write(dir.join(format!("{i}.txt")), "").unwrap();
+        }
+        let n = context_paths(&root).len();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(n, CONTEXT_LIMIT);
     }
 
     #[test]
