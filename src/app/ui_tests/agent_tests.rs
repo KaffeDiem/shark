@@ -806,7 +806,11 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
     let (window, shark) = empty_app(cx);
     let on = on_app(window, shark.clone());
     press_in(window)(cx, &["cmd-n"]);
-    for feature in Feature::ALL {
+    // Artifacts renders without repositories: plans live in the task, not a repo.
+    for feature in Feature::ALL
+        .into_iter()
+        .filter(|f| *f != Feature::Artifacts)
+    {
         on(cx, &|s, w, cx| s.show(Tab::Feature(feature), w, cx));
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);

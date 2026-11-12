@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) mod fetch;
 mod player;
-mod prepare;
+pub(crate) mod prepare;
 pub(crate) use prepare::{Kind, MediaFile, Side, Source, cache_dir, kind, produce, prune_cache};
 
 /// Height of the before/after boxes, fixed so a row never jumps when its image loads.

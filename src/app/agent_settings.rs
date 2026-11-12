@@ -59,31 +59,6 @@ fn reveal_skills(slug: &str, window: &mut Window, cx: &mut App) {
     }
 }
 
-/// An empty list: what's missing and how it fills, in the shape of Home's empty list.
-pub(super) fn empty_state(
-    theme: &Theme,
-    id: &'static str,
-    icon: IconName,
-    title: impl Into<SharedString>,
-    hint: impl Into<SharedString>,
-) -> AnyElement {
-    v_flex()
-        .id(id)
-        .test_support()
-        .py_10()
-        .items_center()
-        .gap_2()
-        .child(Icon::new(icon).with_size(px(32.)).text_color(faint(theme)))
-        .child(div().text_base().child(title.into()))
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(hint.into()),
-        )
-        .into_any_element()
-}
-
 /// A control whose menu hangs from it, as dropdowns do.
 fn menu_button(
     id: &'static str,

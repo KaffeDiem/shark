@@ -19,7 +19,8 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::resize_handle_appearance;
 use gpui_kit::component::{
-    ActiveTheme as _, IndexPath, Selectable as _, Sizable as _, Theme, WindowExt, h_flex, v_flex,
+    ActiveTheme as _, Icon, IndexPath, Selectable as _, Sizable as _, Theme, WindowExt, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -59,6 +60,31 @@ pub(crate) fn alert_dialog(d: AlertDialog) -> AlertDialog {
 /// `docs/themes.py` checks the same blend against the contrast floor.
 pub(crate) fn faint(theme: &Theme) -> Hsla {
     theme.muted_foreground.blend(theme.background.opacity(0.4))
+}
+
+/// An empty list: what's missing and how it fills, in the shape of Home's empty list.
+pub(crate) fn empty_state(
+    theme: &Theme,
+    id: &'static str,
+    icon: IconName,
+    title: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+) -> AnyElement {
+    v_flex()
+        .id(id)
+        .test_support()
+        .py_10()
+        .items_center()
+        .gap_2()
+        .child(Icon::new(icon).with_size(px(32.)).text_color(faint(theme)))
+        .child(div().text_base().child(title.into()))
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(hint.into()),
+        )
+        .into_any_element()
 }
 
 pub(crate) fn notify_err(window: &mut Window, cx: &mut App, e: impl Into<SharedString>) {

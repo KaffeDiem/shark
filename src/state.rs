@@ -95,6 +95,9 @@ pub struct State {
     /// The Files panel's width, once dragged.
     #[serde(default)]
     pub tree_width: Option<f32>,
+    /// The Artifacts list's width, once dragged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts_width: Option<f32>,
     /// The expanded sidebar's width, once dragged.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
@@ -370,6 +373,12 @@ pub struct Task {
     /// Closed until the Git feature is explicitly opened.
     #[serde(default = "diff_closed_by_default")]
     pub git_closed: bool,
+    /// Closed until the Artifacts feature is explicitly opened.
+    #[serde(default = "diff_closed_by_default")]
+    pub artifacts_closed: bool,
+    /// Artifacts pinned to the top of the list, newest pin first; paths inside `.context`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts_pinned: Vec<String>,
     /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
     #[serde(default)]
     pub viewed: HashMap<String, u64>,
@@ -386,6 +395,7 @@ pub enum TabId {
     Chat(String),
     Diff,
     Git,
+    Artifacts,
     /// `repo/rel/path`, as in the diff.
     File(String),
 }
@@ -433,6 +443,8 @@ impl Default for Task {
             active_chat: 0,
             diff_closed: diff_closed_by_default(),
             git_closed: true,
+            artifacts_closed: true,
+            artifacts_pinned: Vec::new(),
             viewed: HashMap::new(),
             tab_order: Vec::new(),
         }
@@ -973,9 +985,10 @@ impl Task {
     /// chats follow the strip's order, so chat-only cycling matches it.
     pub fn normalize_tabs(&mut self) {
         let mut seen = HashSet::new();
-        let (diff, git) = (
+        let (diff, git, artifacts) = (
             crate::features::Feature::Diff.is_open(self),
             crate::features::Feature::Git.is_open(self),
+            crate::features::Feature::Artifacts.is_open(self),
         );
         let chats = &self.chats;
         self.tab_order.retain(|t| {
@@ -983,6 +996,7 @@ impl Task {
                 TabId::Chat(id) => chats.iter().any(|c| &c.id == id),
                 TabId::Diff => diff,
                 TabId::Git => git,
+                TabId::Artifacts => artifacts,
                 TabId::File(_) => true,
             };
             live && seen.insert(t.clone())
@@ -991,6 +1005,7 @@ impl Task {
             .map(|c| TabId::Chat(c.id.clone()))
             .chain(diff.then_some(TabId::Diff))
             .chain(git.then_some(TabId::Git))
+            .chain(artifacts.then_some(TabId::Artifacts))
             .filter(|t| !seen.contains(t))
             .collect();
         self.tab_order.extend(missing);
@@ -1405,6 +1420,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pinned_artifacts_default_empty_and_roundtrip() {
+        let mut task: Task =
+            serde_json::from_str(r#"{"name":"old","branch":"main","repos":[]}"#).unwrap();
+        assert!(task.artifacts_pinned.is_empty());
+        let json = serde_json::to_value(&task).unwrap();
+        assert!(json.get("artifacts_pinned").is_none());
+        task.artifacts_pinned = vec!["plans/a.md".into()];
+        let saved = serde_json::to_string(&task).unwrap();
+        let back: Task = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.artifacts_pinned, ["plans/a.md"]);
+    }
+
+    #[test]
     fn backlog_defaults_false_and_roundtrips() {
         let mut task: Task =
             serde_json::from_str(r#"{"name":"old","branch":"main","repos":[]}"#).unwrap();
@@ -1706,6 +1734,30 @@ mod tests {
         ws.repos[0].branch = Some("kd/x".into());
         let back: Task = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         assert_eq!(back.branch_of(&back.repos[0]), "kd/x");
+    }
+
+    /// Tasks saved before Artifacts load with it closed; an open one keeps its tab.
+    #[test]
+    fn artifacts_state_defaults_closed_and_normalizes() {
+        let mut ws: Task =
+            serde_json::from_str(r#"{"name":"old","branch":"main","repos":[]}"#).unwrap();
+        ws.migrate();
+        assert!(ws.artifacts_closed);
+        assert!(!ws.tab_order.contains(&TabId::Artifacts));
+        assert_eq!(
+            serde_json::to_string(&TabId::Artifacts).unwrap(),
+            r#""artifacts""#
+        );
+        ws.artifacts_closed = false;
+        ws.normalize_tabs();
+        assert!(ws.tab_order.contains(&TabId::Artifacts));
+        let saved = serde_json::to_string(&ws).unwrap();
+        let mut back: Task = serde_json::from_str(&saved).unwrap();
+        back.migrate();
+        assert_eq!(back.tab_order, ws.tab_order);
+        back.artifacts_closed = true;
+        back.normalize_tabs();
+        assert!(!back.tab_order.contains(&TabId::Artifacts));
     }
 
     /// Old tasks get their chats then a shown Diff; the saved strip mixes kinds, round

@@ -68,6 +68,7 @@ actions!(
         ShowUsage,
         ShowDiff,
         ShowGit,
+        ShowArtifacts,
         CreatePrs,
         OpenPrs,
         CreateDraftPrs,
@@ -184,6 +185,19 @@ actions!(
 // The Git conversation (src/features/git/mod.rs): `e`, `r` and `c` on the cursor.
 actions!(shark, [EditDescription, ReplyToThread, CommentOnPr]);
 
+// The Artifacts list: `a`, `p`, `r`, cmd-c, cmd-backspace and cmd-f.
+actions!(
+    shark,
+    [
+        AttachArtifact,
+        PinArtifact,
+        RefreshArtifacts,
+        CopyArtifactPath,
+        DeleteArtifact,
+        FilterArtifacts
+    ]
+);
+
 // Editor and diff review: cmd-p, and `c` / `shift-c` in the diff.
 actions!(
     shark,
@@ -251,14 +265,14 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str = "(Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal) && !TaskPeek";
+    const NAV: &str = "(Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || ArtifactsFeature || VimNormal) && !TaskPeek";
     const TREE: &str = "(FileTree || Sidebar) && !TaskPeek";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "(Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features) && !TaskPeek";
-    const ARROWS: &str = "(Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)) && !TaskPeek";
+    const MOVE: &str = "(Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || ArtifactsFeature || Features) && !TaskPeek";
+    const ARROWS: &str = "(Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (ArtifactsFeature && !Input) || (Diff && !Vim)) && !TaskPeek";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -306,6 +320,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-alt-b", ToggleFileTree, None),
         KeyBinding::new("cmd-shift-d", ShowDiff, None),
         KeyBinding::new("cmd-shift-g", ShowGit, None),
+        KeyBinding::new("cmd-shift-a", ShowArtifacts, None),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
@@ -432,6 +447,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("e", EditDescription, Some("GitFeature && !Input")),
         KeyBinding::new("r", ReplyToThread, Some("GitFeature && !Input")),
         KeyBinding::new("c", CommentOnPr, Some("GitFeature && !Input")),
+        KeyBinding::new("enter", Confirm, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("a", AttachArtifact, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("p", PinArtifact, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("r", RefreshArtifacts, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("cmd-c", CopyArtifactPath, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("cmd-backspace", DeleteArtifact, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("cmd-f", FilterArtifacts, Some("ArtifactsFeature")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(
@@ -650,6 +672,8 @@ mod tests {
         assert!(hit("left", "Sidebar", &CollapseDir) && hit("right", "FileTree", &ExpandDir));
         assert!(hit("enter", "GitFeature", &Confirm) && hit("e", "GitFeature", &EditDescription));
         assert!(hit("r", "GitFeature", &ReplyToThread) && hit("c", "GitFeature", &CommentOnPr));
+        assert!(hit("a", "ArtifactsFeature", &AttachArtifact) && hit("r", "ArtifactsFeature", &RefreshArtifacts));
+        assert!(hit("cmd-backspace", "ArtifactsFeature", &DeleteArtifact));
         assert!(hit("c", "DiffPane", &AddComment) && hit("r", "DiffPane", &ResolveThread));
     }
 }

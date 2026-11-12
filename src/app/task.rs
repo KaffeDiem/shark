@@ -948,6 +948,13 @@ impl Shark {
             {
                 self.show(Tab::Feature(Feature::Git), window, cx)
             }
+            "artifacts"
+                if self
+                    .active_task()
+                    .is_some_and(|ws| Feature::Artifacts.is_open(ws)) =>
+            {
+                self.show(Tab::Feature(Feature::Artifacts), window, cx)
+            }
             "home" => self.enter_home(window, cx),
             _ => {}
         }
@@ -959,6 +966,7 @@ impl Shark {
             _ if self.home.on => "home",
             Tab::Feature(Feature::Diff) => "diff",
             Tab::Feature(Feature::Git) => "git",
+            Tab::Feature(Feature::Artifacts) => "artifacts",
             Tab::Chat | Tab::File => "chat",
         };
         let open = self.active.clone().map(|n| (n, tab.to_string()));
@@ -1638,6 +1646,7 @@ impl Shark {
         self.syncs.remove(name);
         self.parked_sessions.remove(name);
         self.git_features.remove(name);
+        self.artifacts.remove(name);
         self.attach_results.remove(name);
         self.attn.forget(name);
         self.differ.update(cx, |d, _| d.forget_task(name));

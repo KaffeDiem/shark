@@ -216,21 +216,39 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
     // The chat's agent rides on every start, so a resumed session keeps it too.
     let prompt = crate::git::agent_prompt(ws, chat);
     let skills = crate::git::claude_skill_args(ws);
-    let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
-    // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
-    let prompts = ["--permission-prompt-tool", "stdio"];
-    let agent = prompt
-        .iter()
-        .flat_map(|p| ["--append-system-prompt", p.as_str()]);
     run(
         &ws.dir(),
         chat.model(),
         &chat.id,
-        (prompts.into_iter().chain(effort(chat)).chain(resume))
-            .chain(agent)
-            .chain(skills.iter().map(String::as_str)),
+        launch_args(chat, prompt.as_deref(), &skills),
         Some(transcript_path(&chat.id)),
     )
+}
+
+fn launch_args<'a>(
+    chat: &'a ChatMeta,
+    prompt: Option<&'a str>,
+    skills: &'a [String],
+) -> Vec<&'a str> {
+    let resume = chat
+        .session_id
+        .iter()
+        .flat_map(|id| ["--resume", id.as_str()]);
+    // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
+    let prompts = ["--permission-prompt-tool", "stdio"];
+    // Plan files go in the task, not `~/.claude/plans`.
+    let plans = ["--settings", r#"{"plansDirectory":".context/plans"}"#];
+    let agent = prompt
+        .into_iter()
+        .flat_map(|p| ["--append-system-prompt", p]);
+    (prompts
+        .into_iter()
+        .chain(plans)
+        .chain(effort(chat))
+        .chain(resume))
+    .chain(agent)
+    .chain(skills.iter().map(String::as_str))
+    .collect()
 }
 
 /// The flags of a throwaway, toolless run: no tools, no MCP servers, nothing saved.
@@ -887,5 +905,16 @@ not json"#;
             Some(crate::transcript::QUESTION),
             "a notice isn't a user turn"
         );
+    }
+
+    /// Claude's plan files land in the task's `.context/plans`, not `~/.claude/plans`.
+    #[test]
+    fn claude_launch_args_set_plans_directory() {
+        let chat = ChatMeta::default();
+        let skills = ["--add-dir".to_string(), "/t/api".to_string()];
+        let args = launch_args(&chat, Some("agent"), &skills);
+        let at = args.iter().position(|a| *a == "--settings").unwrap();
+        assert_eq!(args[at + 1], r#"{"plansDirectory":".context/plans"}"#);
+        assert!(args.contains(&"--add-dir") && args.contains(&"agent"));
     }
 }

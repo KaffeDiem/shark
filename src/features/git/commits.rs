@@ -83,7 +83,7 @@ fn when(date: &str) -> String {
     date.replacen('T', " ", 1).chars().take(16).collect()
 }
 
-fn markdown(path: &str) -> bool {
+pub(crate) fn markdown(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     [".md", ".markdown", ".mdx", ".mdown"]
         .iter()
@@ -415,6 +415,7 @@ impl Commits {
                 .map(|(d, _)| d.to_string())
                 .unwrap_or_default(),
             web: self.web.clone(),
+            on_disk: false,
         })
     }
 
@@ -1062,15 +1063,19 @@ fn load(
             human_bytes(size)
         )));
     }
-    let bytes = history::blob(wt, &blob.id)?;
-    let binary = bytes[..bytes.len().min(8000)].contains(&0);
-    match String::from_utf8(bytes) {
-        Ok(text) if !binary => Ok(Loaded::Text(text)),
-        _ => Ok(Loaded::Note(format!(
+    match text_of(history::blob(wt, &blob.id)?) {
+        Some(text) => Ok(Loaded::Text(text)),
+        None => Ok(Loaded::Note(format!(
             "Binary file ({}); it has no text preview.",
             human_bytes(size)
         ))),
     }
+}
+
+/// The text in `bytes`, or `None` for binary: a NUL in the first 8000 bytes or invalid UTF-8.
+pub(crate) fn text_of(bytes: Vec<u8>) -> Option<String> {
+    let binary = bytes[..bytes.len().min(8000)].contains(&0);
+    String::from_utf8(bytes).ok().filter(|_| !binary)
 }
 
 impl Render for Commits {

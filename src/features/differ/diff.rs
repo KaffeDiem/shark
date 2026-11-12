@@ -1307,37 +1307,19 @@ impl Differ {
         entries.push(Entry::Sep);
         if on_disk {
             entries.push(reveal_entry(&abs));
-            for app in crate::apps::installed() {
-                if app.kind != crate::apps::Kind::Folder {
-                    continue;
-                }
-                let a = abs.clone();
-                let label = format!("Open in {}", app.name);
-                let item = menu::item(
-                    crate::ui::app_icon(app),
-                    label,
-                    on_differ(self.task_name(), cx, move |_, _, cx| {
-                        cx.emit(DifferEvent::OpenApp {
-                            app,
-                            path: a.clone(),
-                        });
-                    }),
-                );
-                entries.push(item.image(app.icon.clone()));
-            }
+            entries.extend(open_in_entries(&abs, |app, a| {
+                on_differ(self.task_name(), cx, move |_, _, cx| {
+                    cx.emit(DifferEvent::OpenApp {
+                        app,
+                        path: a.clone(),
+                    });
+                })
+            }));
         }
         entries.push(copy_path_entry(&abs));
         // Relative to the repo, as its own tools and the agent's diffs name it.
-        entries.push(menu::item(
-            IconName::Copy,
-            "Copy relative path",
-            move |w, cx| {
-                copy(
-                    p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(),
-                    w,
-                    cx,
-                )
-            },
+        entries.push(copy_relative_entry(
+            p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(),
         ));
         entries
     }
@@ -1434,7 +1416,7 @@ impl Differ {
 }
 
 /// The "Reveal in Finder" menu entry of `abs`.
-fn reveal_entry(abs: &Path) -> Entry {
+pub(crate) fn reveal_entry(abs: &Path) -> Entry {
     let abs = abs.to_path_buf();
     menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
         cx.reveal_path(&abs)
@@ -1442,11 +1424,37 @@ fn reveal_entry(abs: &Path) -> Entry {
 }
 
 /// The "Copy path" menu entry of `abs`.
-fn copy_path_entry(abs: &Path) -> Entry {
+pub(crate) fn copy_path_entry(abs: &Path) -> Entry {
     let abs = abs.display().to_string();
     menu::item(IconName::Copy, "Copy path", move |w, cx| {
         copy(abs.clone(), w, cx)
     })
+}
+
+/// The "Copy relative path" menu entry; `text` is the path the user's tools expect.
+pub(crate) fn copy_relative_entry(text: String) -> Entry {
+    menu::item(IconName::Copy, "Copy relative path", move |w, cx| {
+        copy(text.clone(), w, cx)
+    })
+}
+
+/// One "Open in <app>" entry per installed app that opens any folder; `on_click` makes the
+/// handler that opens `abs` with it.
+pub(crate) fn open_in_entries<F: Fn(&mut Window, &mut App) + 'static>(
+    abs: &Path,
+    on_click: impl Fn(&'static crate::apps::OpenApp, PathBuf) -> F,
+) -> Vec<Entry> {
+    (crate::apps::installed().iter())
+        .filter(|app| app.kind == crate::apps::Kind::Folder)
+        .map(|app| {
+            let item = menu::item(
+                crate::ui::app_icon(app),
+                format!("Open in {}", app.name),
+                on_click(app, abs.to_path_buf()),
+            );
+            item.image(app.icon.clone())
+        })
+        .collect()
 }
 
 /// The diff's mode for the persisted `unified` choice.

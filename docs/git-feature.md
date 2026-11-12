@@ -1,6 +1,6 @@
-# Git artifact
+# Git view
 
-Git follows the Diff artifact lifecycle: it starts closed, opens once per task,
+Git follows the Diff tab lifecycle: it starts closed, opens once per task,
 participates in the saved tab order, and supports closing, reordering, shortcuts,
 pane navigation, the command palette, and the View menu. `cmd-shift-g` opens it.
 Each task has separate Git state and drafts. Open a task before running Git
@@ -242,7 +242,7 @@ The tests use a local `SHARK_GH` executable to exercise the real subprocess boun
 without publishing test comments. Live API validation uses read-only queries; no live
 PR is modified by these tests. History fixtures live in `src/git/history/tests.rs`, the
 UI tests in `src/app/ui_tests/git_tests.rs`, and the native harness (`--test rendering`)
-renders the commit browser alongside the rest of the artifact.
+renders the commit browser alongside the rest of the view.
 
 Run the opt-in live read test explicitly (it never mutates the PR):
 

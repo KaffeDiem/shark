@@ -4,7 +4,7 @@ Shark is a native macOS app for running coding agents in isolated tasks. Start a
 
 A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. An **agent** is a preset for a chat: a name, icon, instructions, skills and default model settings. Each chat has at most one agent. **Sections** group tasks in the sidebar and on Home; they never change a chat's agent. Claude and Codex are the **harnesses** that run a chat.
 
-Use `cmd-k` for the complete command list and current shortcuts. This guide covers the workflow and behaviors that matter when using it. See the [README](../README.md) for installation, [Git workflows](git-feature.md) for the Git artifact, and [Language intelligence](language-intelligence.md) for editor tooling.
+Use `cmd-k` for the complete command list and current shortcuts. This guide covers the workflow and behaviors that matter when using it. See the [README](../README.md) for installation, [Git workflows](git-feature.md) for the Git view, and [Language intelligence](language-intelligence.md) for editor tooling.
 
 ## Get started
 
@@ -136,7 +136,7 @@ Claude's **Ask a side question** (`cmd-shift-enter` on a draft) answers from the
 
 ### Files and references in chat
 
-Drop or paste files into the composer to attach them. Outside files are copied into the task's `.context/attachments/`; files already inside the task are referenced in place. Outside folders are referenced by absolute path. Deleting the task removes its copied attachments.
+Drop or paste files into the composer to attach them. Outside files are copied into the task's `.context/attachments/`; files already inside the task are referenced in place. Outside folders are referenced by absolute path. Deleting the task removes `.context`, which also holds the agents' plans and scratch files.
 
 Type `@` to mention a repository file or folder, `/` for skills and commands, and `#` to find a PR across the task's repositories. A PR number, URL or title can identify it. References help the model find material; they do not attach another repository to the task.
 
@@ -160,6 +160,24 @@ The editor follows disk changes when clean and refuses to overwrite a file that 
 
 Drag Chat, Diff, Git and File tabs into order. Each task remembers its tabs and restores files from disk. `cmd-w`, the close button or middle-click closes a tab. Closing a background tab preserves the current view. Failed file restores are reported and retried later. Optional Vim mode covers the editor, composer and lists; see [Language intelligence](language-intelligence.md) for supported editor features.
 
+## Artifacts
+
+**Artifacts** (`cmd-shift-a`) lists the files in the task's `.context` folder: plans, attachments, agent scratch files and anything else. Files are grouped as Plans, Attachments, Scratch and other folders, newest first. Pinned files move to a **Pinned** group at the top, most recently pinned first, and stay pinned for the task. It works on tasks without repositories.
+
+Select a file to preview it on the left. Markdown, images, video and text files have previews. A dot marks files that are new or changed since you last previewed them.
+
+| Action | Key |
+|---|---|
+| Open in editor | `enter` |
+| Attach to chat | `a` |
+| Pin or unpin | `p` |
+| Copy path | `cmd-c` |
+| Filter | `cmd-f` |
+| Refresh | `r` |
+| Delete, after confirmation | `cmd-backspace` |
+
+Right-click a file for the same actions and more, including **Reveal in Finder** for that file. The `.context` button above the list opens the folder in Finder. Deleting a file moves it to the Trash.
+
 ## Git, PRs and merging
 
 The git button shows the next step across the task's repositories: commit and push, fix checks, address review, merge or delete the completed task. Its menu exposes other git actions. Steps needing judgment send a request to the selected chat's queue and preserve the composer draft. Mechanical steps run directly. A waiting state opens the relevant PR instead of starting work.
@@ -168,7 +186,7 @@ Shark refreshes git and PR state in the background, retains the last successful 
 
 **Create or update PRs** pushes committed work and creates linked PRs for repositories with changes. Uncommitted work blocks creation. Composer text can supply the title and body: a dialog previews the title, and the draft clears after the PRs exist. **Create draft PRs** leaves them draft until **Ready for review**. After a merged PR, further commits can get a new PR.
 
-**Git** (`cmd-shift-g`) opens the PR artifact. Choose a repository to read or edit its description, inspect reviews, post replies and resolve threads according to your GitHub permissions. Drafts stay with their PRs across task changes and restarts. Before saving a description, Shark checks for remote edits; conflicts preserve your draft. Failed reads keep the last good view. Writes are not automatically retried when their outcome is uncertain.
+**Git** (`cmd-shift-g`) opens the PR view. Choose a repository to read or edit its description, inspect reviews, post replies and resolve threads according to your GitHub permissions. Drafts stay with their PRs across task changes and restarts. Before saving a description, Shark checks for remote edits; conflicts preserve your draft. Failed reads keep the last good view. Writes are not automatically retried when their outcome is uncertain.
 
 Review checkouts show **Fetch updates** when the remote PR changes. It moves the review branch only when the worktree is clean, on the expected branch and commit, and no merge or rebase is underway. Local edits or commits produce guidance instead of overwriting your work. Ignored-file collisions also block fetching.
 
@@ -218,12 +236,13 @@ The footer's **Usage** panel shows Claude and Codex allowance and reset times. G
 | Next or previous tab | `ctrl-tab` / `ctrl-shift-tab` |
 | Model / plan mode / interrupt | `cmd-/` / `shift-tab` / `ctrl-c` |
 | Differ / Git / file picker | `cmd-shift-d` / `cmd-shift-g` / `cmd-p` |
+| Show Artifacts | `cmd-shift-a` |
 | Run repository scripts | `cmd-r` |
 | Next task needing attention | `cmd-j` |
 | Move task to Backlog / active (task lists) | `b` |
 | Sidebar rail / Zen mode | `cmd-b` / `cmd-.` |
 
-Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home's task list uses `i`/`a` to reach the prompt; `b` parks or resumes the selected task there and in the sidebar. Expand Backlog to navigate its rows with the same list keys. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, artifact and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
+Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home's task list uses `i`/`a` to reach the prompt; `b` parks or resumes the selected task there and in the sidebar. Expand Backlog to navigate its rows with the same list keys. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, tab and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
 
 Shark stores state, transcripts, plans, comments and Linear snapshots under `~/Library/Application Support/shark/`. Agent skills live there too. Worktrees remain under `~/shark/workspaces/`; the older directory name and serialized `workspaces` fields are retained for existing installations. Do not move worktrees manually: their git metadata refers to their locations.
 

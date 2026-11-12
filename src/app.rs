@@ -75,7 +75,7 @@ mod task_picker;
 pub(crate) mod ui_tests;
 mod usage;
 
-use crate::features::{Feature, FeatureFocus, differ, git as git_feature};
+use crate::features::{Feature, FeatureFocus, artifacts, differ, git as git_feature};
 use crate::ui::*;
 use differ::Differ;
 use differ::Viewed;
@@ -162,6 +162,7 @@ pub struct Shark {
     features_focus: FocusHandle,
     feature_sel: usize,
     git_features: HashMap<String, Entity<git_feature::GitFeature>>,
+    artifacts: HashMap<String, Entity<artifacts::Artifacts>>,
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
@@ -237,7 +238,7 @@ impl Shark {
             let legacy: Vec<_> = (s.state.tasks.iter())
                 .filter(|t| {
                     std::fs::read_to_string(t.dir().join("CLAUDE.md"))
-                        .is_ok_and(|doc| doc.contains("\n## Agent: "))
+                        .is_ok_and(|doc| root_doc_outdated(&doc))
                 })
                 .cloned()
                 .collect();
@@ -385,6 +386,7 @@ impl Shark {
             features_focus: cx.focus_handle(),
             feature_sel: 0,
             git_features: HashMap::new(),
+            artifacts: HashMap::new(),
             attn: crate::attention::Attention::new(cx),
             menu: None,
             app_switcher: None,
@@ -945,6 +947,9 @@ impl Shark {
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_reorder(cx);
+        if self.artifacts_visibility_stale(cx) {
+            cx.defer_in(window, |s, w, cx| s.sync_artifacts_visible(w, cx));
+        }
         // Toasts clear the toolbar, Features rail, and visible Files controls.
         let mut side = if self.right_rail_shown() {
             px(72.)
@@ -953,6 +958,12 @@ impl Render for Shark {
         };
         if self.tree_shown(cx) {
             side += self.differ.read(cx).files_width(cx);
+        }
+        if self.tab == Tab::Feature(Feature::Artifacts)
+            && !self.home_shown()
+            && let Some(artifacts) = self.active_artifacts()
+        {
+            side += artifacts.read(cx).list_width(cx);
         }
         let top = if self.zen_shown() { px(60.) } else { px(104.) };
         if cx.theme().notification.margins.right != side + px(16.)
@@ -1007,6 +1018,9 @@ impl Render for Shark {
                     this.show(Tab::Feature(Feature::Git), w, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &ShowArtifacts, w, cx| {
+                this.show(Tab::Feature(Feature::Artifacts), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(
                 cx.listener(|this, _: &OpenPrs, w, cx| this.with_sync(w, cx, GitSync::open_prs)),
@@ -1203,5 +1217,26 @@ impl Render for Shark {
                     }
                 }
             })
+    }
+}
+
+/// Root docs written before agents were told to keep files in `.context`, or with an agent section.
+fn root_doc_outdated(doc: &str) -> bool {
+    doc.contains("\n## Agent: ") || !doc.contains(".context")
+}
+
+#[cfg(test)]
+mod root_doc_tests {
+    use super::root_doc_outdated;
+
+    #[test]
+    fn launch_rewrites_docs_lacking_context() {
+        assert!(root_doc_outdated("# Task `x`\n\nOld header.\n"));
+        assert!(root_doc_outdated(
+            "# Task `x`\n\nKeep it in `.context/`.\n\n## Agent: A\n"
+        ));
+        assert!(!root_doc_outdated(
+            "# Task `x`\n\nKeep it in `.context/`.\n"
+        ));
     }
 }

@@ -1,4 +1,5 @@
 //! Task features; app owns their hosting and cross-feature coordination.
+pub(crate) mod artifacts;
 pub(crate) mod differ;
 pub(crate) mod git;
 
@@ -6,6 +7,7 @@ pub(crate) mod git;
 pub(crate) enum Feature {
     Diff,
     Git,
+    Artifacts,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +22,7 @@ impl Feature {
         match self {
             Self::Diff => &mut ws.diff_closed,
             Self::Git => &mut ws.git_closed,
+            Self::Artifacts => &mut ws.artifacts_closed,
         }
     }
 
@@ -28,6 +31,7 @@ impl Feature {
         !match self {
             Self::Diff => ws.diff_closed,
             Self::Git => ws.git_closed,
+            Self::Artifacts => ws.artifacts_closed,
         }
     }
 }

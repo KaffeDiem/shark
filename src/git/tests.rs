@@ -1564,6 +1564,40 @@ fn default_base_skips_pruned_origin_head() {
 }
 
 #[test]
+fn root_docs_point_agents_at_context_and_archive_accepts_it() {
+    let root = std::env::temp_dir().join(format!("shark-context-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let repo = init_repo(&root, "api");
+    let dir = root.join("ws/feat");
+    let ws = create_task(
+        &dir,
+        "feat",
+        "feat",
+        &on_branch(std::slice::from_ref(&repo), "feat"),
+    )
+    .unwrap();
+    for doc in [claude_md(&ws, &dir), agents_md(&ws, &dir)] {
+        assert!(doc.contains(".context/plans/"), "{doc}");
+        assert!(doc.contains(".context/scratch/"), "{doc}");
+    }
+    let bare = Task {
+        repos: vec![],
+        ..ws.clone()
+    };
+    assert!(claude_md(&bare, &dir).contains(".context/plans/"));
+    assert!(agents_md(&bare, &dir).contains(".context/plans/"));
+
+    fs::create_dir_all(dir.join(".context/plans")).unwrap();
+    fs::create_dir_all(dir.join(".context/scratch")).unwrap();
+    fs::write(dir.join(".context/plans/a plan.md"), "x").unwrap();
+    assert!(shark_owned(&dir, ".context"));
+    archive_preflight(&ws, &dir, false).unwrap();
+    remove_task(&ws, &dir, false).unwrap();
+    assert!(!dir.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn archive_refusal_is_preflighted_and_tolerates_finder_and_moved_source() {
     let root = std::env::temp_dir().join(format!("shark-archive-pre-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

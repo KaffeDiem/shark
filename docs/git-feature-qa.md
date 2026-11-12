@@ -1,7 +1,7 @@
 # Historical Git feature QA — October 2026
 
 Results, code names and local logs below describe the reviewed revisions;
-see [Git artifact](git-feature.md) for current behavior and validation commands.
+see [Git view](git-feature.md) for current behavior and validation commands.
 
 QA date: 2026-10-28. Reviewed `905b752..1fe6751` on `git-feature`.
 Four tracks: GitHub API boundary, Git interaction/drafts, feature-refactor
@@ -101,7 +101,7 @@ target does not compile. Draft recovery also needs a product decision: losing
 remote access currently prevents accessing the local draft through Shark.
 
 It is not a complete replacement for GitHub's review UI. Approve/request-changes,
-reviewer management, and detailed checks are not offered by the new artifact.
+reviewer management, and detailed checks are not offered by the new view.
 Those are product-scope gaps, not claims that the refactor removed working features.
 
 ## Original confirmed findings
@@ -196,11 +196,11 @@ remote mutation validation at submission. The new acceptance test is
 | See Mermaid diagrams in descriptions, comments and historical Markdown | Covered | Rendered from the PR head or the viewed commit; failures show the error and source; native rendering at both widths |
 | See images and videos referenced by a document | Covered offline | Relative images come from the captured revision, missing ones explain why, HTTP is rejected; remote downloads are covered by cache-lookup tests only, not live network |
 | Read a long message in full and copy its source | Covered locally | Reader past the compact preview, Source in the read-only editor; `cmd-s` in the reader or Commits never posts a hidden draft |
-| Finish a formal review with Approve or Request changes | Product gap | New artifact reads review states but does not submit these decisions |
-| Push, create PR, mark ready, merge, archive | Available elsewhere | Existing workspace Git controls; no duplicate controls required in this artifact |
+| Finish a formal review with Approve or Request changes | Product gap | New view reads review states but does not submit these decisions |
+| Push, create PR, mark ready, merge, archive | Available elsewhere | Existing workspace Git controls; no duplicate controls required in this view |
 
 Staging/hunk staging, stash management, and a general branch-management client are
-not part of the documented new artifact; commit history is a read-only browser. Decide
+not part of the documented new view; commit history is a read-only browser. Decide
 explicitly whether the label “Git” is intended to promise those workflows. For
 Shark's existing agent-oriented workflow, their absence alone is not a regression.
 

@@ -44,7 +44,9 @@ mod review_share;
 mod review_store;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod test_support;
-pub(crate) use diff::Viewed;
+pub(crate) use diff::{
+    Viewed, copy_path_entry, copy_relative_entry, open_in_entries, reveal_entry,
+};
 pub(crate) use review_send::Target;
 
 #[derive(Clone)]

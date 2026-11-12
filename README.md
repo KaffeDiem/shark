@@ -41,7 +41,7 @@ Needs `git`, signed-in `gh` and `claude` on your login shell's PATH. For Codex m
 
 1. **Add a repository.** Use **Add repo** in `cmd-k`. Optionally choose **New agent…** there and set its instructions and default repositories.
 2. **Start a task.** Describe the work on Home (`cmd-0`) and press Enter. Pick an agent for its first chat with **@ Agent**, or type `@designer fix onboarding spacing`. Attach repositories as needed.
-3. **Guide the work.** Use `shift-tab` for plan mode. Review the plan and approve it when ready; a task needs a repository before building.
+3. **Guide the work.** Use `shift-tab` for plan mode. Review the plan and approve it when ready; a task needs a repository before building. Plans and files agents produce are in **Artifacts** (`cmd-shift-a`).
 4. **Review and ship.** Open **Differ** (`cmd-shift-d`) to inspect changes and send comments back to a chat. Use **Git** (`cmd-shift-g`) for PR discussions and the git menu to create, update and merge PRs.
 5. **Finish the task.** Delete it when done; this removes its conversations, plans and worktrees. Agents stay available for the next chat.
 
