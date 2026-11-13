@@ -813,17 +813,7 @@ pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Res
         review_ref(pr.number, "base")
     )];
     if head {
-        let source = match crate::azure::parse_pr_url(&pr.url) {
-            // Azure DevOps has no `refs/pull/<n>/head`; fetch its source branch.
-            Some(_) => {
-                let b = format!("refs/heads/{}", pr.head);
-                git(src, &["check-ref-format", &b]).map_err(|_| {
-                    "Pull request branch is missing; refresh pull requests".to_string()
-                })?;
-                b
-            }
-            None => format!("refs/pull/{}/head", pr.number),
-        };
+        let source = pr_head_ref(src, pr)?;
         specs.push(format!("+{source}:{}", review_ref(pr.number, "head")));
     }
     // --atomic: if the base fails to update, the head must not advance alone.
@@ -833,11 +823,27 @@ pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Res
     Ok(())
 }
 
+/// The ref holding `pr`'s head: GitHub's `refs/pull/<n>/head`, or on Azure DevOps, which has
+/// none, its source branch (asked for when `pr` came without it, as from the git button).
+fn pr_head_ref(src: &Path, pr: &PullRequest) -> Result<String, String> {
+    if crate::azure::parse_pr_url(&pr.url).is_none() {
+        return Ok(format!("refs/pull/{}/head", pr.number));
+    }
+    let head = match pr.head.is_empty() {
+        true => crate::azure::source_branch(src, &pr.url)?,
+        false => pr.head.clone(),
+    };
+    let b = format!("refs/heads/{head}");
+    git(src, &["check-ref-format", &b])
+        .map_err(|_| "Pull request branch is missing; refresh pull requests".to_string())?;
+    Ok(b)
+}
+
 /// Completion lookups must not move an open review's comparison or update baseline.
 pub(crate) fn fetch_composer_pr_head(src: &Path, pr: &PullRequest) -> Result<String, String> {
     let remote = pr_remote(src, pr)?;
     let reference = format!("refs/shark/composer/pull/{}/head", pr.number);
-    let spec = format!("+refs/pull/{}/head:{reference}", pr.number);
+    let spec = format!("+{}:{reference}", pr_head_ref(src, pr)?);
     cmd_bounded(
         src,
         "git",

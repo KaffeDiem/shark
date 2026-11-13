@@ -415,8 +415,8 @@ pub(super) fn execute(
             };
             let p = r.open_pr().expect("planned a merge");
             if crate::azure::parse_pr_url(&p.url).is_some() {
-                crate::azure::merge(wt, &p.url, &p.head, delete_remote)?;
-                return Ok(Some(format!("merged #{}", p.number)));
+                let done = crate::azure::merge(wt, &p.url, &p.head, delete_remote)?;
+                return Ok(Some(format!("{done} #{}", p.number)));
             }
             args.push(merge_method(wt)?.into());
             // Run from the linked worktree, gh deletes only the remote branch: it skips the

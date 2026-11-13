@@ -2149,3 +2149,23 @@ fn draft_sources_mix_new_base_and_existing_branch() {
     assert!(!dir.exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn pr_head_ref_is_the_source_branch_on_azure() {
+    let pr = |url: &str, head: &str| PullRequest {
+        number: 7,
+        url: url.into(),
+        base: "main".into(),
+        head: head.into(),
+    };
+    let dir = std::env::temp_dir();
+    let github = pr("https://github.com/o/r/pull/7", "");
+    assert_eq!(pr_head_ref(&dir, &github).unwrap(), "refs/pull/7/head");
+    let azure = pr(
+        "https://dev.azure.com/o/p/_git/r/pullrequest/7",
+        "feature/x",
+    );
+    assert_eq!(pr_head_ref(&dir, &azure).unwrap(), "refs/heads/feature/x");
+    let bad = pr("https://dev.azure.com/o/p/_git/r/pullrequest/7", "a..b");
+    assert!(pr_head_ref(&dir, &bad).is_err());
+}
