@@ -1,12 +1,12 @@
-//! Recent-first workspace navigation. PR refreshes repaint rows without reranking them.
+//! Recent-first task navigation. PR refreshes repaint rows without reranking them.
 use super::interaction::now_ms;
 use super::*;
 use crate::sync::Repo as SyncRepo;
 use std::cmp::Reverse;
 
-pub(super) struct WorkspacePicker {
+pub(super) struct TaskPicker {
     pub(super) state: Entity<CommandState>,
-    workspaces: Vec<PickerWorkspace>,
+    tasks: Vec<PickerTask>,
     pub(super) hits: Vec<String>,
     query: String,
     current: Option<String>,
@@ -21,18 +21,21 @@ pub(super) struct WorkspacePicker {
 }
 
 #[derive(PartialEq)]
-pub(super) struct PickerWorkspace {
+pub(super) struct PickerTask {
     name: String,
+    title: String,
     repos: Vec<(String, (String, IconName, Option<crate::prs::PrStatus>))>,
     last_interacted_at: Option<u64>,
     running: usize,
+    backlog: bool,
     attention: Attn,
 }
 
-impl PickerWorkspace {
-    fn new(ws: &Workspace, repos: Option<&[SyncRepo]>, running: usize, attention: Attn) -> Self {
+impl PickerTask {
+    fn new(ws: &Task, repos: Option<&[SyncRepo]>, running: usize, attention: Attn) -> Self {
         Self {
             name: ws.name.clone(),
+            title: ws.display_title().to_string(),
             repos: ws
                 .repos
                 .iter()
@@ -47,11 +50,15 @@ impl PickerWorkspace {
                 .collect(),
             last_interacted_at: ws.last_interacted_at,
             running,
+            backlog: ws.backlog,
             attention,
         }
     }
 
     fn activity(&self) -> Option<String> {
+        if self.backlog {
+            return Some("Backlog".into());
+        }
         let running = match self.running {
             0 => None,
             1 => Some("1 chat running".to_string()),
@@ -75,13 +82,14 @@ fn search_key(name: &str) -> String {
         .join(" ")
 }
 
-fn rank(workspaces: &[PickerWorkspace], query: &str) -> Vec<String> {
+fn rank(tasks: &[PickerTask], query: &str) -> Vec<String> {
     let q: Vec<char> = search_key(query.trim()).chars().collect();
-    let mut hits: Vec<_> = workspaces
+    let mut hits: Vec<_> = tasks
         .iter()
         .enumerate()
         .filter_map(|(order, ws)| {
-            let score = std::iter::once(ws.name.as_str())
+            let score = [ws.title.as_str(), ws.name.as_str()]
+                .into_iter()
                 .chain(ws.repos.iter().map(|(name, _)| name.as_str()))
                 .filter_map(|name| crate::complete::score(&q, &search_key(name), 0))
                 .max()?;
@@ -140,14 +148,14 @@ fn interaction_time(at: Option<u64>, now: u64) -> (String, String) {
     )
 }
 
-impl WorkspacePicker {
-    pub(super) fn snapshot(s: &Shark, cx: &App) -> Vec<PickerWorkspace> {
+impl TaskPicker {
+    pub(super) fn snapshot(s: &Shark, cx: &App) -> Vec<PickerTask> {
         s.ws_order(true)
             .into_iter()
-            .map(|ix| &s.state.workspaces[ix])
+            .map(|ix| &s.state.tasks[ix])
             .filter(|ws| !s.archiving.contains(&ws.name))
             .map(|ws| {
-                PickerWorkspace::new(
+                PickerTask::new(
                     ws,
                     s.overview_repos(&ws.name, cx),
                     s.running_chats(&ws.name, cx),
@@ -158,7 +166,7 @@ impl WorkspacePicker {
     }
 
     pub(super) fn new(
-        workspaces: Vec<PickerWorkspace>,
+        tasks: Vec<PickerTask>,
         current: Option<String>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
@@ -176,7 +184,7 @@ impl WorkspacePicker {
         });
         let mut picker = Self {
             state,
-            workspaces,
+            tasks,
             hits: vec![],
             query: String::new(),
             current,
@@ -205,12 +213,12 @@ impl WorkspacePicker {
         }
         let fresh = Self::snapshot(shark.read(cx), cx);
         let live: HashSet<_> = fresh.iter().map(|ws| ws.name.clone()).collect();
-        let known: HashSet<_> = self.workspaces.iter().map(|ws| ws.name.clone()).collect();
+        let known: HashSet<_> = self.tasks.iter().map(|ws| ws.name.clone()).collect();
         let (kept, added): (Vec<_>, Vec<_>) =
             fresh.into_iter().partition(|ws| known.contains(&ws.name));
         let mut kept: HashMap<_, _> = kept.into_iter().map(|ws| (ws.name.clone(), ws)).collect();
-        let mut workspaces: Vec<_> = self
-            .workspaces
+        let mut tasks: Vec<_> = self
+            .tasks
             .iter()
             .filter_map(|ws| kept.remove(&ws.name))
             .collect();
@@ -225,7 +233,7 @@ impl WorkspacePicker {
         let added_hits = rank(&added, &self.query);
         let changed_hits = removed || !added_hits.is_empty();
         self.hits.extend(added_hits);
-        workspaces.extend(added);
+        tasks.extend(added);
         if changed_hits {
             self.select = Some(
                 selected
@@ -234,8 +242,8 @@ impl WorkspacePicker {
             );
         }
         let minute = now_ms() / 60_000;
-        if self.workspaces != workspaces || self.minute != minute {
-            self.workspaces = workspaces;
+        if self.tasks != tasks || self.minute != minute {
+            self.tasks = tasks;
             self.minute = minute;
             self.command_dirty = true;
             cx.notify();
@@ -244,7 +252,7 @@ impl WorkspacePicker {
 
     fn rank(&mut self) {
         self.command_dirty = true;
-        self.hits = rank(&self.workspaces, &self.query);
+        self.hits = rank(&self.tasks, &self.query);
         self.select = Some(if self.query.trim().is_empty() {
             self.hits
                 .iter()
@@ -256,11 +264,7 @@ impl WorkspacePicker {
     }
 
     fn command(&self, window: &Window, cx: &Context<Self>) -> Command {
-        let by_name: HashMap<_, _> = self
-            .workspaces
-            .iter()
-            .map(|ws| (ws.name.as_str(), ws))
-            .collect();
+        let by_name: HashMap<_, _> = self.tasks.iter().map(|ws| (ws.name.as_str(), ws)).collect();
         let now = now_ms();
         let items = self
             .hits
@@ -269,6 +273,7 @@ impl WorkspacePicker {
                 let ws = by_name.get(name.as_str())?;
                 let rows = ws.repos.clone();
                 let running = ws.running;
+                let backlog = ws.backlog;
                 let attention = ws.attention.clone();
                 let activity = ws.activity();
                 let (time, exact) = interaction_time(ws.last_interacted_at, now);
@@ -277,8 +282,9 @@ impl WorkspacePicker {
                 } else {
                     time
                 };
+                let title = ws.title.clone();
                 let label = format!(
-                    "{name}, {}, {time}, {exact}, {}",
+                    "{title}, {}, {time}, {exact}, {}",
                     activity.as_deref().unwrap_or("Idle"),
                     rows.iter()
                         .map(|(name, (status, ..))| format!("{name}: {status}"))
@@ -313,7 +319,8 @@ impl WorkspacePicker {
                                         .test_support()
                                         .size(px(16.))
                                         .flex_none()
-                                        .child(sidebar::workspace_indicator(
+                                        .child(sidebar::task_indicator(
+                                            backlog,
                                             running,
                                             &attention,
                                             muted,
@@ -327,7 +334,7 @@ impl WorkspacePicker {
                                         .min_w_0()
                                         .truncate()
                                         .font_weight(FontWeight::MEDIUM)
-                                        .child(name.clone()),
+                                        .child(title.clone()),
                                 )
                                 .child(
                                     div()
@@ -394,12 +401,12 @@ impl WorkspacePicker {
         let query = cx.entity().downgrade();
         let names = self.hits.clone();
         let shark = self.shark.clone();
-        let empty = self.workspaces.is_empty();
-        Command::new(&self.state)
+        let empty = self.tasks.is_empty();
+        crate::ui::command(&self.state, window)
             .items(items)
             .filterable(false)
             .bordered(false)
-            .placeholder("Open workspace…")
+            .placeholder("Open task…")
             .max_h(
                 (window.viewport_size().height - px(200.))
                     .max(px(48.))
@@ -416,9 +423,9 @@ impl WorkspacePicker {
                     .p_4()
                     .text_color(cx.theme().muted_foreground)
                     .child(if empty {
-                        "No workspaces yet"
+                        "No tasks yet"
                     } else {
-                        "No matching workspaces"
+                        "No matching tasks"
                     })
             })
             .footer(|_, _, cx| {
@@ -444,13 +451,13 @@ impl WorkspacePicker {
                 };
                 w.close_dialog(cx);
                 shark
-                    .update(cx, |s, cx| s.open_workspace_named(name, w, cx))
+                    .update(cx, |s, cx| s.open_task_named(name, w, cx))
                     .ok();
             })
     }
 }
 
-impl Render for WorkspacePicker {
+impl Render for TaskPicker {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Custom Command children are remeasured for every model update, even when unchanged.
         if self.command_dirty || self.viewport != w.viewport_size() {
@@ -469,14 +476,14 @@ impl Render for WorkspacePicker {
 }
 
 impl Shark {
-    pub(super) fn open_workspace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_task_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.app_switcher.is_some() {
             return self.cycle_open_app(true, window, cx);
         }
-        let workspaces = WorkspacePicker::snapshot(self, cx);
+        let tasks = TaskPicker::snapshot(self, cx);
         let current = (!self.home.on).then(|| self.active.clone()).flatten();
         let owner = cx.entity().downgrade();
-        let picker = cx.new(|cx| WorkspacePicker::new(workspaces, current, owner, window, cx));
+        let picker = cx.new(|cx| TaskPicker::new(tasks, current, owner, window, cx));
         let state = picker.read(cx).state.clone();
         window.open_dialog(cx, move |d, w, cx| {
             menu_dialog(d, cx)
@@ -493,12 +500,12 @@ mod tests {
     use super::*;
     use core::prelude::v1::test;
 
-    fn ws(name: &str, repo: &str, at: Option<u64>) -> PickerWorkspace {
-        PickerWorkspace::new(
-            &Workspace {
+    fn task(name: &str, repo: &str, at: Option<u64>) -> PickerTask {
+        PickerTask::new(
+            &Task {
                 name: name.into(),
                 last_interacted_at: at,
-                repos: vec![crate::state::WsRepo {
+                repos: vec![crate::state::TaskRepo {
                     name: repo.into(),
                     src: PathBuf::new(),
                     base: "main".into(),
@@ -513,8 +520,17 @@ mod tests {
     }
 
     #[test]
+    fn backlog_stays_searchable_and_labels_activity() {
+        let mut parked = task("parked", "api", None);
+        parked.backlog = true;
+        parked.attention = Attn::Unread;
+        assert_eq!(parked.activity().as_deref(), Some("Backlog"));
+        assert_eq!(rank(&[parked], "parked"), vec!["parked"]);
+    }
+
+    #[test]
     fn activity_shows_running_counts_and_preserves_questions() {
-        let mut ws = ws("test", "api", None);
+        let mut ws = task("test", "api", None);
         assert_eq!(ws.activity(), None);
         ws.attention = Attn::Unread;
         assert_eq!(ws.activity().as_deref(), Some("Unread"));
@@ -533,44 +549,68 @@ mod tests {
 
     #[test]
     fn relevance_recency_sidebar_and_unicode() {
-        let workspaces = vec![
-            ws("old", "api", None),
-            ws("api", "web", Some(1)),
-            ws("recent", "api", Some(3)),
-            ws("a-prolonged-name-i", "éK", Some(5)),
-            ws("tie", "api", Some(3)),
+        let tasks = vec![
+            task("old", "api", None),
+            task("api", "web", Some(1)),
+            task("recent", "api", Some(3)),
+            task("a-prolonged-name-i", "éK", Some(5)),
+            task("tie", "api", Some(3)),
         ];
         assert_eq!(
-            rank(&workspaces, ""),
+            rank(&tasks, ""),
             ["a-prolonged-name-i", "recent", "tie", "api", "old"]
         );
         assert_eq!(
-            rank(&workspaces, "a"),
+            rank(&tasks, "a"),
             ["recent", "tie", "api", "old", "a-prolonged-name-i"]
         );
         assert_eq!(
-            rank(&workspaces, "ap"),
+            rank(&tasks, "ap"),
             ["recent", "tie", "api", "old", "a-prolonged-name-i"]
         );
         assert_eq!(
-            rank(&workspaces, "api"),
+            rank(&tasks, "api"),
             ["recent", "tie", "api", "old", "a-prolonged-name-i"]
         );
-        assert_eq!(rank(&workspaces, "Ék"), ["a-prolonged-name-i"]);
-        assert!(rank(&workspaces, "no-match").is_empty());
+        assert_eq!(rank(&tasks, "Ék"), ["a-prolonged-name-i"]);
+        assert!(rank(&tasks, "no-match").is_empty());
         assert!(
-            rank(&[ws("ab", "cd", None)], "bc").is_empty(),
+            rank(&[task("ab", "cd", None)], "bc").is_empty(),
             "never match across name/repo boundaries"
         );
     }
 
     #[test]
-    fn spaced_queries_match_words_in_workspace_and_repo_names() {
-        let workspaces = vec![
-            ws("eng-130-rate-limits", "web", Some(3)),
-            ws("rate_limits", "api", Some(2)),
-            ws("billing", "rate.limits", Some(1)),
-            ws("rate", "limits", Some(4)),
+    fn renamed_agents_rank_by_title_and_keep_their_identity_at_scale() {
+        for count in [100, 1000] {
+            let tasks: Vec<_> = (0..count)
+                .map(|i| {
+                    let mut agent = task(&format!("agent-{i:06}"), "api", Some(i));
+                    agent.title = "Investigate connection failures".into();
+                    agent
+                })
+                .collect();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let hits = rank(&tasks, "connection failures");
+                assert_eq!(hits.len(), count as usize);
+                assert_eq!(hits[0], format!("agent-{:06}", count - 1));
+            }
+            eprintln!(
+                "rank {count} renamed tasks: {:?} per query",
+                start.elapsed() / 20
+            );
+            assert_eq!(rank(&tasks, "agent-000000")[0], "agent-000000");
+        }
+    }
+
+    #[test]
+    fn spaced_queries_match_words_in_task_and_repo_names() {
+        let tasks = vec![
+            task("eng-130-rate-limits", "web", Some(3)),
+            task("rate_limits", "api", Some(2)),
+            task("billing", "rate.limits", Some(1)),
+            task("rate", "limits", Some(4)),
         ];
         for query in [
             "rate limits",
@@ -578,7 +618,7 @@ mod tests {
             "rate-limits",
             "rate_limits",
         ] {
-            let hits = rank(&workspaces, query);
+            let hits = rank(&tasks, query);
             assert_eq!(hits.len(), 3, "{query}: {hits:?}");
             assert!(hits.iter().any(|name| name == "eng-130-rate-limits"));
             assert!(
@@ -591,10 +631,10 @@ mod tests {
     #[test]
     fn timestamps_survive_serde_and_unknown_stays_unknown() {
         let old = r#"{"name":"old","branch":"old","repos":[]}"#;
-        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        let mut ws: Task = serde_json::from_str(old).unwrap();
         assert_eq!(ws.last_interacted_at, None);
         ws.last_interacted_at = Some(1_793_117_632_123);
-        let read: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        let read: Task = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         assert_eq!(read.last_interacted_at, ws.last_interacted_at);
         assert_eq!(interaction_time(None, 0).0, "No recorded interaction");
         assert_eq!(interaction_time(Some(60_000), 0).0, "Just now");
@@ -608,9 +648,9 @@ mod tests {
 
     #[test]
     fn explicit_pr_lifecycle_and_unavailable_states() {
-        let ws = Workspace {
+        let ws = Task {
             name: "test".into(),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: PathBuf::new(),
                 base: "main".into(),

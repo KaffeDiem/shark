@@ -49,7 +49,7 @@ finish it (`git rebase --continue`, `git commit`, …), then report what you did
         id: "wrong_branch",
         title: "Switch to branch",
         repos: "repos on another branch",
-        default: "These repos are on a different branch than their workspace branch `{branch}`: {repos}. Switch them back to \
+        default: "These repos are on a different branch than their task branch `{branch}`: {repos}. Switch them back to \
 `{branch}` (bring over any commits made on the other branch), then report what you did.",
     },
     Prompt {

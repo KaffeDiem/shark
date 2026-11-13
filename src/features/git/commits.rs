@@ -83,7 +83,7 @@ fn when(date: &str) -> String {
     date.replacen('T', " ", 1).chars().take(16).collect()
 }
 
-fn markdown(path: &str) -> bool {
+pub(crate) fn markdown(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     [".md", ".markdown", ".mdx", ".mdown"]
         .iter()
@@ -188,7 +188,7 @@ impl Commits {
                     let list = history::commits(&repo.wt, &repo.base)?;
                     let web = crate::git::git(&repo.wt, &["config", "--get", "remote.origin.url"])
                         .ok()
-                        .and_then(|u| crate::sync::github_url(&u));
+                        .and_then(|u| crate::pr::github_url(&u));
                     Ok::<_, String>((list, web))
                 })
                 .await;
@@ -415,6 +415,7 @@ impl Commits {
                 .map(|(d, _)| d.to_string())
                 .unwrap_or_default(),
             web: self.web.clone(),
+            on_disk: false,
         })
     }
 
@@ -580,7 +581,8 @@ impl Commits {
                     .ghost()
                     .on_click(cx.listener(|s, _, _, cx| {
                         s.close_commit(cx);
-                    })),
+                    }))
+                    .map(|b| crate::ui::toolbar("git-commit-back", b)),
             )
             .child(div().flex_1())
             .child(
@@ -590,7 +592,8 @@ impl Commits {
                     .small()
                     .ghost()
                     .disabled(at.is_none_or(|a| a == 0))
-                    .on_click(cx.listener(|s, _, _, cx| s.step(false, cx))),
+                    .on_click(cx.listener(|s, _, _, cx| s.step(false, cx)))
+                    .map(|b| crate::ui::toolbar("git-commit-newer", b)),
             )
             .child(
                 Button::new("git-commit-older")
@@ -599,7 +602,8 @@ impl Commits {
                     .small()
                     .ghost()
                     .disabled(at.is_none_or(|a| a + 1 >= self.summaries.len()))
-                    .on_click(cx.listener(|s, _, _, cx| s.step(true, cx))),
+                    .on_click(cx.listener(|s, _, _, cx| s.step(true, cx)))
+                    .map(|b| crate::ui::toolbar("git-commit-older", b)),
             );
         let body = match (&self.commit, &self.commit_error) {
             (_, Some(e)) => div()
@@ -803,6 +807,7 @@ impl Commits {
                 .selected(self.view == view)
                 .disabled(!enabled)
                 .on_click(cx.listener(move |s, _, _, cx| s.set_view(view, cx)))
+                .map(|b| crate::ui::toolbar(id, b))
         };
         let toolbar = v_flex()
             .px_4()
@@ -823,7 +828,8 @@ impl Commits {
                             .on_click(cx.listener(|s, _, _, cx| {
                                 s.leave_file(cx);
                                 cx.notify();
-                            })),
+                            }))
+                            .map(|b| crate::ui::toolbar("git-file-back", b)),
                     )
                     .child(
                         div()
@@ -866,7 +872,8 @@ impl Commits {
                                         s.source = false;
                                         s.focus.focus(w, cx);
                                         cx.notify();
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("git-file-preview", b)),
                             )
                             .child(
                                 Button::new("git-file-source")
@@ -882,7 +889,8 @@ impl Commits {
                                         // A cached editor isn't refocused by render_file.
                                         s.focus_target(cx).focus(w, cx);
                                         cx.notify();
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("git-file-source", b)),
                             )
                     })
                     .child(div().flex_1())
@@ -1055,15 +1063,19 @@ fn load(
             human_bytes(size)
         )));
     }
-    let bytes = history::blob(wt, &blob.id)?;
-    let binary = bytes[..bytes.len().min(8000)].contains(&0);
-    match String::from_utf8(bytes) {
-        Ok(text) if !binary => Ok(Loaded::Text(text)),
-        _ => Ok(Loaded::Note(format!(
+    match text_of(history::blob(wt, &blob.id)?) {
+        Some(text) => Ok(Loaded::Text(text)),
+        None => Ok(Loaded::Note(format!(
             "Binary file ({}); it has no text preview.",
             human_bytes(size)
         ))),
     }
+}
+
+/// The text in `bytes`, or `None` for binary: a NUL in the first 8000 bytes or invalid UTF-8.
+pub(crate) fn text_of(bytes: Vec<u8>) -> Option<String> {
+    let binary = bytes[..bytes.len().min(8000)].contains(&0);
+    String::from_utf8(bytes).ok().filter(|_| !binary)
 }
 
 impl Render for Commits {
@@ -1107,7 +1119,8 @@ impl Render for Commits {
                                 .ghost()
                                 .tooltip("Refresh commits")
                                 .disabled(self.loading)
-                                .on_click(cx.listener(|s, _, _, cx| s.refresh(cx))),
+                                .on_click(cx.listener(|s, _, _, cx| s.refresh(cx)))
+                                .map(|b| crate::ui::toolbar("git-commits-refresh", b)),
                         ),
                 )
                 .child(

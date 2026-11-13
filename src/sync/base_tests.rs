@@ -4,13 +4,13 @@ use super::{
     worktrees,
 };
 use crate::git::{git, review_pr_url};
-use crate::state::Workspace;
+use crate::state::Task;
 use serde_json::{Value, json};
 use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 struct Fixture {
     root: PathBuf,
-    ws: Workspace,
+    ws: Task,
     wt: PathBuf,
     path: OsString,
     head: String,
@@ -24,7 +24,7 @@ impl Fixture {
             .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
         let name = format!("sync-base-{name}-{}", std::process::id());
         let root = std::env::temp_dir().join(&name);
-        let mut ws = Workspace {
+        let mut ws = Task {
             name,
             branch: "feature".into(),
             ..Default::default()
@@ -78,7 +78,7 @@ impl Fixture {
             ],
         )
         .unwrap();
-        ws.repos.push(crate::state::WsRepo {
+        ws.repos.push(crate::state::TaskRepo {
             name: "api".into(),
             src: wt.clone(),
             base: "refs/shark/pull/7/base".into(),
@@ -1218,4 +1218,89 @@ fn review_guard_still_blocks_other_kinds() {
     let new_pr = crate::pr::NewPr::new("", false);
     let err = run_step(a, &f.ws, job, &[], &[], &new_pr, false, false).unwrap_err();
     assert!(err.contains("local PR review checkout"), "{err}");
+}
+
+#[test]
+fn diff_counts_refresh_with_unchanged_head_and_changed_file_count() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("diff-counts");
+    fs::write(f.wt.join("tracked"), "first\n").unwrap();
+    git(&f.wt, &["add", "tracked"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "tracked"]);
+    let first = status::probe(&f.wt, "feature", "main", None, false).unwrap();
+    assert_eq!(first.diff, Some((1, 0)));
+    fs::write(f.wt.join("tracked"), "first\nsecond\n").unwrap();
+    let second = status::probe(&f.wt, "feature", "main", Some(&first), false).unwrap();
+    assert_eq!(second.diff, Some((2, 0)));
+    fs::write(f.wt.join("tracked"), "first\nsecond\nthird\n").unwrap();
+    let third = status::probe(&f.wt, "feature", "main", Some(&second), false).unwrap();
+    assert_eq!(third.head, second.head);
+    assert_eq!(third.changed, second.changed);
+    assert_eq!(third.diff, Some((3, 0)));
+    git(&f.wt, &["branch", "alternate", "HEAD"]).unwrap();
+    let retargeted = status::probe(&f.wt, "feature", "alternate", Some(&third), false).unwrap();
+    assert_eq!(retargeted.diff, Some((2, 0)));
+    assert_eq!(retargeted.head, third.head);
+}
+
+#[test]
+fn diff_counts_do_not_depend_on_git_locale() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("diff-locale");
+    fs::write(f.wt.join("tracked"), "first\nsecond\n").unwrap();
+    git(&f.wt, &["add", "tracked"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "tracked"]);
+    let wrapper = f.root.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *' --shortstat '*) printf ' 1 Datei geändert, 2 Zeilen hinzugefügt(+)\\n'; exit 0;; esac\nPATH='{}' exec git \"$@\"\n",
+            f.path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let local = status::probe(&f.wt, "feature", "main", None, false).unwrap();
+    assert_eq!(local.diff, Some((2, 0)));
+}
+
+#[test]
+fn diff_probe_takes_no_optional_locks() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("diff-locks");
+    fs::write(f.wt.join("tracked"), "first\nsecond\n").unwrap();
+    git(&f.wt, &["add", "tracked"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "tracked"]);
+    let wrapper = f.root.join("git");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in diff) echo \"$*\" >> '{}/unlocked';; esac\nPATH='{}' exec git \"$@\"\n",
+        f.root.display(),
+        f.path.to_string_lossy()
+    );
+    fs::write(&wrapper, script).unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let local = status::probe(&f.wt, "feature", "main", None, false).unwrap();
+    assert_eq!(local.diff, Some((2, 0)));
+    let unlocked = fs::read_to_string(f.root.join("unlocked")).unwrap_or_default();
+    assert_eq!(unlocked, "", "diff ran without --no-optional-locks");
+}
+
+#[test]
+fn diff_counts_skip_binary_files_and_survive_odd_names() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("diff-odd-names");
+    fs::write(f.wt.join("blob.bin"), b"\0\x01\x02binary\0").unwrap();
+    fs::write(f.wt.join("tab\there\nand \"quote\" é"), "a\nb\nc\n").unwrap();
+    git(&f.wt, &["add", "-A"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "odd"]);
+    let local = status::probe(&f.wt, "feature", "main", None, false).unwrap();
+    assert_eq!(local.diff, Some((3, 0)));
 }

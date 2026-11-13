@@ -1,14 +1,17 @@
 //! Settings dialog (cmd-,): general (stay awake, Vim mode, repo skills), appearance (mode, light
-//! and dark theme, fonts) and the git button's agent prompts. Preferences apply immediately.
+//! and dark theme, fonts), the git button's agent prompts, the repositories and the Linear
+//! connection. Preferences apply immediately.
 use crate::SwitchField;
 use crate::app::Shark;
+use crate::app::linear_connection::LinearPage;
+use crate::app::repo_settings::ReposPage;
 use crate::prompts::{self, PROMPTS};
 use crate::state::{Appearance, State};
 use crate::theme::{THEMES, theme_configs};
 use crate::ui::{caption, card, dialog, faint, mode_pills, row, section};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
@@ -20,12 +23,30 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
+    open_page(state, 0, window, cx)
+}
+
+/// Settings on its Repositories page.
+pub fn open_repos(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
+    open_page(state, REPOS, window, cx)
+}
+
+/// Settings on its Linear page.
+pub fn open_linear(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
+    open_page(state, LINEAR, window, cx)
+}
+
+fn open_page(state: &State, tab: usize, window: &mut Window, cx: &mut Context<Shark>) {
     let shark = cx.entity().downgrade();
     let view = cx.new(|cx| Settings::new(shark, state, window, cx));
+    view.update(cx, |v, _| v.tab = tab);
     let focus = view.read(cx).focus.clone();
     window.open_dialog(cx, move |d, _, _| {
         // No dialog title: the page list and the page title say where you are.
-        dialog(d).w(px(800.)).child(view.clone())
+        dialog(d)
+            .w(px(800.))
+            .on_ok(|_, _, _| false)
+            .child(view.clone())
     });
     focus.focus(window, cx);
 }
@@ -106,9 +127,18 @@ pub struct Settings {
     ui_font: Choice,
     mono_font: Choice,
     prompts: Vec<Entity<TextareaState>>,
+    repos: Entity<ReposPage>,
+    linear: Entity<LinearPage>,
+    /// The OpenRouter key for task titles, emptied once saved.
+    openrouter: Entity<InputState>,
+    openrouter_note: SharedString,
+    /// A key check or Keychain change is running: Enter waits, so an older one can't land last.
+    openrouter_busy: bool,
+    _openrouter_sub: Subscription,
     _subs: Vec<Subscription>,
 }
 
+const SAVED: &str = "Saved in the Keychain";
 const DEFAULT_UI: &str = "Default (Inter)";
 const DEFAULT_MONO: &str = "Default (JetBrains Mono NL)";
 
@@ -209,17 +239,147 @@ impl Settings {
             })
             .collect();
 
+        let focus = cx.focus_handle();
+        let repos = cx.new(|_| ReposPage::new(shark.clone()));
+        let linear = cx.new(|cx| LinearPage::new(shark.clone(), focus.clone(), window, cx));
+        let (openrouter, _openrouter_sub) = Self::openrouter_input(window, cx);
+        // Whether a key is saved, for the note; `Shark` is mid-update here, so read it later.
+        let weak = shark.clone();
+        cx.spawn(async move |this, cx| {
+            let read = (weak.update(cx, |s, cx| {
+                (s.openrouter_key.is_none()).then(|| cx.read_credentials(crate::title::KEYCHAIN))
+            }))
+            .ok()
+            .flatten();
+            let Some(read) = read else { return };
+            let key = crate::title::key_from(read.await);
+            weak.update(cx, |s, _| {
+                s.openrouter_key.get_or_insert(key);
+            })
+            .ok();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
         Settings {
+            openrouter,
+            openrouter_note: SharedString::default(),
+            openrouter_busy: false,
+            _openrouter_sub,
             shark,
             tab: 0,
-            focus: cx.focus_handle(),
+            focus,
             light: swatches("Light"),
             dark: swatches("Dark"),
             ui_font,
             mono_font,
             prompts,
+            repos,
+            linear,
             _subs: subs,
         }
+    }
+
+    fn openrouter_input(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<InputState>, Subscription) {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("sk-or-…")
+        });
+        let sub = cx.subscribe_in(&input, window, |this, _, ev, w, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                this.save_openrouter(w, cx);
+            }
+        });
+        (input, sub)
+    }
+
+    /// Enter saves a key once one title request works with it; Enter on an empty field removes it.
+    fn save_openrouter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.openrouter_busy {
+            return;
+        }
+        self.openrouter_busy = true;
+        let key = self.openrouter.read(cx).value().trim().to_string();
+        let shark = self.shark.clone();
+        if key.is_empty() {
+            let delete = cx.delete_credentials(crate::title::KEYCHAIN);
+            cx.spawn_in(window, async move |this, cx| {
+                let note: SharedString = match delete.await {
+                    Ok(()) => {
+                        shark.update(cx, |s, _| s.openrouter_key = Some(None)).ok();
+                        "Removed: titles come from the prompt".into()
+                    }
+                    Err(e) => format!("Couldn't remove the key: {e}").into(),
+                };
+                this.update(cx, |this, cx| {
+                    this.openrouter_note = note;
+                    this.openrouter_busy = false;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        self.openrouter_note = "Checking the key…".into();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let k = key.clone();
+            let checked = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::title::generate(&k, "Check that this key can name new tasks")
+                })
+                .await;
+            let saved = match checked {
+                Ok(_) => {
+                    let write = this.update(cx, |_, cx| {
+                        cx.write_credentials(
+                            crate::title::KEYCHAIN,
+                            crate::title::KEYCHAIN_USER,
+                            key.as_bytes(),
+                        )
+                    });
+                    match write {
+                        Ok(write) => write.await.map_err(|e| e.to_string()),
+                        Err(_) => return,
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            Self::finish_openrouter_save(this, shark, key, saved, cx);
+        })
+        .detach();
+    }
+
+    pub(crate) fn finish_openrouter_save(
+        this: WeakEntity<Self>,
+        shark: WeakEntity<Shark>,
+        key: String,
+        saved: Result<(), String>,
+        cx: &mut AsyncWindowContext,
+    ) {
+        if saved.is_ok() {
+            shark
+                .update(cx, |s, _| s.openrouter_key = Some(Some(key)))
+                .ok();
+        }
+        this.update_in(cx, |this, window, cx| {
+            this.openrouter_note = match saved {
+                Ok(()) => {
+                    // A new input, not an emptied one: `set_value` leaves the key on the undo stack.
+                    (this.openrouter, this._openrouter_sub) = Self::openrouter_input(window, cx);
+                    SAVED.into()
+                }
+                Err(e) => format!("Not saved: {e}").into(),
+            };
+            this.openrouter_busy = false;
+            cx.notify();
+        })
+        .ok();
     }
 
     fn with_state<R>(&self, cx: &mut App, f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -254,14 +414,27 @@ impl Settings {
         cx.notify();
     }
 
-    pub(crate) fn set_repo_skills(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.with_state(cx, |s| {
+    pub(crate) fn set_repo_skills(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let errors = self.with_state(cx, |s| {
             s.no_repo_skills = !on;
             crate::git::set_repo_skills(on);
-            for ws in &s.workspaces {
-                crate::git::link_skills(ws, &ws.dir());
-            }
+            s.tasks
+                .iter()
+                .filter_map(|ws| crate::git::link_skills(ws, &ws.dir()).err())
+                .collect::<Vec<_>>()
         });
+        if let Some(errors) = errors.filter(|errors| !errors.is_empty()) {
+            crate::ui::notify_err(
+                window,
+                cx,
+                format!("Couldn't refresh skills: {}", errors.join("\n")),
+            );
+        }
         cx.notify();
     }
 
@@ -349,12 +522,18 @@ impl Settings {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (awake, vim, no_skills) = (self.shark.upgrade())
+        let (awake, vim, no_skills, key_saved) = (self.shark.upgrade())
             .map(|s| {
-                let state = &s.read(cx).state;
-                (state.stay_awake, state.vim, state.no_repo_skills)
+                let s = s.read(cx);
+                let state = &s.state;
+                let key_saved = matches!(s.openrouter_key, Some(Some(_)));
+                (state.stay_awake, state.vim, state.no_repo_skills, key_saved)
             })
             .unwrap_or_default();
+        let note = match (&self.openrouter_note, key_saved) {
+            (n, true) if n.is_empty() => SAVED.into(),
+            (n, _) => n.clone(),
+        };
         let this = cx.entity().downgrade();
         let theme = cx.theme();
         card(theme)
@@ -388,12 +567,31 @@ impl Settings {
                 theme,
                 true,
                 "Skills from repos",
-                "Agents can use the skills in each repo of a workspace",
+                "Agents can use the skills in each repo of a task",
                 Switch::new("repo-skills").checked(!no_skills).on_click({
-                    move |&v, _, cx| {
-                        this.update(cx, |s, cx| s.set_repo_skills(v, cx)).ok();
+                    move |&v, window, cx| {
+                        this.update(cx, |s, cx| s.set_repo_skills(v, window, cx))
+                            .ok();
                     }
                 }),
+            ))
+            .child(row(
+                theme,
+                true,
+                "Task titles from OpenRouter",
+                "With a key, DeepSeek names new tasks in 3-4 words; OpenRouter receives each first prompt. Enter saves, Enter on an empty field removes",
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(Input::new(&self.openrouter).small().id("openrouter-key"))
+                    .when(!note.is_empty(), |c| {
+                        c.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(note),
+                        )
+                    }),
             ))
     }
 
@@ -438,14 +636,14 @@ impl Settings {
                         false,
                         "Interface font",
                         "Sidebar, transcript and menus",
-                        Select::new(&self.ui_font).small().menu_max_h(px(320.)),
+                        Select::new(&self.ui_font).menu_max_h(px(320.)),
                     ))
                     .child(row(
                         theme,
                         true,
                         "Code font",
                         "Code, diffs and tool output",
-                        Select::new(&self.mono_font).small().menu_max_h(px(320.)),
+                        Select::new(&self.mono_font).menu_max_h(px(320.)),
                     ))
                     .child(
                         div()
@@ -543,7 +741,22 @@ const PAGES: &[(IconName, (&str, &str))] = &[
             "Sent to the agent by the git button; {repos} and {branch} are filled in when the step runs",
         ),
     ),
+    (
+        IconName::FolderGit2,
+        (
+            "Repositories",
+            "Click one for its scripts and defaults; drag to set the order scripts run in",
+        ),
+    ),
+    (
+        IconName::Link,
+        ("Linear", "Read-only access to your Linear issues"),
+    ),
 ];
+
+/// The Repositories page's index in `PAGES`.
+const REPOS: usize = 3;
+const LINEAR: usize = 4;
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
 fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
@@ -585,7 +798,7 @@ fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
 }
 
 /// A separated row with the label on top and a full-width control beneath.
-fn stacked(
+pub(crate) fn stacked(
     theme: &Theme,
     label: &'static str,
     desc: &'static str,
@@ -606,7 +819,10 @@ impl Render for Settings {
         let body = match self.tab {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_appearance(cx).into_any_element(),
-            _ => self.render_prompts(cx).into_any_element(),
+            2 => self.render_prompts(cx).into_any_element(),
+            REPOS => self.repos.clone().into_any_element(),
+            LINEAR => self.linear.clone().into_any_element(),
+            _ => unreachable!("unknown settings page"),
         };
         let (title, desc) = PAGES[self.tab].1;
         let theme = cx.theme();

@@ -1,6 +1,8 @@
-# Research notes (Oct 2026)
+# Historical research notes — October 2026
 
-Background for shark: a native app that runs coding agents across **multi-repo** workspaces. Items marked [?] are unverified.
+October 2026 comparisons, CLI observations and proposals; [?] marks unverified
+claims, and old Shark “workspace” terminology means today’s task. For current
+behavior, including language support and Git’s Mermaid rendering, see the [manual](manual.md).
 
 ## Conductor (conductor.build)
 - Each workspace is one git worktree of **one** repo, under `~/conductor/workspaces/<repo>/<city>`. A workspace can start from a branch, PR, GitHub issue or Linear issue.
@@ -118,7 +120,7 @@ Goal: Mermaid in markdown, a live-preview markdown editor (`# ` becomes a headin
 - **Never link Zed's `editor`, `markdown`, `rope`, `text` or `vim` crates.** They are GPL-3.0.
 - **Webview is the last resort** (CodeMirror 6 + `@replit/codemirror-vim`). Problems: z-order, focus bridging, about 50 MB per view [?].
 
-### Roadmap (not started)
+### Proposed roadmap at the time (historical)
 1. **Mermaid in chat.**
    - Add `src/mermaid.rs`. Its plugin claims `lang == "mermaid"` fences only once they are closed.
    - Cache rendered diagrams by source hash, as Pending, Svg or Err. Render on the background executor.

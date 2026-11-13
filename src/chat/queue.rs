@@ -37,7 +37,8 @@ impl Queued {
 impl Chat {
     /// Sends the top queued message if the agent is free.
     pub fn drain(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.hold || self.editing.is_some() || self.queue.is_empty() {
+        let held = self.held().is_some();
+        if self.busy || held || self.editing.is_some() || self.queue.is_empty() {
             return;
         }
         let q = self.queue.remove(0); // editing is None here
@@ -117,19 +118,13 @@ impl Chat {
         if self.qsel >= self.queue.len() {
             return;
         }
-        if self.hold {
-            self.push(
-                Block::Info("a git step is running; it stays queued".into()),
-                cx,
-            );
+        if let Some(why) = self.held() {
+            self.push(Block::Info(format!("{why}; it stays queued")), cx);
             return;
         }
         let editing = self.editing;
         let q = self.take_queued(self.qsel);
-        let busy = self.busy;
         if self.send_block(q.text(), true, q.review.clone(), cx) {
-            // Claude may hold it unread until this turn ends; don't restart the process under it.
-            self.steered |= busy;
             cx.emit(ChatEvent::GitReviewsSent(q.git_reviews));
         } else {
             self.editing = editing;

@@ -25,7 +25,7 @@ pub const MAX_BYTES: u64 = 4 << 20;
 pub enum EditorEvent {
     /// The file on disk now matches the buffer; the diff should refresh.
     Saved,
-    /// Escape with nothing left to cancel: focus the file tree or workspace sidebar.
+    /// Escape with nothing left to cancel: focus the file tree or task sidebar.
     Leave,
     /// A completed :wq closes this editor even if another tab is now selected.
     Close,
@@ -75,14 +75,14 @@ pub struct FileEditor {
     /// `:wq` is waiting for its write to land.
     close_after_save: bool,
     pub(crate) external: bool,
-    pub(crate) intelligence: Option<intelligence::Language>,
-    pub(crate) lsp_setup: Option<Task<()>>,
+    intelligence: Option<intelligence::Language>,
+    lsp_setup: Option<Task<()>>,
     /// Project discovery is running; this file may be about to join a session.
-    pub(crate) discovering: bool,
+    discovering: bool,
     /// A dependency source detached by Retry, waiting for this editor's new session.
-    pub(crate) reattach_to: Option<WeakEntity<FileEditor>>,
-    pub(crate) lsp_request: Option<Task<()>>,
-    pub(crate) lsp_error: Option<String>,
+    reattach_to: Option<WeakEntity<FileEditor>>,
+    lsp_request: Option<Task<()>>,
+    lsp_error: Option<String>,
     /// Document symbols from the language server, refreshed after each sync.
     pub(crate) outline: Vec<intelligence::Symbol>,
     /// `outline` indices around the cursor, outermost first: the jump bar's path.

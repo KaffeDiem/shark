@@ -13,7 +13,7 @@ impl Shark {
         cx.notify();
     }
 
-    /// Data that failed to save, as user-facing lines; `only` limits it to one workspace's.
+    /// Data that failed to save, as user-facing lines; `only` limits it to one task's.
     pub(super) fn unsaved_data(&self, only: Option<&str>, cx: &App) -> Vec<String> {
         let mut errors = Vec::new();
         let keep = |ws: &str| only.is_none_or(|o| o == ws);
@@ -24,17 +24,17 @@ impl Shark {
             .as_ref()
             .filter(|_| only.is_none())
         {
-            errors.push(format!("Workspace state and settings: {e}"));
+            errors.push(format!("Task state and settings: {e}"));
         }
         for (ws, e) in self.differ.read(cx).storage_errors() {
             if keep(&ws) {
-                errors.push(format!("Comments in {ws}: {e}"));
+                errors.push(format!("Comments in {}: {e}", self.task_title(&ws)));
             }
         }
         for chat in self.chats.values() {
             let chat = chat.read(cx);
             let mine = only.is_none_or(|o| {
-                (self.ws(o)).is_some_and(|w| {
+                (self.task(o)).is_some_and(|w| {
                     w.chats
                         .iter()
                         .chain(&w.closed)
@@ -44,10 +44,13 @@ impl Shark {
             if let (true, Some(e)) = (mine, &chat.history_save_error) {
                 errors.push(format!("Completed answers in {}: {e}", chat.meta.id));
             }
+            if let (true, Some(e)) = (mine, chat.plan.read(cx).storage_error()) {
+                errors.push(format!("Plans in {}: {e}", chat.meta.id));
+            }
         }
         for (ws, git) in &self.git_features {
             if let (true, Some(e)) = (keep(ws), git.read(cx).storage_error()) {
-                errors.push(format!("Git drafts in {ws}: {e}"));
+                errors.push(format!("Git drafts in {}: {e}", self.task_title(ws)));
             }
         }
         errors.sort();
@@ -61,7 +64,10 @@ impl Shark {
         }
         self.differ.update(cx, |d, _| d.retry_saves());
         for chat in self.chats.values() {
-            chat.update(cx, |c, cx| c.retry_history(cx));
+            chat.update(cx, |c, cx| {
+                c.retry_history(cx);
+                c.plan.update(cx, |p, cx| p.retry_save(cx));
+            });
         }
         for git in self.git_features.values() {
             git.update(cx, |g, cx| g.retry_save(cx));
@@ -77,7 +83,7 @@ impl Shark {
     ) -> bool {
         if !self.creating.is_empty() || !self.adding_repos.is_empty() || !self.archiving.is_empty()
         {
-            window.push_notification("Wait for workspace changes to finish before closing", cx);
+            window.push_notification("Wait for task changes to finish before closing", cx);
             return false;
         }
         if self.git_features.values().any(|g| g.read(cx).busy()) {

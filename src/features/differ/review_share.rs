@@ -73,9 +73,10 @@ fn post(
     mut inline: Option<(Anchor, String)>,
     fallback: String,
 ) -> Result<String, String> {
+    let target = pr.target()?;
     let mut head = pr.head.clone();
     if let Some((anchor, _)) = inline.as_ref().filter(|(a, _)| a.left) {
-        let verified = crate::pr::verify_original_anchor(wt, pr.number, revision, anchor);
+        let verified = crate::pr::verify_original_anchor(wt, &target, revision, anchor);
         if let Some((captured, _)) = &verified {
             head = captured.clone();
         }
@@ -85,8 +86,8 @@ fn post(
     }
     let inline = inline.as_ref().map(|(a, t)| (a, t.as_str()));
     match review {
-        true => crate::pr::publish_review(wt, pr.number, &head, &body, inline),
-        false => crate::pr::publish_note(wt, pr.number, &body),
+        true => crate::pr::publish_review(wt, &target, &head, &body, inline),
+        false => crate::pr::publish_note(wt, &target, &body),
     }
 }
 
@@ -172,9 +173,9 @@ impl Differ {
         }
     }
 
-    /// The dialog is about one of `ids`, in workspace `ws`: it shows their post.
+    /// The dialog is about one of `ids`, in task `ws`: it shows their post.
     fn shares(&self, ws: &str, ids: &[u64]) -> bool {
-        self.workspace_name() == Some(ws)
+        self.task_name() == Some(ws)
             && (self.review.share.as_ref()).is_some_and(|sh| ids.contains(&sh.id))
     }
 
@@ -187,7 +188,7 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(first), Some(ws)) = (comments.first(), self.active_ws()) else {
+        let (Some(first), Some(ws)) = (comments.first(), self.active_task()) else {
             return;
         };
         let repo = first.repo();
@@ -233,7 +234,7 @@ impl Differ {
                 match res {
                     Ok(url) => {
                         cx.emit(DifferEvent::Interacted(ws_name.clone()));
-                        // Into the workspace they came from, even if another one is open now.
+                        // Into the task they came from, even if another one is open now.
                         s.review.store.edit(&ws_name, |l| {
                             for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {
                                 c.github = Some(url.clone());
@@ -269,7 +270,7 @@ impl Differ {
         let Some(s) = &self.review.share else {
             return d;
         };
-        let (Some(c), Some(ws)) = (self.comment(s.id), self.active_ws()) else {
+        let (Some(c), Some(ws)) = (self.comment(s.id), self.active_task()) else {
             return d;
         };
         let Some((pr, pushed)) = self.pr_of(c) else {

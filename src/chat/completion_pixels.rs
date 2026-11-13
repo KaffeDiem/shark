@@ -64,7 +64,7 @@ pub(crate) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         let fixture = format!("completion-pixels-{}-{name}", std::process::id());
                         let chat = cx.new(|cx| {
                             Chat::new(
-                                Workspace {
+                                Task {
                                     name: fixture.clone(),
                                     ..Default::default()
                                 },

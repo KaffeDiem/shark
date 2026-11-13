@@ -4,7 +4,7 @@ use gpui_kit::test::TestEventExt;
 fn fixture() -> State {
     let mut state = State::default();
     for name in ["Alpha", "Beta", "Gamma"] {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: name.into(),
             branch: "main".into(),
             chats: ["one", "two", "three"]
@@ -18,12 +18,12 @@ fn fixture() -> State {
         };
         ws.normalize_tabs();
         fs::create_dir_all(ws.dir()).unwrap();
-        state.workspaces.push(ws);
+        state.tasks.push(ws);
         state.sections.push(Section {
             name: format!("{name} section"),
             icon: "folder".into(),
             collapsed: false,
-            workspaces: vec![name.into()],
+            tasks: vec![name.into()],
         });
     }
     state.last_open = Some(("Alpha".into(), "chat".into()));
@@ -57,7 +57,7 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let state = fixture();
-    let original = state.workspaces[0].tab_order.clone();
+    let original = state.tasks[0].tab_order.clone();
     let (window, shark) = boot(cx, state, options());
     cx.run_until_parked();
     let (source, target) = cx
@@ -80,8 +80,8 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         .update_window(window, |_, w, cx| {
             w.simulate_next_frame(cx);
             w.render_frame(cx);
-            assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, original);
-            assert_eq!(State::load().workspaces[0].tab_order, original);
+            assert_eq!(shark.read(cx).active_task().unwrap().tab_order, original);
+            assert_eq!(State::load().tasks[0].tab_order, original);
             let middle = w.find("chat-tab-Alpha-three").bounds();
             assert!(
                 middle.left() < target.left(),
@@ -113,11 +113,11 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         assert_inside(preview, shark.read(cx).tab_scroll.bounds());
         w.pointer_up(outside, MouseButton::Left, cx);
         assert_eq!(
-            shark.read(cx).active_ws().unwrap().tab_order,
+            shark.read(cx).active_task().unwrap().tab_order,
             original,
             "release outside cancels"
         );
-        assert_eq!(State::load().workspaces[0].tab_order, original);
+        assert_eq!(State::load().tasks[0].tab_order, original);
     })
     .unwrap();
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -145,8 +145,8 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         w.pointer_up(target.center(), MouseButton::Left, cx);
         let mut expected = original.clone();
         move_item(&mut expected, 0, 2);
-        assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, expected);
-        assert_eq!(State::load().workspaces[0].tab_order, expected);
+        assert_eq!(shark.read(cx).active_task().unwrap().tab_order, expected);
+        assert_eq!(State::load().tasks[0].tab_order, expected);
     })
     .unwrap();
     cx.update_window(window, |_, w, cx| {
@@ -156,16 +156,16 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
         w.pointer_down(source, MouseButton::Left, cx);
         w.pointer_move(source + point(px(-8.), px(0.)), Some(MouseButton::Left), cx);
         shark.update(cx, |s, cx| s.close_chat(w, cx));
-        let remaining = shark.read(cx).active_ws().unwrap().tab_order.clone();
+        let remaining = shark.read(cx).active_task().unwrap().tab_order.clone();
         assert!(!remaining.contains(&TabId::Chat("Alpha-one".into())));
         w.pointer_move(target, Some(MouseButton::Left), cx);
         w.pointer_up(target, MouseButton::Left, cx);
         assert_eq!(
-            shark.read(cx).active_ws().unwrap().tab_order,
+            shark.read(cx).active_task().unwrap().tab_order,
             remaining,
             "closed drag source cannot reorder remaining tabs"
         );
-        assert_eq!(State::load().workspaces[0].tab_order, remaining);
+        assert_eq!(State::load().tasks[0].tab_order, remaining);
     })
     .unwrap();
 }
@@ -258,12 +258,9 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
         w.pointer_move(target, Some(MouseButton::Left), cx);
         assert_eq!(shark.read(cx).section_of("Alpha"), Some(2));
         w.pointer_up(target, MouseButton::Left, cx);
-        assert_eq!(
-            shark.read(cx).state.sections[0].workspaces,
-            ["Beta", "Alpha"]
-        );
+        assert_eq!(shark.read(cx).state.sections[0].tasks, ["Beta", "Alpha"]);
         assert!(shark.read(cx).state.sections[0].collapsed);
-        assert!(shark.read(cx).state.sections[2].workspaces.is_empty());
+        assert!(shark.read(cx).state.sections[2].tasks.is_empty());
         assert_eq!(State::load().sections, shark.read(cx).state.sections);
     })
     .unwrap();
@@ -290,10 +287,7 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
             "own section header is a live-preview no-op"
         );
         w.pointer_up(header, MouseButton::Left, cx);
-        assert_eq!(
-            shark.read(cx).state.sections[0].workspaces,
-            ["Beta", "Alpha"]
-        );
+        assert_eq!(shark.read(cx).state.sections[0].tasks, ["Beta", "Alpha"]);
     })
     .unwrap();
     cx.update_window(window, |_, w, cx| {
@@ -305,7 +299,7 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
         w.pointer_move(target, Some(MouseButton::Left), cx);
         w.pointer_up(target, MouseButton::Left, cx);
         assert_eq!(shark.read(cx).section_of("Alpha"), None);
-        assert_eq!(shark.read(cx).state.sections[0].workspaces, ["Beta"]);
+        assert_eq!(shark.read(cx).state.sections[0].tasks, ["Beta"]);
         assert_eq!(State::load().sections, shark.read(cx).state.sections);
     })
     .unwrap();
@@ -344,7 +338,7 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
         let beta = shark
             .read(cx)
             .state
-            .workspaces
+            .tasks
             .iter()
             .position(|ws| ws.name == "Beta")
             .unwrap();
@@ -355,6 +349,23 @@ async fn sidebar_drag_is_vertical_and_preserves_groups(cx: &mut TestAppContext) 
         );
     })
     .unwrap();
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        for section in &mut s.state.sections {
+            section.tasks.clear();
+        }
+        s.state.sections[0].tasks = vec!["Beta".into()];
+        s.state.sections[1].tasks = vec!["Gamma".into()];
+        s.active = Some("Gamma".into());
+        s.enter_home(w, cx);
+        s.home.sel = Some("Beta".into());
+        let mut target = None;
+        s.with_section(w, cx, |_, i, _, _| target = Some(i));
+        assert_eq!(
+            target,
+            Some(0),
+            "section actions follow the selected task, not the hidden active task"
+        );
+    });
 }
 
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {

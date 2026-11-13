@@ -1,6 +1,9 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
 pub use crate::git::Op;
-use crate::git::{cmd_bounded, git, run};
+use crate::git::{cmd_bounded, git, run, short};
+#[cfg(test)]
+use crate::pr::own;
+use crate::pr::{branch_prs, github_url, origin_repo, pick_pr};
 use crate::prompts;
 use crate::prs::PrStatus;
 use serde_json::Value;
@@ -26,7 +29,7 @@ pub struct Local {
     /// patch-equivalent local one and the local tip is newer, so a lease-guarded force push
     /// loses nothing.
     pub rewritten: bool,
-    /// `(ahead, behind)` vs the workspace base, e.g. `origin/main`.
+    /// `(ahead, behind)` vs the task base, e.g. `origin/main`.
     pub base: (u32, u32),
     /// The repo's default branch, e.g. `origin/main`; a base other than it may be a stack.
     pub trunk: String,
@@ -36,6 +39,9 @@ pub struct Local {
     /// HEAD holds parent commits the base doesn't: the parent was rewritten or squash-merged,
     /// so what follows `parent_tip` must be rebased onto the base.
     pub restack: bool,
+    /// Tracked lines against the Diff view base, refreshed on every probe.
+    pub diff: Option<(u32, u32)>,
+    pub(crate) diff_base: Option<(String, String, String)>,
     pub changed: u32,
     pub conflicts: u32,
     pub op: Option<Op>,
@@ -82,6 +88,15 @@ pub struct Pr {
 }
 
 impl Pr {
+    /// Remote identity captured by discovery, independent of gh's working-directory default.
+    pub fn target(&self) -> Result<crate::pr::Target, String> {
+        let target = crate::pr::Target::from_url(&self.url)?;
+        if target.number != self.number {
+            return Err("GitHub pull request URL and number disagree".into());
+        }
+        Ok(target)
+    }
+
     /// `head` is the PR's head, or a merged PR contains it.
     pub fn has(&self, head: &str) -> bool {
         self.head == head || (!head.is_empty() && self.contains_head == head)
@@ -207,7 +222,64 @@ pub fn probe(
             l.remote = Some(ab);
         }
     }
+    let base_oid = crate::git::ref_oid(wt, base);
+    if let Some(base_oid) = base_oid {
+        let merge_base = prev
+            .and_then(|p| p.diff_base.as_ref())
+            .filter(|(head, base, _)| head == &l.head && base == &base_oid)
+            .map(|(_, _, merge)| merge.clone())
+            .or_else(|| git(wt, &["merge-base", "HEAD", &base_oid]).ok());
+        if let Some(merge) = merge_base {
+            l.diff = crate::git::git_bytes(
+                wt,
+                &[
+                    "--no-optional-locks",
+                    "diff",
+                    "--no-ext-diff",
+                    "--numstat",
+                    "-z",
+                    &merge,
+                    "--",
+                ],
+            )
+            .ok()
+            .map(|out| numstat(&out));
+            l.diff_base = Some((l.head.clone(), base_oid, merge));
+        }
+    }
     base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l, allow_parent_update))
+}
+
+/// Sums `git diff --numstat -z` (`added<TAB>deleted<TAB>path<NUL>`, locale-independent). A rename
+/// has an empty path and its two names as the next NUL fields; binary files count `-` as zero.
+fn numstat(out: &[u8]) -> (u32, u32) {
+    let mut counts = (0u32, 0u32);
+    let mut fields = out.split(|b| *b == 0);
+    while let Some(record) = fields.next() {
+        let mut cols = record.splitn(3, |b| *b == b'\t');
+        let mut n = || {
+            cols.next()
+                .and_then(|c| std::str::from_utf8(c).ok()?.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let (added, deleted) = (n(), n());
+        counts = (
+            counts.0.saturating_add(added),
+            counts.1.saturating_add(deleted),
+        );
+        if cols.next().is_some_and(|path| path.is_empty()) {
+            fields.nth(1);
+        }
+    }
+    counts
+}
+
+pub fn compact_age(d: std::time::Duration) -> String {
+    if d.as_secs() < 60 {
+        "now".into()
+    } else {
+        ago(d).trim_end_matches(" ago").into()
+    }
 }
 
 /// The trunk the last probe found, else the repo's default branch.
@@ -355,46 +427,12 @@ fn checks(rollup: &Value) -> Checks {
     }
 }
 
-/// `branch`'s PRs of any state in origin's repo (`--repo`, so a fork's upstream never answers),
-/// as `gh pr list --json fields` gives them; same-named fork branches are left out.
-pub fn branch_prs(wt: &Path, branch: &str, fields: &str, secs: u64) -> Result<Vec<Value>, String> {
-    let origin = origin_repo(wt);
-    let args = crate::pr::with_repo(
-        vec![
-            "pr", "list", "--head", branch, "--state", "all", "--json", fields, "--limit", "100",
-        ],
-        origin.as_deref(),
-    );
-    let json = cmd_bounded(wt, "gh", &args, secs)?;
-    let list: Vec<Value> = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
-    Ok(own(&list).into_iter().cloned().collect())
-}
-
 /// Picks this branch's PR from `gh pr list --head … --state all`: the open one, else the newest.
 /// Fork PRs whose branch happens to have the same name are ignored.
 #[cfg(test)]
 pub fn parse_prs(json: &str) -> Option<Pr> {
     let list: Vec<Value> = serde_json::from_str(json).ok()?;
     Some(parse_pr(pick_pr(&own(&list))?))
-}
-
-/// The PRs from this repo itself; a fork's PR on a same-named branch isn't about it.
-pub fn own(list: &[Value]) -> Vec<&Value> {
-    list.iter()
-        .filter(|p| p["isCrossRepository"] != true)
-        .collect()
-}
-
-/// The open PR, else the most recently updated; also how the Git tab picks, so both agree.
-pub fn pick_pr<'a>(own: &[&'a Value]) -> Option<&'a Value> {
-    own.iter()
-        .copied()
-        .find(|p| p["state"] == "OPEN")
-        .or_else(|| {
-            own.iter()
-                .copied()
-                .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
-        })
 }
 
 fn parse_pr(pick: &Value) -> Pr {
@@ -442,14 +480,6 @@ pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
     Ok(pr.filter(|p| p.state == PrState::Open || tip.as_ref().is_none_or(|t| *t == p.head)))
 }
 
-/// Origin's GitHub URL, for `gh --repo`: gh may default to a fork's upstream, but branch
-/// ownership belongs to origin.
-pub fn origin_repo(wt: &Path) -> Option<String> {
-    git(wt, &["config", "--get", "remote.origin.url"])
-        .ok()
-        .and_then(|url| github_url(&url))
-}
-
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
 /// so it can't be confused with being offline or logged out.
 /// `head` is the local HEAD as just probed.
@@ -488,7 +518,7 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
                 wt,
                 &["check-ref-format", &format!("refs/heads/{}", pr.base)],
             )?;
-            // Only remove the identity we read; another workspace may have changed it meanwhile.
+            // Only remove the identity we read; another task may have changed it meanwhile.
             git(
                 wt,
                 &[
@@ -557,7 +587,7 @@ fn mark_contains_head(wt: &Path, p: &mut Pr, head: &str) {
     }
 }
 
-/// Everything known about one repo of a workspace.
+/// Everything known about one repo of a task.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Repo {
     pub name: String,
@@ -574,7 +604,7 @@ pub struct Repo {
 
 impl Repo {
     /// Known by name only: nothing probed yet.
-    pub fn fresh(r: &crate::state::WsRepo, ws: &crate::state::Workspace) -> Repo {
+    pub fn fresh(r: &crate::state::TaskRepo, ws: &crate::state::Task) -> Repo {
         Repo {
             name: r.name.clone(),
             base: r.base.clone(),
@@ -664,11 +694,6 @@ pub fn restack_prompt(repos: &[&Repo], onto: impl Fn(&Repo) -> String) -> String
     };
     let pairs = repos.iter().map(|r| (&*r.name, &*r.branch));
     prompts::render_each("restack", pairs, fill)
-}
-
-/// `origin/main` → `main`, for labels.
-pub fn short(base: &str) -> &str {
-    base.strip_prefix("origin/").unwrap_or(base)
 }
 
 impl Repo {
@@ -808,7 +833,7 @@ fn act(label: impl Into<String>, kind: Kind, repos: Vec<String>, attention: bool
     }
 }
 
-/// The repos named in `rs`, in workspace order.
+/// The repos named in `rs`, in task order.
 pub fn among<'a>(repos: &'a [Repo], rs: &'a [String]) -> impl Iterator<Item = &'a Repo> {
     repos.iter().filter(|r| rs.contains(&r.name))
 }
@@ -818,7 +843,7 @@ pub fn in_scope(rs: &[String], r: &Repo) -> bool {
     rs.is_empty() || rs.contains(&r.name)
 }
 
-/// The single most useful next step for the whole workspace. Local problems come before
+/// The single most useful next step for the whole task. Local problems come before
 /// remote ones, and within the PR phase actionable steps beat passive waits, so a
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
@@ -1108,7 +1133,7 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         .iter()
         .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged))
     {
-        return act("Merged · archive", Kind::Archive, vec![], false);
+        return act("Merged · delete task", Kind::Archive, vec![], false);
     }
     act("No changes", Kind::None, vec![], false)
 }
@@ -1188,13 +1213,13 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             }
             if p.base != short(&r.base) {
                 return Err(format!(
-                    "PR targets `{}`, but this workspace targets `{}`; retarget the PR before merging",
+                    "PR targets `{}`, but this task targets `{}`; retarget the PR before merging",
                     p.base,
                     short(&r.base)
                 ));
             }
             let l = local()?;
-            // Merge exactly what this workspace has: clean, pushed, and GitHub's head matching.
+            // Merge exactly what this task has: clean, pushed, and GitHub's head matching.
             if l.changed > 0 || l.remote != Some((0, 0)) || p.head != l.head {
                 return Err(
                     "local branch, origin and the PR don't match; push or pull first".into(),
@@ -1216,19 +1241,6 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
         },
         _ => Ok(None),
     }
-}
-
-/// The web URL of a GitHub remote, from its https, scp-style or ssh form.
-pub fn github_url(remote: &str) -> Option<String> {
-    let path = [
-        "https://github.com/",
-        "git@github.com:",
-        "ssh://git@github.com/",
-    ]
-    .iter()
-    .find_map(|p| remote.strip_prefix(p))?;
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-    Some(format!("https://github.com/{path}"))
 }
 
 /// `8s ago`, `2m ago`, `3h ago`, `2d ago`.
@@ -1274,6 +1286,21 @@ mod tests {
     }
 
     #[test]
+    fn numstat_and_compact_age() {
+        assert_eq!(numstat(b"10\t3\ta\0\xff\x01\x02"), (10, 3));
+        assert_eq!(numstat(b"2\t0\tx\0-\t-\tbin\0"), (2, 0));
+        assert_eq!(numstat(b"1\t1\ttab\tname\n\0"), (1, 1));
+        // A rename's names are NUL fields of their own, even when they look like records.
+        assert_eq!(
+            numstat(b"4\t1\t\x005\t6\tfoo\x007\t8\tbar\x002\t0\tz\0"),
+            (6, 1)
+        );
+        assert_eq!(numstat(b""), (0, 0));
+        assert_eq!(compact_age(std::time::Duration::from_secs(59)), "now");
+        assert_eq!(compact_age(std::time::Duration::from_secs(240)), "4m");
+    }
+
+    #[test]
     fn ago_and_diverged() {
         use std::time::Duration;
         assert_eq!(super::ago(Duration::from_secs(8)), "8s ago");
@@ -1289,24 +1316,23 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn github_urls() {
-        for r in [
-            "https://github.com/o/r.git",
-            "https://github.com/o/r",
-            "git@github.com:o/r.git",
-            "ssh://git@github.com/o/r.git",
-        ] {
-            assert_eq!(
-                super::github_url(r).as_deref(),
-                Some("https://github.com/o/r"),
-                "{r}"
-            );
-        }
-        assert_eq!(super::github_url("git@gitlab.com:o/r.git"), None);
-    }
-
     use super::*;
+
+    #[test]
+    fn publication_target_comes_from_discovered_url() {
+        let mut found = pr("CLEAN", Checks::Passing);
+        for url in [
+            "https://github.com/fork/repo/pull/1",
+            "https://github.example/original/repo/pull/1",
+        ] {
+            found.url = url.into();
+            assert_eq!(found.target().unwrap().url(), url);
+        }
+        found.number = 2;
+        assert!(found.target().unwrap_err().contains("disagree"));
+        found.url = "invalid".into();
+        assert!(found.target().is_err());
+    }
 
     #[test]
     fn parses_porcelain_v2() {
@@ -1545,7 +1571,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     #[test]
-    fn fetch_updates_outranks_normal_repo_in_mixed_workspace() {
+    fn fetch_updates_outranks_normal_repo_in_mixed_task() {
         let work = repo("work", clean(2), None);
         assert_eq!(next(std::slice::from_ref(&work)).kind, Kind::CreatePr);
         let a = next(&[reviewed("review", "old", "new", |_| {}), work]);
@@ -2200,7 +2226,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     /// A child merges after its parent, from the button and from the menu alike; the other repo
-    /// of the workspace merges meanwhile.
+    /// of the task merges meanwhile.
     #[test]
     fn child_waits_for_its_parent_to_merge() {
         let own = Some(pr("CLEAN", Checks::Passing));
@@ -2376,7 +2402,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     /// the prompt gives leaves exactly the child's own commit.
     #[test]
     fn parent_tip_tracks_and_restacks_after_a_squash() {
-        use crate::git::{create_workspace_with_prs, git};
+        use crate::git::{create_task_with_prs, git};
         use std::fs;
         let root = std::env::temp_dir().join(format!("shark-stack-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2424,8 +2450,18 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let repo = crate::git::add_repo(&src, &[]).unwrap();
         let on = crate::git::on_branch(&[repo], "ui");
         let parents = [("ios".to_string(), "logic".to_string())];
-        let ws =
-            create_workspace_with_prs(&root.join("ws/ui"), "ui", "ui", &on, &[], &parents).unwrap();
+        let ws = create_task_with_prs(
+            &root.join("ws/ui"),
+            "ui",
+            "ui",
+            &on,
+            &[],
+            &parents,
+            "",
+            None,
+            false,
+        )
+        .unwrap();
         let wt = root.join("ws/ui/ios");
         assert_eq!(ws.repos[0].base, "origin/logic");
         let own = edit(&wt, "c.txt", "c");
@@ -2505,7 +2541,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
 
     #[test]
     fn probes_a_linked_worktree() {
-        use crate::git::{create_workspace, git};
+        use crate::git::{create_task, git};
         use std::fs;
         let root = std::env::temp_dir().join(format!("shark-sync-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2543,7 +2579,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         git(&src, &["remote", "set-head", "origin", "main"]).unwrap();
         let repo = crate::git::add_repo(&src, &[]).unwrap();
         let on = crate::git::on_branch(&[repo], "feat");
-        let ws = create_workspace(&root.join("ws/feat"), "feat", "feat", &on).unwrap();
+        let ws = create_task(&root.join("ws/feat"), "feat", "feat", &on).unwrap();
         let wt = root.join("ws/feat/api");
         let base = ws.repos[0].base.clone();
         let p = || probe(&wt, "feat", &base, None, true).unwrap();

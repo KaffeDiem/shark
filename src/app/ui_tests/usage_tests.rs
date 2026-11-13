@@ -312,7 +312,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 s.rail = rail;
                                 s.home.on = view == "home";
                                 s.active = (view != "home").then(|| "usage-preview".into());
-                                s.state.workspaces = vec![Workspace {
+                                s.state.tasks = vec![Task {
                                     name: "usage-preview".into(),
                                     branch: "usage-preview".into(),
                                     chats: vec![ChatMeta {
@@ -321,7 +321,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     }],
                                     ..Default::default()
                                 }];
-                                s.state.workspaces[0].normalize_tabs();
+                                s.state.tasks[0].normalize_tabs();
                                 s.tab = match view {
                                     "diff" => Tab::Feature(Feature::Diff),
                                     "file" => Tab::File,
@@ -541,7 +541,7 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
     })
     .unwrap();
     let saved = State::load();
-    assert!(saved.workspaces.is_empty() && saved.repos.is_empty());
+    assert!(saved.tasks.is_empty() && saved.repos.is_empty());
     assert!(
         !home
             .join("Library/Application Support/shark/transcripts")

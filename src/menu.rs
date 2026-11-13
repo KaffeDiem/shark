@@ -1,4 +1,4 @@
-//! Right-click menus drawn after Linear's: 32px rows in an inset rounded highlight,
+//! Right-click menus drawn after Linear's: 36px rows in an inset rounded highlight,
 //! muted 16px icons, 1px separators, metadata right-aligned in the muted colour.
 //! gpui-kit's `PopupMenu` hard-codes its row height, 2px separators and icon colour.
 #[cfg(test)]
@@ -11,6 +11,7 @@ use gpui_kit::*;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 type OnClick = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -19,6 +20,7 @@ pub(crate) enum Entry {
         icon: Option<IconName>,
         /// Drawn instead of `icon`: an app's own icon.
         image: Option<Arc<Image>>,
+        agent_icon: Option<crate::state::AgentIcon>,
         label: SharedString,
         /// Right-aligned and muted: the branch a copy will copy, the path an open will open.
         hint: Option<SharedString>,
@@ -29,10 +31,12 @@ pub(crate) enum Entry {
     Sub {
         icon: IconName,
         image: Option<Arc<Image>>,
+        agent_icon: Option<crate::state::AgentIcon>,
         label: SharedString,
         hint: Option<SharedString>,
         entries: Vec<Entry>,
     },
+    Heading(SharedString, SharedString),
     Sep,
 }
 
@@ -44,6 +48,7 @@ pub(crate) fn item(
     Entry::Item {
         icon: icon.into(),
         image: None,
+        agent_icon: None,
         label: label.into(),
         hint: None,
         checked: false,
@@ -55,6 +60,7 @@ pub(crate) fn sub(icon: IconName, label: impl Into<SharedString>, entries: Vec<E
     Entry::Sub {
         icon,
         image: None,
+        agent_icon: None,
         label: label.into(),
         hint: None,
         entries,
@@ -75,6 +81,13 @@ impl Entry {
     pub(crate) fn image(mut self, img: Option<Arc<Image>>) -> Self {
         if let Entry::Item { image, .. } | Entry::Sub { image, .. } = &mut self {
             *image = img;
+        }
+        self
+    }
+
+    pub(crate) fn agent_icon(mut self, icon: crate::state::AgentIcon) -> Self {
+        if let Entry::Item { agent_icon, .. } | Entry::Sub { agent_icon, .. } = &mut self {
+            *agent_icon = Some(icon);
         }
         self
     }
@@ -185,13 +198,13 @@ pub(crate) struct Menu {
 
 impl EventEmitter<DismissEvent> for Menu {}
 
-/// Next row up or down from `from`, wrapping and skipping separators.
+/// Next actionable row up or down from `from`, wrapping.
 fn step(entries: &[Entry], from: Option<usize>, down: bool) -> Option<usize> {
     let n = entries.len();
     let mut ix = from.unwrap_or(if down { n.wrapping_sub(1) } else { 0 });
     for _ in 0..n {
         ix = if down { (ix + 1) % n } else { (ix + n - 1) % n };
-        if !matches!(entries[ix], Entry::Sep) {
+        if matches!(entries[ix], Entry::Item { .. } | Entry::Sub { .. }) {
             return Some(ix);
         }
     }
@@ -207,13 +220,19 @@ fn find(entries: &[Entry], typed: &str, from: usize) -> Option<usize> {
             Entry::Item { label, .. } | Entry::Sub { label, .. } => {
                 label.to_lowercase().starts_with(typed)
             }
-            Entry::Sep => false,
+            Entry::Sep | Entry::Heading(..) => false,
         })
 }
 
 impl Menu {
     /// Starts the highlight on `ix`, e.g. the current choice of a picker.
     pub(crate) fn select(&mut self, ix: usize) {
+        if !matches!(
+            self.entries.get(ix),
+            Some(Entry::Item { .. } | Entry::Sub { .. })
+        ) {
+            return;
+        }
         self.sel = Some(ix);
         self.scroll.scroll_to_item(ix);
     }
@@ -401,7 +420,31 @@ impl Menu {
         let theme = cx.theme();
         let (icons, controls) = columns(entries);
         let rows = entries.iter().enumerate().map(|(ix, e)| {
-            let (icon, image, label, hint, checked, submenu) = match e {
+            let (icon, image, agent_icon, label, hint, checked, submenu) = match e {
+                Entry::Heading(title, detail) => {
+                    return v_flex()
+                        .id(ix)
+                        .test_support()
+                        .h(HEADING_H)
+                        .px(px(10.))
+                        .justify_center()
+                        .gap_1()
+                        .aria_label(format!("{title}. {detail}"))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(detail.clone()),
+                        )
+                        .into_any_element();
+                }
                 Entry::Sep => {
                     return div()
                         .h(px(1.))
@@ -413,18 +456,36 @@ impl Menu {
                 Entry::Item {
                     icon,
                     image,
+                    agent_icon,
                     label,
                     hint,
                     checked,
                     ..
-                } => (*icon, image.clone(), label, hint, *checked, false),
+                } => (
+                    *icon,
+                    image.clone(),
+                    agent_icon,
+                    label,
+                    hint,
+                    *checked,
+                    false,
+                ),
                 Entry::Sub {
                     icon,
                     image,
+                    agent_icon,
                     label,
                     hint,
                     ..
-                } => (Some(*icon), image.clone(), label, hint, false, true),
+                } => (
+                    Some(*icon),
+                    image.clone(),
+                    agent_icon,
+                    label,
+                    hint,
+                    false,
+                    true,
+                ),
             };
             let label_width = text_width(label, window, theme);
             let hint_width = hint
@@ -459,7 +520,7 @@ impl Menu {
                 .h(ROW_H)
                 .flex_none()
                 .px(px(10.))
-                .gap(px(8.))
+                .gap(px(10.))
                 .rounded(theme.radius)
                 .when(selected, |d| d.bg(highlight(theme)))
                 .when(icons, |d| {
@@ -469,18 +530,26 @@ impl Menu {
                             .test_support()
                             .size(px(16.))
                             .flex_none()
-                            .child(match (image, icon) {
-                                // App icons have a margin built in; 18px matches a 16px glyph.
-                                (Some(app), _) => img(app)
-                                    .size(px(18.))
-                                    .mx(px(-1.))
-                                    .flex_none()
-                                    .into_any_element(),
-                                (None, Some(i)) => Icon::new(i)
-                                    .with_size(px(16.))
-                                    .text_color(crate::ui::faint(theme))
-                                    .into_any_element(),
-                                (None, None) => div().size(px(16.)).into_any_element(),
+                            .child(if let Some(icon) = agent_icon {
+                                crate::app::agent_icon_view::agent_icon(icon).into_any_element()
+                            } else {
+                                match (image, icon) {
+                                    // App icons have a margin built in; 18px matches a 16px glyph.
+                                    (Some(app), _) => img(app)
+                                        .size(px(18.))
+                                        .mx(px(-1.))
+                                        .flex_none()
+                                        .into_any_element(),
+                                    (None, Some(i)) => Icon::new(i)
+                                        .with_size(px(16.))
+                                        .text_color(if theme.is_dark() {
+                                            theme.popover.blend(theme.foreground.alpha(0.61))
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .into_any_element(),
+                                    (None, None) => div().size(px(16.)).into_any_element(),
+                                }
                             }),
                     )
                 })
@@ -543,7 +612,7 @@ impl Menu {
             .role(Role::Menu)
             .occlude()
             .relative()
-            .rounded(theme.radius_lg)
+            .text_size(px(14.))
             .w(width)
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .when(back, |d| {
@@ -556,7 +625,7 @@ impl Menu {
                         .h(ROW_H)
                         .flex_none()
                         .px(px(10.))
-                        .gap(px(8.))
+                        .gap(px(10.))
                         .rounded(theme.radius)
                         .hover(|s| s.bg(highlight(theme)))
                         .child(Icon::new(IconName::ChevronLeft).with_size(px(16.)))
@@ -607,6 +676,15 @@ impl Menu {
                 )
             })
             .test_support()
+            .with_animation(
+                if in_sub {
+                    "menu-child-enter"
+                } else {
+                    "menu-parent-enter"
+                },
+                Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                |panel, progress| panel.opacity(progress),
+            )
     }
 }
 
@@ -616,6 +694,10 @@ fn columns(entries: &[Entry]) -> (bool, bool) {
             e,
             Entry::Item { icon: Some(_), .. }
                 | Entry::Item { image: Some(_), .. }
+                | Entry::Item {
+                    agent_icon: Some(_),
+                    ..
+                }
                 | Entry::Sub { .. }
         )
     });
@@ -637,7 +719,7 @@ fn text_width(text: &SharedString, window: &Window, theme: &Theme) -> Pixels {
 
 /// Includes panel/row padding and fixed icon/control columns with their gaps.
 fn fixed_width(icons: bool, controls: bool) -> Pixels {
-    px(32. + if icons { 24. } else { 0. } + if controls { 24. } else { 0. })
+    px(32. + if icons { 26. } else { 0. } + if controls { 26. } else { 0. })
 }
 
 fn measured_panel_width(
@@ -659,10 +741,17 @@ fn panel_width(entries: &[Entry], window: &Window, cx: &App) -> Pixels {
     let mut preferred = px(0.);
     let mut longest_label = px(0.);
     for entry in entries {
+        if let Entry::Heading(title, detail) = entry {
+            preferred = preferred.max(
+                (text_width(title, window, cx.theme()).max(text_width(detail, window, cx.theme()))
+                    + px(32.))
+                .min(px(440.)),
+            );
+        }
         if let Entry::Item { label, hint, .. } | Entry::Sub { label, hint, .. } = entry {
             let label = text_width(label, window, cx.theme());
             // Keep the column gap even when metadata has yielded all of its width.
-            let gap = if hint.is_some() { px(8.) } else { px(0.) };
+            let gap = if hint.is_some() { px(10.) } else { px(0.) };
             longest_label = longest_label.max(label + gap);
             let hint = hint
                 .as_ref()
@@ -682,13 +771,14 @@ fn text_columns(
     has_hint: bool,
 ) -> (Pixels, Pixels) {
     let available =
-        (width - fixed_width(icons, controls) - if has_hint { px(8.) } else { px(0.) }).max(px(0.));
+        (width - fixed_width(icons, controls) - if has_hint { px(10.) } else { px(0.) })
+            .max(px(0.));
     let hint = hint.min(px(180.)).min((available - label).max(px(0.)));
     (available - hint, hint)
 }
 
 /// The look every floating menu shares (this one and the composer's completions): `popover`,
-/// 6px inset, 14px text, 8px corners, and a translucent ring instead of a border, so the shadow shows
+/// 6px inset, 14px text, 14px corners, and a translucent ring instead of a border, so the shadow shows
 /// through the edge.
 pub(crate) fn chrome(theme: &Theme) -> Div {
     let ink = hsla(0., 0., 0., if theme.is_dark() { 0.5 } else { 0.12 });
@@ -697,16 +787,24 @@ pub(crate) fn chrome(theme: &Theme) -> Div {
         .bg(theme.popover)
         .text_color(theme.popover_foreground)
         .text_size(px(14.))
-        .rounded(theme.radius)
+        .rounded(px(14.))
         .shadow(vec![
-            BoxShadow::new(px(0.), px(0.), theme.foreground.alpha(0.1)).spread_radius(px(1.)),
-            BoxShadow::new(px(0.), px(4.), ink).blur_radius(px(8.)),
+            BoxShadow::new(
+                px(0.),
+                px(0.),
+                theme
+                    .foreground
+                    .alpha(if theme.is_dark() { 0.14 } else { 0.1 }),
+            )
+            .spread_radius(px(1.)),
+            BoxShadow::new(px(0.), px(8.), ink).blur_radius(px(24.)),
             BoxShadow::new(px(0.), px(1.), ink.alpha(ink.a / 2.)).blur_radius(px(1.)),
         ])
 }
 
-/// A menu row's height; the composer's completions use it too.
-pub(crate) const ROW_H: Pixels = px(32.);
+/// Shared tap target height for action menus and composer completions.
+pub(crate) const ROW_H: Pixels = px(36.);
+const HEADING_H: Pixels = px(56.);
 
 /// The highlighted row uses a translucent fill, leaving the text colour unchanged.
 pub(crate) fn highlight(theme: &Theme) -> Hsla {
@@ -746,12 +844,10 @@ fn child_placement(
 fn panel_height(entries: &[Entry], back: bool, viewport: Pixels) -> Pixels {
     let rows = entries
         .iter()
-        .map(|e| {
-            if matches!(e, Entry::Sep) {
-                px(13.)
-            } else {
-                ROW_H
-            }
+        .map(|e| match e {
+            Entry::Sep => px(13.),
+            Entry::Heading(..) => HEADING_H,
+            _ => ROW_H,
         })
         .sum::<Pixels>();
     (rows + px(12.) + if back { ROW_H } else { px(0.) }).min((viewport - px(16.)).max(px(0.)))
@@ -916,7 +1012,7 @@ mod tests {
         );
         assert_eq!(
             measured_panel_width(px(800.), px(500.), fixed, px(1000.)),
-            px(580.)
+            px(584.)
         );
         assert_eq!(
             measured_panel_width(px(800.), px(500.), fixed, px(300.)),
@@ -929,17 +1025,17 @@ mod tests {
         let fixed = fixed_width(true, true);
         for width in [px(200.), px(340.), px(440.)] {
             let (label, hint) = text_columns(width, true, true, px(250.), px(180.), true);
-            assert_eq!(label + hint + px(8.) + fixed, width);
-            assert!(label >= px(250.).min(width - fixed - px(8.)));
+            assert_eq!(label + hint + px(10.) + fixed, width);
+            assert!(label >= px(250.).min(width - fixed - px(10.)));
             assert!(hint >= px(0.));
         }
         assert_eq!(
             text_columns(px(340.), true, true, px(250.), px(180.), true),
-            (px(250.), px(2.))
+            (px(246.), px(0.))
         );
         assert_eq!(
             text_columns(px(200.), true, true, px(250.), px(180.), true),
-            (px(112.), px(0.))
+            (px(106.), px(0.))
         );
     }
 
@@ -952,6 +1048,33 @@ mod tests {
         assert_eq!(step(&entries, Some(2), true), Some(0));
         assert_eq!(step(&entries, None, false), Some(2));
         assert_eq!(step(&[], None, true), None);
+    }
+
+    #[test]
+    fn heading_is_not_an_action_or_type_select_target() {
+        let entries = [
+            Entry::Heading("Reset defaults".into(), "Removed calor".into()),
+            item(None, "Reset", |_, _| {}),
+            Entry::Sep,
+            item(None, "Save", |_, _| {}),
+        ];
+        assert_eq!(step(&entries, None, true), Some(1));
+        assert_eq!(step(&entries, Some(3), true), Some(1));
+        assert_eq!(step(&entries, Some(1), false), Some(3));
+        assert_eq!(find(&entries, "reset", 0), Some(1));
+        assert_eq!(find(&entries, "removed", 0), None);
+        assert_eq!(
+            panel_height(&entries, false, px(1000.)),
+            HEADING_H + ROW_H * 2. + px(25.)
+        );
+        assert_eq!(
+            step(
+                &[Entry::Heading("Only heading".into(), "Details".into())],
+                None,
+                true
+            ),
+            None
+        );
     }
 
     #[test]
@@ -968,3 +1091,60 @@ mod tests {
 
 #[cfg(all(test, feature = "test-support"))]
 mod interaction_tests;
+
+/// `label` for `rows` of `(label, hint, value)`, usually one per repo: a single row is one
+/// item, hinted with its label; several make a submenu ending in "All". `f` gets the values.
+pub(crate) fn each_or_all(
+    icon: IconName,
+    label: &'static str,
+    mut rows: Vec<(String, String, String)>,
+    f: impl Fn(&[String], &mut Window, &mut App) + 'static,
+) -> Option<Entry> {
+    let f = Rc::new(f);
+    if rows.len() < 2 {
+        let (hint, _, v) = rows.pop()?;
+        let item = item(icon, label, move |w, cx| f(std::slice::from_ref(&v), w, cx));
+        return Some(item.hint(hint));
+    }
+    let all: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    let mut entries: Vec<Entry> = (rows.into_iter())
+        .map(|(name, hint, v)| {
+            let f = f.clone();
+            let run = move |w: &mut Window, cx: &mut App| f(std::slice::from_ref(&v), w, cx);
+            item(IconName::FolderGit2, name, run).hint(hint)
+        })
+        .collect();
+    entries.extend([Entry::Sep, item(None, "All", move |w, cx| f(&all, w, cx))]);
+    Some(sub(icon, label, entries))
+}
+
+#[cfg(test)]
+mod each_or_all_tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn each_or_all_collapses_one_row() {
+        let row = |n: &str| (n.to_string(), String::new(), n.to_string());
+        let f: fn(&[String], &mut Window, &mut App) = |_, _, _| {};
+        assert!(each_or_all(IconName::Github, "Open", vec![], f).is_none());
+        match each_or_all(IconName::Github, "Open", vec![row("api")], f) {
+            Some(Entry::Item { label, hint, .. }) => {
+                assert_eq!((&*label, hint.as_deref()), ("Open", Some("api")))
+            }
+            _ => panic!("one row is one item"),
+        }
+        match each_or_all(IconName::Github, "Open", vec![row("api"), row("web")], f) {
+            Some(Entry::Sub { entries, .. }) => {
+                let labels: Vec<_> = (entries.iter())
+                    .map(|e| match e {
+                        Entry::Item { label, .. } => label.to_string(),
+                        _ => "-".into(),
+                    })
+                    .collect();
+                assert_eq!(labels, ["api", "web", "-", "All"]);
+            }
+            _ => panic!("several rows are a submenu"),
+        }
+    }
+}

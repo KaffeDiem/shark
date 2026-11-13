@@ -1,4 +1,4 @@
-//! Workspace feature launchers. Each feature opens its content in an artifact tab.
+//! Task feature launchers. Each feature opens its content in an artifact tab.
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -15,28 +15,13 @@ struct Metadata {
 }
 
 impl Feature {
-    pub(super) const ALL: [Self; 2] = [Self::Diff, Self::Git];
+    pub(super) const ALL: [Self; 3] = [Self::Diff, Self::Git, Self::Artifacts];
 
     pub(super) fn tab_id(self) -> TabId {
         match self {
             Self::Diff => TabId::Diff,
             Self::Git => TabId::Git,
-        }
-    }
-
-    /// The workspace's closed flag for this feature.
-    pub(crate) fn closed_mut(self, ws: &mut Workspace) -> &mut bool {
-        match self {
-            Self::Diff => &mut ws.diff_closed,
-            Self::Git => &mut ws.git_closed,
-        }
-    }
-
-    /// Whether the workspace has this feature's tab open.
-    pub(crate) fn is_open(self, ws: &Workspace) -> bool {
-        !match self {
-            Self::Diff => ws.diff_closed,
-            Self::Git => ws.git_closed,
+            Self::Artifacts => TabId::Artifacts,
         }
     }
 
@@ -63,6 +48,17 @@ impl Feature {
                 tab_tip: "Git (cmd-shift-g)",
                 close_id: "close-git",
                 close_label: "Close Git (cmd-w)",
+            },
+            Self::Artifacts => Metadata {
+                title: "Artifacts",
+                launcher_id: "feature-artifacts",
+                launcher_label: "Artifacts — Task files (cmd-shift-a)",
+                launcher_icon: IconName::FolderDot,
+                tab_id: "artifacts-tab",
+                tab_icon: IconName::FolderDot,
+                tab_tip: "Artifacts (cmd-shift-a)",
+                close_id: "close-artifacts",
+                close_label: "Close Artifacts (cmd-w)",
             },
         }
     }
@@ -129,6 +125,17 @@ impl Shark {
                         (SharedString::from(tip), badge)
                     }
                     Feature::Git => (meta.launcher_label.into(), None),
+                    Feature::Artifacts => {
+                        let new =
+                            (self.active_artifacts()).map_or(0, |a| a.read(cx).unseen_count());
+                        match new {
+                            0 => (meta.launcher_label.into(), None),
+                            n => (
+                                format!("{} · {n} new", meta.launcher_label).into(),
+                                Some(theme.primary),
+                            ),
+                        }
+                    }
                 };
                 v_flex().when(ix == 0 && self.rail, |d| d.pt(px(8.))).child(
                     sidebar::rail_button(
@@ -147,7 +154,15 @@ impl Shark {
                         )
                     })
                     .child(Icon::new(meta.launcher_icon).with_size(px(16.)))
-                    .when_some(badge, |d, c| d.child(chats::dot(6., theme).bg(c)))
+                    .when_some(badge, |d, c| {
+                        let id = format!("{}-badge", meta.launcher_id);
+                        d.child(
+                            chats::dot(6., theme)
+                                .id(SharedString::from(id))
+                                .test_support()
+                                .bg(c),
+                        )
+                    })
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                     .on_click(cx.listener(move |s, _, w, cx| s.show(Tab::Feature(feature), w, cx)))
                     .test_support(),
@@ -203,7 +218,7 @@ impl Shark {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if feature == Feature::Git {
+        if matches!(feature, Feature::Git | Feature::Artifacts) {
             return self.finish_close_feature(feature, w, cx);
         }
         let Some(name) = self.active.clone() else {
@@ -225,7 +240,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let at = self.active_tab_index(cx);
-        let Some(ws) = self.active_ws_mut() else {
+        let Some(ws) = self.active_task_mut() else {
             return;
         };
         *feature.closed_mut(ws) = true;
@@ -246,12 +261,12 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<git_feature::GitFeature>> {
-        let ws = self.effective_workspace(self.active_ws()?.clone(), cx);
+        let ws = self.effective_task(self.active_task()?.clone(), cx);
         let archiving = self.archiving.contains(&ws.name);
         if let Some(git) = self.git_features.get(&ws.name).cloned() {
             git.update(cx, |g, cx| {
                 g.set_archiving(archiving, cx);
-                g.set_workspace(ws, window, cx);
+                g.set_task(ws, window, cx);
             });
             return Some(git);
         }
@@ -261,10 +276,10 @@ impl Shark {
             git.set_archiving(archiving, cx);
             git
         });
-        let workspace = name.clone();
+        let task = name.clone();
         self._subs
             .push(cx.subscribe_in(&git, window, move |s, _, event, w, cx| {
-                if s.active.as_ref() != Some(&workspace) {
+                if s.active.as_ref() != Some(&task) {
                     return;
                 }
                 let git_feature::GitFeatureEvent::OpenFile { repo, path } = event;
@@ -275,6 +290,64 @@ impl Shark {
         Some(git)
     }
 
+    pub(super) fn active_artifacts(&self) -> Option<&Entity<artifacts::Artifacts>> {
+        self.artifacts.get(self.active.as_ref()?)
+    }
+
+    /// Artifacts polls and plays only while its tab is on screen: tells each one when that changes.
+    pub(super) fn sync_artifacts_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.tab == Tab::Feature(Feature::Artifacts) && !self.home_shown();
+        for (name, a) in self.artifacts.clone() {
+            let on = shown && self.active.as_ref() == Some(&name);
+            a.update(cx, |a, cx| a.set_visible(on, window, cx));
+        }
+    }
+
+    pub(super) fn artifacts_visibility_stale(&self, cx: &App) -> bool {
+        let shown = self.tab == Tab::Feature(Feature::Artifacts) && !self.home_shown();
+        (self.artifacts.iter())
+            .any(|(name, a)| a.read(cx).visible() != (shown && self.active.as_ref() == Some(name)))
+    }
+
+    /// Tells the task's Artifacts its chats, so a plan copy can name its chat.
+    pub(super) fn sync_artifact_chats(&mut self, name: &str, cx: &mut Context<Self>) {
+        let (Some(ws), Some(artifacts)) = (self.task(name), self.artifacts.get(name).cloned())
+        else {
+            return;
+        };
+        let chats = (ws.chats.iter())
+            .map(|c| (c.id.clone(), c.title.clone()))
+            .collect();
+        artifacts.update(cx, |a, cx| a.set_chats(chats, cx));
+    }
+
+    pub(super) fn ensure_artifacts(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<artifacts::Artifacts>> {
+        let name = self.active_task()?.name.clone();
+        if let Some(entity) = self.artifacts.get(&name).cloned() {
+            self.sync_artifact_chats(&name, cx);
+            return Some(entity);
+        }
+        let dir = self.active_task()?.dir();
+        let width = self.state.artifacts_width;
+        let pins = self.active_task()?.artifacts_pinned.clone();
+        let entity = cx.new(|cx| artifacts::Artifacts::new(dir, width, pins, window, cx));
+        let task = name.clone();
+        self._subs
+            .push(cx.subscribe_in(&entity, window, move |s, _, event, w, cx| {
+                if s.active.as_ref() == Some(&task) {
+                    s.artifacts_event(event, w, cx);
+                }
+            }));
+        self._subs.push(cx.observe(&entity, |_, _, cx| cx.notify()));
+        self.artifacts.insert(name.clone(), entity.clone());
+        self.sync_artifact_chats(&name, cx);
+        Some(entity)
+    }
+
     /// Shows the Git tab and runs `f` on its conversation (palette rows for its keys).
     pub(super) fn with_git(
         &mut self,
@@ -283,7 +356,11 @@ impl Shark {
         f: impl FnOnce(&mut git_feature::GitFeature, &mut Window, &mut Context<git_feature::GitFeature>),
     ) {
         self.show(Tab::Feature(Feature::Git), window, cx);
-        if let Some(git) = self.active_git_feature().cloned() {
+        if let Some(git) = self
+            .active_git_feature()
+            .cloned()
+            .filter(|_| !self.no_repos())
+        {
             git.update(cx, |g, cx| {
                 g.set_view(git_feature::GitView::Conversation, window, cx);
                 f(g, window, cx)
@@ -315,6 +392,13 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         match feature {
+            Feature::Artifacts => {
+                if let Some(artifacts) = self.ensure_artifacts(window, cx) {
+                    artifacts.update(cx, |a, cx| a.focus(window, cx));
+                }
+            }
+            // The offer shows instead of them: focus on a handle not in the tree loses every key.
+            _ if self.no_repos() => self.content_focus.focus(window, cx),
             Feature::Diff => self.differ.update(cx, |d, cx| d.activate(window, cx)),
             Feature::Git => {
                 if let Some(git) = self.ensure_git_feature(window, cx) {
@@ -327,7 +411,7 @@ impl Shark {
     pub(super) fn feature_focus_targets(&self, feature: Feature, cx: &App) -> Vec<FeatureFocus> {
         match feature {
             Feature::Diff => self.differ.read(cx).focus_targets(),
-            Feature::Git => vec![FeatureFocus::Main],
+            Feature::Git | Feature::Artifacts => vec![FeatureFocus::Main],
         }
     }
 
@@ -343,6 +427,10 @@ impl Shark {
                 .active_git_feature()
                 .filter(|g| g.read(cx).has_focus(window, cx))
                 .map(|_| FeatureFocus::Main),
+            Feature::Artifacts => self
+                .active_artifacts()
+                .filter(|a| a.read(cx).has_focus(window, cx))
+                .map(|_| FeatureFocus::Main),
         }
     }
 
@@ -354,6 +442,12 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         match feature {
+            Feature::Artifacts => {
+                if let Some(artifacts) = self.active_artifacts().cloned() {
+                    artifacts.update(cx, |a, cx| a.focus(window, cx));
+                }
+            }
+            _ if self.no_repos() => self.content_focus.focus(window, cx),
             Feature::Diff => self.differ.update(cx, |d, cx| d.focus(target, window, cx)),
             Feature::Git => {
                 if let Some(git) = self.active_git_feature().cloned() {
@@ -365,6 +459,7 @@ impl Shark {
 
     pub(super) fn render_feature_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         match self.tab {
+            _ if self.no_repos() => None,
             Tab::Feature(Feature::Diff) => Some(
                 self.differ
                     .update(cx, |d, cx| d.render_diff_controls(cx).into_any_element()),
@@ -373,13 +468,70 @@ impl Shark {
         }
     }
 
-    pub(super) fn render_feature(&self, feature: Feature) -> AnyElement {
+    /// The open agent has no repository, so Diff and Git have nothing to show.
+    pub(super) fn no_repos(&self) -> bool {
+        self.active_task().is_some_and(|w| w.repos.is_empty())
+    }
+
+    /// Diff and Git of an agent with no repository: the offer instead of Git actions.
+    fn render_attach_offer(&self, feature: Feature, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .id("attach-offer")
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                Icon::new(IconName::FolderGit2)
+                    .with_size(px(32.))
+                    .text_color(faint(theme)),
+            )
+            .child(div().text_base().child("No repository attached"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{} works on an attached repository",
+                        feature.metadata().title
+                    )),
+            )
+            .child(self.attach_button("attach-repository", cx).primary())
+            .test_support()
+            .into_any_element()
+    }
+
+    /// Attach repository, for the open agent.
+    pub(super) fn attach_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
+        Button::new(id)
+            .label("Attach repository")
+            .on_click(cx.listener(|s, _, w, cx| {
+                if let Some(name) = s.active.clone() {
+                    s.attach_repository(name, w, cx);
+                }
+            }))
+    }
+
+    pub(super) fn render_feature(&self, feature: Feature, cx: &mut Context<Self>) -> AnyElement {
+        if self.no_repos() && feature != Feature::Artifacts {
+            return self.render_attach_offer(feature, cx);
+        }
         let content = match feature {
             Feature::Diff => self.differ.clone().into_any_element(),
             Feature::Git => self
                 .active_git_feature()
                 .map(|g| {
                     g.clone()
+                        .cached(StyleRefinement::default().size_full())
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element()),
+            Feature::Artifacts => self
+                .active_artifacts()
+                .map(|a| {
+                    a.clone()
                         .cached(StyleRefinement::default().size_full())
                         .into_any_element()
                 })
@@ -405,6 +557,7 @@ impl Shark {
                     git.update(cx, |g, cx| g.submit(window, cx));
                 }
             }
+            Tab::Feature(Feature::Artifacts) => {}
             Tab::Feature(Feature::Diff) if self.differ.read(cx).edit_snapshot().is_some() => {
                 self.differ
                     .update(cx, |d, cx| d.save_edit(false, window, cx));

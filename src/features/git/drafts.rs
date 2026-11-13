@@ -89,13 +89,13 @@ pub(super) struct DraftStore {
     pub(super) delay: Duration,
     #[cfg(test)]
     pub(super) started: u64,
-    task: Option<Task<()>>,
+    task: Option<gpui_kit::Task<()>>,
 }
 
 impl DraftStore {
-    /// Loads the workspace's drafts; an unreadable file blocks saving so it is never overwritten.
-    pub(super) fn load(workspace: &str) -> Self {
-        let (drafts, error, blocked) = match std::fs::read(store_path(workspace)) {
+    /// Loads the task's drafts; an unreadable file blocks saving so it is never overwritten.
+    pub(super) fn load(task: &str) -> Self {
+        let (drafts, error, blocked) = match std::fs::read(store_path(task)) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(drafts) => (drafts, None, false),
                 Err(e) => (
@@ -157,7 +157,7 @@ impl DraftStore {
                     }
                     (
                         s.store.generation,
-                        store_path(&s.workspace.name),
+                        store_path(&s.task.name),
                         serde_json::to_vec(&s.store.drafts).expect("Git drafts serialize"),
                     )
                 }) else {
@@ -197,10 +197,10 @@ impl DraftStore {
     }
 }
 
-fn store_path(workspace: &str) -> PathBuf {
+pub(crate) fn store_path(task: &str) -> PathBuf {
     crate::state::support_dir()
         .join("git-drafts")
-        .join(format!("{workspace}.json"))
+        .join(format!("{task}.json"))
 }
 
 #[cfg(test)]

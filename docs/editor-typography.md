@@ -1,12 +1,16 @@
 # Editor typography
 
+These defaults apply to code editing and Diff review inside a task. They are
+shared application preferences, independent of the selected agent.
+
 The file editor shows code at **14px with 1.5× line height (21px rows)**,
 adjustable from 10 to 24px with `cmd-=`/`cmd--` (Reset editor text size in `cmd-k`).
 The diff uses **13px text on the same 21px rows**, including inline editing. Its text
 scales at 13/14 of the editor size with the same zoom controls and saved setting.
 The smaller diff text leaves more space around each line.
 
-The constants, `code_font`, and `diff_font` are in `src/editor.rs`.
+The current constants, `code_font`, and `diff_font` are in
+[`src/editor.rs`](../src/editor.rs); row heights round to whole pixels.
 
 ## Why 14px
 

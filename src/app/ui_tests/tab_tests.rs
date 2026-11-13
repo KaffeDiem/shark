@@ -18,7 +18,7 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "append-chats".into(),
             git::on_branch(&repos, "append-chats"),
             vec![],
@@ -33,8 +33,8 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
     .await;
     press(cx, &["cmd-t", "cmd-t"]);
     on(cx, &|s, _, _cx| {
-        s.active_ws_mut().unwrap().closed = ["picked", "retained", "latest"]
-            .map(|id| s.state.new_chat(&Workspace::default(), id.into()))
+        s.active_task_mut().unwrap().closed = ["picked", "retained", "latest"]
+            .map(|id| s.state.new_chat(&Task::default(), id.into(), None))
             .to_vec();
     });
     for (key, restored) in [
@@ -44,7 +44,7 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
         (None, Some("picked")),
     ] {
         press(cx, &["ctrl-1"]);
-        let before = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.clone());
+        let before = cx.update(|cx| shark.read(cx).active_task().unwrap().chats.clone());
         if let Some(key) = key {
             press(cx, &[key]);
         } else {
@@ -52,7 +52,7 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
         }
         cx.update_window(window, |_, w, cx| {
             let s = shark.read(cx);
-            let ws = s.active_ws().unwrap();
+            let ws = s.active_task().unwrap();
             assert_eq!(ws.chats.len(), before.len() + 1);
             assert_eq!(&ws.chats[..before.len()], before.as_slice());
             assert_eq!(ws.active_chat, before.len());
@@ -71,14 +71,14 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
                     .is_focused(w)
             );
             let saved = State::load();
-            assert_eq!(saved.workspaces[0].chats, ws.chats);
-            assert_eq!(saved.workspaces[0].active_chat, ws.active_chat);
+            assert_eq!(saved.tasks[0].chats, ws.chats);
+            assert_eq!(saved.tasks[0].active_chat, ws.active_chat);
         })
         .unwrap();
     }
     cx.update(|cx| {
         let s = shark.read(cx);
-        let closed = &s.active_ws().unwrap().closed;
+        let closed = &s.active_task().unwrap().closed;
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].id, "retained");
     });
@@ -103,7 +103,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "tabs-focus".into(),
             git::on_branch(&repos, "tabs-focus"),
             vec![],
@@ -132,7 +132,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     let ids = cx.update(|cx| {
         shark
             .read(cx)
-            .active_ws()
+            .active_task()
             .unwrap()
             .chats
             .iter()
@@ -280,7 +280,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     }
     // Close an earlier background chat by clicking × without selecting it or moving focus.
     on(cx, &|s, w, cx| {
-        s.select_chat(s.active_ws().unwrap().chats.len() - 1, w, cx);
+        s.select_chat(s.active_task().unwrap().chats.len() - 1, w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
@@ -316,7 +316,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(shark.read(cx).chats.contains_key(&ids[1])));
     click_running(cx);
     on(cx, &|s, _, cx| {
-        let target = s.active_ws().unwrap().chats[0].id.clone();
+        let target = s.active_task().unwrap().chats[0].id.clone();
         s.move_tab(
             "tabs-focus",
             &TabId::Chat(ids[1].clone()),
@@ -324,7 +324,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
             cx,
         );
         chat.update(cx, |c, _| c.meta.session_id = Some("recover-me".into()));
-        s.active_ws_mut()
+        s.active_task_mut()
             .unwrap()
             .chats
             .iter_mut()
@@ -357,14 +357,14 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     .unwrap();
     // Closing all chats still leaves one fresh chat and never closes retained files.
     on(cx, &|s, w, cx| {
-        while s.active_ws().unwrap().chats.len() > 1 {
+        while s.active_task().unwrap().chats.len() > 1 {
             s.close_chat(w, cx);
         }
         s.close_chat(w, cx);
     });
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.active_ws().unwrap().chats.len(), 1);
+        assert_eq!(s.active_task().unwrap().chats.len(), 1);
         assert!(s.active_chat().unwrap().read(cx).meta.session_id.is_none());
         assert!(editor.read(cx).dirty);
     });
@@ -389,7 +389,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "closed-diff".into(),
             git::on_branch(&repos, "closed-diff"),
             vec![],
@@ -409,7 +409,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     .unwrap();
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        assert!(shark.read(cx).active_ws().unwrap().diff_closed);
+        assert!(shark.read(cx).active_task().unwrap().diff_closed);
         assert!(w.find_all("diff-tab").is_empty());
     })
     .unwrap();
@@ -430,7 +430,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         assert!(editor.read(cx).is_focused(w, cx));
     })
     .unwrap();
-    assert!(State::load().workspaces[0].diff_closed);
+    assert!(State::load().tasks[0].diff_closed);
     for (key, tab) in [
         ("ctrl-1", Tab::Chat),
         ("ctrl-2", Tab::File),
@@ -494,11 +494,11 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
             })
             .unwrap();
         }
-        assert!(!State::load().workspaces[0].diff_closed);
+        assert!(!State::load().tasks[0].diff_closed);
         // Diff is last in the strip: the file before it shows.
         press(cx, &["cmd-w"]);
         cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::File));
-        assert!(State::load().workspaces[0].diff_closed);
+        assert!(State::load().tasks[0].diff_closed);
     }
     // Last-file fallback respects closure, and does not reopen Diff as a side effect.
     on(cx, &|s, w, cx| s.select_file(0, w, cx));
@@ -507,9 +507,9 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         assert_eq!(shark.read(cx).tab, Tab::Chat);
         assert!(shark.read(cx).file_tabs.is_empty());
     });
-    assert!(State::load().workspaces[0].diff_closed);
+    assert!(State::load().tasks[0].diff_closed);
     press(cx, &["cmd-shift-d"]);
-    assert!(!State::load().workspaces[0].diff_closed);
+    assert!(!State::load().tasks[0].diff_closed);
     on(cx, &|s, w, cx| s.open_path("api/a.txt".into(), w, cx));
     press(cx, &["cmd-w"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Feature(Feature::Diff)));
@@ -535,7 +535,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Diff));
         assert!(s.differ.read(cx).editing().as_ref().unwrap().dirty);
-        assert!(!s.active_ws().unwrap().diff_closed);
+        assert!(!s.active_task().unwrap().diff_closed);
     });
     // Background inline-edit discard restores Chat's existing focus.
     on(cx, &|s, w, cx| s.select_chat(0, w, cx));
@@ -551,7 +551,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Chat);
         assert!(s.differ.read(cx).editing().is_none());
-        assert!(s.active_ws().unwrap().diff_closed);
+        assert!(s.active_task().unwrap().diff_closed);
         assert!(
             s.active_chat()
                 .unwrap()
@@ -563,9 +563,9 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
-    // Workspace switches retain each workspace's flag.
+    // Task switches retain each task's flag.
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "open-diff".into(),
             git::on_branch(&repos, "open-diff"),
             vec![],
@@ -580,15 +580,15 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     .await;
     on(cx, &|s, w, cx| {
         s.show(Tab::Feature(Feature::Diff), w, cx);
-        assert!(!s.active_ws().unwrap().diff_closed);
+        assert!(!s.active_task().unwrap().diff_closed);
         let ix = s
             .state
-            .workspaces
+            .tasks
             .iter()
             .position(|ws| ws.name == "closed-diff")
             .unwrap();
-        s.open_workspace(ix, w, cx);
-        assert!(s.active_ws().unwrap().diff_closed);
+        s.open_task(ix, w, cx);
+        assert!(s.active_task().unwrap().diff_closed);
     });
     // Even a stale last-open Diff entry cannot reopen a deliberately closed tab.
     on(cx, &|s, _, _cx| {
@@ -601,7 +601,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         w.render_frame(cx);
         let s = restored.read(cx);
         assert_eq!(s.tab, Tab::Chat);
-        assert!(s.active_ws().unwrap().diff_closed);
+        assert!(s.active_task().unwrap().diff_closed);
         assert!(s.file_tabs.is_empty());
         assert!(w.find_all("diff-tab").is_empty());
     })
@@ -628,7 +628,7 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "zen".into(),
             git::on_branch(&repos, "zen"),
             vec![],
@@ -686,14 +686,14 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     // Home ends Zen; coming back doesn't restore it.
     press(cx, &["cmd-.", "cmd-0", "cmd-0"]);
     zen(cx, false, Tab::Chat);
-    // Naming a section needs the sidebar: Zen ends and the field has the keys.
+    // Naming a section uses a focused dialog without leaving Zen.
     press(cx, &["cmd-."]);
     on(cx, &|s, w, cx| s.start_naming(None, None, w, cx));
-    zen(cx, false, Tab::Chat);
+    zen(cx, true, Tab::Chat);
     on(cx, &|s, w, cx| {
-        assert!(s.sidebar_focus.contains_focused(w, cx))
+        assert!(!s.sidebar_focus.contains_focused(w, cx))
     });
-    press(cx, &["escape"]);
+    press(cx, &["escape", "cmd-."]);
     // A side question's field keeps the keys through Zen.
     on(cx, &|s, w, cx| {
         let chat = s.active_chat().unwrap().clone();
@@ -710,7 +710,7 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// The dock badge counts a workspace with an unread chat; reading the chat (selecting its tab)
+/// The dock badge counts a task with an unread chat; reading the chat (selecting its tab)
 /// or closing it clears the count at once.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -730,7 +730,7 @@ async fn dock_badge_follows_unread_chats(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "badge".into(),
             git::on_branch(&repos, "badge"),
             vec![],
@@ -745,7 +745,7 @@ async fn dock_badge_follows_unread_chats(cx: &mut TestAppContext) {
     .await;
     press_in(window)(cx, &["cmd-t"]);
     // The second chat is shown; the first finishes a turn unseen.
-    let first = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats[0].id.clone());
+    let first = cx.update(|cx| shark.read(cx).active_task().unwrap().chats[0].id.clone());
     let mark = |cx: &mut TestAppContext| {
         let first = first.clone();
         on(cx, &move |s, _, cx| {
@@ -782,7 +782,7 @@ async fn build_plan_in_new_chat_refuses_stale_plans(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "plan-n".into(),
             git::on_branch(&repos, "plan-n"),
             vec![],
@@ -798,7 +798,7 @@ async fn build_plan_in_new_chat_refuses_stale_plans(cx: &mut TestAppContext) {
     let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
     let plan = cx.update(|cx| chat.read(cx).plan.clone());
     let chats =
-        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.len());
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_task().unwrap().chats.len());
     cx.update(|cx| {
         plan.update(cx, |p, cx| {
             p.add("t1".into(), "# One\n\nfirst\n".into(), cx);
@@ -817,6 +817,83 @@ async fn build_plan_in_new_chat_refuses_stale_plans(cx: &mut TestAppContext) {
     });
     on(cx, &|s, w, cx| s.build_plan_in_new_chat(w, cx));
     assert_eq!(chats(cx), before, "already approved: no new chat");
+    let id = cx.update(|cx| chat.read(cx).meta.id.clone());
+    crate::plan::delete(&id);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Approving a plan keeps a readable copy of the approved text in the task's `.context/plans`.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn plan_approved_saves_the_approved_plan_into_context(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_task_for_test(
+            "plan-copy".into(),
+            git::on_branch(&repos, "plan-copy"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let (plan, dir) = cx.update(|cx| {
+        let c = chat.read(cx);
+        (c.plan.clone(), c.ws.dir())
+    });
+    let copies = || -> Vec<(String, String)> {
+        let Ok(rd) = fs::read_dir(dir.join(".context/plans")) else {
+            return vec![];
+        };
+        rd.map(|e| {
+            let p = e.unwrap().path();
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read_to_string(&p).unwrap(),
+            )
+        })
+        .collect()
+    };
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.add("t1".into(), "# One\n\nfirst\n".into(), cx);
+            p.add("t2".into(), "# One\n\nsecond\n".into(), cx);
+        })
+    });
+    assert!(copies().is_empty(), "nothing is saved before approval");
+    cx.update(|cx| chat.update(cx, |c, cx| c.plan_approved(cx)));
+    let got = copies();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].0.ends_with(" plan.md"), "{got:?}");
+    assert_eq!(got[0].1, "# One\n\nsecond\n", "the approved text");
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.add("t3".into(), "# One\n\nthird\n".into(), cx);
+        })
+    });
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| p.approve(cx));
+        chat.update(cx, |c, cx| c.plan_approved(cx))
+    });
+    let got = copies();
+    assert_eq!(got.len(), 1, "re-approval replaces the copy: {got:?}");
+    assert_eq!(got[0].1, "# One\n\nthird\n");
     let id = cx.update(|cx| chat.read(cx).meta.id.clone());
     crate::plan::delete(&id);
     fs::remove_dir_all(&home).ok();

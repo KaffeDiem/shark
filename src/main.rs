@@ -1,4 +1,4 @@
-mod agent;
+mod agent_icon;
 mod app;
 mod apps;
 mod attention;
@@ -16,10 +16,13 @@ mod features;
 mod file_icon;
 mod files;
 mod git;
+mod harness;
+mod linear;
 mod lsp;
 mod media;
 mod menu;
 mod menubar;
+mod mermaid;
 mod models;
 mod overflow_fade;
 mod plan;
@@ -27,12 +30,16 @@ mod pr;
 mod proc;
 mod prompts;
 mod prs;
+mod review_protocol;
 mod scripts;
 mod settings;
+mod skills;
 mod stack;
 mod state;
 mod sync;
+mod task_composer;
 mod theme;
+mod title;
 mod transcript;
 mod ui;
 mod usage;
@@ -47,13 +54,14 @@ actions!(
     shark,
     [
         TogglePalette,
-        NewWorkspace,
-        ArchiveWorkspace,
-        ForceArchiveWorkspace,
+        NewTask,
+        NewTaskFromBranch,
+        ArchiveTask,
+        ForceArchiveTask,
         AddRepo,
         CycleOpenApp,
-        OpenWorkspacePicker,
-        AddRepoToWorkspace,
+        OpenTaskPicker,
+        AddRepoToTask,
         StopAgent,
         FocusLeft,
         FocusRight,
@@ -61,6 +69,7 @@ actions!(
         ShowUsage,
         ShowDiff,
         ShowGit,
+        ShowArtifacts,
         CreatePrs,
         OpenPrs,
         CreateDraftPrs,
@@ -86,7 +95,12 @@ actions!(
         ToggleDiffMode,
         RefreshDiff,
         PickModel,
+        AddToDraft,
+        ChangeDraftBranch,
         ToggleSidebar,
+        TogglePeek,
+        RegenerateTitle,
+        PasteAgentIcon,
         ToggleFileTree,
         ToggleViewed,
         OpenFile,
@@ -104,7 +118,7 @@ actions!(
         PickBranch,
         PickPullRequest,
         BranchFromSource,
-        RefreshWorkspaceSources,
+        RefreshTaskSources,
         NextAttention,
         OpenSettings,
         RunScripts,
@@ -129,6 +143,7 @@ actions!(
         InsertSide,
         NewSection,
         MoveToSection,
+        ToggleBacklog,
         RenameSection,
         SectionIcon,
         DeleteSection,
@@ -161,6 +176,7 @@ actions!(
         TogglePlan,
         ApprovePlan,
         BuildPlanInNewChat,
+        HandOff,
         PlanOlder,
         PlanNewer,
         TogglePlanChanges
@@ -169,6 +185,19 @@ actions!(
 
 // The Git conversation (src/features/git/mod.rs): `e`, `r` and `c` on the cursor.
 actions!(shark, [EditDescription, ReplyToThread, CommentOnPr]);
+
+// The Artifacts list: `a`, `p`, `r`, cmd-c, cmd-backspace and cmd-f.
+actions!(
+    shark,
+    [
+        AttachArtifact,
+        PinArtifact,
+        RefreshArtifacts,
+        CopyArtifactPath,
+        DeleteArtifact,
+        FilterArtifacts
+    ]
+);
 
 // Editor and diff review: cmd-p, and `c` / `shift-c` in the diff.
 actions!(
@@ -202,17 +231,17 @@ actions!(
     ]
 );
 
-/// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
+/// Switch the open task to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
 pub struct SetModel(pub usize);
 
-/// Open the nth sidebar workspace (cmd-1 is the top one).
+/// Open the nth sidebar task (cmd-1 is the top one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
-pub struct OpenWorkspace(pub usize);
+pub struct OpenTask(pub usize);
 
-/// Open the nth tab of the current workspace (ctrl-1 is the leftmost one).
+/// Open the nth tab of the current task (ctrl-1 is the leftmost one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
 pub struct OpenTab(pub usize);
@@ -237,14 +266,14 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str = "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal";
-    const TREE: &str = "FileTree || Sidebar";
+    const NAV: &str = "(Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || ArtifactsFeature || VimNormal) && !TaskPeek";
+    const TREE: &str = "(FileTree || Sidebar) && !TaskPeek";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features";
-    const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)";
+    const MOVE: &str = "(Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || ArtifactsFeature || Features) && !TaskPeek";
+    const ARROWS: &str = "(Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (ArtifactsFeature && !Input) || (Diff && !Vim)) && !TaskPeek";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -257,22 +286,21 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
-        KeyBinding::new("cmd-n", NewWorkspace, None),
+        KeyBinding::new("cmd-n", NewTask, None),
         KeyBinding::new("cmd-o", CycleOpenApp, None),
-        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, Some("!FileEditor")),
+        KeyBinding::new("cmd-shift-o", OpenTaskPicker, Some("!FileEditor")),
         KeyBinding::new("cmd-0", ToggleHome, None),
-        // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches
-        // the prompt between new workspace and Ask Shark; i/a jump from the list to it.
-        KeyBinding::new("escape", CancelEdit, Some("HomeView")),
-        KeyBinding::new("tab", SwitchField, Some("HomePrompt")),
+        // Home: esc goes back to the task (or stops an Ask Shark answer); tab switches
+        // the prompt between new task and Ask Shark; i/a jump from the list to it.
+        KeyBinding::new("escape", CancelEdit, Some("HomeView && !Input")),
         KeyBinding::new(
             "i",
             FocusComposer,
             Some("Home || Transcript || Queue || PlanPane"),
         ),
         KeyBinding::new("a", FocusComposer, Some("Home || Transcript || Queue")),
-        // The workspace under the cursor, as in the row menu.
-        KeyBinding::new("cmd-backspace", ArchiveWorkspace, Some("Home || Sidebar")),
+        // The task under the cursor, as in the row menu.
+        KeyBinding::new("cmd-backspace", ArchiveTask, Some("Home || Sidebar")),
         // Not in the editor: Vim users leave insert mode with ctrl-c.
         KeyBinding::new("ctrl-c", StopAgent, Some("!FileEditor")),
         KeyBinding::new("cmd-alt-left", FocusLeft, None),
@@ -281,10 +309,19 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w h", FocusLeft, Some("Vim")),
         KeyBinding::new("ctrl-w l", FocusRight, Some("Vim")),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new(
+            "space",
+            TogglePeek,
+            Some("(Sidebar || (Home && !Input)) && !TaskPeek"),
+        ),
+        KeyBinding::new("escape", CancelEdit, Some("Sidebar")),
+        KeyBinding::new("cmd-d", PasteAgentIcon, Some("AgentEditor")),
+        KeyBinding::new("b", ToggleBacklog, Some("Sidebar || (Home && !Input)")),
         KeyBinding::new("cmd-.", ToggleZen, None),
         KeyBinding::new("cmd-alt-b", ToggleFileTree, None),
         KeyBinding::new("cmd-shift-d", ShowDiff, None),
         KeyBinding::new("cmd-shift-g", ShowGit, None),
+        KeyBinding::new("cmd-shift-a", ShowArtifacts, None),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
@@ -324,6 +361,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("cmd-shift-enter", AskSide, Some("Composer")),
+        KeyBinding::new("cmd-alt-enter", HandOff, Some("Composer")),
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),
         KeyBinding::new("c", CopySide, Some("SideAnswer")),
         KeyBinding::new("enter", InsertSide, Some("SideAnswer")),
@@ -339,11 +377,11 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "enter",
             Confirm,
-            Some("Sidebar || Home || Transcript || FileTree || Queue || Features"),
+            Some("(Sidebar || Home || Transcript || FileTree || Queue || Features) && !TaskPeek"),
         ),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),
-        KeyBinding::new("escape", FocusTranscript, Some("Composer")),
+        KeyBinding::new("escape", FocusTranscript, Some("Composer && !SharkMenu")),
         KeyBinding::new("e", EditQueued, Some("Queue")),
         KeyBinding::new("d", DeleteQueued, Some("Queue")),
         KeyBinding::new("backspace", DeleteQueued, Some("Queue")),
@@ -354,23 +392,33 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("m", MoveToSection, Some("Sidebar")),
         // Inline section name in the sidebar: the Input lets escape through.
         KeyBinding::new("escape", CancelEdit, Some("SectionName")),
-        // New workspace dialog: tab hops between branch and repo filter, space ticks the
+        // New task dialog: tab hops between branch and repo filter, space ticks the
         // highlighted repo (names have no spaces), cmd-b lists its branches, cmd-enter creates
         // from either field.
-        KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),
-        KeyBinding::new("shift-tab", SwitchField, Some("NewWorkspace")),
-        KeyBinding::new("space", ToggleRepo, Some("NewWorkspace > Command")),
-        KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
-        KeyBinding::new("cmd-b", PickBranch, Some("NewWorkspace")),
-        KeyBinding::new("cmd-p", PickPullRequest, Some("NewWorkspace")),
-        KeyBinding::new("alt-enter", BranchFromSource, Some("NewWorkspace")),
-        KeyBinding::new("cmd-r", RefreshWorkspaceSources, Some("NewWorkspace")),
+        KeyBinding::new("tab", SwitchField, Some("NewTask")),
+        KeyBinding::new("shift-tab", SwitchField, Some("NewTask")),
+        KeyBinding::new("space", ToggleRepo, Some("NewTask > Command")),
+        KeyBinding::new("cmd-enter", SubmitForm, Some("NewTask")),
+        KeyBinding::new("cmd-b", PickBranch, Some("NewTask")),
+        KeyBinding::new("cmd-p", PickPullRequest, Some("NewTask")),
+        KeyBinding::new("alt-enter", BranchFromSource, Some("NewTask")),
+        KeyBinding::new("cmd-r", RefreshTaskSources, Some("NewTask")),
         KeyBinding::new("cmd-,", OpenSettings, None),
-        // Outside the New workspace dialog, whose cmd-r refreshes its lists.
+        // Outside the New task dialog, whose cmd-r refreshes its lists.
         KeyBinding::new("cmd-r", RunScripts, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
+        // Enter is for the focused control. The dialog's OK would close Settings first, hiding a
+        // rejected key's message.
+        KeyBinding::new("enter", NoAction, Some("LinearPage")),
         KeyBinding::new("cmd-/", PickModel, None),
+        KeyBinding::new("cmd-i", AddToDraft, Some("HomePrompt")),
+        KeyBinding::new("cmd-shift-b", ChangeDraftBranch, Some("HomePrompt")),
+        KeyBinding::new(
+            "alt-enter",
+            BranchFromSource,
+            Some("TaskComposer || Composer"),
+        ),
         KeyBinding::new("cmd-shift-f", ToggleFastMode, None),
         KeyBinding::new("cmd-shift-.", RaiseEffort, None),
         KeyBinding::new("cmd-shift-,", LowerEffort, None),
@@ -400,6 +448,21 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("e", EditDescription, Some("GitFeature && !Input")),
         KeyBinding::new("r", ReplyToThread, Some("GitFeature && !Input")),
         KeyBinding::new("c", CommentOnPr, Some("GitFeature && !Input")),
+        KeyBinding::new("enter", Confirm, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("a", AttachArtifact, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("p", PinArtifact, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new("r", RefreshArtifacts, Some("ArtifactsFeature && !Input")),
+        KeyBinding::new(
+            "cmd-c",
+            CopyArtifactPath,
+            Some("ArtifactsFeature && !Input"),
+        ),
+        KeyBinding::new(
+            "cmd-backspace",
+            DeleteArtifact,
+            Some("ArtifactsFeature && !Input"),
+        ),
+        KeyBinding::new("cmd-f", FilterArtifacts, Some("ArtifactsFeature")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(
@@ -464,9 +527,7 @@ fn bind_keys(cx: &mut App) {
         (0..models::MODELS.len())
             .map(|i| KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None)),
     );
-    cx.bind_keys(
-        (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
-    );
+    cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenTask(i), None)));
     cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenTab(i), None)));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let scroll = [
@@ -534,10 +595,11 @@ fn main() {
     application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
+            cx.set_app_identity("io.github.kaffediem.shark", "Shark");
             set_dock_icon();
             gpui_kit::init(cx);
             cx.on_app_quit(|_| async {
-                agent::stop_all();
+                harness::stop_all();
                 lsp::client::Client::terminate_all().await
             })
             .detach();
@@ -619,6 +681,11 @@ mod tests {
         assert!(hit("left", "Sidebar", &CollapseDir) && hit("right", "FileTree", &ExpandDir));
         assert!(hit("enter", "GitFeature", &Confirm) && hit("e", "GitFeature", &EditDescription));
         assert!(hit("r", "GitFeature", &ReplyToThread) && hit("c", "GitFeature", &CommentOnPr));
+        assert!(
+            hit("a", "ArtifactsFeature", &AttachArtifact)
+                && hit("r", "ArtifactsFeature", &RefreshArtifacts)
+        );
+        assert!(hit("cmd-backspace", "ArtifactsFeature", &DeleteArtifact));
         assert!(hit("c", "DiffPane", &AddComment) && hit("r", "DiffPane", &ResolveThread));
     }
 }

@@ -6,7 +6,7 @@ use super::status::{
 use crate::git::cmd_bounded;
 use crate::pr;
 use crate::proc::par_map;
-use crate::state::Workspace;
+use crate::state::Task;
 use std::path::PathBuf;
 
 /// Everything a background probe needs, detached from the entity.
@@ -26,7 +26,7 @@ pub(super) struct Job {
 
 impl Job {
     /// Every repo of `ws`, asking GitHub, not fetching.
-    pub(super) fn prs(ws: &Workspace) -> Job {
+    pub(super) fn prs(ws: &Task) -> Job {
         Job {
             repos: worktrees(ws),
             fetch: false,
@@ -205,7 +205,7 @@ pub(super) fn run_job(job: &Job) -> Probed {
     }
 }
 
-/// A slow check of a workspace that isn't on screen, so its sidebar row can say "needs you"
+/// A slow check of a task that isn't on screen, so its sidebar row can say "needs you"
 /// (red CI, a review, conflicts) without opening it. It never fetches: that would fight the
 /// agent for refs, and what changes while nobody looks is GitHub's answer.
 ///
@@ -215,7 +215,7 @@ pub(super) fn run_job(job: &Job) -> Probed {
 /// is `Err` when gh wasn't asked or failed for any repo (offline, logged out, not GitHub), so
 /// the caller keeps the last label and may back off.
 pub fn check_in_background(
-    ws: &Workspace,
+    ws: &Task,
     last: &[Repo],
     gh: bool,
     reviewed: &[String],
@@ -229,7 +229,7 @@ pub fn check_in_background(
 }
 
 pub(super) fn background_answer(
-    ws: &Workspace,
+    ws: &Task,
     locals: Vec<Result<Local, String>>,
     prs: Option<Vec<Result<Option<Pr>, String>>>,
     parents: Vec<Option<Result<Option<Pr>, String>>>,
@@ -278,10 +278,10 @@ pub(super) fn check_review_checkout(repos: &[Repo], rs: &[String]) -> Result<(),
     Ok(())
 }
 
-/// [`status::step_args`] against the workspace's saved base: [`repos_from`] follows an open PR's
+/// [`status::step_args`] against the task's saved base: [`repos_from`] follows an open PR's
 /// base for display, which would hide a retargeted PR from the merge guard.
 pub(super) fn planned_args(
-    ws: &Workspace,
+    ws: &Task,
     kind: &Kind,
     r: &Repo,
 ) -> Result<Option<Vec<String>>, String> {
@@ -296,7 +296,7 @@ type Step<'a> = dyn Fn(&std::path::Path, &Repo) -> Result<Option<String>, String
 /// Runs a step on the target repos. Blocking; called on a background thread.
 pub(super) fn execute(
     a: &Action,
-    ws: &Workspace,
+    ws: &Task,
     repos: &[Repo],
     order: &[String],
     new_pr: &pr::NewPr,
@@ -458,7 +458,7 @@ impl From<&Pr> for crate::git::PullRequest {
 }
 
 /// `(worktree, base, branch)` per repo of `ws`.
-pub(super) fn worktrees(ws: &Workspace) -> Vec<(PathBuf, String, String)> {
+pub(super) fn worktrees(ws: &Task) -> Vec<(PathBuf, String, String)> {
     let dir = ws.dir();
     ws.repos
         .iter()
@@ -468,7 +468,7 @@ pub(super) fn worktrees(ws: &Workspace) -> Vec<(PathBuf, String, String)> {
 
 /// Assemble probe results identically for polling, background attention and execution.
 pub(super) fn repos_from(
-    ws: &Workspace,
+    ws: &Task,
     locals: Vec<Result<Local, String>>,
     prs: Option<Vec<Result<Option<Pr>, String>>>,
     parents: Vec<Option<Result<Option<Pr>, String>>>,
@@ -514,7 +514,7 @@ pub(super) fn repos_from(
 
 /// A merge needs a fresh parent answer; cached display state must never authorize it.
 pub(super) fn execution_repos(
-    ws: &Workspace,
+    ws: &Task,
     fresh: Probed,
     last: &[Repo],
     action: &Action,
@@ -581,7 +581,7 @@ fn merge_method(wt: &std::path::Path) -> Result<&'static str, String> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_step(
     a: Action,
-    ws: &Workspace,
+    ws: &Task,
     job: Job,
     handled: &[String],
     order: &[String],

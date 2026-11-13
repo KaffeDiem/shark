@@ -1,4 +1,4 @@
-//! Apps a workspace, repo or Xcode project can be opened in: every app LaunchServices
+//! Apps a task, repo or Xcode project can be opened in: every app LaunchServices
 //! lists as an editor of folders, plus Xcode. Found once per launch, icons included.
 use gpui_kit::{Image, ImageFormat};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ pub(crate) enum Kind {
     Terminal,
     /// Opens any folder: editors, terminals LaunchServices doesn't call shells.
     Folder,
-    /// Opens a repo, not the workspace folder around them.
+    /// Opens a repo, not the task folder around them.
     Git,
     /// Opens an `.xcworkspace`, `.xcodeproj` or `Package.swift`.
     Xcode,
@@ -87,7 +87,7 @@ impl OpenApp {
             .spawn();
     }
 
-    /// What this app opens, as (label, path): `folder` (the workspace's, if any) and the
+    /// What this app opens, as (label, path): `folder` (the task's, if any) and the
     /// repos for terminals and editors, the repos for git clients, their projects for Xcode.
     pub(crate) fn targets(
         &self,
@@ -197,7 +197,7 @@ fn discover() -> Vec<OpenApp> {
     let mut ids = handlers("public.folder", LSRolesMask::Editor);
     // Terminal, Ghostty and Fork register for `public.directory`, which `public.folder` misses.
     ids.extend(handlers("public.directory", LSRolesMask::Editor));
-    // Finder too: cmd-o is the one way to open a workspace somewhere.
+    // Finder too: cmd-o is the one way to open a task somewhere.
     ids.extend(
         IDES.iter()
             .chain([&XCODE, &FINDER])
@@ -371,7 +371,7 @@ mod tests {
         let (ios, web) = (tmp("t-ios"), tmp("t-web"));
         fs::create_dir_all(ios.join("App.xcodeproj")).unwrap();
         fs::create_dir_all(&web).unwrap();
-        let folder = ("Workspace folder".to_string(), PathBuf::from("/ws"));
+        let folder = ("Task folder".to_string(), PathBuf::from("/ws"));
         let repos = [("ios".to_string(), ios.clone()), ("web".to_string(), web)];
         let app = |kind| OpenApp {
             name: "x".into(),
@@ -384,8 +384,8 @@ mod tests {
                 .map(|t| t.0)
                 .collect()
         };
-        assert_eq!(labels(Kind::Terminal), ["Workspace folder", "ios", "web"]);
-        assert_eq!(labels(Kind::Folder), ["Workspace folder", "ios", "web"]);
+        assert_eq!(labels(Kind::Terminal), ["Task folder", "ios", "web"]);
+        assert_eq!(labels(Kind::Folder), ["Task folder", "ios", "web"]);
         assert_eq!(labels(Kind::Git), ["ios", "web"]);
         assert_eq!(labels(Kind::Xcode), ["ios/App.xcodeproj"]);
         assert_eq!(

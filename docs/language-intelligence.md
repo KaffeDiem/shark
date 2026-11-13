@@ -1,5 +1,7 @@
 # Language intelligence
 
+Language intelligence supports editing and reviewing a task’s isolated worktree.
+Two tasks of the same agent keep separate language sessions and buffers.
 The editor uses GPUI with a 4 MiB document limit. Language servers are shared by
 project, backend, worktree, and toolchain identity. Tool setup and pipe I/O run away
 from the UI thread. Project dependencies and compiler SDKs remain prerequisites.
@@ -7,7 +9,7 @@ This guide covers usage, tool selection, validation, and known limitations.
 
 ## Using it
 
-Open a Rust, Python, TypeScript/JavaScript, Swift, or Go source file in a workspace.
+Open a Rust, Python, TypeScript/JavaScript, Swift, or Go source file in a task.
 The editor starts its language session and reports Starting, Preparing index,
 Ready, or Setup needed. While the server starts or reports `$/progress`, the header
 shows a spinner with the newest work and its percentage ("Indexing 42%"; the server's
@@ -20,7 +22,7 @@ A project's files share one server. Only fields that select the toolchain key it
 (go.mod's `go`/`toolchain` lines, pyproject.toml's `requires-python` and checker
 tables), so editing a dependency does not start a second server. The server outlives the replacement of its only
 tab (tree clicks, same-tab definitions, Back) and stops when the last file using it
-closes. Switching workspaces parks the outgoing workspace's servers for five minutes;
+closes. Switching tasks parks the outgoing task's servers for five minutes;
 returning within that window resumes them warm.
 
 The header is a jump bar: back/forward buttons, the file path, then the symbols around
@@ -31,7 +33,7 @@ a folder works the same way. A file with unsaved edits is never replaced. The mo
 back/forward buttons walk the same history; quick repeated presses step one entry each,
 and an entry whose file was deleted is skipped.
 
-Definitions outside the workspace, and inside installed dependencies (`node_modules`,
+Definitions outside the task worktree, and inside installed dependencies (`node_modules`,
 `site-packages`), open read-only with the server that found them, so hover and
 definitions keep working there. Back returns the replaced file to its tab position.
 
@@ -126,25 +128,17 @@ restored if the swap fails. Cached verified versions can be reused offline; fail
 stages are removed. No npm install scripts or project
 configuration migration commands run.
 
-| Tool | Pin | Provenance |
-|---|---|---|
-| Pyrefly | 1.4.0 | [Published release and asset digest](https://github.com/facebook/pyrefly/releases/tag/1.4.0) |
-| Ruff | 0.17.3 | [Published release and asset digest](https://github.com/astral-sh/ruff/releases/tag/0.17.3) |
-| Native TypeScript | 7.0.2 | [Exact platform package](https://registry.npmjs.org/@typescript/typescript-darwin-arm64/7.0.2) |
-| TypeScript language server | 6.0.2 | [Exact package](https://registry.npmjs.org/typescript-language-server/6.0.2) |
-| Pyright | 1.1.414 | [Exact package](https://registry.npmjs.org/pyright/1.1.414) |
-| Node/npm | Node 22.23.4 distribution | [Official checksums](https://nodejs.org/dist/v22.23.4/SHASUMS256.txt) |
-| SweetPad CLI | 0.1.15 | [Published release and asset digest](https://github.com/sweetpad-dev/sweetpad/releases/tag/cli-v0.1.15) |
-| gopls | 0.24.0, built by Go 1.27.3 | [Pinned module](https://github.com/golang/tools/tree/gopls/v0.24.0/gopls) |
+The [tool manifest](../src/lsp/tool-manifest.json) is the source of truth for
+managed versions, download locations and checksums. `GOPLS_VERSION` in
+[`src/lsp/tools.rs`](../src/lsp/tools.rs) and `GO_VERSION` in
+[`scripts/build-gopls.sh`](../scripts/build-gopls.sh) define the bundled Go server.
 
 Rust and SourceKit-LSP deliberately follow the selected compiler toolchain.
 The gopls build script checks its exact Go version, builds with `-trimpath`,
 executes a protocol smoke test, and emits an archive and checksum. The published
 release asset is that unsigned build; app packaging signs the bundled copy and
-recomputes its checksum after signing. The gopls pin is `GOPLS_VERSION` in
-`src/lsp/tools.rs`; the Go pin is `GO_VERSION` in `scripts/build-gopls.sh`. The
-release workflow builds and checks third-party tools in a job whose token cannot
-write to the repository.
+recomputes its checksum after signing. The release workflow builds and checks
+third-party tools in a job whose token cannot write to the repository.
 
 ## Validation
 
@@ -167,7 +161,7 @@ python3 scripts/lsp-smoke.py ruff -- /path/to/ruff server
 python3 scripts/lsp-smoke.py typescript -- /path/to/tsc --lsp --stdio
 scripts/build-gopls.sh
 python3 scripts/check-language-tools.py
-cargo test --features test-support lsp::
+cargo test --features test-support lsp:: -- --test-threads=1
 ```
 
 For a classic TypeScript SDK, set `SHARK_LSP_SMOKE_INIT` to a JSON object with

@@ -10,24 +10,38 @@ pub(super) const ENTER_PLAN: &str = "Only the user turns plan mode on in this ap
 pub(super) const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
     without it, or tell the user what to run.";
 pub(super) const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
+pub(super) const NEEDS_REPO: &str = "This task has no repository, so it stays in Plan mode. Attach \
+    one to build.";
+pub(super) const ATTACHING: &str = "A repository is still attaching or needs a decision in the \
+    header, so this agent can't build yet.";
 pub(super) const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
     have none of that chat's context: read the code it touches before you change it.";
+
+/// The approved plan as `.context/plans/<title> plan.md` in the task, replacing an earlier copy.
+fn write_plan_copy(task: &std::path::Path, title: &str, text: &str) -> std::io::Result<()> {
+    let dir = task.join(".context/plans");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join(format!("{} plan.md", crate::complete::file_name(title))),
+        text,
+    )
+}
 
 impl Chat {
     /// Plan mode on or off. A running process switches at once, mid-turn too; a new one
     /// switches as it starts.
     pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.meta.plan == on {
+        if self.meta.plan == on || (!on && self.refuse_unready(cx)) {
             return;
         }
         self.meta.plan = on;
-        if self.busy && self.codex() {
+        if self.busy && self.active_codex() {
             self.push(
                 Block::Info("codex switches plan mode from the next message".into()),
                 cx,
             );
         }
-        if let Some(a) = &mut self.agent
+        if let Some(a) = &mut self.harness
             && let Err(e) = a.set_plan_mode(on)
         {
             self.push(Block::Info(format!("switching plan mode failed: {e}")), cx);
@@ -38,6 +52,20 @@ impl Chat {
         }
         cx.emit(ChatEvent::Meta);
         cx.notify();
+    }
+
+    /// The one gate on the way out of Plan mode: everything that ends it or builds a plan comes
+    /// through here. Says what's missing and has the app offer Attach repository. Returns
+    /// whether it refused.
+    pub fn refuse_unready(&mut self, cx: &mut Context<Self>) -> bool {
+        let refused = !self.ws.ready();
+        if refused && !self.ws.attaching.is_empty() {
+            self.push(Block::Info(ATTACHING.into()), cx);
+        } else if refused {
+            self.push(Block::Info(NEEDS_REPO.into()), cx);
+            cx.emit(ChatEvent::NeedsRepo);
+        }
+        refused
     }
 
     /// Why the plan can't be approved or built now: none yet, already approved, or an older
@@ -62,7 +90,7 @@ impl Chat {
         if let Some(why) = why {
             self.push(Block::Info(why.into()), cx);
         }
-        why.is_some()
+        why.is_some() || self.refuse_unready(cx)
     }
 
     /// Ends plan mode and tells the agent to build the latest plan. A draft rides along.
@@ -71,6 +99,8 @@ impl Chat {
             why
         } else if self.busy {
             "the agent is still working; approve when the turn ends (ctrl-c stops it)"
+        } else if self.refuse_unready(cx) {
+            return;
         } else {
             let was = self.meta.plan;
             self.set_plan_mode(false, cx);
@@ -88,6 +118,19 @@ impl Chat {
     /// Marks the latest plan approved and closes the pane: there is nothing left to review.
     pub fn plan_approved(&mut self, cx: &mut Context<Self>) {
         self.plan.update(cx, |p, cx| p.approve(cx));
+        // Codex can't write in plan mode, and claude's draft has a slug name: keep a readable copy.
+        if let Some(text) = crate::plan::handoff_text(&self.meta.id) {
+            let title = match self.meta.title.trim() {
+                "" => self.ws.display_title().to_string(),
+                t => t.to_string(),
+            };
+            if let Err(e) = write_plan_copy(&self.ws.dir(), &title, &text) {
+                self.push(
+                    Block::Info(format!("Couldn't save the plan to .context/plans: {e}")),
+                    cx,
+                );
+            }
+        }
         self.plan_open = false;
         cx.notify();
     }
@@ -95,6 +138,9 @@ impl Chat {
     /// The first message of a chat that builds another chat's plan: the plan and nothing else,
     /// titled after the plan.
     pub fn build_plan(&mut self, plan: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.refuse_unready(cx) {
+            return false;
+        }
         self.meta.title = title_of(&plan::title(plan));
         self.ask(&format!("{BUILD_FRESH}\n\n{plan}"), window, cx)
     }
@@ -119,5 +165,23 @@ impl Chat {
             self.plan.update(cx, |p, cx| p.add(id, text, cx));
             self.plan_open = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn plan_copy_lands_in_context_plans_and_is_overwritten() {
+        let dir = std::env::temp_dir().join(format!("shark-plan-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join(".context/plans/Fix a-b plan.md");
+        write_plan_copy(&dir, "Fix a/b", "# One").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "# One");
+        write_plan_copy(&dir, "Fix a/b", "# Two").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "# Two");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

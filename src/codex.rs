@@ -2,8 +2,8 @@
 //! with the user's own `codex login` (a ChatGPT subscription or an API key). Its notifications
 //! become the same `Ev`s claude's stream-json does; tool items take claude's tool names so the
 //! chat summarizes them the same way.
-use crate::agent::{self, Agent, Ev, SESSION_GONE, text_of};
-use crate::state::{ChatMeta, Workspace};
+use crate::harness::{self, Ev, Harness, SESSION_GONE, text_of};
+use crate::state::{ChatMeta, Task};
 use crate::transcript::{clip_output, clip_strings, output, transcript_path};
 use gpui_kit::base::async_util::Receiver;
 use serde_json::{Value, json};
@@ -45,7 +45,7 @@ pub struct State {
     model: String,
 }
 
-pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
+pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<Ev>)> {
     // SHARK_CODEX swaps in another binary, like SHARK_CLAUDE.
     let mut cmd = Command::new(crate::proc::codex_bin());
     cmd.arg("app-server");
@@ -56,20 +56,27 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
         ..Default::default()
     }));
     if !ws.dir().join("AGENTS.md").exists() {
-        crate::git::write_claude_md(ws); // a workspace from before codex chats
+        crate::git::write_instructions(ws, &ws.dir()).map_err(std::io::Error::other)?;
     }
     // Also catches skills a pull brought in since the links were last written.
-    crate::git::link_skills(ws, &ws.dir());
-    let (agent, rx) = agent::start(
+    let notice = crate::git::link_skills(ws, &ws.dir())
+        .err()
+        .map(|e| format!("Couldn't refresh skills: {e}"));
+    let (agent, rx) = harness::start(
         cmd,
         &ws.dir(),
         &chat.id,
         Some(transcript_path(&chat.id)),
         Some(st),
+        notice,
     )?;
     let mut params = json!({"cwd": ws.dir(), "approvalPolicy": "never", "sandbox": SANDBOX});
     if let Some(m) = model_id(chat.model.as_deref()) {
         params["model"] = m.into();
+    }
+    // The chat's agent, on start and on every resume.
+    if let Some(p) = crate::git::agent_prompt(ws, chat) {
+        params["developerInstructions"] = p.into();
     }
     // The server takes requests in order, so nothing waits for a reply here; `track` sends
     // the messages once the thread is there.
@@ -100,7 +107,7 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     };
     for text in std::mem::take(&mut s.pending) {
         s.next += 1;
-        agent::write(stdin, &request(s, &thread, &text))?;
+        harness::write(stdin, &request(s, &thread, &text))?;
     }
     Ok(())
 }
@@ -177,7 +184,7 @@ fn fast_in(config: &str) -> bool {
 pub fn interrupt(st: &Mutex<State>, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     let s = st.lock().unwrap();
     match (&s.thread, &s.turn) {
-        (Some(thread), Some(turn)) => agent::write(
+        (Some(thread), Some(turn)) => harness::write(
             stdin,
             &json!({"id": "interrupt", "method": "turn/interrupt", "params": {"threadId": thread, "turnId": turn}}),
         ),
@@ -201,9 +208,40 @@ pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> 
     reply(stdin, request_id, json!({"decision": "decline"}))
 }
 
+/// Codex keys answers by question id and uses its TUI's free-text convention.
+pub(crate) fn question_reply(
+    qs: &[harness::Question],
+    answers: Option<&[harness::Answer]>,
+) -> Value {
+    let by_id: serde_json::Map<String, Value> = match answers {
+        Some(answers) => harness::given(qs, answers)
+            .map(|(q, (labels, note), _)| {
+                let mut list = labels.clone();
+                if let Some(n) = note {
+                    if list.is_empty() {
+                        list.push("None of the above".into());
+                    }
+                    list.push(format!("user_note: {n}"));
+                }
+                (q.id.clone(), json!({ "answers": list }))
+            })
+            .collect(),
+        None => qs
+            .iter()
+            .map(|q| {
+                (
+                    q.id.clone(),
+                    json!({"answers": [format!("user_note: {}", harness::ANSWER_IN_CHAT)]}),
+                )
+            })
+            .collect(),
+    };
+    json!({ "answers": by_id })
+}
+
 pub fn reply(stdin: &Mutex<ChildStdin>, request_id: &str, result: Value) -> std::io::Result<()> {
     let id: Value = serde_json::from_str(request_id).unwrap_or(request_id.into());
-    agent::write(stdin, &json!({"id": id, "result": result}))
+    harness::write(stdin, &json!({"id": id, "result": result}))
 }
 
 /// Keeps `State` current from the server's lines, on the reader thread. A thread that can't
@@ -236,7 +274,7 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
                 json!({"id": v["id"], "error": {"code": -32601, "message": "not supported by shark"}})
             }
         };
-        let _ = agent::write(stdin, &reply);
+        let _ = harness::write(stdin, &reply);
         return true;
     }
     let mut s = st.lock().unwrap();
@@ -341,14 +379,12 @@ pub fn parse(v: &Value) -> Vec<Ev> {
                 _ => vec![result(false, String::new())],
             }
         }
-        // Its questions take claude's AskUserQuestion shape where they share fields, plus
-        // `id` and `isOther`; the chat reads both.
-        (Some(USER_INPUT), _) => vec![Ev::Permission {
-            request_id: v["id"].to_string(),
-            tool: "AskUserQuestion".into(),
-            tool_use_id: s(&p["itemId"]),
-            input: json!({"questions": p["questions"]}),
-        }],
+        (Some(USER_INPUT), _) => vec![Ev::Questions(harness::Questions::new(
+            v["id"].to_string(),
+            s(&p["itemId"]),
+            json!({"questions": p["questions"]}),
+            true,
+        ))],
         (Some(method), _) if APPROVALS.contains(&method) => vec![Ev::Permission {
             request_id: v["id"].to_string(),
             tool: method.into(),
@@ -556,7 +592,7 @@ mod tests {
 
     #[test]
     fn parses_app_server() {
-        let evs: Vec<Ev> = SESSION.lines().flat_map(agent::parse).collect();
+        let evs: Vec<Ev> = SESSION.lines().flat_map(harness::parse).collect();
         let done = |is_error: bool, text: &str, secs| Ev::Result {
             is_error,
             text: text.into(),
@@ -622,13 +658,13 @@ mod tests {
                     name: "ExitPlanMode".into(),
                     input: json!({"plan": ""}),
                 },
-                // Plan mode's question, for the chat to show and answer.
-                Ev::Permission {
-                    request_id: "0".into(),
-                    tool: "AskUserQuestion".into(),
-                    tool_use_id: "call_1".into(),
-                    input: json!({"questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}]}),
-                },
+                // Plan mode's question, normalized for the card.
+                Ev::Questions(harness::Questions::new(
+                    "0".into(),
+                    "call_1".into(),
+                    json!({"questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}]}),
+                    true,
+                )),
                 Ev::ToolResult {
                     id: "t6-plan".into(),
                     text: String::new(),
@@ -696,19 +732,19 @@ mod tests {
     fn clips_stored_lines() {
         let long = "é".repeat(MAX_OUTPUT + 5);
         let line = json!({"method": "item/completed", "params": {"item": {"type": "commandExecution", "id": "x", "aggregatedOutput": long, "exitCode": 0}}}).to_string();
-        let live = agent::parse(&line);
+        let live = harness::parse(&line);
         let stored = transcript::compact(&line);
         assert_eq!(
-            agent::parse(&stored),
+            harness::parse(&stored),
             live,
             "replay shows what the live turn did"
         );
         assert!(stored.contains(&format!("\"total_chars\":{}", MAX_OUTPUT + 5)));
         let diff = "+x\n".repeat(MAX_OUTPUT);
         let line = json!({"method": "item/completed", "params": {"item": {"type": "fileChange", "id": "f", "status": "completed", "changes": [{"path": "/a", "diff": diff}]}}}).to_string();
-        let live = agent::parse(&line);
+        let live = harness::parse(&line);
         assert_eq!(
-            agent::parse(&transcript::compact(&line)),
+            harness::parse(&transcript::compact(&line)),
             live,
             "a long diff replays the same"
         );
@@ -774,6 +810,9 @@ done
     #[cfg(feature = "test-support")] // shares the UI tests' home
     /// Runs the chat's process against a fake `codex app-server` until it exits or a turn ends.
     fn run_fake(session_id: Option<&str>, tag: &str, plan: bool) -> Vec<Ev> {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static FAKE_PATH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         FAKE_PATH.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("shark-fake-codex-{}", std::process::id()));
@@ -790,7 +829,7 @@ done
         });
         let root = std::env::temp_dir().join(format!("shark-codex-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("codex-{tag}-{}", std::process::id()),
             ..Default::default()
         };
@@ -803,13 +842,10 @@ done
             effort: Some("xhigh".into()),
             ..Default::default()
         };
-        let _turn = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-        let (mut a, rx) = agent::spawn(&ws, &meta).unwrap();
+        let (mut a, rx) = harness::spawn(&ws, &meta).unwrap();
         a.send("hi").unwrap(); // before the thread exists: held until it does
         let mut evs = vec![];
         while let Ok(ev) = rx.recv_blocking() {
@@ -822,8 +858,8 @@ done
                     }
             );
             // The chat's answer to plan mode's question.
-            if let Ev::Permission { request_id, .. } = &ev {
-                a.allow(request_id, json!({"answers": {"q1": {"answers": ["A"]}}}))
+            if let Ev::Questions(request) = &ev {
+                a.answer_questions(request, Some(&[(vec!["A".into()], None)]))
                     .unwrap();
             }
             evs.push(ev);
@@ -893,8 +929,8 @@ done
     fn plans_a_turn() {
         let evs = run_fake(None, "plan", true);
         assert!(
-            matches!(&evs[..], [Ev::Init { .. }, Ev::Permission { tool, .. }, Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
-                if tool == "AskUserQuestion" && name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
+            matches!(&evs[..], [Ev::Init { .. }, Ev::Questions(_), Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
+                if name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
             "{evs:?}"
         );
     }

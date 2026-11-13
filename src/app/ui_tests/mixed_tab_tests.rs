@@ -8,12 +8,12 @@ fn fixture(home: &Path) -> State {
         ..Default::default()
     };
     for name in ["mixed", "other"] {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: name.into(),
             branch: "main".into(),
             repos: repos
                 .iter()
-                .map(|r| crate::state::WsRepo {
+                .map(|r| crate::state::TaskRepo {
                     name: r.name.clone(),
                     src: r.path.clone(),
                     base: "main".into(),
@@ -32,7 +32,9 @@ fn fixture(home: &Path) -> State {
         ws.open_tab(TabId::File("api/b.txt".into()));
         ws.git_closed = false;
         ws.open_tab(TabId::Git);
-        state.workspaces.push(ws);
+        ws.artifacts_closed = false;
+        ws.open_tab(TabId::Artifacts);
+        state.tasks.push(ws);
     }
     state.last_open = Some(("mixed".into(), "chat".into()));
     state
@@ -43,6 +45,7 @@ fn element(id: &TabId) -> SharedString {
         TabId::Chat(id) => format!("chat-tab-{id}"),
         TabId::Diff => "diff-tab".into(),
         TabId::Git => "git-tab".into(),
+        TabId::Artifacts => "artifacts-tab".into(),
         TabId::File(path) => format!("file-tab-{path}"),
     }
     .into()
@@ -60,7 +63,7 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
             app_owns_titlebar_drag: true,
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(0.), px(0.)),
-                size(px(1440.), px(820.)),
+                size(px(1800.), px(820.)),
             ))),
             ..Default::default()
         },
@@ -99,6 +102,7 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
         TabId::Diff,
         TabId::File("api/a.txt".into()),
         TabId::Git,
+        TabId::Artifacts,
     ];
     // Every kind is both source and target, using actual pointer drags.
     for (from, to) in (0..ids.len()).flat_map(|from| {
@@ -106,7 +110,7 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
             .filter(move |&to| to != from)
             .map(move |to| (from, to))
     }) {
-        let mut expected = cx.update(|cx| shark.read(cx).active_ws().unwrap().tab_order.clone());
+        let mut expected = cx.update(|cx| shark.read(cx).active_task().unwrap().tab_order.clone());
         let a = expected.iter().position(|t| t == &ids[from]).unwrap();
         let b = expected.iter().position(|t| t == &ids[to]).unwrap();
         move_item(&mut expected, a, b);
@@ -129,7 +133,7 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
         cx.run_until_parked();
         cx.update_window(window, |_, w, cx| {
             let s = shark.read(cx);
-            assert_eq!(s.active_ws().unwrap().tab_order, expected);
+            assert_eq!(s.active_task().unwrap().tab_order, expected);
             assert_eq!(s.editor.as_ref(), Some(&editor));
             assert_eq!(s.tab, Tab::File);
             assert!(editor.read(cx).is_focused(w, cx));
@@ -139,19 +143,19 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
                 chat.read(cx).composer.read(cx).value().as_ref(),
                 "draft stays here"
             );
-            assert_eq!(State::load().workspaces[0].tab_order, expected);
+            assert_eq!(State::load().tasks[0].tab_order, expected);
         })
         .unwrap();
     }
-    let order = cx.update(|cx| shark.read(cx).active_ws().unwrap().tab_order.clone());
-    for (workspace, from, to) in [
+    let order = cx.update(|cx| shark.read(cx).active_task().unwrap().tab_order.clone());
+    for (task, from, to) in [
         ("other", ids[0].clone(), ids[1].clone()),
         ("mixed", ids[0].clone(), ids[0].clone()),
         ("mixed", TabId::File("api/gone".into()), ids[1].clone()),
         ("mixed", ids[0].clone(), TabId::Chat("closed".into())),
     ] {
-        on(cx, &|s, _, cx| s.move_tab(workspace, &from, &to, cx));
-        cx.update(|cx| assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, order));
+        on(cx, &|s, _, cx| s.move_tab(task, &from, &to, cx));
+        cx.update(|cx| assert_eq!(shark.read(cx).active_task().unwrap().tab_order, order));
     }
     press(cx, &["cmd-z"]);
     cx.update(|cx| assert_eq!(editor.read(cx).input.read(cx).value().as_ref(), "alpha\n"));
@@ -169,10 +173,10 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         s.new_chat(w, cx);
         assert!(matches!(
-            s.active_ws().unwrap().tab_order.last(),
+            s.active_task().unwrap().tab_order.last(),
             Some(TabId::Chat(_))
         ));
-        let id = s.active_ws().unwrap().tab_order.last().unwrap().clone();
+        let id = s.active_task().unwrap().tab_order.last().unwrap().clone();
         s.move_tab("mixed", &id, &TabId::File("api/a.txt".into()), cx);
         s.cycle_chat(1, w, cx);
         assert_eq!(s.active_chat(), Some(&chat));
@@ -198,7 +202,7 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
         "api//a.txt",
         "api/../api/a.txt",
     ];
-    let dir = state.workspaces[0].dir();
+    let dir = state.tasks[0].dir();
     fs::write(dir.join("api/binary"), [0, 255]).unwrap();
     fs::File::create(dir.join("api/large"))
         .unwrap()
@@ -214,9 +218,9 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
     fs::write(home.join("outside.txt"), "outside").unwrap();
     symlink(home.join("outside.txt"), dir.join("api/outside")).unwrap();
     for path in bad {
-        state.workspaces[0].open_tab(TabId::File(path.into()));
+        state.tasks[0].open_tab(TabId::File(path.into()));
     }
-    let saved = state.workspaces[0].tab_order.clone();
+    let saved = state.tasks[0].tab_order.clone();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     let on = on_app(window, shark.clone());
     let press = press_in(window);
@@ -237,36 +241,36 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
                 .focus_handle(cx)
                 .is_focused(w)
         );
-        assert_eq!(s.active_ws().unwrap().tab_order, saved);
+        assert_eq!(s.active_task().unwrap().tab_order, saved);
     })
     .unwrap();
     on(cx, &|s, w, cx| s.select_file(0, w, cx));
     let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
     cx.update_window(window, |_, w, cx| w.input("discard me ", cx))
         .unwrap();
-    on(cx, &|s, w, cx| s.open_workspace_named("other", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("other", w, cx));
     press(cx, &["escape"]);
     cx.update(|cx| {
         assert_eq!(shark.read(cx).active.as_deref(), Some("mixed"));
         assert_eq!(shark.read(cx).editor.as_ref(), Some(&editor));
         assert!(editor.read(cx).dirty);
-        assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, saved);
+        assert_eq!(shark.read(cx).active_task().unwrap().tab_order, saved);
     });
-    on(cx, &|s, w, cx| s.open_workspace_named("other", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("other", w, cx));
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.as_deref() == Some("other") && shark.read(cx).file_tabs.len() == 2
     })
     .await;
     fs::write(dir.join("api/missing.txt"), "now available\n").unwrap();
-    on(cx, &|s, w, cx| s.open_workspace_named("mixed", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("mixed", w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).file_tabs.len() == 3
     })
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.active_ws().unwrap().tab_order, saved);
+        assert_eq!(s.active_task().unwrap().tab_order, saved);
         let a = &s.file_tabs[0].editor;
         assert_ne!(a, &editor);
         assert_eq!(a.read(cx).input.read(cx).value().as_ref(), "alpha\n");
@@ -274,9 +278,9 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
     });
     // A -> B -> A before any background read lands: generation, not just name, guards it.
     on(cx, &|s, w, cx| {
-        s.open_workspace_named("other", w, cx);
-        s.open_workspace_named("mixed", w, cx);
-        s.open_workspace_named("other", w, cx);
+        s.open_task_named("other", w, cx);
+        s.open_task_named("mixed", w, cx);
+        s.open_task_named("other", w, cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).file_tabs.len() == 2
@@ -288,7 +292,7 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
         assert_eq!(s.active.as_deref(), Some("other"));
         assert_eq!(s.file_tabs.len(), 2);
     });
-    on(cx, &|s, w, cx| s.open_workspace_named("mixed", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("mixed", w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).file_tabs.len() == 3
     })
@@ -309,7 +313,7 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
     cx.update(|cx| {
         let s = again.read(cx);
         assert_eq!(s.tab, Tab::Chat);
-        assert_eq!(s.active_ws().unwrap().tab_order, saved);
+        assert_eq!(s.active_task().unwrap().tab_order, saved);
         assert_eq!(
             s.file_tabs[0]
                 .editor
@@ -328,19 +332,19 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
         s.select_file(0, w, cx);
         s.open_path("api/c.txt".into(), w, cx);
         assert_eq!(
-            s.active_ws().unwrap().tab_order[1],
+            s.active_task().unwrap().tab_order[1],
             TabId::File("api/c.txt".into())
         );
         s.close_file(w, cx);
         assert!(
-            !s.active_ws()
+            !s.active_task()
                 .unwrap()
                 .tab_order
                 .contains(&TabId::File("api/c.txt".into()))
         );
         s.open_path_tab("api/c.txt".into(), w, cx);
         assert_eq!(
-            s.active_ws().unwrap().tab_order.last(),
+            s.active_task().unwrap().tab_order.last(),
             Some(&TabId::File("api/c.txt".into()))
         );
     });
@@ -363,7 +367,7 @@ async fn pending_restore_survives_closing_last_live_editor(cx: &mut TestAppConte
     .await;
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.open_workspace_named("other", w, cx);
+        s.open_task_named("other", w, cx);
         s.open_path_tab("api/a.txt".into(), w, cx);
         assert_eq!(s.file_tabs.len(), 1);
         s.close_file(w, cx);
@@ -377,13 +381,13 @@ async fn pending_restore_survives_closing_last_live_editor(cx: &mut TestAppConte
         let s = shark.read(cx);
         assert_eq!(s.file_tabs[0].editor.read(cx).path, "api/b.txt");
         assert!(
-            !s.active_ws()
+            !s.active_task()
                 .unwrap()
                 .tab_order
                 .contains(&TabId::File("api/a.txt".into()))
         );
         assert!(
-            s.ws("mixed")
+            s.task("mixed")
                 .unwrap()
                 .tab_order
                 .contains(&TabId::File("api/a.txt".into()))
@@ -398,7 +402,7 @@ async fn review_restored_target_during_discard_stays_unique(cx: &mut TestAppCont
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let mut state = fixture(&home);
-    state.workspaces[0].close_tab(&TabId::File("api/b.txt".into()));
+    state.tasks[0].close_tab(&TabId::File("api/b.txt".into()));
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).file_tabs.len() == 1
@@ -414,7 +418,7 @@ async fn review_restored_target_during_discard_stays_unique(cx: &mut TestAppCont
         on(cx, &|s, w, cx| {
             assert!(source.read(cx).dirty);
             // Resume a saved tab restore just before replacing the dirty tab.
-            s.active_ws_mut()
+            s.active_task_mut()
                 .unwrap()
                 .open_tab(TabId::File("api/b.txt".into()));
             s.restore_file_tabs(w, cx);
@@ -458,18 +462,18 @@ async fn review_restored_target_during_discard_stays_unique(cx: &mut TestAppCont
                 assert_eq!(s.editor.as_ref(), Some(&target));
                 assert!(!s.file_tabs.iter().any(|t| t.editor == source));
                 assert!(
-                    !s.active_ws()
+                    !s.active_task()
                         .unwrap()
                         .tab_order
                         .contains(&TabId::File("api/a.txt".into()))
                 );
                 assert_eq!(
-                    s.active_ws().unwrap().tab_order[1],
+                    s.active_task().unwrap().tab_order[1],
                     TabId::File("api/b.txt".into())
                 );
                 assert_eq!(
-                    State::load().workspaces[0].tab_order,
-                    s.active_ws().unwrap().tab_order
+                    State::load().tasks[0].tab_order,
+                    s.active_task().unwrap().tab_order
                 );
             } else {
                 assert_eq!(s.editor.as_ref(), Some(&source));
@@ -477,7 +481,7 @@ async fn review_restored_target_during_discard_stays_unique(cx: &mut TestAppCont
                 assert_eq!(source.read(cx).input.read(cx).value().as_ref(), source_text);
             }
             assert_eq!(
-                fs::read_to_string(s.active_ws().unwrap().dir().join("api/a.txt")).unwrap(),
+                fs::read_to_string(s.active_task().unwrap().dir().join("api/a.txt")).unwrap(),
                 "alpha\n"
             );
             w.render_frame(cx);
@@ -502,7 +506,7 @@ async fn review_tab_scale_and_restore_entity_lifetime(cx: &mut TestAppContext) {
     for count in [10, 100, 300] {
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| {
-                let ws = s.active_ws_mut().unwrap();
+                let ws = s.active_task_mut().unwrap();
                 ws.chats.truncate(1);
                 ws.chats.extend((1..count).map(|i| crate::state::ChatMeta {
                     id: format!("mixed~scale-{i}"),
@@ -532,7 +536,7 @@ async fn review_tab_scale_and_restore_entity_lifetime(cx: &mut TestAppContext) {
             .map(|t| t.editor.downgrade())
             .collect::<Vec<_>>()
     });
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("other", w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_named("other", w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).file_tabs.len() == 2
     })
@@ -550,7 +554,7 @@ async fn review_restore_large_file_batch_releases_buffers(cx: &mut TestAppContex
     let home = test_home();
     let mut state = fixture(&home);
     let text = "A moderately sized line in a persisted file tab.\n".repeat(5_500);
-    let ws = &mut state.workspaces[0];
+    let ws = &mut state.tasks[0];
     for i in 0..24 {
         let path = format!("api/stress-{i}.txt");
         fs::write(ws.dir().join(&path), &text).unwrap();
@@ -575,7 +579,7 @@ async fn review_restore_large_file_batch_releases_buffers(cx: &mut TestAppContex
             .map(|t| t.editor.downgrade())
             .collect::<Vec<_>>()
     });
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("other", w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_named("other", w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).file_tabs.len() == 2
     })
@@ -589,7 +593,7 @@ async fn review_file_tab_scale(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let mut state = fixture(&home);
-    let ws = &mut state.workspaces[0];
+    let ws = &mut state.tasks[0];
     for i in 2..300 {
         let path = format!("api/tab-{i}.txt");
         fs::write(ws.dir().join(&path), "small text\n").unwrap();
@@ -609,7 +613,7 @@ async fn review_file_tab_scale(cx: &mut TestAppContext) {
                     .iter()
                     .map(|t| t.editor.read(cx).path.clone())
                     .collect();
-                s.active_ws_mut()
+                s.active_task_mut()
                     .unwrap()
                     .tab_order
                     .retain(|tab| match tab {
@@ -651,16 +655,16 @@ async fn closing_shows_the_strip_neighbor(cx: &mut TestAppContext) {
     let shown = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            let ws = s.active_ws().unwrap();
+            let ws = s.active_task().unwrap();
             s.visible_tab_ids(ws, cx)[s.active_tab_index(cx).unwrap()].clone()
         })
     };
     let strip = cx.update(|cx| {
         let s = shark.read(cx);
-        s.visible_tab_ids(s.active_ws().unwrap(), cx)
+        s.visible_tab_ids(s.active_task().unwrap(), cx)
     });
     let second =
-        TabId::Chat(cx.update(|cx| shark.read(cx).active_ws().unwrap().chats[1].id.clone()));
+        TabId::Chat(cx.update(|cx| shark.read(cx).active_task().unwrap().chats[1].id.clone()));
     assert_eq!(
         strip,
         [
@@ -669,6 +673,7 @@ async fn closing_shows_the_strip_neighbor(cx: &mut TestAppContext) {
             TabId::Diff,
             TabId::File("api/b.txt".into()),
             TabId::Git,
+            TabId::Artifacts,
             second.clone(),
         ]
     );
@@ -697,7 +702,7 @@ async fn closing_shows_the_strip_neighbor(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(shown(cx), third);
     assert_eq!(
-        cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.len()),
+        cx.update(|cx| shark.read(cx).active_task().unwrap().chats.len()),
         1
     );
 }
@@ -718,7 +723,7 @@ async fn middle_click_closes_the_tab_under_the_pointer(cx: &mut TestAppContext) 
     let strip = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            s.visible_tab_ids(s.active_ws().unwrap(), cx)
+            s.visible_tab_ids(s.active_task().unwrap(), cx)
         })
     };
     let click = |cx: &mut TestAppContext, id: &TabId, button| {
@@ -738,6 +743,7 @@ async fn middle_click_closes_the_tab_under_the_pointer(cx: &mut TestAppContext) 
         TabId::File("api/a.txt".into()),
         TabId::Diff,
         TabId::Git,
+        TabId::Artifacts,
         TabId::File("api/b.txt".into()),
     ] {
         click(cx, &id, MouseButton::Middle);
@@ -767,12 +773,12 @@ async fn replacement_chat_keeps_the_slot(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| {
         let s = shark.read(cx);
-        let ws = s.active_ws().unwrap();
+        let ws = s.active_task().unwrap();
         let fresh = TabId::Chat(ws.chats[0].id.clone());
         assert_ne!(fresh, TabId::Chat("mixed".into()));
         let strip = s.visible_tab_ids(ws, cx);
         assert_eq!(strip[0], fresh);
-        assert_eq!(strip.len(), 5);
+        assert_eq!(strip.len(), 6);
         assert_eq!(s.active_tab_index(cx), Some(0));
     });
 }

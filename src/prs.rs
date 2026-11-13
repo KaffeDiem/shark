@@ -1,5 +1,5 @@
-//! Recent and open PRs of a workspace's repos as `gh pr list` gives them, with an on-disk cache
-//! so the `#` completion and the New workspace dialog are instant after a restart.
+//! Recent and open PRs of a task's repos as `gh pr list` gives them, with an on-disk cache
+//! so the `#` completion and the New task dialog are instant after a restart.
 use crate::state::support_dir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ impl PrStatus {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Pr {
-    /// The workspace repo it was listed in; not from gh.
+    /// The task repo it was listed in; not from gh.
     #[serde(default)]
     pub repo: String,
     pub number: u64,
@@ -142,7 +142,7 @@ fn prs_path(src: &Path, open: bool) -> PathBuf {
         .join(format!("{key:016x}-{scope}.json"))
 }
 
-/// Source paths are shared by the creation dialog and every workspace using that repo.
+/// Source paths are shared by the creation dialog and every task using that repo.
 pub fn cached_repo_prs(repo: &str, src: &Path, open: bool) -> Vec<Pr> {
     std::fs::read_to_string(prs_path(src, open))
         .ok()

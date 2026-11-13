@@ -9,54 +9,38 @@
 use super::review_comment::{Comment, Status, judge, lines_now, posted_as, side, slice};
 use super::review_store::CommentStore;
 use super::*;
-use crate::chat::parse_reports;
 use crate::diff_view::{
     CONTEXT_LINES, DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide, DisplayRow,
 };
+use crate::review_protocol::parse_reports;
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
 use std::cell::Cell;
 
 /// One hunk's patch lines: kind (`b' '`, `b'-'`, `b'+'`), old and new one-based line numbers.
 pub(crate) type Hunk = Vec<(u8, usize, usize)>;
 
-/// Hunks of one file's patch chunk, so the cursor knows the rows the diff draws.
-pub(crate) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
-    let mut hunks: Vec<Hunk> = vec![];
-    let (mut old, mut new, mut inside) = (0, 0, false);
-    for line in chunk.lines() {
-        if let Some(rest) = line.strip_prefix("@@ -") {
-            let start = |s: &str| s.split(',').next()?.parse::<usize>().ok();
-            let mut parts = rest.split(' ');
-            let o = parts.next().and_then(start);
-            let n = parts.next().and_then(|s| start(s.strip_prefix('+')?));
-            inside = o.is_some() && n.is_some();
-            (old, new) = (o.unwrap_or(0), n.unwrap_or(0));
-            if inside {
-                hunks.push(vec![]);
-            }
-            continue;
-        }
-        let Some(h) = hunks.last_mut().filter(|_| inside) else {
-            continue;
-        };
-        match line.as_bytes().first() {
-            Some(b' ') | None => {
-                h.push((b' ', old, new));
-                (old, new) = (old + 1, new + 1);
-            }
-            Some(b'-') => {
-                h.push((b'-', old, 0));
-                old += 1;
-            }
-            Some(b'+') => {
-                h.push((b'+', 0, new));
-                new += 1;
-            }
-            Some(b'\\') => {}
-            _ => inside = false,
-        }
-    }
-    hunks
+/// Geometry from the same validated patch model used for display.
+pub(crate) fn hunks(file: &DiffFile) -> Vec<Hunk> {
+    file.patch_hunks()
+        .map(|hunk| {
+            hunk.iter()
+                .map(|line| {
+                    let old = line
+                        .line(DiffSide::Original)
+                        .map(|ix| file.line_number(DiffSide::Original, ix));
+                    let new = line
+                        .line(DiffSide::Modified)
+                        .map(|ix| file.line_number(DiffSide::Modified, ix));
+                    let kind = match (old, new) {
+                        (Some(_), Some(_)) => b' ',
+                        (Some(_), None) => b'-',
+                        _ => b'+',
+                    };
+                    (kind, old.unwrap_or(0), new.unwrap_or(0))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// The hunks git prints at its default context, for GitHub inline comments.
@@ -452,23 +436,23 @@ impl Differ {
     }
 
     pub(crate) fn ws_comments(&self) -> &[Comment] {
-        self.workspace_name()
+        self.task_name()
             .and_then(|ws| self.review.store.comments.get(ws))
             .map_or(&[], |c| &c[..])
     }
 
-    /// The open workspace's comment `id`.
+    /// The open task's comment `id`.
     pub(crate) fn comment(&self, id: u64) -> Option<&Comment> {
         self.ws_comments().iter().find(|c| c.id == id)
     }
 
-    /// Edits the open workspace's comments and saves them.
+    /// Edits the open task's comments and saves them.
     pub(crate) fn edit_comments(
         &mut self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Vec<Comment>),
     ) {
-        if let Some(ws) = self.workspace_name().map(str::to_string) {
+        if let Some(ws) = self.task_name().map(str::to_string) {
             self.review.store.edit(&ws, f);
             cx.notify();
         }
@@ -560,10 +544,10 @@ impl Differ {
             })
     }
 
-    /// Moves the open workspace's working-copy threads to where their lines are on disk now, so
+    /// Moves the open task's working-copy threads to where their lines are on disk now, so
     /// lines added above one don't leave it beside other code.
     pub(crate) fn reanchor_comments(&mut self) {
-        let Some((ws, dir)) = self.active_ws().map(|w| (w.name.clone(), w.dir())) else {
+        let Some((ws, dir)) = self.active_task().map(|w| (w.name.clone(), w.dir())) else {
             return;
         };
         // ponytail: reads each thread's file on every diff refresh; group by path if many.
@@ -671,7 +655,7 @@ impl Differ {
     /// The comment quoting its lines as they are now (`snapshot`), at the revision they are
     /// read at (`rev`).
     fn anchor_text(&self, c: &Comment) -> Comment {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return c.clone();
         };
         let rev = match c.end.0 {
@@ -698,8 +682,8 @@ impl Differ {
     /// `c`: the composer on the selected lines (the cursor line). A pending thread there is
     /// edited instead.
     pub(crate) fn comment_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.is_none() {
-            return notify_err(window, cx, "Open a workspace first");
+        if self.task.is_none() {
+            return notify_err(window, cx, "Open a task first");
         }
         let Some(range) = self.picked_lines(cx) else {
             let keys = if self.preferences.vim {
@@ -861,7 +845,7 @@ impl Differ {
         let order: HashMap<String, usize> = (self.diff_files.iter().enumerate())
             .map(|(i, f)| (f.path().to_string(), i))
             .collect();
-        let ws = self.workspace_name()?.to_string();
+        let ws = self.task_name()?.to_string();
         let id = match comp.draft.id {
             0 => self.review.store.new_id(&ws),
             id => id,
@@ -1045,7 +1029,7 @@ impl Differ {
             return vec![];
         };
         let act = |f: fn(&mut Self, u64, &mut Window, &mut Context<Self>)| {
-            on_differ(self.workspace_name(), cx, move |s, w, cx| f(s, id, w, cx))
+            on_differ(self.task_name(), cx, move |s, w, cx| f(s, id, w, cx))
         };
         let addressed = matches!(c.status, Status::Addressed { .. } | Status::Outdated);
         let mut entries = vec![menu::item(IconName::Pencil, "Edit", act(Self::edit_thread))];
@@ -1195,9 +1179,9 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let chat = self.comment(id).and_then(|c| c.chat.clone());
-        if let Some(workspace) = self.workspace_name() {
+        if let Some(task) = self.task_name() {
             cx.emit(DifferEvent::OpenChat {
-                workspace: workspace.into(),
+                task: task.into(),
                 chat,
             });
         }
@@ -1853,6 +1837,59 @@ mod tests {
 
     const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,3 @@ fn x\n a\n-b\n-c\n+B\n d\n@@ -10 +10,2 @@\n x\n+y\n\\ No newline at end of file\n";
 
+    #[test]
+    fn geometry_preserves_empty_sides_and_unterminated_lines() {
+        let file = |body: &str| {
+            DiffFile::parse(&format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n{body}"))
+                .unwrap()
+                .remove(0)
+        };
+        assert_eq!(
+            hunks(&file("@@ -0,0 +1,2 @@\n+a\n+b\n")),
+            [vec![(b'+', 0, 1), (b'+', 0, 2)]]
+        );
+        assert_eq!(
+            hunks(&file("@@ -1,2 +0,0 @@\n-a\n-b\n")),
+            [vec![(b'-', 1, 0), (b'-', 2, 0)]]
+        );
+        assert_eq!(
+            hunks(&file(
+                "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n"
+            )),
+            [vec![(b'-', 1, 0), (b'+', 0, 1)]]
+        );
+        assert!(hunks(&file("@@ -0,0 +0,0 @@\n")).iter().all(Vec::is_empty));
+        assert!(hunks(&DiffFile::unchanged("f", "parse failure\n")).is_empty());
+    }
+
+    #[test]
+    fn expanded_geometry_is_narrowed_only_for_remote_inline_policy() {
+        let patch = |expanded: bool| {
+            let (first, last) = if expanded { (1, 20) } else { (7, 13) };
+            let body: String = (first..=last)
+                .map(|line| {
+                    if line == 10 {
+                        "-old\n+new\n".into()
+                    } else {
+                        format!(" line {line}\n")
+                    }
+                })
+                .collect();
+            let count = last - first + 1;
+            format!(
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -{first},{count} +{first},{count} @@\n{body}"
+            )
+        };
+        let expanded = hunks(&DiffFile::parse(&patch(true)).unwrap()[0]);
+        let remote = hunks(&DiffFile::parse(&patch(false)).unwrap()[0]);
+        assert_eq!(expanded[0].len(), 21);
+        assert_eq!(narrow_hunks(expanded), remote);
+        for bad in ["@@ -1,2 +1,2 @@\n-a\n+b\n", "@@ -1 +1 @@\n-a\n+b\n+c\n"] {
+            let source = format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n{bad}");
+            assert!(DiffFile::parse(&source).is_err());
+        }
+    }
+
     fn spots(rows: &[Row]) -> Vec<String> {
         rows.iter()
             .map(|r| match &r.spot {
@@ -1862,6 +1899,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn expanded_context_keeps_local_comments_and_navigation(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1891,7 +1929,7 @@ mod tests {
             d.diff_files = DiffFile::parse(&patch).unwrap();
             d.review
                 .hunks
-                .insert("api/f".into(), narrow_hunks(parse_hunks(&patch)));
+                .insert("api/f".into(), narrow_hunks(hunks(&d.diff_files[0])));
             d.diff
                 .update(cx, |state, cx| state.set_files(d.diff_files.clone(), cx));
             let line = |n| Spot::Line(DiffLinePosition::new("api/f", DiffSide::Modified, n));
@@ -1946,6 +1984,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn rows_follow_the_diff_layout(cx: &mut TestAppContext) {
         // Whole-file context narrows to git's default hunks; 7 lines apart stay separate.
@@ -1970,7 +2009,7 @@ mod tests {
             [(1, 4), (27, 30)]
         );
 
-        let hunks = parse_hunks(PATCH);
+        let hunks = hunks(&DiffFile::parse(PATCH).unwrap()[0]);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0][3], (b'+', 0, 2));
         assert_eq!(hunks[1], [(b' ', 10, 10), (b'+', 0, 11)]);

@@ -3,16 +3,18 @@
 use super::review_comment::{Comment, Status, prompt};
 use super::review_share::{github_body, unposted_by_repo};
 use super::*;
-use crate::chat::{ReviewCard, ReviewItem, effort_label, model_entries, model_label};
 use crate::models::effort_of;
+use crate::models::{effort_label, model_label};
+use crate::review_protocol::{ReviewCard, ReviewItem};
 use crate::state::ChatMeta;
+use crate::ui::model_entries;
 use crate::ui::plural;
 use crate::{CycleTarget, PickModel};
-use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Escape};
 use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::{Disableable as _, Selectable as _};
 
-/// Where a review goes: a chat of the workspace, or a new one on the picked model and
+/// Where a review goes: a chat of the task, or a new one on the picked model and
 /// thinking level (only `model` and `effort` of the meta are read).
 #[derive(Clone)]
 pub(crate) enum Target {
@@ -22,7 +24,7 @@ pub(crate) enum Target {
 
 #[derive(Clone)]
 pub(crate) struct ReviewRequest {
-    pub workspace: String,
+    pub task: String,
     pub target: Target,
     pub card: ReviewCard,
     comments: Vec<Comment>,
@@ -63,7 +65,7 @@ impl Differ {
         });
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let ws = self.active_ws();
+        let ws = self.active_task();
         let cur = ws.and_then(|ws| ws.chats.get(ws.active_chat));
         let title = |c: &ChatMeta| match c.title.is_empty() {
             true => "Untitled chat".to_string(),
@@ -190,8 +192,8 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = (self.active_ws()).and_then(|ws| ws.chats.get(ws.active_chat)) else {
-            return notify_err(window, cx, "Open a workspace first");
+        let Some(id) = (self.active_task()).and_then(|ws| ws.chats.get(ws.active_chat)) else {
+            return notify_err(window, cx, "Open a task first");
         };
         let target = Target::Chat(id.id.clone());
         self.send_review_to(target, ids, note, publish, window, cx);
@@ -207,10 +209,10 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
-        let workspace = ws.name.clone();
+        let task = ws.name.clone();
         self.reanchor_comments(); // the lines as the agent will read them
         let comments: Vec<Comment> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Pending && ids.contains(&c.id))
@@ -242,7 +244,7 @@ impl Differ {
             },
         };
         cx.emit(DifferEvent::SendReview(ReviewRequest {
-            workspace,
+            task,
             target,
             card,
             comments,
@@ -252,7 +254,7 @@ impl Differ {
     }
 
     pub(crate) fn review_request_valid(&self, request: &ReviewRequest) -> bool {
-        self.workspace_name() == Some(request.workspace.as_str())
+        self.task_name() == Some(request.task.as_str())
             && request
                 .comments
                 .iter()
@@ -411,17 +413,12 @@ impl Differ {
                 .any(|c| self.pr_of(c).is_some_and(|(_, pushed)| !pushed));
         let n = s.rows.len();
         let new_chat = s.targets.get(s.target).is_some_and(|t| t.0.is_none());
-        let sheet = v_flex()
+        let sheet = crate::menu::chrome(theme)
             .id("review-sheet")
             .test_support()
             .w(px(500.))
             .max_w_full()
-            .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .shadow_lg()
-            .text_sm()
+            .p_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // cmd-/ anywhere in the sheet (the note too) picks the new chat's model, not the
             // shown chat's.
@@ -514,6 +511,9 @@ impl Differ {
                                     Button::new("sheet-model")
                                         .outline()
                                         .xsmall()
+                                        .dropdown_caret(true)
+                                        .open(self.menu.is_some())
+                                        .accessibility_label("Model and thinking level")
                                         .label(format!(
                                             "{} · {} ⌘/",
                                             model_label(s.pick.model()),
@@ -521,7 +521,8 @@ impl Differ {
                                         ))
                                         .on_click(cx.listener(|this, _, w, cx| {
                                             this.sheet_model_menu(w, cx)
-                                        })),
+                                        }))
+                                        .map(|b| crate::ui::toolbar("sheet-model", b)),
                                 )
                             }),
                     )
@@ -574,6 +575,7 @@ impl Differ {
                         Button::new("sheet-preview-toggle")
                             .ghost()
                             .small()
+                            .selected(s.preview)
                             .label(if s.preview {
                                 "Hide prompt"
                             } else {
@@ -584,7 +586,8 @@ impl Differ {
                                     s.preview = !s.preview;
                                 }
                                 cx.notify();
-                            })),
+                            }))
+                            .map(|b| crate::ui::toolbar("sheet-preview-toggle", b)),
                     )
                     .child(div().flex_1())
                     .child(

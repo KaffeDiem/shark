@@ -1,20 +1,20 @@
-//! Review probes for quick-open lifecycle and scaling with a large workspace catalog.
-use super::super::workspace_picker::WorkspacePicker;
+//! Review probes for quick-open lifecycle and scaling with a large task catalog.
+use super::super::task_picker::TaskPicker;
 use super::*;
 use gpui_kit::test::TestQueryExt;
 use std::cell::Cell;
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_review_cache_tracks_status_and_repository_changes(cx: &mut TestAppContext) {
+async fn task_review_cache_tracks_status_and_repository_changes(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(
         cx,
         State {
-            workspaces: vec![Workspace {
+            tasks: vec![Task {
                 name: "eng-130-rate-limits".into(),
-                repos: vec![crate::state::WsRepo {
+                repos: vec![crate::state::TaskRepo {
                     name: "api".into(),
                     src: PathBuf::new(),
                     base: "main".into(),
@@ -30,8 +30,8 @@ async fn workspace_review_cache_tracks_status_and_repository_changes(cx: &mut Te
     let picker = cx
         .update_window(window, |_, w, cx| {
             let picker = cx.new(|cx| {
-                WorkspacePicker::new(
-                    WorkspacePicker::snapshot(shark.read(cx), cx),
+                TaskPicker::new(
+                    TaskPicker::snapshot(shark.read(cx), cx),
                     None,
                     shark.downgrade(),
                     w,
@@ -56,7 +56,7 @@ async fn workspace_review_cache_tracks_status_and_repository_changes(cx: &mut Te
     let _subscription =
         cx.update(|cx| cx.observe(&picker, move |_, _| observed.set(observed.get() + 1)));
     on_app(window, shark.clone())(cx, &|s, _, cx| {
-        s.state.workspaces[0].viewed.insert("api/file.rs".into(), 1);
+        s.state.tasks[0].viewed.insert("api/file.rs".into(), 1);
         cx.notify();
     });
     if minute == super::super::interaction::now_ms() / 60_000 {
@@ -68,7 +68,7 @@ async fn workspace_review_cache_tracks_status_and_repository_changes(cx: &mut Te
     }
     notifications.set(0);
     on_app(window, shark.clone())(cx, &|s, _, cx| {
-        let ws = &s.state.workspaces[0];
+        let ws = &s.state.tasks[0];
         let mut repo = crate::sync::Repo::fresh(&ws.repos[0], ws);
         repo.pr = Some(Err("offline".into()));
         s.attn.set_checked(&ws.name, vec![repo]);
@@ -94,9 +94,9 @@ async fn workspace_review_cache_tracks_status_and_repository_changes(cx: &mut Te
         })
         .unwrap();
     on_app(window, shark.clone())(cx, &|s, _, cx| {
-        let mut repo = s.state.workspaces[0].repos[0].clone();
+        let mut repo = s.state.tasks[0].repos[0].clone();
         repo.name = "web".into();
-        s.state.workspaces[0].repos.push(repo);
+        s.state.tasks[0].repos.push(repo);
         cx.notify();
     });
     cx.update_window(window, |_, w, cx| {
@@ -125,19 +125,19 @@ async fn workspace_review_cache_tracks_status_and_repository_changes(cx: &mut Te
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn workspace_review_large_catalog_and_release(cx: &mut TestAppContext) {
+async fn task_review_large_catalog_and_release(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.run_until_parked();
     for count in [100, 500, 2000] {
         on_app(window, shark.clone())(cx, &|s, _, _cx| {
-            s.state.workspaces = (0..count)
-                .map(|i| Workspace {
+            s.state.tasks = (0..count)
+                .map(|i| Task {
                     name: format!("workspace-{i:04}"),
                     branch: format!("workspace-{i:04}"),
                     last_interacted_at: Some(i as u64),
-                    repos: vec![crate::state::WsRepo {
+                    repos: vec![crate::state::TaskRepo {
                         name: "api".into(),
                         src: PathBuf::new(),
                         base: "main".into(),
@@ -159,8 +159,8 @@ async fn workspace_review_large_catalog_and_release(cx: &mut TestAppContext) {
         let picker = cx
             .update_window(window, |_, w, cx| {
                 let picker = cx.new(|cx| {
-                    WorkspacePicker::new(
-                        WorkspacePicker::snapshot(shark.read(cx), cx),
+                    TaskPicker::new(
+                        TaskPicker::snapshot(shark.read(cx), cx),
                         None,
                         shark.downgrade(),
                         w,

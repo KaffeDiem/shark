@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -61,6 +62,20 @@ def extract(archive, directory):
 
 
 def install(artifact):
+    for attempt in range(4):
+        try:
+            return install_once(artifact)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt == 3:
+                raise
+            delay = 2 ** (attempt + 1)
+            print(f"{artifact['name']}: download failed ({error}); retrying in {delay}s", file=sys.stderr)
+            time.sleep(delay)
+
+
+def install_once(artifact):
     destination = CACHE / artifact["name"] / artifact["version"]
     executable = destination / artifact["executable"]
     marker = destination / ".verified"
@@ -77,7 +92,11 @@ def install(artifact):
         deadline = time.monotonic() + 180
         if not artifact["url"].startswith("https://"):
             raise ValueError("artifact URL must use HTTPS")
-        with urllib.request.urlopen(artifact["url"], timeout=30) as response, archive.open("xb") as output:
+        request = urllib.request.Request(artifact["url"], headers={"Accept": "application/octet-stream"})
+        if request.host == "api.github.com" and os.environ.get("GH_TOKEN"):
+            # Authenticate only the API request, never the redirected asset download.
+            request.add_unredirected_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
+        with urllib.request.urlopen(request, timeout=30) as response, archive.open("xb") as output:
             if not response.url.startswith("https://"):
                 raise ValueError("artifact redirected outside HTTPS")
             while True:
@@ -182,7 +201,69 @@ def self_test():
         else:
             raise AssertionError("accepted escaping symlink")
         assert not (root / "outside").exists()
-    print("artifact extractor path/symlink checks passed")
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory(prefix="shark-download-proof-") as temp:
+        root = pathlib.Path(temp)
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            member = tarfile.TarInfo("bin/tool")
+            member.size = 4
+            tar.addfile(member, io.BytesIO(b"tool"))
+        data = archive.getvalue()
+        artifact = {"name": "fixture", "version": "1", "url": "https://example.invalid/tool.tgz",
+                    "sha256": hashlib.sha256(data).hexdigest(), "executable": "bin/tool"}
+        response = io.BytesIO(data)
+        response.url = artifact["url"]
+        unavailable = urllib.error.HTTPError(artifact["url"], 504, "Gateway Timeout", {}, None)
+        with patch.dict(globals(), CACHE=root / "cache"), patch("time.sleep") as sleep:
+            with patch("urllib.request.urlopen", side_effect=[unavailable, response]) as request:
+                executable = install(artifact)
+                assert executable.read_bytes() == b"tool"
+                assert request.call_count == 2 and sleep.call_count == 1
+                assert not list(executable.parent.parent.parent.glob(".stage-*"))
+            shutil.rmtree(root / "cache")
+            with patch.dict(os.environ, GH_TOKEN="test-token"):
+                for url, authorized in [(artifact["url"], False),
+                                        ("https://api.github.com/repos/owner/repo/releases/assets/1", True)]:
+                    response = io.BytesIO(data)
+                    response.url = url
+                    with patch("urllib.request.urlopen", return_value=response) as download:
+                        install(dict(artifact, url=url))
+                        request = download.call_args.args[0]
+                        assert request.has_header("Authorization") == authorized
+                        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+                            request, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/tool")
+                        assert not redirected.has_header("Authorization")
+                    shutil.rmtree(root / "cache")
+            with patch("urllib.request.urlopen", side_effect=unavailable) as request:
+                try:
+                    install(artifact)
+                except urllib.error.HTTPError:
+                    pass
+                else:
+                    raise AssertionError("download retries must be bounded")
+                assert request.call_count == 4
+            missing = urllib.error.HTTPError(artifact["url"], 404, "Not Found", {}, None)
+            with patch("urllib.request.urlopen", side_effect=missing) as request:
+                try:
+                    install(artifact)
+                except urllib.error.HTTPError:
+                    pass
+                else:
+                    raise AssertionError("accepted missing artifact")
+                assert request.call_count == 1
+            response = io.BytesIO(b"corrupt archive")
+            response.url = artifact["url"]
+            with patch("urllib.request.urlopen", return_value=response) as request:
+                try:
+                    install(artifact)
+                except ValueError as error:
+                    assert "checksum mismatch" in str(error)
+                else:
+                    raise AssertionError("accepted corrupt artifact")
+                assert request.call_count == 1
+    print("artifact extractor and download retry checks passed")
 
 
 if __name__ == "__main__":

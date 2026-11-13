@@ -1,11 +1,26 @@
 //! Process helpers shared by git, gh, the agents and the language-server tooling.
-use crate::git::finish;
 use std::{
     ffi::OsString,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     time::Duration,
 };
+
+pub(crate) fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
+    finish_bytes(prog, args, out).map(|b| String::from_utf8_lossy(&b).trim().to_string())
+}
+
+pub(crate) fn finish_bytes(prog: &str, args: &[&str], out: Output) -> Result<Vec<u8>, String> {
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(format!(
+            "{prog} {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
 
 /// Sends `sig` to `pid` (a negative pid is a process group; sig 0 only probes). True when
 /// delivered; on failure `io::Error::last_os_error()` still holds the errno.

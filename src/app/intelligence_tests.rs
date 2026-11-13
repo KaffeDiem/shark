@@ -1,4 +1,4 @@
-//! The language edit path uses real GPUI buffers and the normal mixed-tab workspace.
+//! The language edit path uses real GPUI buffers and the normal mixed-tab task.
 use super::*;
 use crate::lsp::document::{EditGuard, Encoding, file_uri};
 use core::prelude::v1::test;
@@ -28,13 +28,13 @@ fn edits(root: &Path, first: &str, second: &str) -> WorkspaceEdit {
     }
 }
 
-/// A workspace with `api/a.txt`, the diff and `api/b.txt` open as tabs, in that order.
+/// A task with `api/a.txt`, the diff and `api/b.txt` open as tabs, in that order.
 pub(super) async fn fixture(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, Entity<Shark>) {
     let home = ui_tests::test_home();
-    let mut ws = Workspace {
+    let mut ws = Task {
         name: "language-proof".into(),
         branch: "main".into(),
-        repos: vec![crate::state::WsRepo {
+        repos: vec![crate::state::TaskRepo {
             name: "api".into(),
             src: home.join("lsp-source"),
             base: "main".into(),
@@ -52,7 +52,7 @@ pub(super) async fn fixture(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandl
     ws.open_tab(TabId::Diff);
     ws.open_tab(TabId::File("api/b.txt".into()));
     let state = State {
-        workspaces: vec![ws],
+        tasks: vec![ws],
         last_open: Some(("language-proof".into(), "chat".into())),
         ..Default::default()
     };
@@ -85,7 +85,7 @@ fn apply_edit(
 ) {
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.apply_workspace_edit(
+            s.apply_task_edit(
                 edit,
                 Encoding::Utf16,
                 root.to_owned(),
@@ -146,7 +146,7 @@ fn server_messages(log: &Path) -> Vec<serde_json::Value> {
 }
 
 fn session_of(editor: &Entity<FileEditor>, cx: &App) -> Option<Entity<crate::lsp::Session>> {
-    (editor.read(cx).intelligence.as_ref()).map(|l| l.session.clone())
+    (editor.read(cx).language()).map(|l| l.session.clone())
 }
 
 async fn open_tab(
@@ -161,7 +161,7 @@ async fn open_tab(
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         (shark.read(cx).editor.as_ref())
-            .is_some_and(|e| e.read(cx).path == path && e.read(cx).intelligence.is_some())
+            .is_some_and(|e| e.read(cx).path == path && e.read(cx).language().is_some())
     })
     .await;
     cx.update(|cx| shark.read(cx).editor.clone().unwrap())
@@ -254,7 +254,7 @@ async fn language_batch_marks_every_target_dirty_and_leaves_tabs_and_disk_alone(
 ) {
     let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (root, window, shark) = fixture(cx).await;
-    let tab_order = cx.update(|cx| shark.read(cx).active_ws().unwrap().tab_order.clone());
+    let tab_order = cx.update(|cx| shark.read(cx).active_task().unwrap().tab_order.clone());
     let buffers = cx.update(|cx| editors(&shark, cx));
     let edit = edits(&root, "one😀", "twoé");
     apply_edit(cx, window, &shark, &root, edit, EditGuard::capture());
@@ -265,7 +265,7 @@ async fn language_batch_marks_every_target_dirty_and_leaves_tabs_and_disk_alone(
     cx.update(|cx| {
         assert_eq!(text(&buffers[0], cx), "one😀\n");
         assert_eq!(text(&buffers[1], cx), "twoé\n");
-        assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, tab_order);
+        assert_eq!(shark.read(cx).active_task().unwrap().tab_order, tab_order);
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "alpha\n"
@@ -768,7 +768,7 @@ async fn language_navigation_replaces_a_clean_tab_unless_asked_for_a_new_one(
         ["api/a.txt", "api/b.txt", "api/d.txt", "api/c.txt"]
     );
     cx.update(|cx| {
-        let tabs = &shark.read(cx).active_ws().unwrap().tab_order;
+        let tabs = &shark.read(cx).active_task().unwrap().tab_order;
         assert_eq!(
             tabs.iter().filter(|t| matches!(t, TabId::File(_))).count(),
             4,
@@ -999,7 +999,7 @@ async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut T
                 cx,
             );
             let third_editor = third.editor.clone();
-            s.active_ws_mut()
+            s.active_task_mut()
                 .unwrap()
                 .open_tab(TabId::File("api/c.txt".into()));
             s.file_tabs.push(third);
@@ -1012,20 +1012,17 @@ async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut T
             second.update(cx, |e, cx| e.attach_language(shared, w, cx));
             third_editor.update(cx, |e, cx| e.attach_language(unrelated.clone(), w, cx));
             s.editor = Some(first.clone());
-            let tabs = s.active_ws().unwrap().tab_order.clone();
+            let tabs = s.active_task().unwrap().tab_order.clone();
             s.restart_language(w, cx);
-            assert!(first.read(cx).intelligence.is_none());
-            assert!(second.read(cx).intelligence.is_none());
-            assert_eq!(
-                third_editor.read(cx).intelligence.as_ref().unwrap().session,
-                unrelated
-            );
+            assert!(first.read(cx).language().is_none());
+            assert!(second.read(cx).language().is_none());
+            assert_eq!(third_editor.read(cx).language().unwrap().session, unrelated);
             assert!(!s.language_sessions.contains_key(&shared_key));
             assert!(s.language_sessions.contains_key(&unrelated_key));
             assert_eq!(text(&first, cx), "unsaved answer\n");
             assert_eq!(first.read(cx).input.read(cx).selected_range(), 2..7);
             assert!(first.read(cx).dirty);
-            assert_eq!(s.active_ws().unwrap().tab_order, tabs);
+            assert_eq!(s.active_task().unwrap().tab_order, tabs);
             assert_eq!(
                 std::fs::read_to_string(root.join("a.txt")).unwrap(),
                 "alpha\n"
@@ -1036,7 +1033,7 @@ async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut T
 }
 
 // One server serves a project's files; it survives the replacement of its only tab and a
-// workspace switch, and shuts down after the parked idle window.
+// task switch, and shuts down after the parked idle window.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn language_sessions_are_shared_and_outlive_their_tabs(cx: &mut TestAppContext) {
@@ -1110,7 +1107,7 @@ async fn language_sessions_are_shared_and_outlive_their_tabs(cx: &mut TestAppCon
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         (shark.read(cx).editor.as_ref())
-            .is_some_and(|e| e.read(cx).path == "api/e.txt" && e.read(cx).intelligence.is_some())
+            .is_some_and(|e| e.read(cx).path == "api/e.txt" && e.read(cx).language().is_some())
     })
     .await;
     cx.update(|cx| {
@@ -1118,7 +1115,7 @@ async fn language_sessions_are_shared_and_outlive_their_tabs(cx: &mut TestAppCon
         assert!(c.upgrade().is_none(), "c.txt was replaced");
         assert_eq!(session_of(s.editor.as_ref().unwrap(), cx), weak.upgrade());
     });
-    // Switching workspaces parks the server, and coming back resumes it.
+    // Switching tasks parks the server, and coming back resumes it.
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             s.drop_editor(cx);
@@ -1161,7 +1158,7 @@ async fn language_keys_send_rename_definition_and_buffer_formatting(cx: &mut Tes
     .unwrap();
     let editor = open_tab(cx, window, &shark, "api/c.txt").await;
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        let language = editor.read(cx).intelligence.as_ref().unwrap();
+        let language = editor.read(cx).language().unwrap();
         language.snapshot.lock().unwrap().text.as_ref() == text
     })
     .await;
@@ -1270,9 +1267,9 @@ async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestApp
         .unwrap();
     let p = open_tab(cx, window, &shark, "api/pending/p.txt").await;
     cx.update(|cx| {
-        p.update(cx, |e, _| {
-            e.intelligence = None;
-            e.discovering = true;
+        p.update(cx, |e, cx| {
+            e.detach_language(None, cx);
+            e.begin_language_discovery(gpui_kit::Task::ready(()), cx);
         })
     });
     let close = |cx: &mut TestAppContext, editor: Entity<FileEditor>| {
@@ -1286,7 +1283,7 @@ async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestApp
     close(cx, a);
     assert!(weak.upgrade().is_some(), "p.txt may still attach to it");
     // A file whose discovery found no server (README, Cargo.toml) does not hold one.
-    cx.update(|cx| p.update(cx, |e, _| e.discovering = false));
+    cx.update(|cx| p.update(cx, |e, cx| e.finish_language_discovery(None, cx)));
     cx.update_window(window, |_, _, cx| {
         shark.update(cx, |s, cx| s.prune_language_sessions(cx))
     })
@@ -1451,7 +1448,7 @@ async fn dependency_sources_are_read_only_share_the_session_and_keep_tab_slots(
             })
         })
         .unwrap();
-    let tabs = cx.update(|cx| shark.read(cx).active_ws().unwrap().tab_order.clone());
+    let tabs = cx.update(|cx| shark.read(cx).active_task().unwrap().tab_order.clone());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             let link = link(&dependency, 0, 0, 6);
@@ -1476,7 +1473,7 @@ async fn dependency_sources_are_read_only_share_the_session_and_keep_tab_slots(
     })
     .await;
     cx.update(|cx| {
-        assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, tabs);
+        assert_eq!(shark.read(cx).active_task().unwrap().tab_order, tabs);
     });
 }
 
@@ -1526,7 +1523,7 @@ async fn retry_reattaches_dependency_sources_and_format_refuses_them(cx: &mut Te
             shark.update(cx, |s, cx| {
                 s.editor = Some(a.clone());
                 s.restart_language(w, cx);
-                assert!(dep.read(cx).intelligence.is_none());
+                assert!(dep.read(cx).language().is_none());
                 // Test discovery finds whichever registered session covers the worktree.
                 let fresh = cx.new(|_| fresh);
                 s.register_session(fresh.clone(), w, cx);

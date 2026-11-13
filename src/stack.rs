@@ -1,8 +1,8 @@
 //! PR stacks: a branch based on another branch with an open PR, as `main ← logic ← ui`.
-//! Pure, from the local workspaces and a repo's open PRs; nothing about stacks is stored.
+//! Pure, from the local tasks and a repo's open PRs; nothing about stacks is stored.
 use crate::prs::Pr;
 
-/// One branch of a stack: its open PR, the local workspace on it, either or both.
+/// One branch of a stack: its open PR, the local task on it, either or both.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub branch: String,
@@ -20,9 +20,9 @@ pub fn parent_of<'a>(base: &'a str, trunk: &str) -> Option<&'a str> {
 }
 
 /// `me`'s stack in one repo, trunk side first, and `me`'s index in it. `local` is
-/// `(workspace, branch, base)` for every workspace with this repo; `prs` are its open PRs.
+/// `(task, branch, base)` for every task with this repo; `prs` are its open PRs.
 /// The chain ends at the trunk, at a branch nothing more is known about, or where it would
-/// loop. ponytail: one child per branch (a workspace before a PR, then the newest PR); list
+/// loop. ponytail: one child per branch (a task before a PR, then the newest PR); list
 /// siblings if branching stacks show up.
 pub fn chain(
     me: &str,
@@ -30,7 +30,7 @@ pub fn chain(
     local: &[(String, String, String)],
     prs: &[Pr],
 ) -> (Vec<Node>, usize) {
-    let trunk_name = crate::sync::short(trunk);
+    let trunk_name = crate::git::short(trunk);
     let own: Vec<&Pr> = prs.iter().filter(|p| !p.is_cross_repository).collect();
     let node = |b: &str| Node {
         branch: b.to_string(),
@@ -49,7 +49,7 @@ pub fn chain(
         }
     };
     // The trunk is nobody's child, so it starts no stack. A child is whatever `parent` (a
-    // workspace's base before its PR's) says is on `b`, so walking up and down agree.
+    // task's base before its PR's) says is on `b`, so walking up and down agree.
     let child = |b: &str| -> Option<String> {
         if b == trunk_name {
             return None;
@@ -82,17 +82,6 @@ pub fn chain(
     (down, ix)
 }
 
-/// `logic ← ui` when all of `bases` are the same, else the branch.
-pub fn title(branch: &str, parents: &[&str]) -> String {
-    let mut ps = parents.to_vec();
-    ps.sort();
-    ps.dedup();
-    match ps[..] {
-        [p] => format!("{p} ← {branch}"),
-        _ => branch.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,7 +102,7 @@ mod tests {
         }
     }
 
-    fn ws(name: &str, branch: &str, base: &str) -> (String, String, String) {
+    fn task(name: &str, branch: &str, base: &str) -> (String, String, String) {
         (name.into(), branch.into(), base.into())
     }
 
@@ -130,13 +119,13 @@ mod tests {
         assert_eq!(parent_of("origin/", "origin/main"), None);
     }
 
-    /// Workspaces and PRs mix: logic is a workspace, ui a workspace on it, wiring only a PR.
+    /// Workspaces and PRs mix: logic is a task, ui a task on it, wiring only a PR.
     #[test]
-    fn chain_walks_workspaces_and_prs() {
+    fn chain_walks_tasks_and_prs() {
         let local = [
-            ws("logic", "logic", "origin/main"),
-            ws("ui", "ui", "origin/logic"),
-            ws("backend", "be", "origin/main"),
+            task("logic", "logic", "origin/main"),
+            task("ui", "ui", "origin/logic"),
+            task("backend", "be", "origin/main"),
         ];
         let prs = [
             pr(1, "logic", "main"),
@@ -158,10 +147,10 @@ mod tests {
         );
     }
 
-    /// A colleague's PR stack, with no workspace for any of it but ours.
+    /// A colleague's PR stack, with no task for any of it but ours.
     #[test]
     fn chain_from_prs_alone() {
-        let local = [ws("mine", "mine", "origin/b")];
+        let local = [task("mine", "mine", "origin/b")];
         let prs = [pr(1, "a", "main"), pr(2, "b", "a")];
         assert_eq!(
             names(&chain("mine", "origin/main", &local, &prs)),
@@ -172,7 +161,7 @@ mod tests {
     /// A merged parent is gone from the open PRs: it ends the chain by name.
     #[test]
     fn chain_ends_at_an_unknown_parent() {
-        let local = [ws("ui", "ui", "origin/logic")];
+        let local = [task("ui", "ui", "origin/logic")];
         let c = chain("ui", "origin/main", &local, &[]);
         assert_eq!(names(&c), (vec!["logic", "ui"], 1));
         assert_eq!(
@@ -187,7 +176,7 @@ mod tests {
 
     #[test]
     fn chain_stops_on_loops() {
-        let local = [ws("a", "a", "origin/b"), ws("b", "b", "origin/a")];
+        let local = [task("a", "a", "origin/b"), task("b", "b", "origin/a")];
         assert_eq!(
             names(&chain("a", "origin/main", &local, &[])),
             (vec!["b", "a"], 1)
@@ -199,10 +188,10 @@ mod tests {
         );
     }
 
-    /// One child per branch: a workspace before a PR, then the newest PR. Fork PRs never count.
+    /// One child per branch: a task before a PR, then the newest PR. Fork PRs never count.
     #[test]
     fn chain_picks_one_child() {
-        let local = [ws("a", "a", "origin/main"), ws("c", "c", "origin/a")];
+        let local = [task("a", "a", "origin/main"), task("c", "c", "origin/a")];
         let prs = [pr(5, "b", "a"), pr(6, "d", "a")];
         assert_eq!(
             names(&chain("a", "origin/main", &local, &prs)),
@@ -221,18 +210,18 @@ mod tests {
         assert_eq!(c.0[0].pr, None);
     }
 
-    /// A workspace on the trunk isn't the bottom of every PR's stack; a workspace's own base
+    /// A task on the trunk isn't the bottom of every PR's stack; a task's own base
     /// outranks its PR's stale one, from either end of the chain.
     #[test]
-    fn chain_skips_the_trunk_and_trusts_workspace_bases() {
+    fn chain_skips_the_trunk_and_trusts_task_bases() {
         let prs = [pr(1, "feature", "main")];
-        let local = [ws("main", "main", "origin/main")];
+        let local = [task("main", "main", "origin/main")];
         assert_eq!(
             names(&chain("main", "origin/main", &local, &prs)),
             (vec!["main"], 0)
         );
         // b was retargeted from a to main; its PR hasn't caught up yet.
-        let local = [ws("a", "a", "origin/main"), ws("b", "b", "origin/main")];
+        let local = [task("a", "a", "origin/main"), task("b", "b", "origin/main")];
         let prs = [pr(1, "a", "main"), pr(2, "b", "a")];
         assert_eq!(
             names(&chain("a", "origin/main", &local, &prs)),
@@ -242,13 +231,5 @@ mod tests {
             names(&chain("b", "origin/main", &local, &prs)),
             (vec!["b"], 0)
         );
-    }
-
-    #[test]
-    fn title_shows_one_shared_parent() {
-        assert_eq!(title("ui", &["logic"]), "logic ← ui");
-        assert_eq!(title("ui", &["logic", "logic"]), "logic ← ui");
-        assert_eq!(title("ui", &["logic", "api-x"]), "ui");
-        assert_eq!(title("ui", &[]), "ui");
     }
 }

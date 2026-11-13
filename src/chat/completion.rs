@@ -2,10 +2,10 @@
 use super::*;
 use crate::complete::Kind;
 use gpui_kit::component::Theme;
-use gpui_kit::component::input::InlineToken;
 
 /// The open `@`/`/`/`#` completion menu.
 pub(super) struct Menu {
+    query: String,
     /// Bytes of the `@query` in the composer that a pick replaces.
     range: std::ops::Range<usize>,
     /// The trigger character: `@`, `/` or `#`.
@@ -13,7 +13,7 @@ pub(super) struct Menu {
     pub(super) matches: Vec<usize>,
     pub(super) sel: usize,
     /// Whether enter picks the highlighted row. A `#` query that only fuzzily matches a PR
-    /// (`#endif`) leaves it off, so enter sends the text; moving the highlight turns it on.
+    /// (`#endif`) leaves it off, so enter inserts a newline; moving the highlight turns it on.
     pub(super) armed: bool,
 }
 
@@ -60,6 +60,13 @@ fn row_parts(it: &Item, multi: bool, theme: &Theme, faint: Hsla) -> RowParts {
                 status.label()
             )),
         },
+        Kind::Issue => RowParts {
+            icon: plain(IconName::Tag),
+            file_icon: None,
+            badge: None,
+            detail: it.detail.clone(),
+            aria: Some(format!("{} {} issue", it.label, it.detail)),
+        },
         Kind::Command => RowParts {
             icon: plain(IconName::Slash),
             file_icon: None,
@@ -105,6 +112,72 @@ fn row_parts(it: &Item, multi: bool, theme: &Theme, faint: Hsla) -> RowParts {
 }
 
 impl Chat {
+    fn refresh_reference_prs(&mut self) {
+        self.pr_items.retain(|item| item.kind == Kind::Issue);
+        self.pr_items.extend(complete::pr_items(&self.prs));
+    }
+
+    pub(crate) fn set_completion_issues(
+        &mut self,
+        issues: Vec<crate::linear::Hit>,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = self
+            .menu
+            .as_ref()
+            .filter(|menu| menu.src == '#')
+            .and_then(|menu| Some((self.menu_item(menu.sel)?.insert.clone(), menu.armed)));
+        self.pr_items.retain(|item| item.kind != Kind::Issue);
+        let mut items = complete::issue_items(&issues);
+        items.append(&mut self.pr_items);
+        self.pr_items = items;
+        if self.menu.is_some() {
+            self.update_menu(cx);
+        }
+        if let Some((insert, armed)) = selection
+            && let Some(menu) = self.menu.as_mut().filter(|menu| menu.src == '#')
+        {
+            let selected = menu
+                .matches
+                .iter()
+                .position(|&i| self.pr_items[i].insert == insert);
+            menu.armed = selected.is_some() && armed;
+            if let Some(selected) = selected {
+                menu.sel = selected;
+                self.menu_scroll.scroll_to_item(selected);
+            }
+        }
+    }
+
+    pub(super) fn unarmed_reference(&self) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|menu| menu.src == '#' && !menu.armed)
+    }
+
+    pub(super) fn attach_completion_issue(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(menu) = self.menu.as_ref().filter(|menu| menu.armed) else {
+            return false;
+        };
+        let Some(complete::Reference::Issue(issue)) = self
+            .menu_item(menu.sel)
+            .and_then(|item| item.reference.clone())
+        else {
+            return false;
+        };
+        let range = self.menu.take().unwrap().range;
+        self.composer.update(cx, |input, cx| {
+            input.set_selected_range(range, cx);
+            input.replace("", window, cx);
+        });
+        cx.emit(ChatEvent::AttachCompletionIssue(issue));
+        true
+    }
+
     fn source(&self, src: char) -> &[Item] {
         match src {
             '/' => &self.commands,
@@ -146,6 +219,14 @@ impl Chat {
             }
         }
         let query = &text[range.start + 1..range.end];
+        if src == '#'
+            && self
+                .menu
+                .as_ref()
+                .is_none_or(|menu| menu.range != range || menu.query != query)
+        {
+            cx.emit(ChatEvent::SearchCompletionIssues(query.to_string()));
+        }
         let items = self.source(src);
         let matches = match src {
             '#' => complete::rank_prs(items, query, MENU_ROWS),
@@ -159,6 +240,7 @@ impl Chat {
             || armed
             || (matches.first()).is_some_and(|&i| complete::names_pr(&items[i], query));
         self.menu = Some(Menu {
+            query: query.to_string(),
             range,
             src,
             matches,
@@ -217,6 +299,17 @@ impl Chat {
         self.insert_mention(item.insert, label, window, cx);
     }
 
+    /// Attaches the task file at `path` as a chip, as a pasted file is.
+    pub fn attach_mention(
+        &mut self,
+        path: &str,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_mention(complete::mention(path), label, window, cx);
+    }
+
     /// Puts `@path` in place of the selection as a chip, plus a space to keep typing.
     fn insert_mention(
         &mut self,
@@ -225,14 +318,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let token = InlineToken::new(text.clone(), text.clone()).with_label(label);
-        self.composer.update(cx, |c, cx| {
-            if c.replace_with_token(token, window, cx).is_err() {
-                // ponytail: tokens reject control characters; such a path goes in as plain text
-                c.replace(text, window, cx);
-            }
-            c.insert(" ", window, cx);
-        });
+        crate::task_composer::insert_token(&self.composer, text, label, window, cx);
         cx.notify();
     }
 
@@ -252,58 +338,75 @@ impl Chat {
                     detail,
                     aria,
                 } = row_parts(it, multi, theme, faint);
+                let row = h_flex()
+                    .id(ix)
+                    .when_some(aria, |d, label| d.aria_label(label))
+                    .h(crate::menu::ROW_H)
+                    .px(px(10.))
+                    .gap(px(10.))
+                    .rounded(theme.radius)
+                    .when(ix == m.sel && m.armed, |d| {
+                        d.bg(crate::menu::highlight(theme))
+                    })
+                    // The mouse moves the one highlight, as in the other menus.
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        if let Some(m) = (this.menu.as_mut()).filter(|m| m.sel != ix || !m.armed) {
+                            (m.sel, m.armed) = (ix, true);
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.pick(ix, window, cx);
+                            window.prevent_default(); // keep focus in the composer
+                        }),
+                    )
+                    .child(match file_icon {
+                        // File icons include padding; 18px matches the menu's 16px glyphs.
+                        Some(i) => img(i)
+                            .size(px(18.))
+                            .mx(px(-1.))
+                            .flex_none()
+                            .into_any_element(),
+                        None => icon.with_size(px(16.)).into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.foreground)
+                            .child(it.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    )
+                    .children(badge.map(|b| b.text_xs()))
+                    .into_any_element();
                 Some(
-                    h_flex()
-                        .id(ix)
-                        .when_some(aria, |d, label| d.aria_label(label))
-                        .h(crate::menu::ROW_H)
-                        .px_2()
-                        .gap_2()
-                        .rounded(px(4.))
-                        .when(ix == m.sel && m.armed, |d| {
-                            d.bg(crate::menu::highlight(theme))
-                        })
-                        // The mouse moves the one highlight, as in the other menus.
-                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                            if let Some(m) =
-                                (this.menu.as_mut()).filter(|m| m.sel != ix || !m.armed)
-                            {
-                                (m.sel, m.armed) = (ix, true);
-                                cx.notify();
-                            }
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                this.pick(ix, window, cx);
-                                window.prevent_default(); // keep focus in the composer
-                            }),
+                    v_flex()
+                        .when(
+                            m.src == '#'
+                                && (ix == 0
+                                    || self.menu_item(ix - 1).is_some_and(|previous| {
+                                        (previous.kind == Kind::Issue) != (it.kind == Kind::Issue)
+                                    })),
+                            |d| {
+                                d.child(div().px_2().py_1().text_xs().text_color(faint).child(
+                                    if it.kind == Kind::Issue {
+                                        "Issues"
+                                    } else {
+                                        "Pull requests"
+                                    },
+                                ))
+                            },
                         )
-                        .child(match file_icon {
-                            // 16px matches a 14px glyph, as app icons in `menu.rs`.
-                            Some(i) => img(i)
-                                .size(px(16.))
-                                .mx(px(-1.))
-                                .flex_none()
-                                .into_any_element(),
-                            None => icon.with_size(px(14.)).into_any_element(),
-                        })
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(theme.foreground)
-                                .child(it.label.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(detail),
-                        )
-                        .children(badge.map(|b| b.text_xs()))
+                        .child(row)
                         .into_any_element(),
                 )
             })
@@ -321,8 +424,8 @@ impl Chat {
             ('#', _) if self.pr_items.is_empty() && !self.prs_errs.is_empty() => {
                 Some("Couldn't list pull requests".into())
             }
-            ('#', _) if self.pr_items.is_empty() => Some("No pull requests".into()),
-            ('#', _) => Some("No matching pull requests".into()),
+            ('#', _) if self.pr_items.is_empty() => Some("No references".into()),
+            ('#', _) => Some("No matching references".into()),
             _ if self.indexing.is_some() && self.files.is_empty() => Some("Indexing files…".into()),
             _ => Some("No matching files".into()),
         };
@@ -393,7 +496,23 @@ impl Chat {
                         .text_xs()
                         .text_color(faint)
                         .child(hint("up down", "navigate"))
-                        .child(hint("enter", if m.armed { "add" } else { "send" }))
+                        .child(hint(
+                            "enter",
+                            if m.src == '#' {
+                                "mention"
+                            } else if m.armed {
+                                "add"
+                            } else {
+                                "send"
+                            },
+                        ))
+                        .when(
+                            m.src == '#'
+                                && self
+                                    .menu_item(m.sel)
+                                    .is_some_and(|item| item.kind == Kind::Issue),
+                            |d| d.child(hint("alt-enter", "attach")),
+                        )
                         .child(hint("escape", "close"))
                         .when(m.src != '/' && multi, |d| {
                             d.child(div().flex_1())
@@ -411,11 +530,11 @@ impl Chat {
         if self.indexing.is_some() {
             return;
         }
-        let repos = self.ws.repo_paths();
+        let (task, repos) = (self.ws.dir(), self.ws.repo_paths());
         self.indexing = Some(cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { complete::files(&repos) })
+                .spawn(async move { complete::files(&task, &repos) })
                 .await;
             this.update(cx, |c, cx| {
                 c.indexing = None;
@@ -482,7 +601,7 @@ impl Chat {
                         Ok(list) => {
                             c.prs.retain(|p| p.repo != repo);
                             c.prs.extend(list);
-                            c.pr_items = complete::pr_items(&c.prs);
+                            c.refresh_reference_prs();
                         }
                         Err(e) => c.prs_errs.push((repo, e)),
                     }
@@ -496,17 +615,17 @@ impl Chat {
                 if c.prs_errs.is_empty() {
                     c.prs_at = Some(Instant::now());
                 }
-                // A repo that left the workspace takes its PRs with it.
+                // A repo that left the task takes its PRs with it.
                 let repos = &c.ws.repos;
                 c.prs.retain(|p| repos.iter().any(|r| r.name == p.repo));
-                c.pr_items = complete::pr_items(&c.prs);
+                c.refresh_reference_prs();
                 c.update_menu(cx);
             })
             .ok();
         }));
     }
 
-    /// Dropped or pasted files: copied into the workspace off the main thread, then mentioned at
+    /// Dropped or pasted files: copied into the task off the main thread, then mentioned at
     /// the cursor in drop order. Pasted image bytes come as `(bytes, ext)`.
     pub(super) fn attach(
         &mut self,
@@ -548,5 +667,72 @@ impl Chat {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn issue_refresh_preserves_reference_highlight(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Chat::new(Task::default(), ChatMeta::default(), false, window, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            chat.update(cx, |chat, cx| {
+                let prs = serde_json::from_str::<Vec<complete::Pr>>(
+                    r#"[{"repo":"api","number":12,"title":"Login page","author":null,
+                     "url":"https://github.com/o/api/pull/12","state":"OPEN","updatedAt":"1"},
+                    {"repo":"web","number":7,"title":"Fix endpoint","author":null,
+                     "url":"https://github.com/o/web/pull/7","state":"OPEN","updatedAt":"2"}]"#,
+                )
+                .unwrap();
+                chat.pr_items = complete::pr_items(&prs);
+                chat.composer.update(cx, |input, cx| {
+                    input.set_value("#", window, cx);
+                    input.set_selected_range(1..1, cx);
+                });
+                chat.update_menu(cx);
+                let menu = chat.menu.as_mut().unwrap();
+                menu.sel = 1;
+                menu.armed = true;
+                let selected = chat.menu_item(1).unwrap().insert.clone();
+                let issue = crate::linear::Hit {
+                    id: "issue".into(),
+                    identifier: "ENG-1".into(),
+                    url: "https://linear.app/acme/issue/ENG-1".into(),
+                    title: "Issue".into(),
+                    status: "Todo".into(),
+                    state_type: "unstarted".into(),
+                    priority: 0,
+                    team: "ENG".into(),
+                    assignee: None,
+                    updated_at: "3".into(),
+                };
+                chat.set_completion_issues(vec![issue], cx);
+                let menu = chat.menu.as_ref().unwrap();
+                assert!(
+                    menu.armed,
+                    "an issue response must preserve the keyboard selection"
+                );
+                assert_eq!(chat.menu_item(menu.sel).unwrap().insert, selected);
+                chat.menu.as_mut().unwrap().armed = false;
+                chat.set_completion_issues(vec![], cx);
+                let menu = chat.menu.as_ref().unwrap();
+                assert!(!menu.armed, "a source refresh must not arm a reference");
+                assert_eq!(chat.menu_item(menu.sel).unwrap().insert, selected);
+            })
+        })
+        .unwrap();
     }
 }

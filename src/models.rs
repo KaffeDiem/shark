@@ -55,6 +55,44 @@ impl ChatMeta {
     }
 }
 
+/// A thinking level as people read it: "xhigh" → "Extra high".
+pub(crate) fn effort_label(level: &str) -> String {
+    match level {
+        "xhigh" => "Extra high".into(),
+        l => model_label(l),
+    }
+}
+
+/// A model id as people read it: "opus" → "Opus", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
+pub(crate) fn model_label(id: &str) -> String {
+    let cap = |w: &str| {
+        let mut w = w.to_string();
+        if let Some(c) = w.get_mut(..1) {
+            c.make_ascii_uppercase();
+        }
+        w
+    };
+    match codex::model_id(Some(id)) {
+        Some(m) => {
+            let mut words = m.split('-');
+            let head = match (words.next(), words.next()) {
+                (Some("gpt"), Some(v)) => format!("GPT-{v}"),
+                (a, b) => [a, b]
+                    .into_iter()
+                    .flatten()
+                    .map(cap)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            std::iter::once(head)
+                .chain(words.map(cap))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        None => cap(id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +109,12 @@ mod tests {
         assert_eq!((meta.is_codex(), effort_of(&meta)), (true, "ultra"));
         meta.model = Some("opus".into());
         assert_eq!(effort_of(&meta), "max");
+    }
+    #[test]
+    fn labels_read_like_names() {
+        let l = super::model_label;
+        assert_eq!(l("opus"), "Opus");
+        assert_eq!(l("codex:gpt-6.1-sol"), "GPT-6.1 Sol");
+        assert_eq!(l("codex:gpt-6-astra"), "GPT-6 Astra");
     }
 }

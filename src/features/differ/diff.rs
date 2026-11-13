@@ -49,7 +49,7 @@ fn parse_chunk(chunk: &str) -> Option<DiffFile> {
 }
 
 impl DiffData {
-    pub(crate) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
+    pub(crate) fn load(ws: &Task, uncommitted_only: bool) -> DiffData {
         let (patch, mut error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
             Ok(p) => (p, None),
             Err(e) => (String::new(), Some(e)),
@@ -73,7 +73,7 @@ impl DiffData {
                 let file = parse_chunk(chunk)?;
                 hunks.insert(
                     file.path().clone(),
-                    review::narrow_hunks(review::parse_hunks(chunk)),
+                    review::narrow_hunks(review::hunks(&file)),
                 );
                 media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
                 Some((file, review_comment::chunk_fingerprint(chunk)))
@@ -115,7 +115,7 @@ impl DiffData {
 
 impl Differ {
     pub(crate) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws().cloned() else {
+        let Some(ws) = self.active_task().cloned() else {
             return;
         };
         self.diff_gen += 1;
@@ -147,7 +147,7 @@ impl Differ {
         data: DiffData,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_name() == Some(name) && self.diff_gen == generation {
+        if self.task_name() == Some(name) && self.diff_gen == generation {
             self.apply_diff(data, cx);
         }
     }
@@ -201,7 +201,7 @@ impl Differ {
             .get(self.diff_file)
             .map(|f| f.path().clone());
         let tree_on_file = (self.tree_rows.get(self.tree_sel)).is_none_or(|r| r.file.is_some());
-        // First files of this workspace's diff: no mouse scroll yet, so `j` starts a line cursor.
+        // First files of this task's diff: no mouse scroll yet, so `j` starts a line cursor.
         let first_load = self.diff_files.is_empty();
         self.diff_fp = data.fp;
         self.diff_fps = data.fps;
@@ -298,7 +298,7 @@ impl Differ {
     }
 
     pub(crate) fn viewed(&self, ix: usize) -> Viewed {
-        let (Some(ws), Some(f)) = (self.active_ws(), self.diff_files.get(ix)) else {
+        let (Some(ws), Some(f)) = (self.active_task(), self.diff_files.get(ix)) else {
             return Viewed::No;
         };
         match ws.viewed.get(f.path().as_str()) {
@@ -348,10 +348,10 @@ impl Differ {
     }
 
     fn set_viewed(&mut self, files: &[usize], on: bool, cx: &mut Context<Self>) {
-        let Some(name) = self.workspace_name().map(str::to_string) else {
+        let Some(name) = self.task_name().map(str::to_string) else {
             return;
         };
-        let Some(ws) = self.workspace.as_mut().filter(|w| w.name == name) else {
+        let Some(ws) = self.task.as_mut().filter(|w| w.name == name) else {
             return;
         };
         for &ix in files {
@@ -363,7 +363,7 @@ impl Differ {
         }
         // Files outside the current diff (say in Uncommitted mode) keep their marks.
         cx.emit(DifferEvent::Viewed {
-            workspace: name,
+            task: name,
             viewed: ws.viewed.clone(),
         });
         self.recompute_viewed();
@@ -460,7 +460,7 @@ impl Differ {
 
     /// Files belongs only to the active Diff artifact.
     pub(crate) fn tree_shown(&self) -> bool {
-        self.show_tree && self.workspace.is_some()
+        self.show_tree && self.task.is_some()
     }
 
     /// The Diff artifact's internal split; the outer Features rail never resizes.
@@ -749,7 +749,7 @@ impl Differ {
             .get(repo)
             .map(String::as_str)
             .or_else(|| {
-                self.active_ws()?
+                self.active_task()?
                     .repos
                     .iter()
                     .find(|r| r.name == repo)
@@ -760,7 +760,7 @@ impl Differ {
 
     /// The bases the diff compares against, and its total added and deleted lines.
     pub(crate) fn changes_stats(&self) -> (String, usize, usize) {
-        let mut bases: Vec<&str> = (self.active_ws().into_iter())
+        let mut bases: Vec<&str> = (self.active_task().into_iter())
             .flat_map(|ws| ws.repos.iter().map(|r| self.diff_base(&r.name)))
             .collect();
         bases.sort_unstable();
@@ -792,10 +792,7 @@ impl Differ {
             .child(
                 Button::new("uncommitted-only")
                     .xsmall()
-                    .h(px(28.))
                     .px(px(10.))
-                    .rounded(px(6.))
-                    .outline()
                     .selected(self.preferences.uncommitted_only)
                     .toggled(self.preferences.uncommitted_only)
                     .accessibility_label("Uncommitted changes only")
@@ -805,18 +802,17 @@ impl Differ {
                         "All changes"
                     })
                     .tooltip(if self.preferences.uncommitted_only {
-                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: workspace base → working tree.".to_string()
+                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: task base → working tree.".to_string()
                     } else {
-                        format!("Workspace base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
+                        format!("Task base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
                     })
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx)))
+                    .map(|b| crate::ui::toolbar("uncommitted-only", b)),
             )
             .child(
                 Button::new("diff-mode")
                     .xsmall()
-                    .size(px(28.))
                     .px_0()
-                    .rounded(px(6.))
                     .icon(if self.preferences.unified {
                         IconName::Rows2
                     } else {
@@ -829,16 +825,13 @@ impl Differ {
                     } else {
                         "Split view · Click for Unified (s)"
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx)))
+                    .map(|b| crate::ui::toolbar("diff-mode", b)),
             )
             .child(
                 Button::new("files-toggle")
                     .xsmall()
-                    .h(px(28.))
-                    .rounded(px(6.))
-                    .outline()
                     .selected(self.show_tree)
-                    .w(px(28.))
                     .px_0()
                     .icon(IconName::PanelRight)
                     .toggled(self.show_tree)
@@ -848,7 +841,8 @@ impl Differ {
                         if self.show_tree { "Hide" } else { "Show" },
                         self.viewed_now.len(),
                     ))
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx)))
+                    .map(|b| crate::ui::toolbar("files-toggle", b)),
             )
     }
 
@@ -988,10 +982,61 @@ impl Differ {
         let depth = r.depth;
         let next_depth = self.tree_rows.get(ix + 1).map_or(0, |r| r.depth);
         let guide = theme.border;
-        let folder_color = theme.foreground;
+        let folder_color = if selected && focused {
+            theme.foreground
+        } else {
+            theme.sidebar_foreground
+        };
+        let background = theme.background.blend(if selected && focused {
+            theme.list_active
+        } else if selected {
+            theme.list_hover
+        } else {
+            theme.transparent
+        });
+        let hover_background = theme.background.blend(theme.list_hover);
+        let (path, name) = r
+            .name
+            .split_at(r.name.rfind('/').map_or(0, |slash| slash + 1));
+        let full_path = r.path.clone();
+        let label = h_flex()
+            .id(("tree-label", ix))
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .aria_label(full_path.clone())
+            .tooltip(move |w, cx| Tooltip::new(full_path.clone()).build(w, cx))
+            .when(!path.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id(("tree-path", ix))
+                        .test_support()
+                        // shortcut: ellipsis may split a folder name; measure text if whole-folder cuts are needed.
+                        .flex_shrink(1e9)
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_start()
+                        .text_color(folder_color)
+                        .group_hover("tree-row", |d| d.text_color(theme.foreground))
+                        .child(path.to_string()),
+                )
+            })
+            .child(
+                crate::overflow_fade::label(
+                    name.to_string().into(),
+                    background,
+                    Some(("tree-row", hover_background)),
+                )
+                .id(("tree-name", ix))
+                .test_support()
+                .flex_initial(),
+            );
         // `uniform_list` rows: no margin, so the 30px height is the pitch.
         let row = side_row(theme)
             .id(("tree-row", ix))
+            .group("tree-row")
             .test_support()
             .w_full()
             .mx_0()
@@ -1061,23 +1106,23 @@ impl Differ {
                 // A 14px chevron in a 16px slot, so folder and file names line up.
                 .child(
                     h_flex().size(px(16.)).flex_none().justify_center().child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .with_size(px(14.))
-                        .text_color(folder_color),
+                        // Icon captures inherited color before group-hover styles are applied.
+                        svg()
+                            .path(if open {
+                                IconName::ChevronDown.path()
+                            } else {
+                                IconName::ChevronRight.path()
+                            })
+                            .size(px(14.))
+                            .flex_none()
+                            .text_color(folder_color)
+                            .group_hover("tree-row", |d| d.text_color(theme.foreground)),
                     ),
                 )
                 .child(
-                    div()
-                        .id(("tree-label", ix))
-                        .test_support()
-                        .flex_1()
-                        .truncate()
+                    label
                         .text_color(folder_color)
-                        .child(r.name.clone()),
+                        .group_hover("tree-row", |d| d.text_color(theme.foreground)),
                 )
                 .child(self.dir_viewed_box(ix, &r.path, cx))
                 .into_any_element();
@@ -1097,29 +1142,12 @@ impl Differ {
                     .text_color(theme.muted_foreground),
             )
             .child(
-                div()
-                    .id(("tree-label", ix))
-                    .test_support()
-                    .flex_1()
-                    .truncate()
+                label
                     .text_color(match state {
                         Viewed::Yes => theme.muted_foreground,
                         _ => theme.foreground,
                     })
-                    .when(is_open, |d| d.font_weight(FontWeight::MEDIUM))
-                    .child(
-                        StyledText::new(r.name.clone()).with_highlights(r.name.rfind('/').map(
-                            |slash| {
-                                (
-                                    0..slash + 1,
-                                    HighlightStyle {
-                                        color: Some(theme.foreground),
-                                        ..Default::default()
-                                    },
-                                )
-                            },
-                        )),
-                    ),
+                    .when(is_open, |d| d.font_weight(FontWeight::MEDIUM)),
             )
             .when(self.uncommitted.contains(f.path().as_str()), |d| {
                 d.child(
@@ -1207,7 +1235,7 @@ impl Differ {
     /// Right-click menu of file `path` (`repo/…`): the tree's file rows, the editor header
     /// and the File tab. By path, since the open file need not be in the diff.
     pub(crate) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let abs = ws.dir().join(path);
@@ -1225,7 +1253,7 @@ impl Differ {
             entries.push(menu::item(
                 IconName::FileCode,
                 "Open in editor",
-                on_differ(self.workspace_name(), cx, move |s, _w, cx| {
+                on_differ(self.task_name(), cx, move |s, _w, cx| {
                     s.request_editor(p.clone(), false, false, cx)
                 }),
             ));
@@ -1236,7 +1264,7 @@ impl Differ {
                 entries.push(menu::item(
                     IconName::Pencil,
                     "Edit working copy",
-                    on_differ(self.workspace_name(), cx, move |s, w, cx| {
+                    on_differ(self.task_name(), cx, move |s, w, cx| {
                         s.request_activation(cx);
                         s.edit_working_copy(Some(p.clone().into()), w, cx)
                     }),
@@ -1247,7 +1275,7 @@ impl Differ {
                 menu::item(
                     IconName::MessageSquare,
                     "Comment",
-                    on_differ(self.workspace_name(), cx, move |s, w, cx| {
+                    on_differ(self.task_name(), cx, move |s, w, cx| {
                         s.request_activation(cx);
                         s.comment_in(&p1, w, cx)
                     }),
@@ -1255,7 +1283,7 @@ impl Differ {
                 menu::item(
                     IconName::Check,
                     "Viewed",
-                    on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                    on_differ(self.task_name(), cx, move |s, _, cx| {
                         s.toggle_viewed_path(&p2, cx)
                     }),
                 )
@@ -1268,9 +1296,9 @@ impl Differ {
             entries.push(menu::item(
                 IconName::Undo,
                 "Discard uncommitted changes…",
-                on_differ(self.workspace_name(), cx, move |_s, _w, cx| {
+                on_differ(self.task_name(), cx, move |_s, _w, cx| {
                     cx.emit(DifferEvent::DiscardFile {
-                        workspace: name.clone(),
+                        task: name.clone(),
                         path: path.clone(),
                     })
                 }),
@@ -1279,44 +1307,26 @@ impl Differ {
         entries.push(Entry::Sep);
         if on_disk {
             entries.push(reveal_entry(&abs));
-            for app in crate::apps::installed() {
-                if app.kind != crate::apps::Kind::Folder {
-                    continue;
-                }
-                let a = abs.clone();
-                let label = format!("Open in {}", app.name);
-                let item = menu::item(
-                    crate::ui::app_icon(app),
-                    label,
-                    on_differ(self.workspace_name(), cx, move |_, _, cx| {
-                        cx.emit(DifferEvent::OpenApp {
-                            app,
-                            path: a.clone(),
-                        });
-                    }),
-                );
-                entries.push(item.image(app.icon.clone()));
-            }
+            entries.extend(open_in_entries(&abs, |app, a| {
+                on_differ(self.task_name(), cx, move |_, _, cx| {
+                    cx.emit(DifferEvent::OpenApp {
+                        app,
+                        path: a.clone(),
+                    });
+                })
+            }));
         }
         entries.push(copy_path_entry(&abs));
         // Relative to the repo, as its own tools and the agent's diffs name it.
-        entries.push(menu::item(
-            IconName::Copy,
-            "Copy relative path",
-            move |w, cx| {
-                copy(
-                    p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(),
-                    w,
-                    cx,
-                )
-            },
+        entries.push(copy_relative_entry(
+            p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(),
         ));
         entries
     }
 
     /// Right-click menu of folder `dir` in the tree; it is the tree cursor's row.
     fn dir_menu(&self, dir: &str, cx: &Context<Self>) -> Vec<Entry> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let abs = ws.dir().join(dir);
@@ -1326,7 +1336,7 @@ impl Differ {
             menu::item(
                 IconName::Check,
                 "All viewed",
-                on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                on_differ(self.task_name(), cx, move |s, _, cx| {
                     s.toggle_viewed_dir(&d, cx)
                 }),
             )
@@ -1342,7 +1352,7 @@ impl Differ {
                     IconName::ChevronDown
                 },
                 if open { "Collapse" } else { "Expand" },
-                on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                on_differ(self.task_name(), cx, move |s, _, cx| {
                     s.set_dir_open(Some(!open), cx)
                 }),
             ));
@@ -1357,26 +1367,24 @@ impl Differ {
             menu::item(
                 IconName::FileDiff,
                 "Uncommitted only",
-                on_differ(self.workspace_name(), cx, |s, w, cx| {
-                    s.toggle_uncommitted(w, cx)
-                }),
+                on_differ(self.task_name(), cx, |s, w, cx| s.toggle_uncommitted(w, cx)),
             )
             .checked(self.preferences.uncommitted_only),
             menu::item(
                 IconName::Columns2,
                 "Unified",
-                on_differ(self.workspace_name(), cx, |s, _, cx| s.toggle_diff_mode(cx)),
+                on_differ(self.task_name(), cx, |s, _, cx| s.toggle_diff_mode(cx)),
             )
             .checked(self.preferences.unified),
             menu::item(
                 IconName::RefreshCw,
                 "Refresh",
-                on_differ(self.workspace_name(), cx, |s, _, cx| s.refresh_diff(cx)),
+                on_differ(self.task_name(), cx, |s, _, cx| s.refresh_diff(cx)),
             ),
             menu::item(
                 IconName::PanelRight,
                 "Show files",
-                on_differ(self.workspace_name(), cx, |s, w, cx| s.toggle_tree(w, cx)),
+                on_differ(self.task_name(), cx, |s, w, cx| s.toggle_tree(w, cx)),
             )
             .checked(self.show_tree),
         ];
@@ -1386,7 +1394,7 @@ impl Differ {
                 menu::item(
                     IconName::Send,
                     "Send review…",
-                    on_differ(self.workspace_name(), cx, |s, w, cx| s.open_sheet(w, cx)),
+                    on_differ(self.task_name(), cx, |s, w, cx| s.open_sheet(w, cx)),
                 ),
             ]);
         }
@@ -1408,7 +1416,7 @@ impl Differ {
 }
 
 /// The "Reveal in Finder" menu entry of `abs`.
-fn reveal_entry(abs: &Path) -> Entry {
+pub(crate) fn reveal_entry(abs: &Path) -> Entry {
     let abs = abs.to_path_buf();
     menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
         cx.reveal_path(&abs)
@@ -1416,11 +1424,37 @@ fn reveal_entry(abs: &Path) -> Entry {
 }
 
 /// The "Copy path" menu entry of `abs`.
-fn copy_path_entry(abs: &Path) -> Entry {
+pub(crate) fn copy_path_entry(abs: &Path) -> Entry {
     let abs = abs.display().to_string();
     menu::item(IconName::Copy, "Copy path", move |w, cx| {
         copy(abs.clone(), w, cx)
     })
+}
+
+/// The "Copy relative path" menu entry; `text` is the path the user's tools expect.
+pub(crate) fn copy_relative_entry(text: String) -> Entry {
+    menu::item(IconName::Copy, "Copy relative path", move |w, cx| {
+        copy(text.clone(), w, cx)
+    })
+}
+
+/// One "Open in <app>" entry per installed app that opens any folder; `on_click` makes the
+/// handler that opens `abs` with it.
+pub(crate) fn open_in_entries<F: Fn(&mut Window, &mut App) + 'static>(
+    abs: &Path,
+    on_click: impl Fn(&'static crate::apps::OpenApp, PathBuf) -> F,
+) -> Vec<Entry> {
+    (crate::apps::installed().iter())
+        .filter(|app| app.kind == crate::apps::Kind::Folder)
+        .map(|app| {
+            let item = menu::item(
+                crate::ui::app_icon(app),
+                format!("Open in {}", app.name),
+                on_click(app, abs.to_path_buf()),
+            );
+            item.image(app.icon.clone())
+        })
+        .collect()
 }
 
 /// The diff's mode for the persisted `unified` choice.
@@ -1431,7 +1465,7 @@ pub(crate) fn diff_mode(unified: bool) -> DiffMode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     // Not `super::*`: it would bring `gpui_kit::test` in over the `#[test]` its macro expands to.
     use super::{DiffData, parse_chunk};

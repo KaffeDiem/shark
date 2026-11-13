@@ -1,8 +1,8 @@
-//! Repo settings (click a repo in the sidebar): new workspace, default model, setup, run and
-//! archive scripts, removal. Every change saves at once, as in Settings.
+//! Settings › Repositories lists the repos; clicking one opens its settings: new task, default
+//! model, setup, run and archive scripts, removal. Every change saves at once, as in Settings.
 use super::*;
-use crate::chat::{effort_label, model_label};
 use crate::models::efforts;
+use crate::models::{effort_label, model_label};
 use crate::scripts::Phase;
 use crate::state::RepoSettings;
 use crate::ui::{card, row, section};
@@ -19,7 +19,7 @@ fn info(p: Phase) -> (&'static str, &'static str, &'static str) {
         ),
         Phase::Run => (
             "Run",
-            "cmd-r starts these and stops them; across repos, drag the repos in the sidebar. $SHARK_PORT is a free block of 10 ports",
+            "cmd-r starts these and stops them; across repos, drag them in Settings › Repositories. $SHARK_PORT is a free block of 10 ports",
             "npm run dev -- --port $SHARK_PORT",
         ),
         Phase::Archive => (
@@ -53,6 +53,130 @@ impl Render for ScriptDrag {
             .font_family(theme.mono_font_family.clone())
             .text_size(theme.mono_font_size)
             .child(self.label.clone())
+    }
+}
+
+/// A repo row being dragged: its index and name, shown under the pointer.
+#[derive(Clone)]
+struct RepoDrag(usize, SharedString);
+
+impl Render for RepoDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.border)
+            .text_sm()
+            .child(self.1.clone())
+    }
+}
+
+/// Settings › Repositories: the repos in script order. Click one for its settings, drag to
+/// reorder, right-click for its menu.
+pub(crate) struct ReposPage {
+    shark: WeakEntity<Shark>,
+}
+
+impl ReposPage {
+    pub(crate) fn new(shark: WeakEntity<Shark>) -> Self {
+        ReposPage { shark }
+    }
+
+    fn row(&self, ix: usize, r: &Repo, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (click, menu) = (r.clone(), r.clone());
+        h_flex()
+            .id(("repo", ix))
+            .test_support()
+            .h(px(48.))
+            .px_3()
+            .gap_3()
+            .when(ix > 0, |d| d.border_t_1().border_color(theme.border))
+            .hover(|d| d.bg(theme.secondary_hover))
+            // Drag to reorder: scripts run in this order across a task's repos.
+            .on_drag(RepoDrag(ix, r.name.clone().into()), |d, _, _, cx| {
+                cx.new(|_| d.clone())
+            })
+            .drag_over::<RepoDrag>(|s, _, _, cx| s.bg(cx.theme().accent))
+            .on_drop(cx.listener(move |this, d: &RepoDrag, _, cx| {
+                (this.shark)
+                    .update(cx, |s, cx| {
+                        if d.0 != ix && d.0 < s.state.repos.len() {
+                            move_item(&mut s.state.repos, d.0, ix);
+                            let _ = s.state.save();
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            }))
+            .child(Icon::new(IconName::FolderGit2).with_size(px(16.)))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_sm().truncate().child(r.name.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .truncate()
+                            .child(tilde(&r.path)),
+                    ),
+            )
+            .child(
+                Icon::new(IconName::ChevronRight)
+                    .with_size(px(14.))
+                    .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _, w, cx| {
+                (this.shark)
+                    .update(cx, |s, cx| open(s, click.clone(), w, cx))
+                    .ok();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    (this.shark)
+                        .update(cx, |s, cx| {
+                            let entries = menus::repo_menu(s, &menu, cx);
+                            s.show_menu(e.position, entries, w, cx);
+                        })
+                        .ok();
+                }),
+            )
+    }
+}
+
+impl Render for ReposPage {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let repos = (self.shark.upgrade())
+            .map(|s| s.read(cx).state.repos.clone())
+            .unwrap_or_default();
+        let rows: Vec<AnyElement> = (repos.iter().enumerate())
+            .map(|(ix, r)| self.row(ix, r, cx).into_any_element())
+            .collect();
+        let theme = cx.theme();
+        v_flex()
+            .gap_3()
+            .when(!rows.is_empty(), |d| {
+                d.child(card(theme).overflow_hidden().children(rows))
+            })
+            .child(
+                h_flex().child(
+                    Button::new("add-repo")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Plus)
+                        .label("Add repo…")
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.shark.update(cx, |s, cx| s.add_repo(w, cx)).ok();
+                        })),
+                ),
+            )
     }
 }
 
@@ -247,36 +371,57 @@ impl RepoSettingsView {
         }
     }
 
-    fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.repo.name.clone();
-        window.close_dialog(cx);
+        // Settings may be open underneath.
+        window.close_all_dialogs(cx);
         (self.shark)
-            .update(cx, |s, cx| s.new_workspace(vec![name], None, window, cx))
+            .update(cx, |s, cx| {
+                s.new_task_from_repos(vec![name], None, window, cx)
+            })
             .ok();
     }
 
-    fn remove_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn can_remove(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let name = self.repo.name.clone();
         let used: Vec<String> = (self.shark.upgrade())
             .map(|s| {
                 let s = s.read(cx);
-                // A workspace being created or getting a repo isn't in `workspaces` yet.
-                (s.state.workspaces.iter())
-                    .filter(|w| w.repos.iter().any(|r| r.name == name))
-                    .map(|w| w.name.clone())
-                    .chain(s.creating.iter().chain(&s.adding_repos).cloned())
+                // Queued attachments still need this repo's setup scripts and defaults.
+                (s.state.tasks.iter())
+                    .filter(|w| {
+                        w.repos.iter().any(|r| r.name == name)
+                            || w.attaching.iter().any(|a| a.repo == name)
+                    })
+                    .map(|w| w.display_title().to_string())
+                    .chain(s.creating.keys().chain(&s.adding_repos).cloned())
                     .collect()
             })
             .unwrap_or_default();
         if !used.is_empty() {
-            let msg = format!("{name} is in {}; archive those first", used.join(", "));
-            return notify_err(window, cx, msg);
+            let msg = format!(
+                "{name} is in {}; finish or cancel its attachments, or delete those tasks first",
+                used.join(", ")
+            );
+            notify_err(window, cx, msg);
+            return false;
         }
+        true
+    }
+
+    fn remove_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_remove(window, cx) {
+            return;
+        }
+        let name = self.repo.name.clone();
         confirm(
             format!("Remove {name} from Shark?"),
             "Its folder stays where it is; its scripts and defaults here are forgotten.",
             "Remove",
             move |this: &mut Self, window, cx| {
+                if !this.can_remove(window, cx) {
+                    return;
+                }
                 let name = this.repo.name.clone();
                 window.close_dialog(cx);
                 (this.shark)
@@ -471,12 +616,12 @@ impl Render for RepoSettingsView {
                     .on_click(move |_, w, cx| copy(p2.display().to_string(), w, cx)),
             )
             .child(
-                Button::new("repo-new-workspace")
+                Button::new("repo-new-task")
                     .primary()
                     .small()
                     .icon(IconName::Plus)
-                    .label("New workspace")
-                    .on_click(cx.listener(|this, _, w, cx| this.new_workspace(w, cx))),
+                    .label("New task")
+                    .on_click(cx.listener(|this, _, w, cx| this.new_task(w, cx))),
             );
         v_flex()
             .id("repo-settings")
@@ -486,21 +631,21 @@ impl Render for RepoSettingsView {
             .overflow_y_scroll()
             .child(header)
             .child(
-                v_flex().gap_1p5().child(section(theme, "Agent")).child(
+                v_flex().gap_1p5().child(section(theme, "Task")).child(
                     card(theme)
                         .child(row(
                             theme,
                             false,
                             "Default model",
-                            "New chats in workspaces with this repo",
-                            Select::new(&self.model).small(),
+                            "New chats in tasks with this repo",
+                            Select::new(&self.model),
                         ))
                         .child(row(
                             theme,
                             true,
                             "Thinking",
                             "Their thinking level",
-                            Select::new(&self.effort).small(),
+                            Select::new(&self.effort),
                         )),
                 ),
             )

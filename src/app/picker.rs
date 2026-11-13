@@ -1,4 +1,4 @@
-//! "Open file…": fuzzy-pick any file in the workspace's repos and open it in the editor.
+//! "Open file…": fuzzy-pick any file in the task's repos and open it in the editor.
 use super::*;
 use crate::complete::{self, Item, Kind};
 
@@ -10,11 +10,12 @@ pub(super) struct FilePicker {
     hits: Vec<usize>,
     query: String,
     shark: WeakEntity<Shark>,
-    _load: Task<()>,
+    _load: gpui_kit::Task<()>,
 }
 
 impl FilePicker {
     fn new(
+        task: PathBuf,
         repos: Vec<(String, PathBuf)>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
@@ -25,7 +26,7 @@ impl FilePicker {
         let _load = cx.spawn_in(window, async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { complete::files(&repos) })
+                .spawn(async move { complete::files(&task, &repos) })
                 .await;
             this.update_in(cx, |p, window, cx| {
                 p.files = files.into_iter().filter(|i| i.kind == Kind::File).collect();
@@ -49,7 +50,7 @@ impl FilePicker {
         self.hits = complete::rank(&self.files, &self.query, ROWS);
     }
 
-    /// Workspace-relative path of a hit, `api/src/a.rs`.
+    /// Task-relative path of a hit, `api/src/a.rs`.
     fn path(&self, row: usize) -> Option<String> {
         Some(rel(self.files.get(*self.hits.get(row)?)?))
     }
@@ -60,7 +61,7 @@ fn rel(item: &Item) -> String {
 }
 
 impl Render for FilePicker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = cx.theme().is_dark();
         let items = (self.hits.iter()).map(|&i| {
             let label: SharedString = rel(&self.files[i]).into();
@@ -70,7 +71,7 @@ impl Render for FilePicker {
             }
         });
         let (q, pick) = (cx.entity().downgrade(), cx.entity().downgrade());
-        Command::new(&self.state)
+        crate::ui::command(&self.state, window)
             .items(items.collect::<Vec<_>>())
             .filterable(false)
             .placeholder("Open file…")
@@ -99,14 +100,14 @@ impl Render for FilePicker {
 }
 
 impl Shark {
-    /// cmd-p: the picker over every tracked and untracked file of the open workspace.
+    /// cmd-p: the picker over every tracked and untracked file of the open task.
     pub(super) fn open_any_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
-        let repos = ws.repo_paths();
+        let (task, repos) = (ws.dir(), ws.repo_paths());
         let shark = cx.entity().downgrade();
-        let picker = cx.new(|cx| FilePicker::new(repos, shark, window, cx));
+        let picker = cx.new(|cx| FilePicker::new(task, repos, shark, window, cx));
         let state = picker.read(cx).state.clone();
         window.open_dialog(cx, move |d, _, cx| menu_dialog(d, cx).child(picker.clone()));
         state.update(cx, |p, cx| p.focus(window, cx));
@@ -114,7 +115,7 @@ impl Shark {
 
     /// Opens a picked path; text files only, since the editor would show a binary one empty.
     fn open_any_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let abs = ws.dir().join(&path);
         let text = std::fs::metadata(&abs).is_ok_and(|m| m.len() <= crate::editor::MAX_BYTES)
             && std::fs::read(&abs).is_ok_and(|b| std::str::from_utf8(&b).is_ok());

@@ -1,16 +1,15 @@
 //! Publishing a local review to GitHub: anchors, verification, and the `gh api` calls.
-use super::{gh, gh_post, last_line};
+use super::{Target, gh, gh_post, last_line};
 use crate::git::cmd_bounded;
 use std::path::Path;
 
-/// Posts `body` to PR `number` of the repo at `wt` as a conversation comment (a reviewer
+/// Posts `body` to `target` as a conversation comment (a reviewer
 /// note); returns its URL.
-pub fn publish_note(wt: &Path, number: u64, body: &str) -> Result<String, String> {
-    if let Some(remote) = crate::azure::Remote::of(wt) {
-        return crate::azure::publish(wt, &remote, number, body, None);
+pub fn publish_note(wt: &Path, target: &Target, body: &str) -> Result<String, String> {
+    if let Some(remote) = target.remote() {
+        return crate::azure::publish(wt, &remote, target.number, body, None);
     }
-    let n = number.to_string();
-    let out = gh_post(wt, &["pr", "comment", &n, "--body", body], 60)?;
+    let out = gh_post(wt, &["pr", "comment", &target.url(), "--body", body], 60)?;
     Ok(last_line(&out))
 }
 
@@ -26,16 +25,26 @@ pub struct Anchor {
 /// Verify against fresh GitHub data; any unavailable or changing evidence means excerpt-only.
 pub fn verify_original_anchor(
     wt: &Path,
-    number: u64,
+    target: &Target,
     revision: &str,
     anchor: &Anchor,
 ) -> Option<(String, bool)> {
     // ponytail: no old-side check on Azure DevOps; such comments go as path and excerpt.
-    crate::azure::Remote::of(wt).is_none().then_some(())?;
+    target.remote().is_none().then_some(())?;
     let read = |endpoint: &str| -> Option<serde_json::Value> {
-        serde_json::from_str(&cmd_bounded(wt, &gh(), &["api", endpoint], 30).ok()?).ok()
+        serde_json::from_str(
+            &cmd_bounded(
+                wt,
+                &gh(),
+                &["api", "--hostname", &target.host, endpoint],
+                30,
+            )
+            .ok()?,
+        )
+        .ok()
     };
-    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
+    let repo = format!("repos/{}/{}", target.owner, target.repo);
+    let endpoint = format!("{repo}/pulls/{}", target.number);
     let commits = |v: &serde_json::Value| -> Option<(String, String)> {
         let sha = |v: &serde_json::Value| {
             v.as_str()
@@ -45,10 +54,7 @@ pub fn verify_original_anchor(
         Some((sha(&v["base"]["sha"])?, sha(&v["head"]["sha"])?))
     };
     let first = commits(&read(&endpoint)?)?;
-    let comparison = read(&format!(
-        "repos/{{owner}}/{{repo}}/compare/{}...{}",
-        first.0, first.1
-    ));
+    let comparison = read(&format!("{repo}/compare/{}...{}", first.0, first.1));
     let valid = comparison
         .as_ref()
         .is_some_and(|comparison| original_anchor_matches(comparison, revision, anchor));
@@ -120,33 +126,38 @@ fn original_anchor_matches(
     valid().unwrap_or(false)
 }
 
-/// Posts a Comment review (neither approves nor requests changes) to PR `number` at commit
+/// Posts a Comment review (neither approves nor requests changes) to `target` at commit
 /// `head`: `body` alone, or with `inline` as a comment on its lines (then `body` is the
 /// review's note). Returns the review's URL.
 pub fn publish_review(
     wt: &Path,
-    number: u64,
+    target: &Target,
     head: &str,
     body: &str,
     inline: Option<(&Anchor, &str)>,
 ) -> Result<String, String> {
-    if let Some(remote) = crate::azure::Remote::of(wt) {
-        return crate::azure::publish(wt, &remote, number, body, inline);
+    if let Some(remote) = target.remote() {
+        return crate::azure::publish(wt, &remote, target.number, body, inline);
     }
-    let args = review_api_args(&number.to_string(), head, body, inline);
+    let args = review_api_args(target, head, body, inline);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     gh_post(wt, &args, 60)
 }
 
-/// `gh api` for a review, with one inline comment when given; gh fills in `{owner}/{repo}`.
+/// `gh api` for a review, with explicit host and repository identity.
 fn review_api_args(
-    n: &str,
+    target: &Target,
     head: &str,
     body: &str,
     inline: Option<(&Anchor, &str)>,
 ) -> Vec<String> {
-    let mut v: Vec<String> = ["api", "--method", "POST"].map(String::from).into();
-    v.push(format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews"));
+    let mut v: Vec<String> = ["api", "--hostname", &target.host, "--method", "POST"]
+        .map(String::from)
+        .into();
+    v.push(format!(
+        "repos/{}/{}/pulls/{}/reviews",
+        target.owner, target.repo, target.number
+    ));
     let mut field = |flag: &str, kv: String| v.extend([flag.to_string(), kv]);
     field("-f", "event=COMMENT".into());
     field("-f", format!("commit_id={head}"));
@@ -184,7 +195,11 @@ mod tests {
         fs::write(
             &script,
             r#"#!/bin/sh
-case "$2" in
+printf '%s|' "$@" >> calls
+echo >> calls
+if [ "$1" = pr ]; then echo "$3#issuecomment-1"; exit; fi
+if [ "$4" = --method ]; then echo https://github.example/review; exit; fi
+case "$4" in
 */compare/*) cat comparison.json; if [ -e move ]; then cp moved.json pr.json; fi ;;
 */pulls/*) cat pr.json ;;
 *) exit 1 ;;
@@ -222,6 +237,7 @@ esac
         )
         .unwrap();
         fs::write(root.join("comparison.json"), json!({"merge_base_commit":{"sha":base},"files":[{"filename":"a.rs","status":"modified","patch":"@@ -1 +1 @@\n-old\n+new","additions":1,"deletions":1}]}).to_string()).unwrap();
+        let target = Target::from_url("https://github.example/acme/review/pull/1").unwrap();
         let anchor = Anchor {
             path: "a.rs".into(),
             line: 1,
@@ -229,21 +245,60 @@ esac
             left: true,
         };
         assert_eq!(
-            verify_original_anchor(&root, 1, &base, &anchor),
+            verify_original_anchor(&root, &target, &base, &anchor),
             Some((head.clone(), true))
         );
         assert_eq!(
-            verify_original_anchor(&root, 1, "legacy", &anchor),
+            verify_original_anchor(&root, &target, "legacy", &anchor),
             Some((head.clone(), false))
         );
+        // Same-number PRs can live in a fork, its original, or another GitHub host.
+        for url in [
+            "https://github.example/fork/review/pull/1",
+            "https://github.example/original/review/pull/1",
+            "https://github.com/original/other/pull/1",
+        ] {
+            let target = Target::from_url(url).unwrap();
+            assert_eq!(
+                verify_original_anchor(&root, &target, &base, &anchor),
+                Some((head.clone(), true))
+            );
+            assert_eq!(
+                publish_note(&root, &target, "note").unwrap(),
+                format!("{url}#issuecomment-1")
+            );
+            publish_review(&root, &target, &head, "review", Some((&anchor, "inline"))).unwrap();
+            let calls = fs::read_to_string(root.join("calls")).unwrap();
+            let repo = format!("repos/{}/{}", target.owner, target.repo);
+            assert!(
+                calls.contains(&format!("pr|comment|{url}|--body|note|")),
+                "{calls}"
+            );
+            assert!(
+                calls.contains(&format!("api|--hostname|{}|{repo}/pulls/1|", target.host)),
+                "{calls}"
+            );
+            assert!(
+                calls.contains(&format!("api|--hostname|{}|{repo}/compare/", target.host)),
+                "{calls}"
+            );
+            assert!(
+                calls.contains(&format!(
+                    "api|--hostname|{}|--method|POST|{repo}/pulls/1/reviews|",
+                    target.host
+                )),
+                "{calls}"
+            );
+            assert!(!calls.contains("{owner}"), "{calls}");
+        }
         fs::write(root.join("move"), "").unwrap();
         assert_eq!(
-            verify_original_anchor(&root, 1, &base, &anchor),
+            verify_original_anchor(&root, &target, &base, &anchor),
             Some((head, false))
         );
         fs::remove_file(root.join("comparison.json")).unwrap();
         assert_eq!(
-            verify_original_anchor(&root, 1, &base, &anchor),
+            verify_original_anchor(&root, &target, &base, &anchor),
             Some(("c".repeat(40), false))
         );
         fs::remove_dir_all(root).unwrap();
@@ -287,15 +342,16 @@ esac
             start: Some(631),
             left: false,
         };
+        let target = Target::from_url("https://github.example/acme/api/pull/128").unwrap();
         let args = review_api_args(
-            "128",
+            &target,
             "abc",
             "app.rs:631-632",
             Some((&a, "Keep it aligned.")),
         );
         assert_eq!(
             args.join(" "),
-            "api --method POST repos/{owner}/{repo}/pulls/128/reviews -f event=COMMENT \
+            "api --hostname github.example --method POST repos/acme/api/pulls/128/reviews -f event=COMMENT \
              -f commit_id=abc -f body=app.rs:631-632 -f comments[][path]=src/app.rs \
              -F comments[][line]=632 -f comments[][side]=RIGHT \
              -F comments[][start_line]=631 -f comments[][start_side]=RIGHT \
@@ -306,14 +362,14 @@ esac
             left: true,
             ..a
         };
-        let args = review_api_args("7", "h", "note", Some((&one, "x"))).join(" ");
+        let args = review_api_args(&target, "h", "note", Some((&one, "x"))).join(" ");
         assert!(
             args.contains("-f body=note") && args.contains("side]=LEFT"),
             "{args}"
         );
         assert!(!args.contains("start_line"));
         // Without an inline comment: the review alone.
-        let args = review_api_args("7", "h", "note", None).join(" ");
+        let args = review_api_args(&target, "h", "note", None).join(" ");
         assert!(args.ends_with("-f body=note -q .html_url"), "{args}");
     }
 }

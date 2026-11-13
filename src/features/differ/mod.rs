@@ -1,11 +1,11 @@
 //! Differ owns its presentation, edits, reviews and asynchronous work. The host supplies
-//! workspace snapshots and handles only requests that cross feature boundaries.
+//! task snapshots and handles only requests that cross feature boundaries.
 use super::FeatureFocus;
 use crate::checkbox::Checkbox;
 use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use crate::files::{self, Row};
 use crate::menu::{self, Entry};
-use crate::state::{State, Workspace};
+use crate::state::{State, Task};
 use crate::ui::{
     confirm, copy, faint, kbd, list_cursor_row, notify_err, quiet_edge, side_header, side_row,
 };
@@ -16,6 +16,8 @@ use crate::{
     ResolveThread, SaveFile, SelectFirst, SelectLast, SelectNext, SelectPrev, SendComments,
     SendNow, SubmitForm, SuggestChange, ToggleDiffMode, ToggleRow, ToggleViewed, ViewChange, git,
 };
+#[cfg(test)]
+use core::prelude::v1::test;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
@@ -42,7 +44,9 @@ mod review_share;
 mod review_store;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod test_support;
-pub(crate) use diff::Viewed;
+pub(crate) use diff::{
+    Viewed, copy_path_entry, copy_relative_entry, open_in_entries, reveal_entry,
+};
 pub(crate) use review_send::Target;
 
 #[derive(Clone)]
@@ -75,8 +79,8 @@ pub(crate) enum Preference {
 
 /// Effective comparison bases and PR context are captured by the host from GitSync.
 #[derive(Clone)]
-pub(crate) struct WorkspaceSnapshot {
-    pub workspace: Workspace,
+pub(crate) struct TaskSnapshot {
+    pub task: Task,
     pub prs: HashMap<String, (crate::sync::Pr, bool)>,
 }
 
@@ -92,26 +96,26 @@ pub(crate) enum DifferEvent {
         action: AfterDiscard,
     },
     OpenEditor {
-        workspace: String,
+        task: String,
         path: String,
         new_tab: bool,
         existing_only: bool,
     },
     OpenChat {
-        workspace: String,
+        task: String,
         chat: Option<String>,
     },
     EditWorkingCopy {
-        workspace: String,
+        task: String,
         path: SharedString,
     },
     DiscardFile {
-        workspace: String,
+        task: String,
         path: String,
     },
     Interacted(String),
     Viewed {
-        workspace: String,
+        task: String,
         viewed: HashMap<String, u64>,
     },
     Preference(Preference),
@@ -121,7 +125,7 @@ impl EventEmitter<DifferEvent> for Differ {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EditSnapshot {
-    pub workspace: String,
+    pub task: String,
     pub path: SharedString,
     pub abs: PathBuf,
     pub input: EntityId,
@@ -131,7 +135,7 @@ pub(crate) struct EditSnapshot {
 }
 
 pub(crate) struct Differ {
-    workspace: Option<Workspace>,
+    task: Option<Task>,
     preferences: Preferences,
     prs: HashMap<String, (crate::sync::Pr, bool)>,
     editor_path: Option<String>,
@@ -148,7 +152,7 @@ pub(crate) struct Differ {
     diff_gen: u64,
     /// The file last moved to (`}`/`{`, the tree); the diff can't say which one is on screen.
     diff_file: usize,
-    /// False until the first refresh of the open workspace lands.
+    /// False until the first refresh of the open task lands.
     diff_loaded: bool,
     diff_error: Option<String>,
     /// Git status paths, independently of the diff's selected comparison base.
@@ -219,7 +223,7 @@ impl Differ {
             ),
         ];
         Self {
-            workspace: None,
+            task: None,
             preferences,
             prs: HashMap::new(),
             editor_path: None,
@@ -254,22 +258,22 @@ impl Differ {
         }
     }
 
-    fn active_ws(&self) -> Option<&Workspace> {
-        self.workspace.as_ref()
+    fn active_task(&self) -> Option<&Task> {
+        self.task.as_ref()
     }
-    pub(crate) fn workspace_name(&self) -> Option<&str> {
-        self.workspace.as_ref().map(|ws| ws.name.as_str())
+    pub(crate) fn task_name(&self) -> Option<&str> {
+        self.task.as_ref().map(|ws| ws.name.as_str())
     }
 
-    pub(crate) fn set_workspace(
+    pub(crate) fn set_task(
         &mut self,
-        snapshot: Option<WorkspaceSnapshot>,
+        snapshot: Option<TaskSnapshot>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = snapshot.as_ref().map(|s| s.workspace.name.as_str());
-        if self.workspace_name() != name {
-            // Typed words stay a pending comment of the workspace being left.
+        let name = snapshot.as_ref().map(|s| s.task.name.as_str());
+        if self.task_name() != name {
+            // Typed words stay a pending comment of the task being left.
             self.keep_draft(window, cx);
             self.diff_gen += 1;
             self.editing = None;
@@ -294,19 +298,19 @@ impl Differ {
             self.menu = None;
             self.diff.update(cx, |d, cx| d.set_files([], cx));
         }
-        self.update_workspace(snapshot);
+        self.update_task(snapshot);
         cx.notify();
     }
 
-    pub(crate) fn update_workspace(&mut self, mut snapshot: Option<WorkspaceSnapshot>) {
+    pub(crate) fn update_task(&mut self, mut snapshot: Option<TaskSnapshot>) {
         // Viewed marks originate here; a host snapshot can arrive before their persistence event.
-        if let (Some(current), Some(next)) = (&self.workspace, &mut snapshot)
-            && current.name == next.workspace.name
+        if let (Some(current), Some(next)) = (&self.task, &mut snapshot)
+            && current.name == next.task.name
         {
-            next.workspace.viewed = current.viewed.clone();
+            next.task.viewed = current.viewed.clone();
         }
         self.prs = snapshot.as_ref().map(|s| s.prs.clone()).unwrap_or_default();
-        self.workspace = snapshot.map(|s| s.workspace);
+        self.task = snapshot.map(|s| s.task);
     }
 
     pub(crate) fn configure(&mut self, vim: bool, editor_path: Option<String>) {
@@ -339,7 +343,7 @@ impl Differ {
     pub(crate) fn edit_snapshot(&self) -> Option<EditSnapshot> {
         let e = self.editing.as_ref()?;
         Some(EditSnapshot {
-            workspace: self.workspace_name()?.into(),
+            task: self.task_name()?.into(),
             path: e.path.clone(),
             abs: e.abs.clone(),
             revision: files::fingerprint(e.buf.text()),
@@ -435,16 +439,16 @@ impl Differ {
 }
 
 fn on_differ(
-    workspace: Option<&str>,
+    task: Option<&str>,
     cx: &Context<Differ>,
     f: impl Fn(&mut Differ, &mut Window, &mut Context<Differ>) + 'static,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     let entity = cx.entity().downgrade();
-    let workspace = workspace.map(str::to_owned);
+    let task = task.map(str::to_owned);
     move |window, cx| {
         entity
             .update(cx, |s, cx| {
-                if s.workspace_name() == workspace.as_deref() {
+                if s.task_name() == task.as_deref() {
                     f(s, window, cx);
                 }
             })
@@ -539,8 +543,8 @@ impl Differ {
     }
 
     fn request_activation(&self, cx: &mut Context<Self>) {
-        if let Some(workspace) = self.workspace_name() {
-            cx.emit(DifferEvent::Activate(workspace.into()));
+        if let Some(task) = self.task_name() {
+            cx.emit(DifferEvent::Activate(task.into()));
         }
     }
 
@@ -557,9 +561,9 @@ impl Differ {
         existing_only: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(workspace) = self.workspace_name() {
+        if let Some(task) = self.task_name() {
             cx.emit(DifferEvent::OpenEditor {
-                workspace: workspace.into(),
+                task: task.into(),
                 path,
                 new_tab,
                 existing_only,
@@ -661,11 +665,11 @@ impl Differ {
 
     pub(crate) fn file_discarded(
         &mut self,
-        workspace: &str,
+        task: &str,
         path: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.workspace_name() != Some(workspace) {
+        if self.task_name() != Some(task) {
             return false;
         }
         let ended_edit = self.editing.as_ref().is_some_and(|e| e.path == path);
@@ -687,7 +691,7 @@ impl Differ {
     pub(crate) fn retry_saves(&mut self) {
         self.review.store.retry();
     }
-    pub(crate) fn forget_workspace(&mut self, name: &str) {
+    pub(crate) fn forget_task(&mut self, name: &str) {
         self.review.store.forget(name);
     }
     pub(crate) fn unqueue_review(

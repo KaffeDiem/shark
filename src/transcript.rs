@@ -1,8 +1,8 @@
 //! A chat's stored transcript and stderr log: what is clipped on the way in, appended,
 //! read back, and what the stored events say about the chat's state.
-use crate::agent::{Ev, parse_record, text_of};
 use crate::codex;
-use crate::state::{Workspace, support_dir};
+use crate::harness::{Ev, parse_record, text_of};
+use crate::state::{Task, support_dir};
 use serde_json::Value;
 use std::{
     borrow::Cow,
@@ -120,8 +120,8 @@ pub fn forget(chat: &str) {
     let _ = fs::remove_file(log_path(chat));
 }
 
-/// When any of the workspace's chats last wrote to its transcript. Reads file metadata.
-pub(crate) fn last_activity(ws: &Workspace) -> Option<SystemTime> {
+/// When any of the task's chats last wrote to its transcript. Reads file metadata.
+pub(crate) fn last_activity(ws: &Task) -> Option<SystemTime> {
     (ws.chats.iter())
         .filter_map(|c| fs::metadata(transcript_path(&c.id)).ok()?.modified().ok())
         .max()
@@ -130,16 +130,10 @@ pub(crate) fn last_activity(ws: &Workspace) -> Option<SystemTime> {
 pub const PLAN_TO_APPROVE: &str = "Plan to approve";
 pub const QUESTION: &str = "Question to answer";
 
-/// What one of the workspace's chats waits on the user for, by how its last turn ended: a plan
-/// to approve before a question. `None` while a turn runs. Reads each chat's transcript tail
-/// and plans: call it off the UI thread.
-pub(crate) fn waiting_on_user(ws: &Workspace) -> Option<&'static str> {
-    (ws.chats.iter())
-        .filter_map(|c| {
-            let plan = c.plan && crate::plan::unapproved(&c.id);
-            waiting(&read_tail(&transcript_path(&c.id)), plan)
-        })
-        .min_by_key(|l| *l != PLAN_TO_APPROVE)
+/// Reads a chat's transcript tail and plan off the UI thread.
+pub(crate) fn waiting_on_chat(chat: &crate::state::ChatMeta) -> Option<&'static str> {
+    let plan = chat.plan && crate::plan::unapproved(&chat.id);
+    waiting(&read_tail(&transcript_path(&chat.id)), plan)
 }
 
 /// How a chat's events end: a finished turn, with a plan pending or a question in its last text.
@@ -175,6 +169,76 @@ fn read_tail(path: &Path) -> Vec<Ev> {
 /// process started while this was read, and arrive live.
 pub fn read_history(path: &Path, len: u64) -> Vec<Ev> {
     read_range(path, 0, len, true)
+}
+
+/// The original prompt for title regeneration; stops reading at the first user message.
+pub(crate) fn first_prompt(chat: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = File::open(transcript_path(chat)).ok()?;
+    for line in BufReader::new(file).lines() {
+        for event in crate::harness::parse(&line.ok()?) {
+            if let Ev::User(text) = event {
+                let prompt = crate::chat::split_notes(&text).1;
+                if !prompt.trim().is_empty() {
+                    return Some(prompt.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The whole conversation as Markdown, for another chat to read when it's handed off: messages
+/// and replies in order, each tool call one line, tool output left out. `None` when nothing could
+/// be read.
+pub fn markdown(path: &Path, title: &str, plan: Option<&str>) -> Option<String> {
+    let events = read_history(path, u64::MAX);
+    if events.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "# Transcript: {title}\n\nAn earlier chat of this task, handed off to you. The files it changed are in the task folder. Continue from where it ends.\n"
+    );
+    let mut role = "";
+    let mut heading = |out: &mut String, to: &'static str| {
+        if role != to {
+            role = to;
+            *out += &format!("\n## {to}\n\n");
+        }
+    };
+    for ev in events {
+        match ev {
+            Ev::User(text) => {
+                heading(&mut out, "User");
+                out += &format!("{}\n", text.trim());
+            }
+            Ev::Text(text) if !text.trim().is_empty() => {
+                heading(&mut out, "Assistant");
+                out += &format!("{}\n\n", text.trim());
+            }
+            Ev::ToolUse { name, input, .. } => {
+                heading(&mut out, "Assistant");
+                let about = ["file_path", "command", "pattern", "description", "url"]
+                    .iter()
+                    .find_map(|k| input[k].as_str())
+                    .map(|v| {
+                        v.lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(120)
+                            .collect()
+                    })
+                    .map_or(String::new(), |v: String| format!(": `{v}`"));
+                out += &format!("- {name}{about}\n");
+            }
+            _ => {}
+        }
+    }
+    if let Some(plan) = plan {
+        out += &format!("\n## Plan\n\n{}\n", plan.trim());
+    }
+    Some(out)
 }
 
 fn read_range(path: &Path, mut start: u64, end: u64, include_completed_answers: bool) -> Vec<Ev> {
@@ -218,6 +282,86 @@ pub(crate) fn append(path: &Option<PathBuf>, line: &str) {
     if let Some(path) = path {
         let _ = append_records(path, &[line], None);
     }
+}
+
+/// `"Which DB?"="Postgres", …`: the answers as claude's tool result words them.
+pub(crate) fn answer_pairs(
+    qs: &[crate::harness::Question],
+    answers: &[crate::harness::Answer],
+) -> String {
+    let pairs: Vec<String> = crate::harness::given(qs, answers)
+        // Only the agent gets a secret; the row shows that one was given.
+        .map(|(q, _, all)| {
+            format!(
+                "\"{}\"=\"{}\"",
+                q.text,
+                if q.secret { "••••" } else { &all }
+            )
+        })
+        .collect();
+    match pairs.is_empty() {
+        true => "No answers".into(),
+        false => pairs.join(", "),
+    }
+}
+
+/// The wordings a tool result gives answers in: codex's (which we write) and claude's own,
+/// each as the text before and after the answers.
+const RESULTS: [(&str, &str); 2] = [
+    (
+        "Your questions have been answered: ",
+        ". You can now continue",
+    ),
+    ("The user answered: ", ". Read the answers carefully"),
+];
+
+/// The tool result recorded for codex's answers, in claude's words.
+pub(crate) fn answer_result(summary: &str) -> String {
+    let (prefix, ending) = RESULTS[0];
+    format!("{prefix}{summary}{ending}")
+}
+
+/// A question row's summary from claude's tool result, when it holds the answers.
+pub(crate) fn answered(result: &str) -> Option<&str> {
+    // A clipped result has no reliable protocol suffix; keep all retained answer text.
+    let truncated = result.rsplit_once("\n… truncated, ").is_some_and(|(_, n)| {
+        n.strip_suffix(" chars total")
+            .is_some_and(|n| n.parse::<u64>().is_ok())
+    });
+    for (prefix, ending) in RESULTS {
+        if let Some(r) = result.strip_prefix(prefix) {
+            return Some(
+                r.rsplit_once(ending)
+                    .filter(|_| !truncated)
+                    .map_or(r, |(answer, _)| answer),
+            );
+        }
+    }
+    (result == crate::harness::ANSWER_IN_CHAT).then_some("Answered in the chat")
+}
+
+/// The questions as the row's summary until they're answered.
+pub(crate) fn asked_summary(input: &Value) -> String {
+    let qs = crate::harness::questions(input);
+    let texts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
+    texts.join(" · ")
+}
+
+/// Completed answers keep their existing Claude-shaped history records for replay.
+pub(crate) fn completed_answer(
+    request: crate::harness::Questions,
+    result: String,
+) -> ([String; 2], Vec<Ev>) {
+    let (id, input) = (request.tool_use_id, request.input);
+    let records = [
+        serde_json::json!({"type":"assistant", "shark_completed_answer":true, "message":{"content":[{"type":"tool_use", "id":id, "name":"AskUserQuestion", "input":input}]}}),
+        serde_json::json!({"type":"user", "shark_completed_answer":true, "message":{"content":[{"type":"tool_result", "tool_use_id":id, "content":result, "is_error":false}]}}),
+    ].map(|v| compact(&v.to_string()).into_owned());
+    let events = records
+        .iter()
+        .flat_map(|record| crate::harness::parse(record))
+        .collect();
+    (records, events)
 }
 
 pub(crate) fn append_answer(path: &Path, id: &str, records: &[String; 2]) -> std::io::Result<()> {
@@ -286,6 +430,53 @@ mod tests {
 
     const USER_TURN: &str = r#"{"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}"#;
     const SHORT_RESULT: &str = r#"{"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": "1\thello\n2\t"}]}, "parent_tool_use_id": null}"#;
+
+    #[test]
+    fn rows_summarize_claudes_results() {
+        let r = r#"Your questions have been answered: "Which DB?"="Postgres". You can now continue with these answers in mind."#;
+        assert_eq!(answered(r), Some(r#""Which DB?"="Postgres""#));
+        let r = r#"The user answered: "Name?"="bob". Read the answers carefully — they may request clarification"#;
+        assert_eq!(answered(r), Some(r#""Name?"="bob""#));
+        assert_eq!(
+            answered(crate::harness::ANSWER_IN_CHAT),
+            Some("Answered in the chat")
+        );
+        assert_eq!(answered("(interrupted)"), None);
+        assert_eq!(
+            asked_summary(&json!({"questions": [{"question": "A?"}, {"question": "B?"}]})),
+            "A? · B?"
+        );
+    }
+
+    #[test]
+    fn answer_summaries_keep_protocol_words_inside_user_text() {
+        for (prefix, ending) in RESULTS {
+            let summary = format!(r#""Instructions?"="Stop{ending} after tests""#);
+            let result = format!("{prefix}{summary}{ending}");
+            assert_eq!(answered(&result), Some(summary.as_str()));
+        }
+    }
+
+    #[test]
+    fn clipped_answer_summaries_keep_protocol_words_inside_user_text() {
+        for (prefix, ending) in RESULTS {
+            let summary = format!(
+                r#""Instructions?"="Stop{ending} after {}""#,
+                "x".repeat(crate::transcript::MAX_OUTPUT)
+            );
+            let result = format!("{prefix}{summary}{ending}");
+            let record = json!({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"q", "content":result}]}}).to_string();
+            let events = crate::harness::parse(&crate::transcript::compact(&record));
+            let [Ev::ToolResult { text, .. }] = events.as_slice() else {
+                panic!()
+            };
+            assert!(text.contains("… truncated,"));
+            assert_eq!(
+                answered(text).unwrap().len(),
+                text.strip_prefix(prefix).unwrap().len()
+            );
+        }
+    }
 
     #[test]
     fn forget_removes_transcript_and_log() {
@@ -380,6 +571,47 @@ mod tests {
     }
 
     #[test]
+    fn markdown_keeps_the_conversation_and_drops_tool_output() {
+        let path =
+            std::env::temp_dir().join(format!("shark-handoff-md-{}.jsonl", std::process::id()));
+        let fixture = [
+            json!({"type":"user","message":{"content":"Fix the login"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Looking."}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"web/login.ts"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"SECRET OUTPUT"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Fixed it."}]}}),
+            json!({"type":"result","result":"Fixed it.","is_error":false}),
+        ];
+        let lines: Vec<_> = fixture.iter().map(ToString::to_string).collect();
+        fs::write(&path, lines.join("\n")).unwrap();
+        let md = markdown(&path, "Login", Some("# Plan\nStep one")).unwrap();
+        fs::write(&path, "").unwrap();
+        assert_eq!(
+            markdown(&path, "Login", None),
+            None,
+            "an unreadable transcript is no handoff"
+        );
+        fs::remove_file(path).unwrap();
+        assert!(md.starts_with("# Transcript: Login"));
+        let (user, assistant) = (
+            md.find("## User").unwrap(),
+            md.find("## Assistant").unwrap(),
+        );
+        assert!(user < assistant);
+        assert!(
+            md.contains("Fix the login") && md.contains("Looking.") && md.contains("Fixed it.")
+        );
+        assert!(md.contains("- Read: `web/login.ts`"));
+        assert!(!md.contains("SECRET OUTPUT"), "tool output stays out");
+        assert_eq!(
+            md.matches("## Assistant").count(),
+            1,
+            "one heading per turn"
+        );
+        assert!(md.ends_with("## Plan\n\n# Plan\nStep one\n"));
+    }
+
+    #[test]
     fn read_tail_drops_a_cut_line() {
         let path = std::env::temp_dir().join(format!("shark-tail-{}.jsonl", std::process::id()));
         // The tail starts inside this line; a cut user line must not reset the turn.
@@ -456,11 +688,11 @@ mod tests {
         ]}})
         .to_string();
         let note = format!("\n… truncated, {} chars total", MAX_OUTPUT + 5);
-        let [Ev::ToolResult { text: live, .. }] = &crate::agent::parse(&line)[..] else {
+        let [Ev::ToolResult { text: live, .. }] = &crate::harness::parse(&line)[..] else {
             panic!("{line}");
         };
         let stored = compact(&line);
-        let [Ev::ToolResult { text, .. }] = &crate::agent::parse(&stored)[..] else {
+        let [Ev::ToolResult { text, .. }] = &crate::harness::parse(&stored)[..] else {
             panic!("{stored}");
         };
         assert_eq!(text, live, "replay shows what the live turn did");
@@ -478,7 +710,7 @@ mod tests {
         ]}})
         .to_string();
         let stored = compact(&write);
-        let [Ev::ToolUse { input, .. }] = &crate::agent::parse(&stored)[..] else {
+        let [Ev::ToolUse { input, .. }] = &crate::harness::parse(&stored)[..] else {
             panic!("{stored}");
         };
         assert_eq!(input["content"].as_str().unwrap().len(), MAX_INPUT);

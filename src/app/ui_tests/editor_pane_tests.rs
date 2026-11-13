@@ -106,10 +106,10 @@ async fn editor_text_size_defaults_and_zoom_steps(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn jump_bar_folder_results_and_selection_stay_in_their_workspace(cx: &mut TestAppContext) {
+async fn jump_bar_folder_results_and_selection_stay_in_their_task(cx: &mut TestAppContext) {
     let _guard = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_, window, shark) = fixture(cx).await;
-    let workspace = cx.update(|cx| shark.read(cx).active.clone());
+    let task = cx.update(|cx| shark.read(cx).active.clone());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             s.select_file(0, w, cx);
@@ -125,7 +125,7 @@ async fn jump_bar_folder_results_and_selection_stay_in_their_workspace(cx: &mut 
             "a stale folder listing must not open a menu"
         );
         shark.update(cx, |s, cx| {
-            s.active = workspace;
+            s.active = task;
             s.folder_menu("api".into(), w, cx);
         });
     })
@@ -135,12 +135,12 @@ async fn jump_bar_folder_results_and_selection_stay_in_their_workspace(cx: &mut 
     })
     .await;
     cx.update_window(window, |_, w, cx| {
-        // Another existing workspace is active when a row of the menu built for the first one is
-        // picked: the pick belongs to the old workspace and must be dropped, not opened here.
+        // Another existing task is active when a row of the menu built for the first one is
+        // picked: the pick belongs to the old task and must be dropped, not opened here.
         shark.update(cx, |s, _| {
-            let mut other = s.active_ws().unwrap().clone();
+            let mut other = s.active_task().unwrap().clone();
             other.name = "different-workspace".into();
-            s.state.workspaces.push(other);
+            s.state.tasks.push(other);
             s.active = Some("different-workspace".into());
         });
         w.render_frame(cx);

@@ -2,7 +2,8 @@
 //! GitHub repos, mapped onto the same types, plus the work items (PBIs and their tasks) a
 //! branch is for. A repo is on Azure DevOps when its origin is; nothing is configured.
 use crate::git::{cmd_bounded, git};
-use crate::pr::git_feature::{Comment, Details, Review, Target, Thread};
+use crate::pr::Target;
+use crate::pr::git_feature::{Comment, Details, Review, Thread};
 use crate::sync::{Checks, Pr, PrState};
 use serde_json::{Value, json};
 use std::path::Path;

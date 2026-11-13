@@ -39,22 +39,33 @@ pub(crate) fn store_path(chat: &str) -> PathBuf {
     support_dir().join("plans").join(format!("{chat}.json"))
 }
 
-fn load(chat: &str) -> Store {
-    std::fs::read(store_path(chat))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+fn load(chat: &str) -> std::io::Result<Store> {
+    match std::fs::read(store_path(chat)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The approved plan, or the latest version when none was approved.
+pub(crate) fn handoff_text(chat: &str) -> Option<String> {
+    let store = load(chat).ok()?;
+    store
+        .approved
+        .and_then(|i| store.versions.get(i))
+        .or_else(|| store.versions.last())
+        .map(|version| version.text.clone())
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// The chat's latest plan is still waiting for the user's approval.
 pub fn unapproved(chat: &str) -> bool {
-    let s = load(chat);
-    !s.versions.is_empty() && s.approved != Some(s.versions.len() - 1)
+    load(chat).is_ok_and(|s| !s.versions.is_empty() && s.approved != Some(s.versions.len() - 1))
 }
 
 /// The user approved one of the chat's plans.
 pub fn approved_any(chat: &str) -> bool {
-    load(chat).approved.is_some()
+    load(chat).is_ok_and(|s| s.approved.is_some())
 }
 
 /// With the chat's transcript: a later chat with the same id starts with no plans.
@@ -86,6 +97,8 @@ fn tint(bg: Hsla, color: Hsla, alpha: f32) -> String {
 /// The plan pane, next to the chat's transcript.
 pub struct PlanPane {
     chat: String,
+    blocked: bool,
+    save_error: Option<String>,
     pub versions: Vec<Version>,
     pub approved: Option<usize>,
     /// The version on screen.
@@ -103,9 +116,19 @@ pub struct PlanPane {
 
 impl PlanPane {
     pub fn new(chat: &str, cx: &mut Context<Self>) -> Self {
-        let store = load(chat);
+        let (store, save_error) = match load(chat) {
+            Ok(store) => (store, None),
+            Err(e) => (
+                Store::default(),
+                Some(format!(
+                    "Cannot read plans: {e}. The original file is protected; repair it and restart Shark."
+                )),
+            ),
+        };
         let mut p = PlanPane {
             chat: chat.into(),
+            blocked: save_error.is_some(),
+            save_error,
             shown: store.versions.len().saturating_sub(1),
             versions: store.versions,
             approved: store.approved,
@@ -121,14 +144,30 @@ impl PlanPane {
         p
     }
 
-    fn save(&self) {
+    fn save(&mut self) {
+        if self.blocked {
+            return;
+        }
         let store = Store {
             versions: self.versions.clone(),
             approved: self.approved,
         };
         // Written aside, synced and renamed, so a failed write never truncates the history.
-        if let Ok(json) = serde_json::to_vec(&store) {
-            let _ = crate::state::write(&store_path(&self.chat), &json);
+        self.save_error = serde_json::to_vec(&store)
+            .map_err(std::io::Error::other)
+            .and_then(|json| crate::state::write(&store_path(&self.chat), &json))
+            .err()
+            .map(|e| format!("Could not save plans: {e}"));
+    }
+
+    pub(crate) fn storage_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
+    }
+
+    pub(crate) fn retry_save(&mut self, cx: &mut Context<Self>) {
+        if self.save_error.is_some() {
+            self.save();
+            cx.notify();
         }
     }
 
@@ -330,7 +369,8 @@ impl Render for PlanPane {
                         .label("Changes")
                         .selected(self.changes)
                         .tooltip(format!("Mark changes from v{} (d)", self.shown))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_changes(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_changes(cx)))
+                        .map(|b| crate::ui::toolbar("plan-changes", b)),
                 )
             })
             .when(n > 0, |d| {
@@ -382,7 +422,7 @@ impl Render for PlanPane {
                 .pt_2()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(crate::chat::markdown(&self.md, "plan-body", vec![]).scrollable(true))
+                .child(crate::ui::markdown(&self.md, "plan-body", vec![]).scrollable(true))
                 .into_any_element(),
         };
         let footer = h_flex()
@@ -470,6 +510,24 @@ impl Render for PlanPane {
             .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy(w, cx)))
             .on_click(cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
             .child(header)
+            .when_some(self.save_error.clone(), |d, error| {
+                d.child(
+                    v_flex()
+                        .px_4()
+                        .py_2()
+                        .text_sm()
+                        .text_color(theme.danger_foreground)
+                        .child(error)
+                        .when(!self.blocked, |d| {
+                            d.child(
+                                Button::new("plan-retry-save")
+                                    .small()
+                                    .label("Retry save")
+                                    .on_click(cx.listener(|p, _, _, cx| p.retry_save(cx))),
+                            )
+                        }),
+                )
+            })
             .child(body)
             .when(n > 0, |d| d.child(footer))
     }
@@ -479,6 +537,39 @@ impl Render for PlanPane {
 mod tests {
     use super::title;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn handoff_prefers_approved_then_latest_plan() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let chat = format!("handoff-plan-test-{}", std::process::id());
+        let path = super::store_path(&chat);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = super::Store {
+            versions: vec![
+                super::Version {
+                    id: "one".into(),
+                    text: "Approved".into(),
+                    resubmits: vec![],
+                },
+                super::Version {
+                    id: "two".into(),
+                    text: "Latest".into(),
+                    resubmits: vec![],
+                },
+            ],
+            approved: Some(0),
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(super::handoff_text(&chat).as_deref(), Some("Approved"));
+        store.approved = None;
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(super::handoff_text(&chat).as_deref(), Some("Latest"));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(super::handoff_text(&chat), None);
+    }
 
     #[test]
     fn title_is_the_first_line_without_hashes() {

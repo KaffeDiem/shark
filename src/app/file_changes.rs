@@ -2,13 +2,13 @@
 use super::*;
 
 impl Shark {
-    fn can_discard_file(&self, name: &str, path: &str, cx: &App) -> Result<Workspace, String> {
+    fn can_discard_file(&self, name: &str, path: &str, cx: &App) -> Result<Task, String> {
         let ws = self
-            .active_ws()
+            .active_task()
             .filter(|ws| ws.name == name)
-            .ok_or("The workspace changed; open the file menu again")?;
+            .ok_or("The task changed; open the file menu again")?;
         if self.archiving.contains(name) {
-            return Err("This workspace is being archived".into());
+            return Err("This task is being deleted".into());
         }
         if let Some(reason) = self
             .syncs
@@ -55,7 +55,7 @@ impl Shark {
                     return;
                 };
                 if !ws.repos.iter().any(|r| r.name == repo) {
-                    return notify_err(window, cx, "This file is not in a workspace repository");
+                    return notify_err(window, cx, "This file is not in a repository of this task");
                 }
                 // shortcut: restore blocks app saves; add editor write locks and a worker if Git filters make it slow.
                 if let Err(e) = git::discard_file(&ws.dir().join(repo), rel) {

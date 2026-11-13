@@ -1,4 +1,4 @@
-//! Chat tabs of the open workspace, and the agent status in the header.
+//! Chat tabs of the open agent, and the agent status in the header.
 use super::*;
 use std::time::Duration;
 
@@ -57,7 +57,7 @@ pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
 
 impl Shark {
     /// The persisted strip's visible tabs, then external files (unlisted); unavailable files have none.
-    pub(super) fn visible_tab_ids(&self, ws: &Workspace, cx: &App) -> Vec<TabId> {
+    pub(super) fn visible_tab_ids(&self, ws: &Task, cx: &App) -> Vec<TabId> {
         let external = self.file_tabs.iter().filter_map(|tab| {
             let editor = tab.editor.read(cx);
             editor.external.then(|| TabId::File(editor.path.clone()))
@@ -67,6 +67,7 @@ impl Shark {
                 TabId::Chat(id) => ws.chats.iter().any(|c| &c.id == id),
                 TabId::Diff => Feature::Diff.is_open(ws),
                 TabId::Git => Feature::Git.is_open(ws),
+                TabId::Artifacts => Feature::Artifacts.is_open(ws),
                 TabId::File(path) => self.file_tab_ix(path, cx).is_some(),
             })
             .cloned()
@@ -75,7 +76,7 @@ impl Shark {
     }
 
     /// The shown tab's identity, if it is in the strip.
-    fn current_tab_id(&self, ws: &Workspace, cx: &App) -> Option<TabId> {
+    fn current_tab_id(&self, ws: &Task, cx: &App) -> Option<TabId> {
         Some(match self.tab {
             Tab::Chat => TabId::Chat(ws.chats.get(ws.active_chat)?.id.clone()),
             Tab::Feature(feature) => feature.tab_id(),
@@ -84,7 +85,7 @@ impl Shark {
     }
 
     pub(super) fn active_tab_index(&self, cx: &App) -> Option<usize> {
-        let ws = self.active_ws()?;
+        let ws = self.active_task()?;
         let current = self.current_tab_id(ws, cx)?;
         (self.visible_tab_ids(ws, cx).iter()).position(|id| *id == current)
     }
@@ -92,7 +93,7 @@ impl Shark {
     /// The chat entity for `meta`, started (transcript replayed) on first use.
     pub(super) fn ensure_chat(
         &mut self,
-        ws: &Workspace,
+        ws: &Task,
         meta: &ChatMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -103,27 +104,62 @@ impl Shark {
         // Opened mid-archive (its row is still listed): sends stay refused.
         let archiving = self.archiving.contains(&ws.name);
         let vim = self.state.vim;
+        // Current, whatever the caller cloned: a chat opened mid-attachment inherits its hold.
+        let ws = self.task(&ws.name).unwrap_or(ws).clone();
+        let ws = &ws;
         let chat = cx.new(|cx| {
             let mut c = Chat::new(ws.clone(), meta.clone(), vim, window, cx);
             c.archiving = archiving;
+            c.next_agent = self.handoff_target(meta);
             c
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
         // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
-        self._subs.push(cx.observe(&chat, |this, chat, cx| {
-            this.update_awake(cx);
-            // Home's "Approve a plan": approving notifies the chat.
-            if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
-                this.state.mark(|s| &mut s.approved_plan);
-            }
-            cx.notify()
-        }));
+        let task = name.clone();
+        self._subs
+            .push(cx.observe_in(&chat, window, move |this, chat, window, cx| {
+                this.update_awake(cx);
+                if this.task(&task).is_some_and(|t| t.backlog) && this.running_chats(&task, cx) > 0
+                {
+                    this.set_backlog(&task, false, None, cx);
+                }
+                // Home's "Approve a plan": approving notifies the chat.
+                if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
+                    this.state.mark(|s| &mut s.approved_plan);
+                }
+                this.advance_attachment(&task, window, cx);
+                cx.notify()
+            }));
         self._subs.push(cx.subscribe_in(
             &chat,
             window,
             move |this, chat, ev: &ChatEvent, window, cx| {
                 match ev {
-                    ChatEvent::Meta => this.save_meta(chat, cx),
+                    ChatEvent::SearchCompletionIssues(query) => {
+                        this.search_reference_issues(query.clone(), cx)
+                    }
+                    ChatEvent::AttachCompletionIssue(hit) => {
+                        this.attach_chat_reference_issue(name.clone(), hit.clone(), window, cx)
+                    }
+                    ChatEvent::Meta => this.save_meta(chat, false, cx),
+                    ChatEvent::Title(prompt) => {
+                        if let Some(prompt) = prompt.as_deref() {
+                            let first = this
+                                .task(&name)
+                                .and_then(|t| t.chats.first())
+                                .is_some_and(|m| m.id == id);
+                            if !(first && this.titling.contains(&name)) {
+                                this.request_title(&name, Some(id.clone()), prompt, None, cx);
+                            }
+                        }
+                        this.save_meta(chat, true, cx);
+                    }
+                    ChatEvent::HandOff { to } => match to {
+                        Some(to) => this.hand_off(&name, to, Some(id.clone()), window, cx),
+                        None => this.hand_off_picker(&name, Some(id.clone()), window, cx),
+                    },
+                    ChatEvent::AgentMenu => this.chat_agent_menu(chat.clone(), window, cx),
+                    ChatEvent::NeedsRepo => this.offer_attach(&name, window, cx),
                     ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                     ChatEvent::Picked => {
                         this.record_interaction(&name, cx);
@@ -143,12 +179,16 @@ impl Shark {
                         if this.active.as_ref() == Some(&name) {
                             this.refresh_diff(cx);
                         }
+                        if let Some(artifacts) = this.artifacts.get(&name).cloned() {
+                            artifacts.update(cx, |a, cx| a.refresh(window, cx));
+                            this.sync_artifact_chats(&name, cx);
+                        }
                         if this.home_shown() || this.active_chat() != Some(chat) {
                             this.unread.insert(id.clone());
                         }
                         this.refresh_home(Some(&name), cx);
-                        this.turn_done(&name, cx);
-                        if let Some(ws) = this.ws(&name) {
+                        this.turn_done(&name, &id, cx);
+                        if let Some(ws) = this.task(&name) {
                             let dir = ws.dir();
                             let c = chat.read(cx);
                             let (turn, reply, held) =
@@ -159,7 +199,7 @@ impl Shark {
                         }
                         cx.notify();
                     }
-                    // A question off screen marks its tab; the workspace needs you until it's answered.
+                    // A question off screen marks its tab; the task needs you until it's answered.
                     ChatEvent::Asking => {
                         if this.active_chat() != Some(chat) && chat.read(cx).asking() {
                             this.unread.insert(id.clone());
@@ -189,26 +229,55 @@ impl Shark {
             sync.update(cx, |g, cx| g.add_chat(chat.clone(), cx));
         }
         self.chats.insert(meta.id.clone(), chat.clone());
-        self.save_meta(&chat, cx); // replay may have found a title
+        self.sync_reference_completion(cx);
+        self.save_meta(&chat, true, cx); // a persisted chat may already have a title
         chat
     }
 
-    fn save_meta(&mut self, chat: &Entity<Chat>, cx: &mut Context<Self>) {
+    /// A chat's first title fills a still untitled task.
+    fn save_meta(&mut self, chat: &Entity<Chat>, title: bool, cx: &mut Context<Self>) {
         let meta = chat.read(cx).meta.clone();
-        let slot = (self.state.workspaces.iter_mut())
-            .flat_map(|w| w.chats.iter_mut())
-            .find(|c| c.id == meta.id);
-        if let Some(slot) = slot
-            && *slot != meta
-        {
-            *slot = meta;
+        let ws = (self.state.tasks.iter_mut()).find(|w| w.chats.iter().any(|c| c.id == meta.id));
+        let Some(ws) = ws else { return };
+        let untitled = title
+            && (ws.title.is_empty() || ws.title == crate::state::NEW_TASK)
+            && !meta.title.is_empty();
+        if untitled {
+            ws.title = meta.title.clone();
+        }
+        let slot = ws.chats.iter_mut().find(|c| c.id == meta.id);
+        let agent = slot.as_ref().is_some_and(|s| s.agent != meta.agent);
+        let changed = slot.filter(|s| **s != meta).map(|s| *s = meta).is_some();
+        let name = ws.name.clone();
+        if changed || untitled {
             let _ = self.state.save();
+        }
+        if agent && let Err(e) = self.relink_agents(&name, cx) {
+            eprintln!("relinking agents of {name}: {e}");
         }
     }
 
-    /// Shows the workspace's `ix`th chat tab.
+    /// Notification targets use saved identities: tabs may have moved since delivery.
+    pub(crate) fn open_notification(
+        &mut self,
+        name: &str,
+        instance: &str,
+        chat: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if instance.is_empty() || self.task(name).is_none_or(|ws| ws.instance_id != instance) {
+            return notify_err(window, cx, "The selected task is no longer available");
+        }
+        self.open_task_then(name, chat, window, cx, |s, window, cx| {
+            let Some(ws) = s.active_task() else { return };
+            s.select_chat(ws.active_chat, window, cx);
+        });
+    }
+
+    /// Shows the task's `ix`th chat tab.
     pub(super) fn select_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws_mut() else {
+        let Some(ws) = self.active_task_mut() else {
             return;
         };
         let Some(meta) = ws.chats.get(ix).cloned() else {
@@ -218,11 +287,8 @@ impl Shark {
             ws.active_chat = ix;
             let _ = self.state.save();
         }
-        let ws = self.active_ws().cloned().unwrap();
+        let ws = self.active_task().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
-        if self.unread.remove(&meta.id) {
-            self.refresh_attention(cx); // the dock badge counts it
-        }
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
         }
@@ -234,19 +300,19 @@ impl Shark {
     /// Reorder identities, keeping entities, selected content and focus intact.
     pub(super) fn move_tab(
         &mut self,
-        workspace: &str,
+        task: &str,
         from: &TabId,
         to: &TabId,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws().filter(|ws| ws.name == workspace) else {
+        let Some(ws) = self.active_task().filter(|ws| ws.name == task) else {
             return;
         };
         let tabs = self.visible_tab_ids(ws, cx);
         if !tabs.contains(from) || !tabs.contains(to) {
             return;
         }
-        if !self.active_ws_mut().unwrap().move_tab(from, to) {
+        if !self.active_task_mut().unwrap().move_tab(from, to) {
             return;
         }
         self.sort_file_tabs(cx);
@@ -275,7 +341,7 @@ impl Shark {
     }
 
     pub(super) fn cycle_chat(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ws) = self.active_ws() {
+        if let Some(ws) = self.active_task() {
             let n = ws.chats.len() as isize;
             let ix = (ws.active_chat as isize + d).rem_euclid(n) as usize;
             self.select_chat(ix, window, cx);
@@ -287,7 +353,7 @@ impl Shark {
         if self.home_shown() {
             return self.cycle_chat(d, window, cx);
         }
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let Some(active) = self.active_tab_index(cx) else {
             return;
         };
@@ -297,7 +363,7 @@ impl Shark {
     }
 
     pub(super) fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let Some(id) = self.visible_tab_ids(ws, cx).get(ix).cloned() else {
             return;
         };
@@ -306,6 +372,7 @@ impl Shark {
             (TabId::Chat(_), Some(ix)) => self.select_chat(ix, window, cx),
             (TabId::Diff, _) => self.show(Tab::Feature(Feature::Diff), window, cx),
             (TabId::Git, _) => self.show(Tab::Feature(Feature::Git), window, cx),
+            (TabId::Artifacts, _) => self.show(Tab::Feature(Feature::Artifacts), window, cx),
             (TabId::File(path), _) => {
                 if let Some(ix) = self.file_tab_ix(&path, cx) {
                     self.select_file(ix, window, cx);
@@ -323,7 +390,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let n = self.visible_tab_ids(ws, cx).len();
         if n > 0 {
             self.select_tab(at.min(n - 1), window, cx);
@@ -334,14 +401,17 @@ impl Shark {
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
-        let Some(id) = self.active_ws().map(Workspace::next_chat_id) else {
-            return notify_err(window, cx, "Open a workspace first");
+        let agent = self
+            .active_chat()
+            .and_then(|c| c.read(cx).meta.agent.clone());
+        let Some(id) = self.active_task_mut().map(Task::next_chat_id) else {
+            return notify_err(window, cx, "Open a task first");
         };
         let meta = ChatMeta {
             fast,
-            ..self.state.new_chat(self.active_ws().unwrap(), id)
+            ..self.state.new_chat(self.active_task().unwrap(), id, agent)
         };
-        let at = self.active_ws_mut().unwrap().push_chat(meta);
+        let at = self.active_task_mut().unwrap().push_chat(meta);
         let _ = self.state.save();
         self.select_chat(at, window, cx);
     }
@@ -358,13 +428,13 @@ impl Shark {
     }
 
     /// Closes the shown chat, asking first if it's running. The last tab gives way to a
-    /// fresh one, so a workspace always has a chat.
+    /// fresh one, so a task always has a chat.
     pub(super) fn close_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The chat isn't on screen.
         if self.home_shown() {
             return;
         }
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let (name, id) = (ws.name.clone(), ws.chats[ws.active_chat].id.clone());
         self.close_chat_by_id(&name, &id, window, cx);
     }
@@ -380,12 +450,13 @@ impl Shark {
             }
             match &id {
                 TabId::Chat(id) => {
-                    if let Some(workspace) = this.active.clone() {
-                        this.close_chat_by_id(&workspace, id, w, cx);
+                    if let Some(task) = this.active.clone() {
+                        this.close_chat_by_id(&task, id, w, cx);
                     }
                 }
                 TabId::Diff => this.close_feature(Feature::Diff, w, cx),
                 TabId::Git => this.close_feature(Feature::Git, w, cx),
+                TabId::Artifacts => this.close_feature(Feature::Artifacts, w, cx),
                 TabId::File(path) => {
                     let tab = (this.file_tabs.iter()).find(|t| t.editor.read(cx).path == *path);
                     if let Some(editor) = tab.map(|t| t.editor.clone()) {
@@ -398,22 +469,22 @@ impl Shark {
 
     fn close_chat_by_id(
         &mut self,
-        workspace: &str,
+        task: &str,
         id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let chat = self.chats.get(id).filter(|chat| chat.read(cx).working());
         let Some(chat) = chat else {
-            return self.close_chat_now(workspace, id, window, cx);
+            return self.close_chat_now(task, id, window, cx);
         };
         let title = chat.read(cx).title();
-        let (workspace, id) = (workspace.to_string(), id.to_string());
+        let (task, id) = (task.to_string(), id.to_string());
         confirm(
             format!("Stop and close “{title}”?"),
             "The agent is still running in this chat. Closing stops it; cmd-shift-t reopens the chat.",
             "Stop and close",
-            move |s, w, cx| s.close_chat_now(&workspace, &id, w, cx),
+            move |s, w, cx| s.close_chat_now(&task, &id, w, cx),
             window,
             cx,
         );
@@ -421,13 +492,25 @@ impl Shark {
 
     fn close_chat_now(
         &mut self,
-        workspace: &str,
+        task: &str,
         id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(chat) = self.chats.get(id) {
-            chat.update(cx, |c, cx| c.retry_history(cx));
+            chat.update(cx, |c, cx| {
+                c.retry_history(cx);
+                c.plan.update(cx, |p, cx| p.retry_save(cx));
+            });
+            let plan_error = chat
+                .read(cx)
+                .plan
+                .read(cx)
+                .storage_error()
+                .map(str::to_owned);
+            if let Some(error) = plan_error {
+                return notify_err(window, cx, error);
+            }
             if chat.read(cx).history_save_error.is_some() {
                 return notify_err(
                     window,
@@ -438,11 +521,11 @@ impl Shark {
         }
         // The closed chat's strip slot, used when it is the one shown.
         let at = self.active_tab_index(cx);
-        let Some(ws) = self.ws(workspace) else {
+        let Some(ws) = self.task(task) else {
             return;
         };
-        let fresh = self.state.new_chat(ws, String::new());
-        let Some(ws) = self.ws_mut(workspace) else {
+        let fresh = self.state.new_chat(ws, String::new(), None);
+        let Some(ws) = self.task_mut(task) else {
             return;
         };
         let Some(shown) = ws.chats.get(ws.active_chat).map(|c| c.id == id) else {
@@ -479,16 +562,17 @@ impl Shark {
             sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
         }
         self.refresh_attention(cx); // an unread or asking tab no longer counts
-        if self.active.as_deref() == Some(workspace) && shown {
+        self.advance_attachment(task, window, cx); // a closed chat can't report going idle
+        if self.active.as_deref() == Some(task) && shown {
             if self.tab == Tab::Chat && !self.home_shown() {
                 match at {
                     Some(at) if !last => self.select_neighbor(at, window, cx),
                     _ => self.select_chat(next, window, cx),
                 }
             } else {
-                let ws = self.active_ws().cloned().unwrap();
+                let ws = self.active_task().cloned().unwrap();
                 let chat = self.ensure_chat(&ws, &ws.chats[next], window, cx);
-                if let Some(sync) = self.syncs.get(workspace) {
+                if let Some(sync) = self.syncs.get(task) {
                     sync.update(cx, |g, cx| g.set_chat(chat, cx));
                 }
             }
@@ -503,11 +587,11 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws_mut() else {
-            return notify_err(window, cx, "Open a workspace first");
+        let Some(ws) = self.active_task_mut() else {
+            return notify_err(window, cx, "Open a task first");
         };
         let Some(ix) = pick.or(ws.closed.len().checked_sub(1)) else {
-            return notify_err(window, cx, "No closed chats in this workspace");
+            return notify_err(window, cx, "No closed chats in this task");
         };
         let meta = ws.closed.remove(ix);
         let at = ws.push_chat(meta);
@@ -517,11 +601,11 @@ impl Shark {
     }
 
     pub(super) fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
         if ws.closed.is_empty() {
-            return notify_err(window, cx, "No closed chats in this workspace");
+            return notify_err(window, cx, "No closed chats in this task");
         }
         // Newest first.
         let n = ws.closed.len();
@@ -548,11 +632,11 @@ impl Shark {
         );
     }
 
-    /// The shown workspace's chat, or a toast saying to open a workspace.
+    /// The shown task's chat, or a toast saying to open one.
     pub(super) fn chat_or_err(&self, window: &mut Window, cx: &mut App) -> Option<Entity<Chat>> {
         let chat = self.active_chat().cloned();
         if chat.is_none() {
-            notify_err(window, cx, "Open a workspace first");
+            notify_err(window, cx, "Open a task first");
         }
         chat
     }
@@ -567,13 +651,13 @@ impl Shark {
     }
 
     pub(super) fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(chat) = self.active_chat().cloned() {
+        if let Some(chat) = self.chat_or_err(window, cx) {
             self.show(Tab::Chat, window, cx);
             chat.update(cx, |c, cx| c.focus_queue(window, cx));
         }
     }
 
-    /// How many of a workspace's chats have something going on.
+    /// How many of a task's chats have something going on.
     /// Chats whose agent is at work. One waiting on answers to its questions isn't: it
     /// needs you (`asking_chat`).
     pub(crate) fn running_chats(&self, ws: &str, cx: &App) -> usize {
@@ -586,9 +670,9 @@ impl Shark {
         (self.started_chats(ws).iter()).any(|c| c.read(cx).asking())
     }
 
-    /// A workspace's open chat tabs that have been shown (and so have an entity).
+    /// A task's open chat tabs that have been shown (and so have an entity).
     pub(super) fn started_chats(&self, ws: &str) -> Vec<Entity<Chat>> {
-        let Some(ws) = self.ws(ws) else {
+        let Some(ws) = self.task(ws) else {
             return vec![];
         };
         (ws.chats.iter())
@@ -596,9 +680,9 @@ impl Shark {
             .collect()
     }
 
-    /// A chat tab of the workspace finished a turn that hasn't been looked at.
+    /// A chat tab of the task finished a turn that hasn't been looked at.
     pub(crate) fn chat_unread(&self, ws: &str) -> bool {
-        self.ws(ws)
+        self.task(ws)
             .is_some_and(|w| w.chats.iter().any(|c| self.unread.contains(&c.id)))
     }
 
@@ -679,11 +763,12 @@ impl Shark {
 
     /// The no-menu fast path, so confirm the switch in a toast.
     pub(super) fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {
-            return notify_err(window, cx, "Open a workspace first");
+        let Some(m) = MODELS.get(ix) else { return };
+        let Some(chat) = self.chat_or_err(window, cx) else {
+            return;
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
-        let m = crate::chat::model_label(m);
+        let m = crate::models::model_label(m);
         window.push_notification(format!("Model: {m} (from the next message)"), cx);
     }
 
@@ -706,7 +791,7 @@ impl Shark {
     }
 
     fn effort_toast(&self, chat: &Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
-        let l = crate::chat::effort_label(chat.read(cx).effort());
+        let l = crate::models::effort_label(chat.read(cx).effort());
         window.push_notification(format!("Thinking: {l} (from the next message)"), cx);
     }
 
@@ -776,7 +861,7 @@ impl Shark {
 
     /// Chats, Diff and files share equal-width tabs that shrink to fit the header.
     pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let theme = cx.theme();
@@ -799,34 +884,92 @@ impl Shark {
                     0 => label,
                     n => format!("{label} · {n}").into(),
                 };
-                let icon = ctrl_chip(ctrl_held, tab_ix).unwrap_or_else(|| {
-                    match (
-                        chat.is_some_and(|c| c.working()),
-                        self.unread.contains(&meta.id),
-                    ) {
-                        // Waiting on answers to its questions.
-                        _ if chat.is_some_and(|c| c.asking()) => {
+                let agent = meta.agent.as_deref().and_then(|slug| self.agent(slug));
+                let icon = if let Some(agent) = agent {
+                    let status = if chat.is_some_and(|c| c.asking()) {
+                        Some(
                             Icon::new(IconName::MessageCircleQuestionMark)
                                 .with_size(px(14.))
                                 .text_color(theme.warning_foreground)
-                                .into_any_element()
+                                .into_any_element(),
+                        )
+                    } else if chat.is_some_and(|c| c.working()) {
+                        Some(
+                            Spinner::new()
+                                .icon(IconName::LoaderCircle)
+                                .color(theme.primary)
+                                .with_size(px(14.))
+                                .into_any_element(),
+                        )
+                    } else if self.unread.contains(&meta.id) {
+                        Some(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(theme.primary)
+                                .into_any_element(),
+                        )
+                    } else {
+                        None
+                    };
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("chat-agent-identity")
+                                .test_support()
+                                .size(px(16.))
+                                .flex_none()
+                                .child(super::agent_icon_view::agent_icon(&agent.icon)),
+                        )
+                        .children(status.map(|status| {
+                            div()
+                                .id("chat-agent-status")
+                                .test_support()
+                                .size(px(14.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(status)
+                        }))
+                        .children(ctrl_chip(ctrl_held, tab_ix))
+                        .into_any_element()
+                } else {
+                    ctrl_chip(ctrl_held, tab_ix).unwrap_or_else(|| {
+                        match (
+                            chat.is_some_and(|c| c.working()),
+                            self.unread.contains(&meta.id),
+                        ) {
+                            _ if chat.is_some_and(|c| c.asking()) => {
+                                Icon::new(IconName::MessageCircleQuestionMark)
+                                    .with_size(px(14.))
+                                    .text_color(theme.warning_foreground)
+                                    .into_any_element()
+                            }
+                            (true, _) => Spinner::new()
+                                .icon(IconName::LoaderCircle)
+                                .color(theme.primary)
+                                .with_size(px(14.))
+                                .into_any_element(),
+                            (false, unread) => div()
+                                .relative()
+                                .child(Icon::new(IconName::MessageSquare).with_size(px(14.)))
+                                .when(unread, |d| d.child(dot(-2., theme)))
+                                .into_any_element(),
                         }
-                        (true, _) => Spinner::new()
-                            .icon(IconName::LoaderCircle)
-                            .color(theme.primary)
-                            .with_size(px(14.))
-                            .into_any_element(),
-                        (false, unread) => div()
-                            .relative()
-                            .child(Icon::new(IconName::MessageSquare).with_size(px(14.)))
-                            .when(unread, |d| d.child(dot(-2., theme)))
-                            .into_any_element(),
-                    }
-                });
+                    })
+                };
+                let tooltip = meta
+                    .agent
+                    .as_deref()
+                    .and_then(|slug| self.agent(slug))
+                    .map(|a| format!("{} · {label}", a.name))
+                    .unwrap_or_else(|| label.to_string());
                 (
                     TabId::Chat(meta.id.clone()),
                     pill(format!("chat-tab-{}", meta.id), on, theme)
-                        .aria_label(label.clone())
+                        .aria_label(tooltip.clone())
                         .pl_2p5()
                         .pr_1()
                         .map(|d| self.tab_drag(d, TabId::Chat(meta.id.clone()), label.clone()))
@@ -851,13 +994,13 @@ impl Shark {
                                 .id("tab-label")
                                 .test_support(),
                         )
-                        .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
+                        .tooltip(move |w, cx| Tooltip::new(tooltip.clone()).build(w, cx))
                         .child(tab_close(
                             crate::ui::close_button("close-chat", "Close chat (cmd-w)").on_click({
-                                let (workspace, id) = (ws.name.clone(), meta.id.clone());
+                                let (task, id) = (ws.name.clone(), meta.id.clone());
                                 cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.close_chat_by_id(&workspace, &id, window, cx)
+                                    this.close_chat_by_id(&task, &id, window, cx)
                                 })
                             }),
                             theme,
@@ -957,7 +1100,7 @@ impl Shark {
             })
             .id("chat-tabs")
             .role(Role::TabList)
-            .aria_label("Workspace tabs")
+            .aria_label("Task tabs")
             .test_support()
             .min_w_0()
             .gap_1()
@@ -993,7 +1136,7 @@ impl Shark {
 
     /// Right-click on the `ix`th chat tab; closing it is offered where its close button is.
     pub(super) fn chat_tab_menu(&self, ix: usize, cx: &Context<Self>) -> Vec<Entry> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let Some(meta) = ws.chats.get(ix) else {
@@ -1004,6 +1147,7 @@ impl Shark {
             "New chat",
             on_shark(cx, |s, w, cx| s.new_chat(w, cx)),
         )];
+        entries.extend(super::menus::handoff_submenu(self, ws, Some(meta), cx));
         if !ws.closed.is_empty() {
             entries.push(menu::item(
                 IconName::RotateCcw,
@@ -1039,7 +1183,7 @@ impl Shark {
         entries
     }
 
-    /// Chats whose agent is at work, in any workspace.
+    /// Chats whose agent is at work, in any task.
     pub(crate) fn working_chats(&self, cx: &App) -> usize {
         self.chats.values().filter(|c| c.read(cx).working()).count()
     }

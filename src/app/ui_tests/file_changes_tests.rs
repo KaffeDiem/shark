@@ -22,7 +22,7 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "discard".into(),
             git::on_branch(&repos, "discard"),
             vec![],
@@ -247,7 +247,7 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     fs::remove_dir_all(home).unwrap();
 }
 
-/// A PR target learned after opening a workspace must replace the trunk diff immediately.
+/// A PR target learned after opening a task must replace the trunk diff immediately.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContext) {
@@ -274,8 +274,7 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
     g(src, &["update-ref", "refs/remotes/origin/parent", "HEAD"]);
     g(src, &["branch", "child"]);
     let dir = home.join("shark/workspaces/pr-diff");
-    let ws =
-        git::create_workspace(&dir, "pr-diff", "child", &git::on_branch(&repos, "child")).unwrap();
+    let ws = git::create_task(&dir, "pr-diff", "child", &git::on_branch(&repos, "child")).unwrap();
     let wt = dir.join("api");
     fs::write(wt.join("shared.txt"), "child\n").unwrap();
     g(&wt, &["add", "."]);
@@ -285,13 +284,13 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
         cx,
         State {
             repos,
-            workspaces: vec![ws],
+            tasks: vec![ws],
             ..Default::default()
         },
         WindowOptions::default(),
     );
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| s.open_workspace(0, w, cx));
+    on(cx, &|s, w, cx| s.open_task(0, w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).differ.read(cx).diff_loaded()
     })
@@ -335,7 +334,7 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
         );
         assert_eq!(s.differ.read(cx).changes_stats().0, "origin/parent");
         assert_eq!(
-            s.active_ws().unwrap().repos[0].base,
+            s.active_task().unwrap().repos[0].base,
             "origin/main",
             "configured lifecycle base is preserved"
         );
@@ -375,7 +374,7 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
     cx.run_until_parked();
     // Also apply a comparison that started before editing began.
     on(cx, &|s, _, cx| {
-        let ws = s.active_ws().unwrap().clone();
+        let ws = s.active_task().unwrap().clone();
         s.differ
             .update(cx, |d, cx| d.apply_diff(DiffData::load(&ws, false), cx));
         assert_eq!(s.differ.read(cx).diff_base("api"), "origin/main");

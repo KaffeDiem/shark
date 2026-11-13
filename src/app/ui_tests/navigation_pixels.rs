@@ -31,31 +31,46 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             .unwrap();
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| {
-                s.state.workspaces = ["Displayed", "Cursor", "Inactive", "Warning", "Unread", "Running"]
-                    .map(|name| Workspace {
+                s.state.tasks = ["Displayed", "Cursor", "Inactive", "Warning", "Unread", "Running"]
+                    .map(|name| Task {
                         name: name.into(),
                         branch: name.into(),
-                        repos: vec![crate::state::WsRepo {
+                        repos: vec![crate::state::TaskRepo {
                             name: "api".into(), src: home.join("api"), base: "main".into(), branch: None,
                         }],
                         chats: vec![ChatMeta { id: name.into(), ..Default::default() }],
                         ..Default::default()
                     }).to_vec();
-                for ws in &mut s.state.workspaces {
+                for ws in &mut s.state.tasks {
                     ws.normalize_tabs();
                 }
                 s.state.repos = vec![Repo { name: "api".into(), path: home.join("api") }];
                 s.state.sections = vec![Section {
                     name: "Projects".into(), icon: "folder".into(), collapsed: false,
-                    workspaces: vec!["Warning".into()],
+                    tasks: vec!["Warning".into()],
                 }];
                 s.unread.insert("Unread".into());
+                for task in &s.state.tasks {
+                    s.home.activity.insert(task.name.clone(), std::time::SystemTime::now() - Duration::from_secs(240));
+                    let mut repo = crate::sync::Repo::fresh(&task.repos[0], task);
+                    let local = repo.local.as_mut().unwrap();
+                    local.head = "fixture".into();
+                    local.branch = Some(task.branch.clone());
+                    local.diff = Some((42, 7));
+                    local.changed = 3;
+                    local.remote = Some((2, 0));
+                    if task.name == "Warning" {
+                        repo.pr = Some(Ok(crate::sync::parse_prs(r#"[{"number":142,"url":"https://github.com/o/api/pull/142","state":"OPEN","headRefOid":"fixture","baseRefName":"main","reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"tests","status":"COMPLETED","conclusion":"FAILURE"}]}]"#)));
+                    }
+                    s.attn.set_checked(&task.name, vec![repo]);
+                }
                 for ix in [0, 1, 3, 5] {
-                    let ws = s.state.workspaces[ix].clone();
+                    let ws = s.state.tasks[ix].clone();
                     let chat = cx.new(|cx| Chat::new(ws.clone(), ws.chats[0].clone(), s.state.vim, w, cx));
                     chat.update(cx, |c, cx| {
                         if ix == 5 {
                             c.busy = true;
+                            c.started = Some(Instant::now());
                         } else if ix == 3 {
                             crate::chat::ui_tests::play(c, &[r#"{"type":"control_request","request_id":"nav-question","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"nav-tool","input":{"questions":[{"header":"Color","question":"Which color?","options":[{"label":"Blue","description":"Blue"},{"label":"Red","description":"Red"}]}]}}}"#], cx);
                         }
@@ -68,25 +83,25 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             });
         }).unwrap();
 
-        for rail in [false, true] {
+        let home_only = std::env::var_os("SHARK_RENDER_HOME_ONLY").is_some();
+        for rail in [false, true].into_iter().filter(|_| !home_only) {
             for case in [
                 "workspace",
                 "home",
                 "focus",
                 "section-focus",
                 "folded",
-                "rename",
                 "switched",
                 "hover",
+                "peek",
             ] {
-                if rail && case == "rename" {
-                    continue;
-                }
                 let checks = cx
                     .update_window(window, |_, w, cx| {
                         shark.update(cx, |s, cx| {
                             s.rail = rail;
-                            s.naming = None;
+                            s.peek = Default::default();
+                            s.peek.task = (case == "peek").then(|| "Warning".into());
+                            s.peek.keyboard = true;
                             s.state.sections[0].collapsed = case == "folded";
                             s.active = Some(
                                 if case == "switched" {
@@ -100,15 +115,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             s.sel = if case == "section-focus" {
                                 SideRow::Section(0)
                             } else {
-                                SideRow::Ws(1)
+                                SideRow::Task(1)
                             };
                             if matches!(case, "focus" | "section-focus") {
                                 s.sidebar_focus.focus(w, cx);
                             } else {
                                 s.home.focus.focus(w, cx);
-                            }
-                            if case == "rename" {
-                                s.start_naming(Some(0), None, w, cx);
                             }
                             cx.notify();
                         });
@@ -119,10 +131,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             w.render_frame(cx);
                         }
                         let theme = cx.theme();
-                        let (dim, bright, secondary, primary, warning, unread) = (
+                        let (dim, bright, primary, warning, unread) = (
                             theme.sidebar_foreground,
                             theme.foreground,
-                            theme.muted_foreground,
                             theme.primary,
                             theme.warning_foreground,
                             theme.success_foreground,
@@ -139,7 +150,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             let focused = case == "focus" && ix == 1;
                             let fg = if selected || focused { bright } else { dim };
                             let icon = Bounds::new(
-                                point(b.left() + px(8.), b.top() + (b.size.height - px(16.)) / 2.),
+                                point(
+                                    b.left() + px(8.),
+                                    b.top()
+                                        + if rail {
+                                            (b.size.height - px(16.)) / 2.
+                                        } else {
+                                            px(6.)
+                                        },
+                                ),
                                 size(px(16.), px(16.)),
                             );
                             checks.push((
@@ -153,6 +172,16 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 },
                             ));
                             if !rail {
+                                if ix == 5 {
+                                    checks.push((
+                                        "running age",
+                                        Bounds::new(
+                                            point(b.right() - px(38.), b.top()),
+                                            size(px(30.), px(24.)),
+                                        ),
+                                        theme.link,
+                                    ));
+                                }
                                 checks.push((
                                     "workspace label",
                                     Bounds::new(
@@ -161,14 +190,36 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     ),
                                     fg,
                                 ));
-                                checks.push((
-                                    "workspace metadata",
-                                    Bounds::new(
-                                        point(b.left() + px(32.), b.top() + px(24.)),
-                                        size(b.size.width - px(40.), px(18.)),
-                                    ),
-                                    if selected || focused { secondary } else { dim },
-                                ));
+                                // The second line's diff stat fades with the title off the cursor.
+                                // The active row drops it, so check the cursor only while focused.
+                                if (matches!(ix, 2 | 4) && !(case == "hover" && ix == 2))
+                                    || (ix == 1 && case == "focus")
+                                {
+                                    let muted = theme.muted_foreground;
+                                    checks.push((
+                                        "diff stat",
+                                        Bounds::new(
+                                            point(b.right() - px(60.), b.top() + px(24.)),
+                                            size(px(52.), px(16.)),
+                                        ),
+                                        if selected || focused {
+                                            muted
+                                        } else {
+                                            theme.sidebar.blend(muted.opacity(sidebar::DETAIL_FADE))
+                                        },
+                                    ));
+                                }
+                                // The required action occupies the fixed second line.
+                                if ix == 3 {
+                                    checks.push((
+                                        "needs-you step",
+                                        Bounds::new(
+                                            point(b.left() + px(32.), b.top() + px(24.)),
+                                            size(b.size.width - px(40.), px(16.)),
+                                        ),
+                                        warning,
+                                    ));
+                                }
                             }
                             if focused {
                                 checks.push((
@@ -178,29 +229,48 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 ));
                             }
                         }
-                        if case == "rename" {
-                            checks.push(("inline name", w.find("section-name").bounds(), bright));
-                        } else {
-                            let b = w.find(("section", 0usize)).bounds();
-                            checks.push((
-                                "section icon",
-                                Bounds::new(
-                                    point(
-                                        b.left() + px(8.),
-                                        b.top() + (b.size.height - px(16.)) / 2.,
-                                    ),
-                                    size(px(16.), px(16.)),
+                        let b = w.find(("section", 0usize)).bounds();
+                        checks.push((
+                            "section icon",
+                            Bounds::new(
+                                point(
+                                    b.left() + px(8.),
+                                    b.top()
+                                        + if rail {
+                                            (b.size.height - px(16.)) / 2.
+                                        } else {
+                                            px(6.)
+                                        },
                                 ),
-                                match case {
-                                    "folded" => warning,
-                                    "section-focus" => bright,
-                                    _ => dim,
-                                },
-                            ));
+                                size(px(16.), px(16.)),
+                            ),
+                            if case == "section-focus" { bright } else { dim },
+                        ));
+                        // A folded section still shows that a task inside needs you.
+                        if case == "folded" {
+                            let id = if rail {
+                                "section-rail-warning"
+                            } else {
+                                "section-needs"
+                            };
+                            checks.push(("folded warning", w.find((id, 0usize)).bounds(), warning));
                         }
-                        checks.push(("repo", w.find(("repo", 0usize)).bounds(), dim));
+                        let toolbar_ink = if cx.theme().is_dark() {
+                            cx.theme()
+                                .background
+                                .blend(cx.theme().foreground.alpha(0.61))
+                        } else {
+                            cx.theme().muted_foreground
+                        };
                         for id in ["toggle-sidebar", "new-workspace"] {
-                            checks.push((id, w.find(id).bounds(), dim));
+                            checks.push((id, w.find(id).bounds(), toolbar_ink));
+                        }
+                        if case == "peek" {
+                            // The card's shadow covers nearby rail pixels; check its own surface.
+                            let card = w.find("task-peek").bounds();
+                            assert!(card.left() >= px(0.) && card.right() <= px(1000.));
+                            assert!(card.top() >= px(0.) && card.bottom() <= px(720.));
+                            checks = vec![("peek text", card, theme.popover_foreground)];
                         }
                         checks
                     })
@@ -219,10 +289,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         .unwrap();
                 }
                 let scale = screenshot.width() as f32 / 1000.;
+                let bg = cx.update(|cx| cx.theme().sidebar.to_rgb());
+                let bg = [bg.r, bg.g, bg.b].map(|c| (c * 255.).round() as u8);
                 for (label, bounds, color) in checks {
                     let rgb = color.to_rgb();
                     let expected = [rgb.r, rgb.g, rgb.b].map(|c| (c * 255.).round() as u8);
-                    let mut matches = 0;
+                    let (mut matches, mut ink) = (0, bg);
+                    let far = |p: [u8; 3]| (0..3).map(|c| p[c].abs_diff(bg[c]) as u32).sum::<u32>();
                     for y in (bounds.top().as_f32() * scale).ceil() as u32
                         ..(bounds.bottom().as_f32() * scale).floor() as u32
                     {
@@ -232,7 +305,17 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             let pixel = screenshot.get_pixel(x, y);
                             matches +=
                                 usize::from((0..3).all(|c| pixel[c].abs_diff(expected[c]) <= 4));
+                            if far([pixel[0], pixel[1], pixel[2]]) > far(ink) {
+                                ink = [pixel[0], pixel[1], pixel[2]];
+                            }
                         }
+                    }
+                    // Glyph edges pass through every fainter shade, so a fade shows in the inkiest pixel.
+                    if label == "diff stat" {
+                        assert!(
+                            (0..3).all(|c| ink[c].abs_diff(expected[c]) <= 6),
+                            "{mode_name}, rail={rail}, {case}: {label} ink must be {expected:?}, got {ink:?}"
+                        );
                     }
                     assert!(
                         matches > 2,
@@ -241,11 +324,77 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 }
             }
         }
+        for case in [
+            "backlog-closed",
+            "backlog-open",
+            "repo-filter",
+            "repo-empty",
+            "repo-picker",
+            "sidebar-filter",
+            "sidebar-repo-menu",
+        ] {
+            cx.update_window(window, |_, w, cx| {
+                w.close_all_dialogs(cx);
+                shark.update(cx, |s, cx| {
+                    s.rail = false;
+                    s.home.on = true;
+                    s.state.home_checklist_dismissed = true;
+                    s.state.tasks[2].backlog = true;
+                    s.state.tasks[1].repos.clear();
+                    s.home.waiting.insert("Inactive".into(), "Plan to approve");
+                    s.home.backlog_open = case != "backlog-closed";
+                    s.home.repo_filter = match case {
+                        "repo-filter" | "repo-picker" => Some(home::RepoFilter::Repo("api".into())),
+                        "repo-empty" => Some(home::RepoFilter::Repo("web".into())),
+                        _ => None,
+                    };
+                    s.sidebar_repo_filter = matches!(case, "sidebar-filter" | "sidebar-repo-menu")
+                        .then(|| home::RepoFilter::Repo("api".into()));
+                    s.fix_home_sel(cx);
+                    if case == "repo-picker" {
+                        s.pick_repo_filter(w, cx);
+                    }
+                    cx.notify();
+                });
+                w.render_frame(cx);
+                shark.update(cx, |s, _| {
+                    s.home.page.set_offset(point(
+                        px(0.),
+                        if case == "repo-empty" {
+                            px(0.)
+                        } else {
+                            px(-140.)
+                        },
+                    ));
+                });
+                w.render_frame(cx);
+                assert!(w.try_find("repo-filter").is_some());
+                if case == "repo-empty" {
+                    assert!(w.try_find("repo-empty-tasks").is_some());
+                } else if case != "repo-picker" {
+                    assert!(w.try_find("backlog-heading").is_some());
+                }
+                if case == "sidebar-repo-menu" {
+                    w.click("sidebar-repo-filter", cx);
+                    w.render_frame(cx);
+                    assert!(w.try_find("menu-parent").is_some());
+                }
+            })
+            .unwrap();
+            let screenshot = cx
+                .capture_screenshot(window)
+                .expect("repository and backlog renderer");
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                screenshot
+                    .save(dir.join(format!("navigation-{mode_name}-{case}.png")))
+                    .unwrap();
+            }
+        }
         cx.update_window(window, |_, w, _| w.remove_window())
             .unwrap();
     }
     fs::remove_dir_all(&home).ok();
-    println!(
-        "navigation pixels: dark/light, expanded/rail, Home/workspace/focus, statuses, folding and naming passed"
-    );
+    println!("navigation pixels: selected dark/light cases passed");
 }

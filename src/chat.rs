@@ -3,7 +3,8 @@ mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
 mod critters;
-mod links;
+mod handoff;
+pub(crate) use handoff::HandoffTarget;
 mod model;
 mod planmode;
 mod question;
@@ -13,11 +14,14 @@ mod side;
 mod tools;
 
 use self::queue::Queued;
-use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
+use crate::harness::{self, Ev, Harness};
 use crate::models::EFFORT;
+use crate::models::{effort_label, model_label};
 use crate::plan::{self, PlanPane};
-use crate::state::{ChatMeta, Workspace};
+use crate::review_protocol::{ReviewCard, card_of, hidden_reply, hide_reports, may_report};
+use crate::state::{ChatMeta, REPO_CONTEXT, Task, context_record};
+use crate::ui::{copy_button, link_roots, markdown, model_entries};
 use crate::ui::{hint, plural};
 use crate::vim::{self, Vim};
 use crate::*;
@@ -35,18 +39,16 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
+use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Icon, Selectable as _, ThemeColor, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-pub(crate) use links::{copy_button, link_roots, markdown};
-pub(crate) use model::{effort_label, model_entries, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
-pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
-use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};
+pub(crate) use review::split_notes;
+use review::{NOTES_END, info_notes, review_title};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
@@ -91,14 +93,25 @@ impl Block {
 type Row = (usize, Option<usize>);
 
 pub enum ChatEvent {
-    /// `meta` changed (session, model or title); the app saves it.
+    AttachCompletionIssue(crate::linear::Hit),
+    SearchCompletionIssues(String),
+    /// Chat metadata changed; the app saves it.
     Meta,
+    /// The chat received its first title; only a live user send carries a prompt.
+    Title(Option<String>),
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
     Picked,
     TurnDone,
+    HandOff {
+        to: Option<String>,
+    },
+    /// The agent button: the app lists agents to pick, or to hand off to once the chat started.
+    AgentMenu,
     GitReviewsSent(Vec<String>),
     /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
     Asking,
+    /// `refuse_unready` said no: the app offers Attach repository.
+    NeedsRepo,
     /// A review card's "Review changes" row: show the diff.
     ShowChanges,
     /// A review card's comment link: show that comment in the diff.
@@ -113,27 +126,34 @@ pub enum ChatEvent {
 }
 
 pub struct Chat {
-    pub ws: Workspace,
+    pub ws: Task,
     pub meta: ChatMeta,
+    pub(crate) next_agent: Option<HandoffTarget>,
+    handoff_dismissed: bool,
     blocks: Vec<Block>,
     /// What the list shows, derived from `blocks`; see `sync_rows`.
     rows: Vec<Row>,
     sel: usize,
     pub busy: bool,
     /// Background tasks (subagents, shells) still running; the turn can end before they do.
-    pub background: Vec<agent::Task>,
+    pub background: Vec<harness::BackgroundTask>,
     critters: HashMap<String, usize>,
     hop: usize,
-    hopping: Option<Task<()>>,
+    hopping: Option<gpui_kit::Task<()>>,
     /// When the running turn started.
     pub started: Option<Instant>,
+    pub failed: Option<String>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
-    /// Set while the workspace's worktrees are being removed; sends are refused.
+    /// Set while the agent has an attachment operation (`Task::attaching`). Its own field:
+    /// a git step ending must not release it, nor it a git step.
+    pub attach_hold: bool,
+    /// Set while the task's worktrees are being removed; sends are refused.
     pub archiving: bool,
-    /// Told to the agent with the next message (a repo joined the workspace mid-session).
-    note: Option<String>,
-    agent: Option<Agent>,
+    /// What `ChatMeta::delivered` becomes once the agent echoes the message at a block: a message
+    /// it never read leaves the context pending.
+    told: Vec<(usize, std::collections::BTreeMap<String, u64>, String)>,
+    harness: Option<Harness>,
     pub(crate) composer: Entity<TextareaState>,
     /// The reply of the turn that ended last, and that turn's number (see `turns`).
     pub last_reply: String,
@@ -146,26 +166,30 @@ pub struct Chat {
     /// The model menu, opening upward from the model button, whose bounds the last paint kept.
     model_menu: Option<(Entity<crate::menu::Menu>, Subscription)>,
     model_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// The agent button's bounds, where the app anchors its menu.
+    pub(crate) agent_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Model and (claude) thinking level the running process was started with; a mismatch
     /// respawns it on the next send.
-    agent_model: Option<String>,
-    agent_effort: &'static str,
+    harness_model: Option<String>,
+    harness_effort: &'static str,
     /// Repo directories passed to the running Claude (`git::claude_skill_args`).
-    agent_skills: Vec<String>,
+    harness_skills: Vec<String>,
+    /// The agent prompt the process started with (`git::agent_prompt`).
+    harness_agent: Option<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
-    reader: Option<Task<()>>,
+    reader: Option<gpui_kit::Task<()>>,
     files: Vec<Item>,
     commands: Vec<Item>,
     menu: Option<Menu>,
     menu_scroll: ScrollHandle,
-    indexing: Option<Task<()>>,
-    probing: Option<Task<()>>,
+    indexing: Option<gpui_kit::Task<()>>,
+    probing: Option<gpui_kit::Task<()>>,
     /// PRs of every repo, as last listed; cached on disk per source repository.
     prs: Vec<complete::Pr>,
     pr_items: Vec<Item>,
-    fetching_prs: Option<Task<()>>,
+    fetching_prs: Option<gpui_kit::Task<()>>,
     /// Repos whose PR list hasn't landed yet in the running fetch.
     prs_left: usize,
     /// `(repo, reason)` for each repo the last fetch couldn't list.
@@ -177,7 +201,7 @@ pub struct Chat {
     /// The turn was interrupted; its result reads "interrupted".
     cut: bool,
     /// SIGTERM fallback for an interrupt claude doesn't act on.
-    stopping: Option<Task<()>>,
+    stopping: Option<gpui_kit::Task<()>>,
     /// Applying stored history: nothing is emitted to the app.
     replaying: bool,
     queue: Vec<Queued>,
@@ -215,7 +239,7 @@ const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 impl EventEmitter<ChatEvent> for Chat {}
 
 /// A tab title from a message: its first line, cut at a word near 40 characters.
-fn title_of(text: &str) -> String {
+pub(crate) fn title_of(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or_default();
     if line.chars().count() <= 40 {
         return line.to_string();
@@ -230,7 +254,7 @@ pub(crate) fn read_events<T: 'static>(
     rx: gpui_kit::base::async_util::Receiver<Ev>,
     apply: fn(&mut T, Ev, &mut Context<T>),
     cx: &mut Context<T>,
-) -> Task<()> {
+) -> gpui_kit::Task<()> {
     cx.spawn(async move |this, cx| {
         while let Ok(ev) = rx.recv().await {
             if this.update(cx, |t, cx| apply(t, ev, cx)).is_err() {
@@ -250,17 +274,18 @@ pub(crate) fn duration(secs: u64) -> String {
 
 impl Chat {
     pub fn new(
-        ws: Workspace,
-        meta: ChatMeta,
+        ws: Task,
+        mut meta: ChatMeta,
         vim_on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Every chat passes here, new, reopened or restored: none starts out of Plan mode
+        // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
+        meta.plan |= ws.repos.is_empty();
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 10)
+            crate::task_composer::textarea(window, cx, 1)
                 .placeholder("Message the agent (@ to add files, / for skills)")
-                .submit_on_enter(true)
         });
         let _sub =
             cx.subscribe_in(
@@ -292,6 +317,7 @@ impl Chat {
             }
         });
         let ws_name = ws.name.clone();
+        let attach_hold = !ws.attaching.is_empty();
         let prs = ws
             .repos
             .iter()
@@ -302,6 +328,8 @@ impl Chat {
         let mut chat = Chat {
             ws,
             meta,
+            next_agent: None,
+            handoff_dismissed: false,
             blocks: vec![],
             rows: vec![],
             sel: 0,
@@ -311,10 +339,12 @@ impl Chat {
             hop: 0,
             hopping: None,
             started: None,
+            failed: None,
             hold: false,
+            attach_hold,
             archiving: false,
-            note: None,
-            agent: None,
+            told: vec![],
+            harness: None,
             composer,
             last_reply: String::new(),
             last_turn: 0,
@@ -323,9 +353,11 @@ impl Chat {
             vim_took: None,
             model_menu: None,
             model_at: Default::default(),
-            agent_model: None,
-            agent_effort: EFFORT,
-            agent_skills: Vec::new(),
+            agent_at: Default::default(),
+            harness_model: None,
+            harness_effort: EFFORT,
+            harness_skills: Vec::new(),
+            harness_agent: None,
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -390,6 +422,7 @@ impl Chat {
         }
         let live = std::mem::take(&mut self.blocks);
         let unread = std::mem::take(&mut self.unread);
+        let told = std::mem::take(&mut self.told);
         // state.json's session (it may have been reset), or the live process's
         let kept = (
             self.busy,
@@ -399,6 +432,7 @@ impl Chat {
             self.hopping.take(),
             self.started,
             self.cut,
+            self.steered,
             self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
@@ -422,11 +456,16 @@ impl Chat {
             self.hopping,
             self.started,
             self.cut,
+            self.steered,
             self.meta.session_id,
         ) = kept;
         let n = self.blocks.len();
         self.blocks.extend(live);
         self.unread = unread.into_iter().map(|i| i + n).collect();
+        self.told = told
+            .into_iter()
+            .map(|(bi, record, wire)| (bi + n, record, wire))
+            .collect();
         self.rows = self.build_rows();
         self.list.reset(self.rows.len() + 1); // + the activity footer
         self.list.set_follow_mode(FollowMode::Tail);
@@ -440,7 +479,7 @@ impl Chat {
             && let Some(t) = first
         {
             self.meta.title = t;
-            cx.emit(ChatEvent::Meta);
+            cx.emit(ChatEvent::Title(None));
         }
         cx.notify();
     }
@@ -448,6 +487,36 @@ impl Chat {
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
+    }
+
+    /// Nothing is running or about to: no turn, background task or question, and no message sent
+    /// into a turn that ended before reading it, which starts one of its own.
+    pub fn idle(&self) -> bool {
+        !self.working() && !self.asking() && !self.steered
+    }
+
+    /// Why sends wait, if they do, and what to do about it. Every path that sends asks this,
+    /// through `send_block` at least.
+    pub fn held(&self) -> Option<String> {
+        use crate::state::AttachStage::*;
+        if self.hold {
+            return Some("a git step is running".into());
+        }
+        if !self.attach_hold {
+            return None;
+        }
+        let list = &self.ws.attaching;
+        let Some(a) = list.iter().find(|a| a.stuck()).or(list.first()) else {
+            return Some("a repository is being attached".into());
+        };
+        let repo = &a.repo;
+        let chip = "its chip in the header (or Attach repository… in cmd-k)";
+        Some(match a.stage {
+            SetupFailed => format!("setup of {repo} failed; open {chip} to retry or continue"),
+            Uncertain => format!("Shark can't tell how {repo} ended up; open {chip} to check"),
+            Queued => format!("{repo} is queued to attach; {chip} says what it waits for"),
+            Creating | Setup => format!("{repo} is being attached; {chip} shows how far it got"),
+        })
     }
 
     pub fn queued(&self) -> usize {
@@ -527,6 +596,15 @@ impl Chat {
             self.attach(p, None, window, cx);
             return true;
         }
+        if crate::task_composer::paste_reference(&self.composer, item, window, cx) {
+            return true;
+        }
+        if let Some(text) = item
+            .text()
+            .filter(|text| complete::pasted_reference(text).is_some())
+        {
+            cx.emit(ChatEvent::SearchCompletionIssues(text));
+        }
         // Text wins over a rendered image of it, as copied from a word processor.
         if entries
             .iter()
@@ -573,9 +651,9 @@ impl Chat {
             self.drain(cx);
         }
         let busy = self.busy;
-        let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
-        self.steered |= sent && busy;
-        if !sent && (self.busy || self.hold) {
+        let held = self.held().is_some();
+        let sent = !held && (!busy || now) && self.send_text(text, now, cx);
+        if !sent && (self.busy || held) {
             self.qsel = self.queue_draft(content);
         } else if !sent {
             return; // spawn or write failed; the error is in the transcript, keep the draft
@@ -593,6 +671,14 @@ impl Chat {
         cx.notify();
     }
 
+    /// Feeds `ev` to the chat as its process would.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn play(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        // Injected events replace the reader: a real exit at cleanup trips the test scheduler.
+        self.reader = None;
+        self.apply(ev, cx);
+    }
+
     /// What went out, oldest first: messages, and reviews as their prompt.
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn sent_texts(&self) -> Vec<String> {
@@ -604,6 +690,7 @@ impl Chat {
     /// Sends a host-written prompt together with any draft instructions.
     pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut draft = self.composer.read(cx).value().trim().to_string();
+        let had_draft = !draft.is_empty();
         // The same prompt put back below after a failed start: retrying must not send it twice.
         if draft == prompt.trim() {
             draft.clear();
@@ -613,15 +700,15 @@ impl Chat {
             false => format!("{prompt}\n\nAlso: {draft}"),
         };
         let sent = self.send_text(text.clone(), false, cx);
-        if sent && !draft.is_empty() {
+        if sent && had_draft {
             cx.emit(ChatEvent::GitReviewsSent(std::mem::take(
                 &mut self.editing_git_reviews,
             )));
             self.finish_draft(window, cx);
         }
-        // The agent didn't start (refusals keep `hold`/`archiving` set): a new chat's first
-        // message, e.g. from New workspace, goes back to the composer instead of being lost.
-        let failed = !sent && self.agent.is_none() && !self.hold && !self.archiving;
+        // It didn't go out (refusals keep a hold or `archiving` set): a new chat's first message,
+        // e.g. from Home, goes back to the composer instead of being lost.
+        let failed = !sent && !self.busy && self.held().is_none() && !self.archiving;
         if failed && draft.is_empty() && self.meta.session_id.is_none() {
             self.composer
                 .update(cx, |c, cx| c.set_value(text, window, cx));
@@ -646,31 +733,44 @@ impl Chat {
         if text.is_empty() || (self.busy && !steer) {
             return false;
         }
-        if self.hold {
-            self.push(
-                Block::Info("a git step is running; send again when it finishes".into()),
-                cx,
-            );
+        if let Some(why) = self.held() {
+            let msg = format!("{why}; send again when it finishes");
+            self.push(Block::Info(msg), cx);
             return false;
         }
         if self.archiving {
             self.push(
-                Block::Info("this workspace is being archived; nothing was sent".into()),
+                Block::Info("this task is being deleted; nothing was sent".into()),
                 cx,
             );
             return false;
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
         let skills = crate::git::claude_skill_args(&self.ws);
-        let stale = self.agent_model != self.meta.model
+        let agent = crate::git::agent_prompt(&self.ws, &self.meta);
+        let stale = self.harness_model != self.meta.model
+            || self.harness_agent != agent
             || (!self.codex()
-                && (self.agent_effort != self.effort() || self.agent_skills != skills));
-        if self.agent.is_some() && stale && !self.busy && !self.steered {
-            self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
+                && (self.harness_effort != self.effort() || self.harness_skills != skills));
+        if self.harness.is_some() && stale && !self.busy && !self.steered {
+            self.harness = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
-        if self.agent.is_none() {
-            match agent::spawn(&self.ws, &self.meta) {
+        if self.harness.is_none() {
+            // A session starting now reads the repos from the root docs and its agent from the
+            // system prompt (`git::agent_prompt`), and has nothing else.
+            if self.meta.session_id.is_none() {
+                let mut context = self.context();
+                context.retain(|k, _| {
+                    k.starts_with(REPO_CONTEXT) || k.starts_with(crate::state::AGENT_CONTEXT)
+                });
+                let known = context_record(&context);
+                if self.meta.delivered != known {
+                    self.meta.delivered = known;
+                    cx.emit(ChatEvent::Meta);
+                }
+            }
+            match harness::spawn(&self.ws, &self.meta) {
                 Ok((mut a, rx)) => {
                     if self.meta.plan
                         && let Err(e) = a.set_plan_mode(true)
@@ -678,10 +778,11 @@ impl Chat {
                         self.push(Block::Info(format!("plan mode failed: {e}")), cx);
                         return false;
                     }
-                    self.agent = Some(a);
-                    self.agent_model = self.meta.model.clone();
-                    self.agent_effort = self.effort();
-                    self.agent_skills = skills;
+                    self.harness = Some(a);
+                    self.harness_model = self.meta.model.clone();
+                    self.harness_effort = self.effort();
+                    self.harness_skills = skills;
+                    self.harness_agent = agent;
                     self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
@@ -694,15 +795,25 @@ impl Chat {
                 }
             }
         }
-        let wire = match &self.note {
-            Some(n) => format!("{n}\n\n{text}"),
-            None => text.clone(),
+        // A `/command` must stay the whole message, and a steer lands mid-turn: the context waits
+        // for the next normal message.
+        let notes = match self.busy || text.trim_start().starts_with('/') {
+            true => vec![],
+            false => self.pending_context(),
         };
-        if let Err(e) = self.agent.as_mut().unwrap().send(&wire) {
+        let wire = match notes.is_empty() {
+            true => text.clone(),
+            false => format!("{}{NOTES_END}{text}", notes.join("\n")),
+        };
+        if let Err(e) = self.harness.as_mut().unwrap().send(&wire) {
             self.push(Block::Info(format!("send failed: {e}")), cx);
             return false;
         }
-        self.note = None;
+        if !notes.is_empty() {
+            self.blocks.extend(info_notes(&notes.join("\n")));
+            self.told
+                .push((self.blocks.len(), context_record(&self.context()), wire));
+        }
         let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
         if let Some(ids) = ids {
@@ -736,36 +847,78 @@ impl Chat {
             .count()
     }
 
-    /// A repo joined the workspace: refresh `@` files, show it, and tell the agent next turn
-    /// (its CLAUDE.md was read at session start).
-    pub fn repos_changed(&mut self, ws: &Workspace, note: String, cx: &mut Context<Self>) {
-        self.ws.repos = ws.repos.clone();
-        self.push(Block::Info(note.clone()), cx);
-        self.note = Some(match self.note.take() {
-            Some(old) => format!("{old}\n{note}"),
-            None => note,
-        });
-        self.reindex(cx);
-        self.prs_at = None; // the next `#` lists the new repo's PRs
+    /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
+    /// the agent hears of it with its next normal turn (`pending_context`). Ending the attachment
+    /// hold sends what waited for it, unless a git step still holds it.
+    pub fn task_changed(&mut self, ws: &Task, cx: &mut Context<Self>) {
+        let grew = ws.repos.len() != self.ws.repos.len();
+        let released = self.attach_hold && ws.attaching.is_empty();
+        self.ws = ws.clone();
+        self.attach_hold = !ws.attaching.is_empty();
+        if grew {
+            self.reindex(cx);
+            self.prs_at = None; // the next `#` lists the new repo's PRs
+        }
+        if released {
+            self.drain(cx);
+        }
+        cx.notify();
+    }
+
+    /// The notes of `Task::context` this chat's session hasn't received, for its next
+    /// normal message. Derived from what is saved, so it needs no event: chats closed, not yet
+    /// loaded or from before a restart catch up the same way.
+    pub(crate) fn pending_context(&self) -> Vec<String> {
+        (self.context().into_iter())
+            .filter(|(k, note)| self.meta.delivered.get(k) != Some(&note.fingerprint))
+            .map(|(_, note)| note.text)
+            .collect()
+    }
+
+    /// Only the current turn: old unfinished tools must not look like live work.
+    pub fn activity(&self) -> Option<String> {
+        if !self.busy {
+            return None;
+        }
+        for block in self.blocks.iter().rev() {
+            let call = match block {
+                Block::Tools { calls, .. } => calls.iter().rev().find(|c| c.result.is_none()),
+                Block::Tool(call) if call.result.is_none() => Some(call),
+                Block::Text { done: false, .. } => return Some("Writing".into()),
+                Block::User(_, false) | Block::Review(_, false) | Block::Info(_) => break,
+                _ => None,
+            };
+            if let Some(call) = call {
+                return Some(format!("{} {}", call.name, call.summary));
+            }
+        }
+        Some("Thinking".into())
     }
 
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
-        let queued = self.busy;
-        if !queued {
+        self.handoff_dismissed = false;
+        self.failed = None;
+        // codex runs `/compact` as a request of its own, with no user message to echo.
+        let echoed = !(self.active_codex() && text.trim() == "/compact");
+        let queued = self.busy && echoed;
+        if !self.busy {
             self.started = Some(Instant::now());
         }
+        self.steered |= queued;
         self.busy = true;
         if self.meta.title.is_empty() {
             self.meta.title = match &review {
                 Some(r) => review_title(r),
                 None => title_of(&text),
             };
-            cx.emit(ChatEvent::Meta);
+            cx.emit(ChatEvent::Title(review.is_none().then(|| text.clone())));
         }
         // Jump to the end so push follows the new message and the reply.
         self.sel = self.rows.len().saturating_sub(1);
         self.list.set_follow_mode(FollowMode::Tail);
-        self.unread.push_back(self.blocks.len());
+        if echoed {
+            self.unread.push_back(self.blocks.len());
+        }
         self.push(
             match review {
                 Some(r) => Block::Review(r, queued),
@@ -780,7 +933,7 @@ impl Chat {
     /// the process, since that is the only way to end them. Idle, does nothing.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         let working = self.working();
-        let Some(a) = &mut self.agent else {
+        let Some(a) = &mut self.harness else {
             return;
         };
         if !self.busy || self.stopping.is_some() {
@@ -796,7 +949,7 @@ impl Chat {
         self.stopping = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(INTERRUPT_GRACE).await;
             this.update(cx, |c, cx| {
-                if let Some(a) = &c.agent
+                if let Some(a) = &c.harness
                     && c.busy
                 {
                     // SIGTERM also ends background tasks: with some running, let the user decide.
@@ -838,12 +991,13 @@ impl Chat {
 
     /// The process is gone (or going): forget its state, end its calls, flag what it never read.
     fn drop_process(&mut self, cx: &mut Context<Self>) {
-        self.agent = None; // drop stops it
+        self.harness = None; // drop stops it
         self.drop_asked(cx);
         self.set_background(vec![], cx);
         self.stopping = None;
         self.cut = false;
         self.steered = false;
+        self.told.clear(); // never echoed now: that context stays pending
         self.interrupt();
         self.drop_unread(cx);
     }
@@ -861,6 +1015,7 @@ impl Chat {
         });
         if was_working {
             self.keep_reply();
+            self.handoff_dismissed = false;
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -970,12 +1125,17 @@ impl Chat {
             } => self.on_init(session_id, &model, &permission_mode, &mcp, cx),
             Ev::Background(tasks) => self.set_background(tasks, cx),
             Ev::Interrupted => self.cut = true,
-            Ev::User(text) => self.on_echo(text),
+            Ev::User(text) => self.on_echo(text, cx),
             Ev::Notice(text) => self.blocks.push(Block::Info(text)),
             Ev::TextDelta(s) => self.on_text(s, cx),
             Ev::Text(full) => self.on_full_text(full, cx),
             Ev::ToolUse { id, name, input } => self.on_tool_use(id, name, input),
             Ev::ToolResult { id, text, is_error } => self.on_tool_result(id, text, is_error),
+            Ev::Questions(request) => {
+                if !self.replaying {
+                    self.show_asked(request, cx);
+                }
+            }
             Ev::Permission {
                 request_id,
                 tool,
@@ -1008,6 +1168,7 @@ impl Chat {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
                     self.keep_reply();
+                    self.handoff_dismissed = false;
                     cx.emit(ChatEvent::TurnDone);
                 } else {
                     let first = msg.lines().next().unwrap_or_default();
@@ -1030,8 +1191,7 @@ impl Chat {
     ) {
         // A process of the backend the chat just switched away from: its session
         // can't be resumed by the new one.
-        let stale =
-            !self.replaying && codex::is_codex(self.agent_model.as_deref()) != self.meta.is_codex();
+        let stale = !self.replaying && self.active_codex() != self.meta.is_codex();
         if !stale && self.meta.session_id.as_ref() != Some(&id) {
             self.meta.session_id = Some(id);
             if !self.replaying {
@@ -1053,11 +1213,15 @@ impl Chat {
     }
 
     /// claude's echo: the oldest message it hadn't read is now part of the turn.
-    /// `ends_with`: a workspace `note` may have been put before the text on the wire.
     /// Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
-    fn on_echo(&mut self, text: String) {
-        let read = (self.unread.iter())
-            .position(|&bi| (self.blocks[bi].message()).is_some_and(|(t, _)| text.ends_with(t)));
+    fn on_echo(&mut self, text: String, cx: &mut Context<Self>) {
+        let read =
+            self.unread
+                .iter()
+                .position(|&bi| match self.told.iter().find(|(b, ..)| *b == bi) {
+                    Some((_, _, wire)) => wire == &text,
+                    None => self.blocks[bi].message().is_some_and(|(t, _)| t == text),
+                });
         match read {
             Some(k) => {
                 let bi = self.unread.remove(k).unwrap();
@@ -1065,16 +1229,20 @@ impl Chat {
                     *queued = false;
                 }
                 self.remeasure(bi);
-                // codex reads a steer into the running turn, with no new init after.
-                if self.unread.is_empty() {
-                    self.steered = false;
+                if let Some(i) = self.told.iter().position(|(b, ..)| *b == bi) {
+                    self.meta.delivered = self.told.remove(i).1;
+                    cx.emit(ChatEvent::Meta);
                 }
+                // codex reads a steer into the running turn, with no new init after.
+                self.steered = self
+                    .unread
+                    .iter()
+                    .any(|&bi| matches!(self.blocks[bi].message(), Some((_, true))));
             }
             None => {
-                // A replayed message carries the workspace notes sent with it.
+                // A replayed message carries the task notes sent with it.
                 let (notes, text) = split_notes(&text);
-                self.blocks
-                    .extend(notes.lines().map(|n| Block::Info(n.into())));
+                self.blocks.extend(info_notes(notes));
                 self.blocks.push(match card_of(text) {
                     Some(card) => Block::Review(Rc::new(card), false),
                     None => Block::User(text.into(), false),
@@ -1138,7 +1306,7 @@ impl Chat {
         let call = Call {
             summary: match name.as_str() {
                 PLAN_TOOL => plan::title(input["plan"].as_str().unwrap_or_default()),
-                ASK_TOOL => question::asked_summary(&input),
+                ASK_TOOL => crate::transcript::asked_summary(&input),
                 _ => summarize(&input, &self.ws.dir().to_string_lossy()),
             },
             input: full_input(&input),
@@ -1166,7 +1334,7 @@ impl Chat {
         });
         if let Some((bi, c)) = call {
             if c.name == ASK_TOOL
-                && let Some(answer) = question::answered(&text)
+                && let Some(answer) = crate::transcript::answered(&text)
             {
                 c.summary = answer.to_string();
             }
@@ -1184,11 +1352,6 @@ impl Chat {
         input: Value,
         cx: &mut Context<Self>,
     ) {
-        // Questions wait for the user's answers in a card; the turn holds meanwhile.
-        // (Replayed history has none: a request is only ever live.)
-        if tool == ASK_TOOL && !self.replaying {
-            return self.show_asked(request_id, tool_use_id, input, cx);
-        }
         // Plan mode's approval happens in the plan pane, after the turn: the agent is
         // told the plan was shown, and the turn ends instead of waiting on a person.
         let reason = match tool.as_str() {
@@ -1202,7 +1365,7 @@ impl Chat {
             "WebSearch" | "WebFetch" => None,
             _ => Some(NEEDS_APPROVAL),
         };
-        if let Some(a) = &mut self.agent
+        if let Some(a) = &mut self.harness
             && let Err(e) = match reason {
                 Some(reason) => a.deny(&request_id, reason),
                 None => a.allow(&request_id, input),
@@ -1216,13 +1379,21 @@ impl Chat {
     fn on_result(&mut self, is_error: bool, text: String, secs: u64, cx: &mut Context<Self>) {
         self.busy = false;
         if !self.replaying {
+            self.failed = is_error.then(|| text.clone());
             self.stopping = None; // a live interrupt's fallback outlives history
             self.drop_asked(cx);
         }
         let cut = std::mem::take(&mut self.cut);
+        // Codex won't start a turn for unread messages after refusal/interruption. Retiring them
+        // also keeps a later retry of the same text from acknowledging the refused message.
+        if self.active_codex() && (is_error || cut) {
+            self.drop_unread(cx);
+            self.told.clear();
+            self.steered = false;
+        }
         // A pruned or deleted session: claude says so in the result and exits, and
         // every resume would fail the same way. (Replay restores the session after.)
-        let gone = is_error && text.starts_with(agent::SESSION_GONE);
+        let gone = is_error && text.starts_with(harness::SESSION_GONE);
         let took = duration(secs);
         self.blocks.push(Block::Info(if cut {
             format!("interrupted · {took}")
@@ -1242,6 +1413,7 @@ impl Chat {
                 cx.emit(ChatEvent::Meta);
             }
             self.keep_reply();
+            self.handoff_dismissed = false;
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -1341,7 +1513,7 @@ impl Chat {
                                         )
                                     }
                                     (ASK_TOOL, _) => (c.result.as_deref())
-                                        .and_then(question::answered)
+                                        .and_then(crate::transcript::answered)
                                         .unwrap_or(&c.summary)
                                         .to_string(),
                                     _ => c.summary.clone(),
@@ -1481,7 +1653,7 @@ impl Chat {
                     .gap_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(t.clone())
+                    .child(div().min_w_0().child(t.clone()))
                     .when_some(reply, |d, r| {
                         d.child(copy_button(("copy", ix), r, "row").when(latest, |d| d.visible()))
                     })
@@ -1601,6 +1773,7 @@ impl Chat {
             theme.secondary,
             theme.muted_foreground,
         );
+        let held = self.held().is_some();
         // The editor's Vim pill, on `muted`: the card is already `secondary`.
         let vim_pill = self.vim_on.then(|| {
             div()
@@ -1618,6 +1791,7 @@ impl Chat {
             .pb_4()
             .pt_1()
             .children(self.render_side(window, cx))
+            .children(self.render_handoff(cx))
             .children(asked_card)
             .child(
                 v_flex()
@@ -1646,6 +1820,11 @@ impl Chat {
                     .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
                         this.focus.focus(window, cx);
                         cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, _: &HandOff, _, cx| {
+                        if this.show_handoff() {
+                            cx.emit(ChatEvent::HandOff { to: this.next_agent.as_ref().map(|a| a.slug.clone()) });
+                        }
                     }))
                     .on_action(cx.listener(|this, _: &AskSide, window, cx| {
                         this.ask_draft_aside(window, cx)
@@ -1684,10 +1863,18 @@ impl Chat {
                             cx.stop_propagation();
                         }
                     }))
+                    .capture_action(cx.listener(|this, _: &crate::BranchFromSource, window, cx| {
+                        if this.attach_completion_issue(window, cx) { cx.stop_propagation(); }
+                        else if this.unarmed_reference() { this.composer.update(cx, |input, cx| input.replace("\n", window, cx)); cx.stop_propagation(); }
+                    }))
                     .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-                        // With no match, Enter sends what was typed.
-                        if !a.shift && this.pick_selected(window, cx) {
-                            cx.stop_propagation();
+                        // Unarmed reference queries stay text; other Enter presses send.
+                        if !a.shift {
+                            if this.pick_selected(window, cx) { cx.stop_propagation(); }
+                            else if this.unarmed_reference() {
+                                this.composer.update(cx, |input, cx| input.replace("\n", window, cx));
+                                cx.stop_propagation();
+                            }
                         }
                     }))
                     .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
@@ -1725,6 +1912,7 @@ impl Chat {
                             .gap_2()
                             .text_xs()
                             .text_color(muted)
+                            .child(self.render_agent_chip(cx))
                             .child(
                                 Button::new("plan-mode")
                                     .ghost()
@@ -1732,6 +1920,7 @@ impl Chat {
                                     .icon(IconName::ClipboardList)
                                     .label("Plan")
                                     .selected(self.meta.plan)
+                                    .toggled(self.meta.plan)
                                     .tooltip(if self.meta.plan {
                                         "Plan mode on: the agent plans and edits nothing (shift-tab)"
                                     } else {
@@ -1739,7 +1928,8 @@ impl Chat {
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_plan_mode(!this.meta.plan, cx)
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("plan-mode", b)),
                             )
                             .when(self.codex(), |d| d.child(
                                 Button::new("fast-mode")
@@ -1748,6 +1938,7 @@ impl Chat {
                                     .icon(IconName::Zap)
                                     .label("Fast")
                                     .selected(self.fast())
+                                    .toggled(self.fast())
                                     .tooltip_with_action(
                                         "Fast: quicker replies that use more of your plan's usage",
                                         &ToggleFastMode,
@@ -1755,7 +1946,8 @@ impl Chat {
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_fast(!this.fast(), cx)
-                                    })),
+                                    }))
+                                    .map(|b| crate::ui::toolbar("fast-mode", b)),
                             ))
                             .child(
                                 div().relative().min_w_0().child(
@@ -1765,6 +1957,7 @@ impl Chat {
                                     .icon(IconName::Sparkles)
                                     .label(self.model_chip())
                                     .dropdown_caret(true)
+                                    .open(self.model_menu.is_some())
                                     // Shrinks to an ellipsis before the footer overflows.
                                     .flex_shrink(1.)
                                     .min_w_0()
@@ -1779,7 +1972,8 @@ impl Chat {
                                     )
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(PickModel.boxed_clone(), cx)
-                                    }),
+                                    })
+                                    .map(|b| crate::ui::toolbar("model", b)),
                                 )
                                 .child({
                                     let at = self.model_at.clone();
@@ -1803,13 +1997,13 @@ impl Chat {
                                     .overflow_hidden()
                                     .justify_end()
                                     .gap_3()
-                                    .when(self.busy || self.hold, |d| {
+                                    .when(self.busy || held, |d| {
                                         d.child(match self.editing {
                                             Some(_) => hint("enter", "save"),
                                             None => hint("enter", "queue"),
                                         })
                                     })
-                                    .when(self.busy && !self.hold, |d| {
+                                    .when(self.busy && !held, |d| {
                                         d.child(hint("cmd-enter", "send now"))
                                     })
                                     .when(self.busy, |d| d.child(hint("ctrl-c", "interrupt"))),
@@ -2008,7 +2202,7 @@ pub(crate) mod ui_tests {
         // Injected events replace the reader, including the fake process's exit during cleanup.
         c.reader = None;
         for l in lines {
-            for ev in agent::parse(l) {
+            for ev in harness::parse(l) {
                 c.apply(ev, cx);
             }
         }
@@ -2051,7 +2245,7 @@ pub(crate) mod ui_tests {
                         cx.new(|cx| {
                             let chat = cx.new(|cx| {
                                 Chat::new(
-                                    Workspace::default(),
+                                    Task::default(),
                                     ChatMeta {
                                         id: "activity-pixels".into(),
                                         ..Default::default()
@@ -2086,7 +2280,7 @@ pub(crate) mod ui_tests {
                     c.set_background(vec![], cx);
                     c.set_background(
                         (0..4)
-                            .map(|i| agent::Task {
+                            .map(|i| harness::BackgroundTask {
                                 id: format!("agent-{i}"),
                                 kind: "local_agent".into(),
                                 description: format!("Background agent {}", i + 1),
@@ -2172,7 +2366,7 @@ pub(crate) mod ui_tests {
         let chat = open_chat("background-hop", cx);
         let tasks = || {
             (0..4)
-                .map(|i| agent::Task {
+                .map(|i| harness::BackgroundTask {
                     id: format!("live-{i}"),
                     kind: "local_agent".into(),
                     description: format!("Background agent {i}"),
@@ -2300,7 +2494,7 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-side-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let fake = fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("side-proc-{}", std::process::id()),
             ..Default::default()
         };
@@ -2314,10 +2508,10 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-        let (mut a, rx) = agent::spawn_side(&ws, &meta).unwrap();
+        let (mut a, rx) = harness::spawn_side(&ws, &meta).unwrap();
         a.send("what is x?").unwrap();
         let mut text = String::new();
         while let Ok(ev) = rx.recv_blocking() {
@@ -2352,7 +2546,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let (mut a, rx) = agent::spawn_ask("haiku", "the docs").unwrap();
+        let (mut a, rx) = harness::spawn_ask("haiku", "the docs").unwrap();
         a.send("what is x?").unwrap();
         let mut text = String::new();
         while let Ok(ev) = rx.recv_blocking() {
@@ -2390,12 +2584,12 @@ exec cat >>"$0.stdin"
                 unsafe { std::env::set_var("SHARK_CLAUDE", &self.0) };
             }
         }
-        let _restore = Restore(fake);
+        let _restore = Restore(fake.clone());
         // SAFETY: as above.
         unsafe { std::env::set_var("SHARK_CLAUDE", "/nonexistent") };
         let root = std::env::temp_dir().join(format!("shark-noclaude-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("noclaude-test-{}", std::process::id()),
             ..Default::default()
         };
@@ -2403,7 +2597,7 @@ exec cat >>"$0.stdin"
             id: ws.name.clone(),
             ..Default::default()
         };
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (window, chat) = cx
@@ -2437,6 +2631,17 @@ exec cat >>"$0.stdin"
                 assert_eq!(c.composer.read(cx).value().as_ref(), "build the thing");
             })
         });
+        // A successful retry consumes the restored draft without sending it twice.
+        unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+        cx.update_window(window, |_, w, cx| {
+            chat.update(cx, |c, cx| {
+                assert!(c.ask("build the thing", w, cx));
+                assert_eq!(c.sent_texts(), ["build the thing"]);
+                assert!(c.composer.read(cx).value().is_empty());
+                c.reader = None;
+            });
+        })
+        .unwrap();
         let _ = std::fs::remove_file(ws.dir());
     }
 
@@ -2451,7 +2656,7 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-side-ui-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("side-test-{}", std::process::id()),
             ..Default::default()
         };
@@ -2464,7 +2669,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (window, chat) = cx
@@ -2516,7 +2721,7 @@ exec cat >>"$0.stdin"
             let side = c.side.as_ref().unwrap();
             assert_eq!(side.question, "what is x?");
             assert_eq!(side.text, "Forty-two");
-            assert!(side.done && side.agent.is_none() && side.error.is_none());
+            assert!(side.done && side.harness.is_none() && side.error.is_none());
             assert!(c.blocks.is_empty(), "the chat never sees the side question");
             assert!(!c.busy);
             assert_eq!(c.composer.read(cx).value().as_ref(), "");
@@ -2584,8 +2789,14 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-plan-ui-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("plan-test-{}", std::process::id()),
+            repos: vec![crate::state::TaskRepo {
+                name: "api".into(),
+                src: root.clone(),
+                base: "main".into(),
+                branch: None,
+            }],
             ..Default::default()
         };
         let meta = ChatMeta {
@@ -2595,7 +2806,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (window, chat) = cx
@@ -2758,7 +2969,7 @@ exec cat >>"$0.stdin"
         });
         cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
         cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
-        cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
+        cx.update(|cx| chat.update(cx, |c, _| c.harness = None));
         let _ = std::fs::remove_file(super::plan::store_path(&ws.name));
         let _ = std::fs::remove_file(ws.dir());
     }
@@ -2776,7 +2987,7 @@ exec cat >>"$0.stdin"
             gpui_kit::init(cx);
             crate::bind_keys(cx);
         });
-        let ws = Workspace {
+        let ws = Task {
             name: format!("ask-test-{}", std::process::id()),
             ..Default::default()
         };
@@ -2811,17 +3022,14 @@ exec cat >>"$0.stdin"
             cx.update(|cx| {
                 chat.update(cx, |c, cx| {
                     c.busy = true;
-                    c.agent_model = c.meta.model.clone(); // a codex process asks
+                    c.harness_model = c.meta.model.clone(); // a codex process asks
                     c.apply(
-                        Ev::Permission {
-                            request_id: id.into(),
-                            tool: ASK_TOOL.into(),
-                            tool_use_id: format!("call-{id}"),
-                            input: serde_json::json!({"questions": [
+                        Ev::Questions(harness::Questions::new(
+                            id.into(), format!("call-{id}"), serde_json::json!({"questions": [
                                 {"id": "db", "header": "DB", "question": "Which DB?", "isOther": true, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": "KV"}]},
                                 {"id": "tests", "header": "Tests", "question": "Which tests?", "isOther": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
-                            ]}),
-                        },
+                            ]}), true,
+                        )),
                         cx,
                     );
                 })
@@ -2947,7 +3155,7 @@ exec cat >>"$0.stdin"
     #[gpui_kit::test]
     fn send_scrolls_to_bottom(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let ws = Workspace {
+        let ws = Task {
             name: format!("scroll-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
@@ -3019,10 +3227,10 @@ exec cat >>"$0.stdin"
         footer(cx);
     }
 
-    /// A chat on a fresh workspace resuming session `s1`.
+    /// A chat on a fresh task resuming session `s1`.
     fn open_chat(tag: &str, cx: &mut TestAppContext) -> Entity<Chat> {
         cx.update(gpui_kit::init);
-        let ws = Workspace {
+        let ws = Task {
             name: format!("{tag}-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
@@ -3043,6 +3251,358 @@ exec cat >>"$0.stdin"
             })
             .unwrap();
         chat
+    }
+
+    /// Toolbar controls keep their hit targets, keyboard activation and model-menu focus
+    /// when the composer has little room or the app changes theme.
+    #[gpui_kit::test]
+    fn composer_toolbar_interactions_and_layout(cx: &mut TestAppContext) {
+        struct ComposerControls(Entity<Chat>);
+        impl Render for ComposerControls {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .tab_group()
+                    .on_action(cx.listener(|s, _: &PickModel, w, cx| {
+                        s.0.update(cx, |c, cx| c.open_model_menu(w, cx));
+                    }))
+                    .child(self.0.clone())
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
+            for width in [420., 800.] {
+                let (window, host) = cx
+                    .update(|cx| {
+                        crate::theme::apply(
+                            &crate::state::Appearance {
+                                mode,
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(500.)),
+                                ))),
+                                ..Default::default()
+                            },
+                            cx,
+                            |w, cx| {
+                                let fixture =
+                                    format!("composer-toolbar-{}-{width}", std::process::id());
+                                let chat = cx.new(|cx| {
+                                    let mut chat = Chat::new(
+                                        Task {
+                                            name: fixture.clone(),
+                                            ..Default::default()
+                                        },
+                                        ChatMeta {
+                                            id: fixture,
+                                            model: Some("codex:gpt-6.1-sol".into()),
+                                            fast: Some(false),
+                                            ..Default::default()
+                                        },
+                                        false,
+                                        w,
+                                        cx,
+                                    );
+                                    chat.plan_open = false;
+                                    chat
+                                });
+                                cx.new(|_| ComposerControls(chat))
+                            },
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let plan = w.find("plan-mode");
+                    let fast = w.find("fast-mode");
+                    let model = w.find("model");
+                    assert_eq!(plan.role(), Some(Role::Button));
+                    assert_eq!(fast.role(), Some(Role::Button));
+                    for button in [&plan, &fast, &model] {
+                        assert!(button.visible());
+                        assert_eq!(button.bounds().size.height, px(32.));
+                        assert!(button.bounds().left() >= px(16.));
+                        assert!(button.bounds().right() <= px(width - 16.));
+                        assert_eq!(button.bounds().top(), plan.bounds().top());
+                    }
+                    assert!(plan.bounds().right() <= fast.bounds().left());
+                    assert!(fast.bounds().right() <= model.bounds().left());
+                    w.click("fast-mode", cx);
+                    let chat = host.read(cx).0.clone();
+                    assert!(chat.read(cx).fast(), "click enables Fast");
+                    for _ in 0..6 {
+                        w.focus_next(cx);
+                        w.render_frame(cx);
+                        if w.find("fast-mode").focused() == Some(true) {
+                            break;
+                        }
+                    }
+                    assert_eq!(w.find("fast-mode").focused(), Some(true));
+                    w.press("space", cx);
+                    assert!(!chat.read(cx).fast(), "Space toggles the focused button");
+                    w.focus_next(cx);
+                    w.render_frame(cx);
+                    assert_eq!(w.find("model").focused(), Some(true));
+                    w.click("model", cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let chat = host.read(cx).0.clone();
+                    assert!(chat.read(cx).model_menu.is_some());
+                    assert!(w.find("menu-parent").visible());
+                    w.press("escape", cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let chat = host.read(cx).0.clone();
+                    assert!(
+                        chat.read(cx).model_menu.is_none(),
+                        "Escape closes the model menu before moving to the transcript (transcript focused: {})",
+                        chat.read(cx).focus.is_focused(w)
+                    );
+                    assert_eq!(w.find("model").focused(), Some(true));
+                    w.remove_window();
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    struct InfoPreview(Entity<Chat>);
+
+    impl Render for InfoPreview {
+        fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(cx.theme().background)
+                .child(self.0.update(cx, |c, cx| c.render_row(1, w, cx)))
+        }
+    }
+
+    fn info_preview(w: &mut Window, cx: &mut App) -> Entity<InfoPreview> {
+        let chat = cx.new(|cx| Chat::new(Task::default(), ChatMeta::default(), false, w, cx));
+        chat.update(cx, |c, cx| {
+            c.apply(Ev::Text("**reply**".into()), cx);
+            c.push(Block::Info("done · 1s".into()), cx);
+        });
+        cx.new(|_| InfoPreview(chat))
+    }
+
+    fn check_info_layout(host: &Entity<InfoPreview>, w: &mut Window, cx: &mut App, width: f32) {
+        let chat = host.read(cx).0.clone();
+        let mut short_copy_top = px(0.);
+        for (i, text) in [
+            "done · 1s".to_string(),
+            "[shark] Repository instructions could not be loaded from the requested working directory. ".repeat(8),
+            format!("[shark] instructions: /Users/{}AGENTS.md", "very_long_directory_name/".repeat(16)),
+        ].into_iter().enumerate() {
+            chat.update(cx, |c, cx| {
+                c.blocks[1] = Block::Info(text);
+                cx.notify();
+            });
+            w.render_frame(cx);
+            let copy = w.find(("copy", 1usize));
+            assert!(copy.visible());
+            assert!(copy.bounds().left() >= w.rem_size());
+            assert!(copy.bounds().right() <= w.viewport_size().width - w.rem_size(), "case {i}, width {width}, copy {:?}", copy.bounds());
+            if i == 0 {
+                short_copy_top = copy.bounds().top();
+                assert!(copy.bounds().left() < px(width / 2.), "short status keeps copy adjacent");
+            } else {
+                assert!(copy.bounds().top() > short_copy_top + px(12.), "long Info wraps: case {i}, width {width}, copy {:?}", copy.bounds());
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn info_rows_wrap_and_keep_copy_reachable(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for width in [320., 420., 800.] {
+            let (window, host) = cx
+                .update(|cx| {
+                    gpui_kit::open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(0.), px(0.)),
+                                size(px(width), px(700.)),
+                            ))),
+                            ..Default::default()
+                        },
+                        cx,
+                        info_preview,
+                    )
+                })
+                .unwrap();
+            cx.update_window(window, |_, w, cx| check_info_layout(&host, w, cx, width))
+                .unwrap();
+        }
+    }
+
+    /// The composer's agent button with no agent, with one, and once the chat started, in both
+    /// modes; `SHARK_RENDER_DIR` keeps the screenshots.
+    pub(crate) fn render_agent_chip_pixels(cx: &mut HeadlessAppContext) {
+        let ws = Task {
+            name: "agent-chip".into(),
+            agents: vec![crate::state::AgentLink {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                icon: crate::state::AgentIcon::Emoji {
+                    value: "🎨".into()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (mode, label) in [
+            (crate::state::Mode::Dark, "dark"),
+            (crate::state::Mode::Light, "light"),
+        ] {
+            cx.update(|cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            for case in ["none", "agent", "started"] {
+                let ws = ws.clone();
+                let (window, chat) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(760.), px(260.)),
+                                ))),
+                                focus: false,
+                                show: false,
+                                ..Default::default()
+                            },
+                            cx,
+                            move |w, cx| {
+                                let meta = ChatMeta {
+                                    agent: (case != "none").then(|| "designer".into()),
+                                    model: Some(crate::models::MODELS[0].into()),
+                                    ..Default::default()
+                                };
+                                cx.new(|cx| Chat::new(ws, meta, false, w, cx))
+                            },
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
+                    chat.update(cx, |c, cx| {
+                        if case == "started" {
+                            c.apply(Ev::User("Sketch the onboarding".into()), cx);
+                            c.apply(Ev::Text("Here are three directions.".into()), cx);
+                        }
+                    });
+                    w.render_frame(cx);
+                    let chip = w.find("chat-agent");
+                    let model = w.find("model");
+                    assert!(chip.visible() && model.visible(), "{case}");
+                    assert!(
+                        chip.bounds().right() <= model.bounds().left(),
+                        "agent comes first"
+                    );
+                    assert_eq!(chip.bounds().top(), model.bounds().top(), "one row");
+                })
+                .unwrap();
+                if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                    let dir = PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    cx.capture_screenshot(window)
+                        .expect("real agent chip renderer")
+                        .save(dir.join(format!("agent-chip-{label}-{case}.png")))
+                        .unwrap();
+                }
+                cx.update_window(window, |_, w, _| w.remove_window())
+                    .unwrap();
+            }
+        }
+    }
+
+    pub(crate) fn render_info_pixels(cx: &mut HeadlessAppContext) {
+        for (mode, label) in [
+            (crate::state::Mode::Dark, "dark"),
+            (crate::state::Mode::Light, "light"),
+        ] {
+            cx.update(|cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            for width in [320., 420., 800.] {
+                let (window, host) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(700.)),
+                                ))),
+                                focus: false,
+                                show: false,
+                                ..Default::default()
+                            },
+                            cx,
+                            info_preview,
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| check_info_layout(&host, w, cx, width))
+                    .unwrap();
+                for copy in [true, false] {
+                    if !copy {
+                        cx.update_window(window, |_, w, cx| {
+                            host.read(cx).0.clone().update(cx, |c, cx| {
+                                c.blocks[0] = Block::Info("[shark] instructions".into());
+                                cx.notify();
+                            });
+                            w.render_frame(cx);
+                            assert!(w.find_all(("copy", 1usize)).is_empty());
+                        })
+                        .unwrap();
+                    }
+                    if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                        let dir = PathBuf::from(dir);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        cx.capture_screenshot(window)
+                            .expect("real Info renderer")
+                            .save(
+                                dir.join(format!(
+                                    "info-{label}-{}-copy-{copy}.png",
+                                    width as usize
+                                )),
+                            )
+                            .unwrap();
+                    }
+                }
+                cx.update_window(window, |_, w, _| w.remove_window())
+                    .unwrap();
+            }
+        }
     }
 
     /// Copy buttons: a message's shows on hover without moving, the latest reply's always
@@ -3093,6 +3653,56 @@ exec cat >>"$0.stdin"
         assert_eq!(clip(cx).as_deref(), Some("hi"));
     }
 
+    #[gpui_kit::test]
+    fn streaming_mermaid_reply_renders_after_fence_closes(cx: &mut TestAppContext) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let chat = open_chat("mermaid-stream", cx);
+        let window = cx.windows()[0];
+        let open = "```mermaid\nflowchart TD\n  A[Start] --> B[Done]\n";
+        let closed = format!("{open}```");
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| c.apply(Ev::TextDelta(open.into()), cx));
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            assert!(
+                w.try_find("md-mermaid").is_none(),
+                "open fence stays source"
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| c.apply(Ev::Text(closed.clone()), cx));
+        });
+        cx.update_window(window, |_, w, cx| w.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let bounds = w.find("md-mermaid").bounds();
+            assert!(
+                bounds.size.height > px(20.) && bounds.size.height <= px(560.),
+                "{bounds:?}"
+            );
+            chat.update(cx, |c, cx| {
+                assert_eq!(c.blocks.len(), 1, "streaming updates keep one reply");
+                assert!(matches!(&c.blocks[0], Block::Text { src, .. } if src == &closed));
+                c.sel = 0;
+                c.copy_selected(w, cx);
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(closed),
+            "copy preserves the Mermaid source"
+        );
+    }
+
     /// A codex model starts a new conversation (claude's session can't carry over) and keeps
     /// plan mode; another codex model keeps the thread.
     #[gpui_kit::test]
@@ -3111,15 +3721,146 @@ exec cat >>"$0.stdin"
                 c.set_model("opus", cx);
                 assert_eq!(c.meta.session_id, None);
                 // The codex process still running reports its thread: not opus's to resume.
-                c.agent_model = Some("codex:gpt-6.1-sol".into());
+                c.harness_model = Some("codex:gpt-6.1-sol".into());
                 let init =
                     r#"{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#;
-                for ev in agent::parse(init) {
+                for ev in harness::parse(init) {
                     c.apply(ev, cx);
                 }
                 assert_eq!(c.meta.session_id, None);
             })
         });
+    }
+
+    /// A model pick affects the successor, while compact and failed steers keep the live backend's semantics.
+    #[gpui_kit::test]
+    fn busy_backend_switch_keeps_live_compact_and_result_semantics(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("shark-backend-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("agent");
+        std::fs::write(&fake, r#"#!/bin/sh
+: > "$0.in"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.in"
+    case "$line" in
+        *'"thread/resume"'*) printf '%s\n' '{"id":"resume","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+        *'"thread/start"'*) printf '%s\n' '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+    esac
+done
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct Restore([Option<std::ffi::OsString>; 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, old) in ["SHARK_CLAUDE", "SHARK_CODEX"].into_iter().zip(&self.0) {
+                    // SAFETY: all provider-spawning tests hold UI_LOCK.
+                    unsafe {
+                        match old {
+                            Some(old) => std::env::set_var(key, old),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore([
+            std::env::var_os("SHARK_CLAUDE"),
+            std::env::var_os("SHARK_CODEX"),
+        ]);
+        for key in ["SHARK_CLAUDE", "SHARK_CODEX"] {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(key, &fake) };
+        }
+        for (running, selected, is_codex) in [
+            ("codex:gpt-6.1-sol", "opus", true),
+            ("opus", "codex:gpt-6.1-sol", false),
+        ] {
+            let chat = open_chat(
+                if is_codex {
+                    "switch-from-codex"
+                } else {
+                    "switch-from-claude"
+                },
+                cx,
+            );
+            chat.update(cx, |c, cx| {
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.meta.model = Some(running.into());
+                assert!(c.send_text("first".into(), false, cx));
+                c.apply(Ev::User("first".into()), cx);
+                c.set_model(selected, cx);
+                assert_eq!(c.harness.as_ref().unwrap().is_codex(), is_codex);
+                assert_eq!(c.active_codex(), is_codex);
+                assert!(c.send_text("/compact".into(), true, cx));
+                assert_eq!(c.unread.len(), usize::from(!is_codex));
+                assert_eq!(c.steered, !is_codex);
+                let compact_seen = || {
+                    std::fs::read_to_string(fake.with_extension("in"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|v| {
+                            if is_codex {
+                                v["method"] == "thread/compact/start"
+                            } else {
+                                v["type"] == "user" && v["message"]["content"] == "/compact"
+                            }
+                        })
+                };
+                for _ in 0..1000 {
+                    if compact_seen() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(
+                    compact_seen(),
+                    "compact must reach the process that is still running"
+                );
+                // Keep transport events out of the manually driven result assertions.
+                c.reader = None;
+                c.unread.clear();
+                c.steered = false;
+                for interrupted in [false, true] {
+                    c.busy = true;
+                    let wire = "pending".to_string();
+                    c.told.push((
+                        c.blocks.len(),
+                        [("issue:one".into(), 1)].into_iter().collect(),
+                        wire.clone(),
+                    ));
+                    c.sent(wire, None, cx);
+                    if interrupted {
+                        c.apply(Ev::Interrupted, cx);
+                    }
+                    c.apply(
+                        Ev::Result {
+                            is_error: !interrupted,
+                            text: "refused".into(),
+                            secs: 0,
+                        },
+                        cx,
+                    );
+                    assert_eq!(
+                        c.unread.is_empty(),
+                        is_codex,
+                        "interrupted={interrupted}, running={running}"
+                    );
+                    assert_eq!(c.told.is_empty(), is_codex);
+                    assert_eq!(c.steered, !is_codex);
+                    c.unread.clear();
+                    c.told.clear();
+                    c.steered = false;
+                }
+                c.drop_process(cx);
+                std::fs::remove_dir_all(c.ws.dir()).unwrap();
+            });
+        }
     }
 
     /// Thinking levels: `high` until picked, stepping stops at the ends, and a level the model
@@ -3162,9 +3903,9 @@ exec cat >>"$0.stdin"
                 c.set_effort("ultra", cx);
                 assert_eq!(c.effort(), "max");
                 // What the send checks: claude's process is stale on another level.
-                c.agent_model = c.meta.model.clone();
-                c.agent_effort = "high";
-                assert_ne!(c.agent_effort, c.effort());
+                c.harness_model = c.meta.model.clone();
+                c.harness_effort = "high";
+                assert_ne!(c.harness_effort, c.effort());
             })
         });
     }
@@ -3181,18 +3922,20 @@ exec cat >>"$0.stdin"
                 let dir = c.ws.dir();
                 std::fs::create_dir_all(&dir).unwrap();
                 assert!(c.send_text("first".into(), false, cx));
-                assert!(c.agent_skills.is_empty());
+                assert!(c.harness_skills.is_empty());
                 let mut ws = c.ws.clone();
                 std::fs::create_dir_all(dir.join("api")).unwrap();
-                ws.repos.push(crate::state::WsRepo {
+                ws.repos.push(crate::state::TaskRepo {
                     name: "api".into(),
                     src: dir.join("api"),
                     base: "HEAD".into(),
                     branch: None,
                 });
-                c.repos_changed(&ws, "added api".into(), cx);
+                c.task_changed(&ws, cx);
                 assert!(c.send_text("steer".into(), true, cx));
-                assert!(c.agent_skills.is_empty(), "never restart an active turn");
+                assert!(c.harness_skills.is_empty(), "never restart an active turn");
+                c.apply(Ev::User("first".into()), cx);
+                c.apply(Ev::User("steer".into()), cx);
                 c.apply(
                     Ev::Result {
                         is_error: false,
@@ -3202,10 +3945,10 @@ exec cat >>"$0.stdin"
                     cx,
                 );
                 assert!(c.send_text("next".into(), false, cx));
-                assert_eq!(c.agent_skills, crate::git::claude_skill_args(&ws));
-                assert_eq!(c.agent_skills.len(), 2, "restarted with the added repo");
+                assert_eq!(c.harness_skills, crate::git::claude_skill_args(&ws));
+                assert_eq!(c.harness_skills.len(), 2, "restarted with the added repo");
                 c.reader = None;
-                c.agent = None;
+                c.harness = None;
                 std::fs::remove_dir_all(dir).unwrap();
             })
         });
@@ -3222,7 +3965,7 @@ exec cat >>"$0.stdin"
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.set_model("codex:gpt-6.1-sol", cx);
-                c.agent_model = c.meta.model.clone();
+                c.harness_model = c.meta.model.clone();
                 c.fast_by_config = true;
                 assert!(c.fast() && c.meta.fast.is_none(), "codex's config, untouched");
                 c.set_fast(false, cx);
@@ -3265,10 +4008,10 @@ exec cat >>"$0.stdin"
         });
     }
 
-    /// A replayed message that went out with workspace notes shows them as Info rows, not in
+    /// A replayed message that went out with task notes shows them as Info rows, not in
     /// the user's bubble.
     #[gpui_kit::test]
-    fn replay_splits_workspace_notes_from_the_message(cx: &mut TestAppContext) {
+    fn replay_splits_task_notes_from_the_message(cx: &mut TestAppContext) {
         let chat = open_chat("note-replay", cx);
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
@@ -3295,6 +4038,378 @@ exec cat >>"$0.stdin"
         });
     }
 
+    /// Context notes may hold blank lines, and what they quote stays out of the rows and the
+    /// user's bubble.
+    #[gpui_kit::test]
+    fn replay_keeps_multi_paragraph_notes_out_of_the_message(cx: &mut TestAppContext) {
+        let chat = open_chat("note-paragraphs", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.replaying = true;
+                let wire = format!(
+                    "[shark] Issue ENG-1 changed:\nFirst paragraph.\n\nSecond.{NOTES_END}fix it"
+                );
+                c.apply(Ev::User(wire), cx);
+                c.replaying = false;
+                assert!(matches!(&c.blocks[0], Block::Info(t) if t.ends_with("changed:")));
+                assert!(matches!(&c.blocks[1], Block::User(t, _) if t == "fix it"));
+                assert_eq!(c.blocks.len(), 2);
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn agent_notes_are_per_chat_and_its_pick_locks_once_started(cx: &mut TestAppContext) {
+        let chat = open_chat("chat-agent", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.session_id = None;
+                c.ws.agents = vec![crate::state::AgentLink {
+                    slug: "planner".into(),
+                    name: "Planner".into(),
+                    instructions: "Plan carefully".into(),
+                    ..Default::default()
+                }];
+                assert!(
+                    !c.context().contains_key("agent:planner"),
+                    "another chat's agent"
+                );
+                assert!(crate::git::agent_prompt(&c.ws, &c.meta).is_none());
+                let defaults = Some((crate::models::MODELS[1].to_string(), Some("low".into())));
+                assert!(c.set_agent(Some("planner".into()), defaults, cx));
+                assert_eq!(c.meta.model.as_deref(), Some(crate::models::MODELS[1]));
+                assert_eq!(c.meta.effort.as_deref(), Some("low"));
+                let notes = c.context();
+                assert!(notes.contains_key("agent:planner"));
+                let prompt = crate::git::agent_prompt(&c.ws, &c.meta).unwrap();
+                assert!(prompt.contains("Planner") && prompt.contains("Plan carefully"));
+                assert!(!c.set_agent(Some("planner".into()), None, cx), "unchanged");
+                c.blocks.push(Block::User("Go".into(), false));
+                assert!(!c.agent_open());
+                assert!(
+                    !c.set_agent(None, None, cx),
+                    "a started chat keeps its agent"
+                );
+                assert_eq!(c.meta.agent.as_deref(), Some("planner"));
+            })
+        });
+    }
+
+    /// A message the agent never read leaves its context pending: only an echo records it.
+    #[gpui_kit::test]
+    fn context_stays_pending_until_the_agent_reads_it(cx: &mut TestAppContext) {
+        let chat = open_chat("context-echo", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.ws.repos.push(crate::state::TaskRepo {
+                    name: "api".into(),
+                    src: "/src/api".into(),
+                    base: "main".into(),
+                    branch: None,
+                });
+                let record = context_record(&c.ws.context());
+                let unread = |c: &mut Chat, record: &std::collections::BTreeMap<_, _>| {
+                    c.blocks.push(Block::User("hi".into(), false));
+                    c.unread.push_back(c.blocks.len() - 1);
+                    c.told.push((
+                        c.blocks.len() - 1,
+                        record.clone(),
+                        "[shark] x\n[/shark]\n\nhi".into(),
+                    ));
+                };
+                unread(c, &record);
+                c.apply(Ev::Exited("claude exited".into()), cx);
+                assert!(c.told.is_empty() && c.meta.delivered.is_empty());
+                assert_eq!(c.pending_context().len(), 1);
+                unread(c, &record);
+                c.apply(Ev::User("[shark] x\n[/shark]\n\nhi".into()), cx);
+                assert_eq!(c.meta.delivered, record);
+                assert!(c.pending_context().is_empty());
+            })
+        });
+    }
+
+    /// The real Codex transport carries repo and issue notes, leaves compact requests alone,
+    /// and acknowledges context only when its app-server echoes the user message.
+    #[gpui_kit::test]
+    fn codex_delivers_attachment_context_on_normal_turns(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let chat = open_chat("codex-context", cx);
+        let root = std::env::temp_dir().join(format!("shark-codex-context-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("codex");
+        std::fs::write(&fake, r#"#!/bin/sh
+: > "$0.in"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.in"
+    case "$line" in
+        *'"thread/resume"'*) printf '%s\n' '{"id":"resume","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+        *'"thread/start"'*) printf '%s\n' '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+    esac
+done
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: tests that spawn providers hold UI_LOCK.
+                unsafe {
+                    match &self.0 {
+                        Some(old) => std::env::set_var("SHARK_CODEX", old),
+                        None => std::env::remove_var("SHARK_CODEX"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("SHARK_CODEX"));
+        // SAFETY: as above.
+        unsafe { std::env::set_var("SHARK_CODEX", &fake) };
+        let request = |n: usize| {
+            for _ in 0..1000 {
+                let log = std::fs::read_to_string(fake.with_extension("in")).unwrap_or_default();
+                let turns: Vec<Value> = log
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .filter(|v| {
+                        matches!(
+                            v["method"].as_str(),
+                            Some("turn/start" | "thread/compact/start")
+                        )
+                    })
+                    .collect();
+                if let Some(turn) = turns.get(n) {
+                    return turn.clone();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            panic!("Codex request {n} was not received");
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.meta.model = Some("codex:gpt-6.1-sol".into());
+                c.ws.repos.push(crate::state::TaskRepo { name: "api".into(), src: "/src/api".into(), base: "main".into(), branch: None });
+                let issue = crate::linear::Snapshot { org: "org".into(), id: "one".into(), identifier: "ENG-1".into(), title: "Fix login".into(), description: "Use the existing session".into(), ..Default::default() };
+                c.ws.linear.attach((&issue).into());
+                c.ws.issues.push(issue);
+                assert!(c.send_text("/compact".into(), false, cx));
+                assert_eq!(request(0)["method"], "thread/compact/start");
+                assert_eq!(c.pending_context().len(), 2);
+                c.play(Ev::Result { is_error: false, text: String::new(), secs: 0 }, cx);
+                assert!(c.send_text("build it".into(), false, cx));
+                let wire = request(1)["params"]["input"][0]["text"].as_str().unwrap().to_string();
+                assert!(wire.contains("Repo `api`") && wire.contains("Linear issue ENG-1"), "{wire}");
+                assert!(wire.ends_with("build it"));
+                assert_eq!(c.pending_context().len(), 2, "not yet echoed");
+                let echo = serde_json::json!({"method":"item/started", "params":{"item":{"type":"userMessage", "id":"u1", "content":[{"type":"text", "text":wire}]}}});
+                play(c, &[&echo.to_string()], cx);
+                assert!(c.pending_context().is_empty());
+                c.play(Ev::Result { is_error: false, text: String::new(), secs: 0 }, cx);
+                assert!(c.send_text("next".into(), false, cx));
+                assert_eq!(request(2)["params"]["input"][0]["text"], "next");
+                c.drop_process(cx);
+                let _ = std::fs::remove_dir_all(c.ws.dir());
+            })
+        });
+    }
+
+    /// A refused message cannot claim another message's echo, even with the same user text
+    /// after its context changed.
+    #[gpui_kit::test]
+    fn echoes_match_the_exact_message_and_context(cx: &mut TestAppContext) {
+        let chat = open_chat("exact-echo", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("it".into(), None, cx);
+                c.busy = false; // refused without an echo
+                c.sent("fix it".into(), None, cx);
+                c.apply(Ev::User("fix it".into()), cx);
+                assert_eq!(c.unread.iter().copied().collect::<Vec<_>>(), [0]);
+
+                let old = [("issue:one".into(), 1)].into_iter().collect();
+                let new: std::collections::BTreeMap<String, u64> =
+                    [("issue:one".into(), 2)].into_iter().collect();
+                for (record, wire) in [
+                    (old, format!("[shark] Old context{NOTES_END}retry")),
+                    (new.clone(), format!("[shark] New context{NOTES_END}retry")),
+                ] {
+                    c.busy = false;
+                    c.told.push((c.blocks.len(), record, wire));
+                    c.sent("retry".into(), None, cx);
+                }
+                c.apply(Ev::User(format!("[shark] New context{NOTES_END}retry")), cx);
+                assert_eq!(c.meta.delivered, new);
+                assert_eq!(
+                    c.told.len(),
+                    1,
+                    "the refused context was never acknowledged"
+                );
+                assert_eq!(c.unread.len(), 2, "only the matching message was read");
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn activity_survives_queued_steering(cx: &mut TestAppContext) {
+        let chat = open_chat("activity-steer", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::TextDelta("Working".into()), cx);
+                assert_eq!(c.activity().as_deref(), Some("Writing"));
+                c.sent("also check this".into(), None, cx);
+                assert_eq!(c.activity().as_deref(), Some("Writing"));
+                c.apply(
+                    Ev::ToolUse {
+                        id: "edit".into(),
+                        name: "Edit".into(),
+                        input: serde_json::json!({"file_path": "sidebar.rs"}),
+                    },
+                    cx,
+                );
+                let activity = c.activity();
+                assert!(activity.as_ref().unwrap().starts_with("Edit "));
+                c.sent("and keep this".into(), None, cx);
+                assert_eq!(c.activity(), activity);
+                c.busy = false;
+                c.sent("new turn".into(), None, cx);
+                assert_eq!(c.activity().as_deref(), Some("Thinking"));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn review_starts_a_new_activity_turn(cx: &mut TestAppContext) {
+        let chat = open_chat("activity-review", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::TextDelta("Old activity".into()), cx);
+                c.busy = false;
+                let review = Rc::new(ReviewCard {
+                    prompt: "Review this".into(),
+                    items: vec![],
+                    changes: String::new(),
+                });
+                c.sent(review.prompt.clone(), Some(review), cx);
+                assert_eq!(c.activity().as_deref(), Some("Thinking"));
+            });
+        });
+    }
+
+    /// History can finish loading between a turn ending and a pending steer being read.
+    #[gpui_kit::test]
+    fn history_preserves_pending_steers_and_context(cx: &mut TestAppContext) {
+        let chat = open_chat("history-steer", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::User("first".into()), cx);
+                let wire = format!("[shark] Context{NOTES_END}steer");
+                let record = [("issue:one".into(), 1)].into_iter().collect();
+                c.told.push((c.blocks.len(), record, wire.clone()));
+                c.sent("steer".into(), None, cx);
+                c.apply(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        secs: 1,
+                    },
+                    cx,
+                );
+                assert!(!c.idle());
+                c.load_history(
+                    vec![
+                        Ev::User("history".into()),
+                        Ev::Init {
+                            session_id: "old".into(),
+                            model: "m".into(),
+                            permission_mode: "plan".into(),
+                            mcp: vec![],
+                        },
+                        Ev::Exited("old process exited".into()),
+                    ],
+                    cx,
+                );
+                assert!(
+                    !c.idle(),
+                    "attachments and deletion must still wait for the steer"
+                );
+                assert_eq!(c.told.len(), 1);
+                c.apply(Ev::User(wire), cx);
+                assert_eq!(c.meta.delivered.get("issue:one"), Some(&1));
+                assert!(c.idle());
+            })
+        });
+    }
+
+    /// While an attachment holds a chat, every way of sending stops at the same gate and nothing
+    /// is lost; a git hold ending doesn't change that. Plan mode and the plan stay as they are.
+    #[gpui_kit::test]
+    fn attach_hold_stops_every_way_of_sending(cx: &mut TestAppContext) {
+        let chat = open_chat("attach-hold", cx);
+        let window = cx.windows()[0];
+        let act = |cx: &mut TestAppContext,
+                   f: &dyn Fn(&mut Chat, &mut Window, &mut Context<Chat>)| {
+            cx.update_window(window, |_, w, cx| chat.update(cx, |c, cx| f(c, w, cx)))
+                .unwrap();
+        };
+        act(cx, &|c, w, cx| {
+            c.attach_hold = true;
+            c.ws.repos.push(crate::state::TaskRepo {
+                name: "api".into(),
+                src: "/src/api".into(),
+                base: "main".into(),
+                branch: None,
+            });
+            c.ws.attaching.push(crate::state::Attachment::fresh(
+                &crate::state::Repo {
+                    name: "web".into(),
+                    path: "/src/web".into(),
+                },
+                "b",
+                "",
+            ));
+            c.meta.plan = true;
+            c.plan
+                .update(cx, |p, cx| p.add("p1".into(), "# Plan".into(), cx));
+            assert!(!c.send_text("direct".into(), false, cx), "the gate itself");
+            assert!(!c.ask("host prompt", w, cx), "ask");
+            c.approve_plan(w, cx);
+            assert!(!c.build_plan("# Plan", w, cx), "build");
+            c.set_plan_mode(false, cx);
+            assert!(c.meta.plan, "attachment never leaves Plan mode");
+            assert_eq!(c.plan.read(cx).approved, None, "or approves");
+            // Composer, git prompt and review: they queue.
+            c.composer.update(cx, |t, cx| t.set_value("typed", w, cx));
+            c.send(false, w, cx);
+            c.composer.update(cx, |t, cx| t.set_value("now!", w, cx));
+            c.send(true, w, cx);
+            assert!(c.enqueue("git prompt", vec![], cx));
+            let card = ReviewCard {
+                prompt: "R".into(),
+                items: vec![],
+                changes: String::new(),
+            };
+            assert!(c.send_review(card, cx));
+            assert_eq!(c.queued(), 4);
+            c.qsel = 1;
+            c.steer(w, cx);
+            c.drain(cx);
+            assert_eq!(c.queued(), 4, "steering and draining wait");
+            assert!(c.sent_texts().is_empty());
+            assert!(c.harness.is_none(), "no provider started");
+            // A git step coming and going leaves it alone.
+            c.hold = true;
+            c.hold = false;
+            c.drain(cx);
+            assert_eq!(c.queued(), 4);
+        });
+    }
+
     /// A codex turn as the chat sees it: a message sent mid-turn joins the running turn with no
     /// new init, and once read nothing stays unread or steered. One codex refuses is never
     /// echoed, and doesn't hold up the next.
@@ -3309,7 +4424,7 @@ exec cat >>"$0.stdin"
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.meta.model = Some("codex:gpt-6-astra".into());
-                c.agent_model = c.meta.model.clone();
+                c.harness_model = c.meta.model.clone();
                 c.sent("first".into(), None, cx);
                 c.steered = true; // what a cmd-enter send does mid-turn
                 c.sent("second".into(), None, cx);
@@ -3337,6 +4452,80 @@ exec cat >>"$0.stdin"
                     [("first", false), ("second", false), ("refused", false), ("next", false)],
                     "read in place, none twice"
                 );
+            })
+        });
+    }
+
+    /// Entries codex will never echo don't keep a chat from going idle: `/compact` isn't recorded,
+    /// a refused message doesn't outlive the turn it was refused in, and a steer read later isn't
+    /// held up by either. An attachment waiting on `idle` would hold the turn that clears them.
+    #[gpui_kit::test]
+    fn stale_codex_messages_leave_the_chat_idle(cx: &mut TestAppContext) {
+        let chat = open_chat("codex-stale", cx);
+        let done = || Ev::Result {
+            is_error: false,
+            text: String::new(),
+            secs: 1,
+        };
+        let refused = || Ev::Result {
+            is_error: true,
+            text: "bad input".into(),
+            secs: 0,
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.harness_model = c.meta.model.clone();
+                c.sent("/compact".into(), None, cx);
+                assert!(c.unread.is_empty(), "never echoed");
+                c.apply(done(), cx);
+                c.sent("refused".into(), None, cx);
+                c.apply(refused(), cx);
+                assert!(c.unread.is_empty());
+
+                // A steer read with those around, as the reviewer's case had it.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("/compact".into(), None, cx);
+                assert!(!c.steered, "no steer to read");
+                c.sent("steer".into(), None, cx);
+                assert!(c.steered);
+                c.apply(Ev::User("steer".into()), cx);
+                assert!(!c.steered, "the stale entry doesn't hold it");
+                c.apply(done(), cx);
+                assert!(c.idle());
+
+                // Retrying refused text as a steer must read the retry, not the stale entry.
+                c.sent("again".into(), None, cx);
+                c.apply(refused(), cx);
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("again".into(), None, cx);
+                c.apply(Ev::User("again".into()), cx);
+                c.apply(done(), cx);
+                assert!(c.idle() && c.unread.is_empty());
+
+                // A steer refused, then one in an interrupted turn: nothing starts a turn for them.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 2".into(), None, cx);
+                c.apply(refused(), cx);
+                assert!(c.idle(), "refused");
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 3".into(), None, cx);
+                c.apply(Ev::Interrupted, cx);
+                c.apply(done(), cx);
+                assert!(c.idle(), "interrupted");
+
+                // A steer left unread by a turn that ended well does start its own: still waits.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 4".into(), None, cx);
+                c.apply(done(), cx);
+                assert!(!c.idle());
+                c.apply(Ev::User("steer 4".into()), cx);
+                assert!(c.idle());
             })
         });
     }
@@ -3477,7 +4666,7 @@ exec cat >>"$0.stdin"
             r#"{"type":"user","isReplay":true,"message":{"content":"<local-command-stdout>Compacted </local-command-stdout>"}}"#,
             r#"{"type":"result","subtype":"success","local_command":"compact","is_error":false,"result":"","total_cost_usd":0,"duration_ms":0}"#,
         ];
-        let evs = || lines.iter().flat_map(|l| crate::agent::parse(l));
+        let evs = || lines.iter().flat_map(|l| crate::harness::parse(l));
         let infos = |c: &Chat| {
             (c.blocks.iter())
                 .filter_map(|b| match b {
@@ -3495,7 +4684,7 @@ exec cat >>"$0.stdin"
                 evs().for_each(|e| c.apply(e, cx));
                 assert!(matches!(&c.blocks[0], Block::User(_, true)), "not echoed yet");
                 let echo = r#"{"type":"user","isReplay":true,"message":{"content":"<command-message>compact</command-message>\n<command-name>/compact</command-name>\n<command-args></command-args>"}}"#;
-                crate::agent::parse(echo).into_iter().for_each(|e| c.apply(e, cx));
+                crate::harness::parse(echo).into_iter().for_each(|e| c.apply(e, cx));
                 let users: Vec<_> = (c.blocks.iter())
                     .filter(|b| matches!(b, Block::User(..)))
                     .collect();
@@ -3524,13 +4713,13 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-queue-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("queue-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
             ..Default::default()
         };
-        // The UI tests reset the test home; don't let one do that under this workspace.
+        // The UI tests reset the test home; don't let one do that under this task.
         let meta = ChatMeta {
             id: ws.name.clone(),
             ..Default::default()
@@ -3538,7 +4727,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (dir, transcript) = (ws.dir(), crate::transcript::transcript_path(&meta.id));
         let (window, chat) = cx
@@ -3787,7 +4976,7 @@ exec cat >>"$0.stdin"
 
         cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
         cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
-        cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
+        cx.update(|cx| chat.update(cx, |c, _| c.harness = None));
         let _ = std::fs::remove_file(dir);
         let _ = std::fs::remove_file(transcript);
         std::fs::remove_dir_all(root).unwrap();
@@ -3796,7 +4985,7 @@ exec cat >>"$0.stdin"
     /// `@` opens the file menu; keys drive it and a pick leaves a repo-qualified chip.
     #[gpui_kit::test]
     fn dropping_a_file_attaches_it(cx: &mut TestAppContext) {
-        // Its workspace dir is under the UI tests' home, which they wipe.
+        // Its task dir is under the UI tests' home, which they wipe.
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3804,7 +4993,7 @@ exec cat >>"$0.stdin"
             gpui_kit::init(cx);
             crate::bind_keys(cx);
         });
-        let ws = Workspace {
+        let ws = Task {
             name: format!("drop-test-{}", std::process::id()),
             branch: "b".into(),
             ..Default::default()
@@ -3887,13 +5076,13 @@ exec cat >>"$0.stdin"
             crate::git::git(&dir, &["init", "-q"]).unwrap();
             repos.push((name.to_string(), dir));
         }
-        let repo = |n: &str| crate::state::WsRepo {
+        let repo = |n: &str| crate::state::TaskRepo {
             name: n.into(),
             src: root.join(n),
             base: "origin/main".into(),
             branch: None,
         };
-        let ws = Workspace {
+        let ws = Task {
             name: format!("at-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![repo("api"), repo("web")],
@@ -3913,8 +5102,8 @@ exec cat >>"$0.stdin"
         cx.run_until_parked();
         cx.update(|cx| {
             chat.update(cx, |c, _| {
-                c.files = complete::files(&repos);
-                c.indexing = Some(Task::ready(())); // the workspace dir doesn't exist; keep these
+                c.files = complete::files(&c.ws.dir(), &repos);
+                c.indexing = Some(gpui_kit::Task::ready(())); // the workspace dir doesn't exist; keep these
             })
         });
         let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
@@ -3995,6 +5184,18 @@ exec cat >>"$0.stdin"
             let c = chat.read(cx).composer.read(cx);
             assert_eq!(c.tokens().last().unwrap().token().label(), "api#12");
         });
+        for key in ["enter", "alt-enter"] {
+            act(cx, &|w, cx| w.input(" #endif", cx));
+            assert_eq!(armed(cx), Some(false));
+            act(cx, &|w, cx| w.press(key, cx));
+            assert!(value(cx).ends_with(" #endif\n"), "{key}: {}", value(cx));
+            cx.update(|cx| {
+                assert!(
+                    chat.read(cx).queue.is_empty(),
+                    "unarmed references never submit"
+                )
+            });
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4004,7 +5205,7 @@ exec cat >>"$0.stdin"
             gpui_kit::init(cx);
             crate::bind_keys(cx);
         });
-        let ws = Workspace {
+        let ws = Task {
             name: format!("vim-test-{}", std::process::id()),
             branch: "b".into(),
             ..Default::default()

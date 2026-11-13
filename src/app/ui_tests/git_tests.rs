@@ -1,4 +1,4 @@
-//! Git is an ordinary workspace artifact: one tab, persisted ordering, independent drafts.
+//! Git is an ordinary task artifact: one tab, persisted ordering, independent drafts.
 use super::*;
 use crate::features::git::{
     GitFeature,
@@ -26,7 +26,7 @@ fn pr_fixture(threads: usize) -> Value {
     })
 }
 
-/// Real subprocess boundary, local JSON state: every write stays inside the test workspace.
+/// Real subprocess boundary, local JSON state: every write stays inside the test task.
 fn fake_github(home: &Path, state: &State, threads: usize) -> (GhGuard, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let script = home.join("fake-gh");
@@ -84,7 +84,7 @@ else:
     print(json.dumps({'data':{'repository':{'pullRequest':pr}}}))
 "#).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    for ws in &state.workspaces {
+    for ws in &state.tasks {
         for repo in &ws.repos {
             let dir = ws.dir().join(&repo.name);
             fs::write(dir.join("git-pr.json"), pr_fixture(threads).to_string()).unwrap();
@@ -99,7 +99,7 @@ else:
             .unwrap();
         }
     }
-    let dir = state.workspaces[0].dir().join("api");
+    let dir = state.tasks[0].dir().join("api");
     (GhGuard::set(&script), dir)
 }
 
@@ -110,10 +110,10 @@ fn fixture(home: &Path) -> State {
         ..Default::default()
     };
     for name in ["git-review", "git-other"] {
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: name.into(),
             branch: "main".into(),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: repos[0].path.clone(),
                 base: "main".into(),
@@ -123,7 +123,7 @@ fn fixture(home: &Path) -> State {
         };
         ws.migrate();
         init_repo(&ws.dir().join("api"));
-        state.workspaces.push(ws);
+        state.tasks.push(ws);
     }
     state.last_open = Some(("git-review".into(), "chat".into()));
     state
@@ -132,7 +132,7 @@ fn fixture(home: &Path) -> State {
 #[test]
 fn git_artifact_state_migrates_and_normalizes() {
     let legacy = r#"{"name":"legacy","branch":"main","repos":[],"diff_closed":false}"#;
-    let mut ws: Workspace = serde_json::from_str(legacy).unwrap();
+    let mut ws: Task = serde_json::from_str(legacy).unwrap();
     ws.migrate();
     assert!(ws.git_closed);
     assert!(!ws.tab_order.contains(&TabId::Git));
@@ -142,7 +142,7 @@ fn git_artifact_state_migrates_and_normalizes() {
     assert_eq!(ws.tab_order.iter().filter(|t| **t == TabId::Git).count(), 1);
     assert!(ws.move_tab(&TabId::Git, &TabId::Chat("legacy".into())));
     let saved = serde_json::to_string(&ws).unwrap();
-    let mut restored: Workspace = serde_json::from_str(&saved).unwrap();
+    let mut restored: Task = serde_json::from_str(&saved).unwrap();
     restored.migrate();
     assert_eq!(restored.tab_order, ws.tab_order);
     assert!(!restored.git_closed);
@@ -157,7 +157,7 @@ fn git_artifact_state_migrates_and_normalizes() {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut TestAppContext) {
+async fn git_feature_tab_launch_close_reorder_and_task_restore(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
@@ -168,7 +168,7 @@ async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut Tes
         w.render_frame(cx);
         assert!(w.find("feature-git").visible());
         assert!(w.try_find("git-tab").is_none());
-        assert!(shark.read(cx).active_ws().unwrap().git_closed);
+        assert!(shark.read(cx).active_task().unwrap().git_closed);
         w.click("feature-git", cx);
     })
     .unwrap();
@@ -183,11 +183,11 @@ async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut Tes
             assert_eq!(s.tab, Tab::Feature(Feature::Git));
             assert_eq!(s.active_git_feature(), Some(&feature));
             assert_eq!(w.find_all("git-tab").len(), 1);
-            assert!(!s.active_ws().unwrap().git_closed);
+            assert!(!s.active_task().unwrap().git_closed);
         })
         .unwrap();
     }
-    assert!(!State::load().workspaces[0].git_closed);
+    assert!(!State::load().tasks[0].git_closed);
     on(cx, &|s, _, cx| {
         s.move_tab(
             "git-review",
@@ -196,29 +196,29 @@ async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut Tes
             cx,
         )
     });
-    assert_eq!(State::load().workspaces[0].tab_order[0], TabId::Git);
+    assert_eq!(State::load().tasks[0].tab_order[0], TabId::Git);
     press(cx, &["ctrl-2"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
     press(cx, &["ctrl-shift-tab"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Feature(Feature::Git)));
     press(cx, &["cmd-w"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
-    assert!(State::load().workspaces[0].git_closed);
+    assert!(State::load().tasks[0].git_closed);
     press(cx, &["cmd-shift-g"]);
     cx.update(|cx| {
         assert_eq!(shark.read(cx).tab, Tab::Feature(Feature::Git));
         assert_eq!(shark.read(cx).active_git_feature(), Some(&feature));
     });
-    on(cx, &|s, w, cx| s.open_workspace_named("git-other", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("git-other", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        assert!(shark.read(cx).active_ws().unwrap().git_closed);
+        assert!(shark.read(cx).active_task().unwrap().git_closed);
         assert!(w.try_find("git-tab").is_none());
     })
     .unwrap();
     press(cx, &["cmd-shift-g"]);
     cx.update(|cx| assert_ne!(shark.read(cx).active_git_feature(), Some(&feature)));
-    on(cx, &|s, w, cx| s.open_workspace_named("git-review", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("git-review", w, cx));
     press(cx, &["cmd-shift-g"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active_git_feature(), Some(&feature)));
     cx.update_window(window, |_, w, cx| {
@@ -229,7 +229,7 @@ async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut Tes
         assert_eq!(shark.read(cx).tab, Tab::Chat);
     })
     .unwrap();
-    assert!(State::load().workspaces[0].git_closed);
+    assert!(State::load().tasks[0].git_closed);
 }
 
 #[gpui_kit::test]
@@ -384,9 +384,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
-    cx: &mut TestAppContext,
-) {
+async fn git_feature_description_conflict_and_task_changes_keep_drafts(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let state = fixture(&home);
@@ -421,7 +419,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
         )
     });
     assert!(!dir.join("git-writes.jsonl").exists());
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("git-other", w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_named("git-other", w, cx));
     press(cx, &["cmd-shift-g"]);
     let other = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     until(cx, window, |_, cx| {
@@ -429,7 +427,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     })
     .await;
     cx.update(|cx| assert!(other.read(cx).draft_text(cx).is_none()));
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("git-review", w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task_named("git-review", w, cx));
     press(cx, &["cmd-shift-g"]);
     cx.update(|cx| {
         assert_eq!(shark.read(cx).active_git_feature(), Some(&feature));
@@ -490,8 +488,7 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
     let home = test_home();
     let state = fixture(&home);
     let (_gh, dir) = fake_github(&home, &state, 1000);
-    let target =
-        crate::pr::git_feature::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
+    let target = crate::pr::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
     let details = crate::pr::git_feature::load(&dir, &target).unwrap();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
@@ -637,8 +634,8 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let state = fixture(&home);
-    let mut empty_workspace = state.workspaces[0].clone();
-    empty_workspace.repos.clear();
+    let mut empty_task = state.tasks[0].clone();
+    empty_task.repos.clear();
     let (_gh, dir) = fake_github(&home, &state, 1);
     fs::write(dir.join("git-fail"), "offline").unwrap();
     let (window, shark) = boot(cx, state, WindowOptions::default());
@@ -714,7 +711,7 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
         w.click("git-thread-collapse-T_0", cx);
         w.render_frame(cx);
         assert!(w.find("git-thread-collapsed-T_0").visible());
-        feature.update(cx, |f, cx| f.set_workspace(empty_workspace, w, cx));
+        feature.update(cx, |f, cx| f.set_task(empty_task, w, cx));
         w.render_frame(cx);
         assert!(w.find("git-empty-repositories").visible());
         assert!(w.try_find("git-state-retry").is_none());
@@ -723,7 +720,7 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
     assert!(!dir.join("git-writes.jsonl").exists());
 }
 
-/// Polls real background work (git, merman, image decoding) in the native harness.
+/// Polls real background work (git, merman, image decoding) in the native agent.
 fn settle(
     cx: &mut gpui_kit::HeadlessAppContext,
     window: AnyWindowHandle,
@@ -906,14 +903,13 @@ fn rich_conversation(details: &mut crate::pr::git_feature::Details) {
 }
 
 /// Real Metal rendering of the complete Git artifact, including a draft composer.
-/// Polls real background work (git, merman, image decoding) in the native harness.
+/// Polls real background work (git, merman, image decoding) in the native agent.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let (fixture, _, _) = history_fixture(&home);
     let (_gh, dir) = fake_github(&home, &fixture, 2);
-    let target =
-        crate::pr::git_feature::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
+    let target = crate::pr::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
     let mut details = crate::pr::git_feature::load(&dir, &target).unwrap();
     details.title =
         "Keep sign-in sessions reliable when reconnecting after a network interruption".into();
@@ -951,14 +947,14 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .unwrap();
             cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
-                    let mut ws = fixture.workspaces[0].clone();
+                    let mut ws = fixture.tasks[0].clone();
                     ws.git_closed = false;
                     ws.open_tab(TabId::Git);
                     s.active = Some(ws.name.clone());
-                    s.state.workspaces = vec![ws];
+                    s.state.tasks = vec![ws];
                     s.home.on = false;
                     s.tab = Tab::Feature(Feature::Git);
-                    s.sel = SideRow::Ws(0);
+                    s.sel = SideRow::Task(0);
                     let feature = s.ensure_git_feature(w, cx).unwrap();
                     feature.update(cx, |f, cx| f.inject_details(details.clone(), cx));
                     cx.notify();
@@ -1189,9 +1185,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             matches!(state, "loading" | "no-pr" | "error"),
                             matches!(state, "error" | "stale").then(|| "GitHub could not load this pull request because the request timed out. Check your connection and GitHub authentication, then retry. Your saved drafts are still available in this workspace.".into()), cx);
                         if state == "no-repositories" {
-                            let mut workspace = fixture.workspaces[0].clone();
-                            workspace.repos.clear();
-                            f.set_workspace(workspace, w, cx);
+                            let mut task = fixture.tasks[0].clone();
+                            task.repos.clear();
+                            f.set_task(task, w, cx);
                         }
                         cx.notify();
                     });
@@ -1244,12 +1240,8 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let state = fixture(&home);
-    fs::write(state.workspaces[0].dir().join("api/login.rs"), "retry();\n").unwrap();
-    fs::write(
-        state.workspaces[0].dir().join("api/other.rs"),
-        "original();\n",
-    )
-    .unwrap();
+    fs::write(state.tasks[0].dir().join("api/login.rs"), "retry();\n").unwrap();
+    fs::write(state.tasks[0].dir().join("api/other.rs"), "original();\n").unwrap();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     until(cx, window, |_, cx| {
@@ -1332,16 +1324,16 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let mut state = fixture(&home);
-    let ws = &mut state.workspaces[0];
+    let ws = &mut state.tasks[0];
     init_repo(&ws.dir().join("web"));
-    ws.repos.push(crate::state::WsRepo {
+    ws.repos.push(crate::state::TaskRepo {
         name: "web".into(),
         src: home.join("src/web"),
         base: "main".into(),
         branch: None,
     });
     let (_gh, dir) = fake_github(&home, &state, 1);
-    let web = state.workspaces[0].dir().join("web");
+    let web = state.tasks[0].dir().join("web");
     let mut second = pr_fixture(1);
     second["url"] = json!("https://github.com/acme/web/pull/9");
     second["number"] = json!(9);
@@ -1736,7 +1728,9 @@ async fn feature_rail_keys_clamp_and_focus_walks_feature_columns(cx: &mut TestAp
         assert_eq!(shark.read(cx).feature_sel, 0);
     })
     .unwrap();
-    press(cx, &["down", "down", "enter"]);
+    press(cx, &["down", "down", "down"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).feature_sel, 2, "clamps at the last feature"));
+    press(cx, &["up", "enter"]);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Git));
@@ -1781,12 +1775,12 @@ async fn inactive_git_write_blocks_close_and_archive(cx: &mut TestAppContext) {
         feature.update(cx, |g, cx| g.submit(w, cx));
         assert!(feature.read(cx).busy());
         shark.update(cx, |s, cx| {
-            s.open_workspace_now(1, w, cx);
+            s.open_task_now(1, w, cx);
             assert!(!s.storage_guard(true, w, cx));
             assert!(!s.close_window(w, cx));
-            s.remove_workspace("git-review", false, w, cx);
+            s.remove_task("git-review", false, w, cx);
             assert!(!s.archiving.contains("git-review"));
-            assert!(s.ws("git-review").is_some());
+            assert!(s.task("git-review").is_some());
         });
     })
     .unwrap();
@@ -1995,9 +1989,9 @@ async fn git_feature_slow_save_keeps_input_responsive_and_discard_ordered(cx: &m
     })
     .unwrap();
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.open_workspace_now(1, w, cx);
+        s.open_task_now(1, w, cx);
         assert!(!s.storage_guard(true, w, cx));
-        s.remove_workspace("git-review", false, w, cx);
+        s.remove_task("git-review", false, w, cx);
         assert!(!s.archiving.contains("git-review"));
     });
     cx.executor().advance_clock(Duration::from_secs(61));
@@ -2298,9 +2292,9 @@ fn png(w: u32, h: u32) -> Vec<u8> {
 
 fn history_fixture(home: &Path) -> (State, PathBuf, [String; 3]) {
     let mut state = fixture(home);
-    let wt = state.workspaces[0].dir().join("api");
+    let wt = state.tasks[0].dir().join("api");
     git::git(&wt, &["branch", "start"]).unwrap();
-    state.workspaces[0].repos[0].base = "start".into();
+    state.tasks[0].repos[0].base = "start".into();
     fs::create_dir_all(wt.join("docs")).unwrap();
     fs::write(
         wt.join("docs/readme.md"),
@@ -2598,12 +2592,12 @@ async fn git_commits_survive_rapid_switching_and_a_missing_base(cx: &mut TestApp
 
     // A missing base is an explicit error, never all of history.
     let ws = cx.update(|cx| {
-        let mut ws = b.shark.read(cx).active_ws().unwrap().clone();
+        let mut ws = b.shark.read(cx).active_task().unwrap().clone();
         ws.repos[0].base = "origin/nope".into();
         ws
     });
     cx.update_window(window, |_, w, cx| {
-        b.feature.update(cx, |g, cx| g.set_workspace(ws, w, cx))
+        b.feature.update(cx, |g, cx| g.set_task(ws, w, cx))
     })
     .unwrap();
     until(cx, window, |_, cx| {
@@ -3079,9 +3073,9 @@ async fn git_repo_switch_keeps_reply_draft_on_its_own_pr_thread(cx: &mut TestApp
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let mut state = fixture(&home);
-    let ws = &mut state.workspaces[0];
+    let ws = &mut state.tasks[0];
     init_repo(&ws.dir().join("web"));
-    ws.repos.push(crate::state::WsRepo {
+    ws.repos.push(crate::state::TaskRepo {
         name: "web".into(),
         src: home.join("src/web"),
         base: "main".into(),
@@ -3089,7 +3083,7 @@ async fn git_repo_switch_keeps_reply_draft_on_its_own_pr_thread(cx: &mut TestApp
     });
     let (_gh, api) = fake_github(&home, &state, 1);
     // Both PRs have a thread with the id `T_0`: drafts must be keyed by PR as well.
-    let web = state.workspaces[0].dir().join("web");
+    let web = state.tasks[0].dir().join("web");
     let mut second = pr_fixture(1);
     second["url"] = json!("https://github.com/acme/web/pull/9");
     second["number"] = json!(9);
