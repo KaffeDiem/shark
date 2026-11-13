@@ -6868,7 +6868,7 @@ dependencies = [
 
 [[package]]
 name = "shark"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "async-channel",
