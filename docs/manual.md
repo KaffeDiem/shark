@@ -94,7 +94,7 @@ Use **+ › Branch or pull request…** on Home to choose repositories and a bra
 
 ### Open a pull request from the browser
 
-Shark handles `shark://open?url=<pull request URL>` links. The Chrome extension in `extensions/chrome` adds an **Open in Shark** toolbar button for GitHub pull request pages: load the folder unpacked at `chrome://extensions` with Developer mode on. The PR's repository must be registered in Shark. The task that has the PR opens, whether it created the PR or checked it out. Otherwise Shark starts a `pr/<number>` task on the PR, as **Branch or pull request…** would. Note: links reach the installed `Shark.app`; `cargo run` builds don't register the scheme.
+Shark handles `shark://open?url=<pull request URL>` links. The Chrome extension in `extensions/chrome` adds an **Open in Shark** button to github.com pull request headers, and a toolbar button for any GitHub host: load the folder unpacked at `chrome://extensions` with Developer mode on. The PR's repository must be registered in Shark. The task that has the PR opens, whether it created the PR or checked it out. Otherwise Shark starts a `pr/<number>` task on the PR, as **Branch or pull request…** would. Note: links reach the installed `Shark.app`; `cargo run` builds don't register the scheme.
 
 Repository chips in the task header show branch and attachment state. Hover for the path, base and stack position. Their menus contain PR and branch actions, **Reveal in Finder**, **Open in** and path copying. The available external apps come from those installed on your Mac; multiple repositories or projects get a picker.
 
