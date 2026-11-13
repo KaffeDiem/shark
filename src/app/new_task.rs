@@ -830,6 +830,7 @@ impl NewTaskForm {
                             number: pr.number,
                             url: pr.url.clone(),
                             base: pr.base_ref_name.clone(),
+                            head: pr.head_ref_name.clone(),
                         }),
                         (_, Some(branch)) => BranchSpec::Existing(branch.clone()),
                         _ => BranchSpec::New {
@@ -903,6 +904,7 @@ impl NewTaskForm {
                         number: pr.number,
                         url: pr.url.clone(),
                         base: pr.base_ref_name.clone(),
+                        head: pr.head_ref_name.clone(),
                     },
                 ))
             })

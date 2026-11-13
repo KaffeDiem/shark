@@ -659,6 +659,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
         number: 7,
         url: "https://github.com/o/upstream/pull/7".into(),
         base: "release".into(),
+        head: String::new(),
     };
     let picked = [(repo.clone(), "pr/7".into())];
     let prs = [(repo.name.clone(), pr.clone())];
@@ -702,6 +703,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
             number: 404,
             url: "https://github.com/o/upstream/pull/404".into(),
             base: "release".into(),
+            head: String::new(),
         },
     )];
     let failed = root.join("ws/missing");
@@ -799,6 +801,7 @@ fn review_base_refresh_follows_target_and_preserves_worktree() {
         number: 7,
         url: "https://github.com/o/upstream/pull/7".into(),
         base: "release".into(),
+        head: String::new(),
     };
     let dir = root.join("ws/review");
     let ws = create_task_with_prs(
@@ -1720,6 +1723,7 @@ fn pr_remote_matches_origin_case_insensitively() {
         number: 3,
         url: url.into(),
         base: "main".into(),
+        head: String::new(),
     };
     let same = pr("https://github.com/owner/repo/pull/3");
     assert_eq!(pr_remote(&repo.path, &same).unwrap(), "origin");
@@ -2144,4 +2148,24 @@ fn draft_sources_mix_new_base_and_existing_branch() {
     assert!(retry.contains("already exists"), "{retry}");
     assert!(!dir.exists());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pr_head_ref_is_the_source_branch_on_azure() {
+    let pr = |url: &str, head: &str| PullRequest {
+        number: 7,
+        url: url.into(),
+        base: "main".into(),
+        head: head.into(),
+    };
+    let dir = std::env::temp_dir();
+    let github = pr("https://github.com/o/r/pull/7", "");
+    assert_eq!(pr_head_ref(&dir, &github).unwrap(), "refs/pull/7/head");
+    let azure = pr(
+        "https://dev.azure.com/o/p/_git/r/pullrequest/7",
+        "feature/x",
+    );
+    assert_eq!(pr_head_ref(&dir, &azure).unwrap(), "refs/heads/feature/x");
+    let bad = pr("https://dev.azure.com/o/p/_git/r/pullrequest/7", "a..b");
+    assert!(pr_head_ref(&dir, &bad).is_err());
 }

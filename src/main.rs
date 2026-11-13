@@ -2,6 +2,7 @@ mod agent_icon;
 mod app;
 mod apps;
 mod attention;
+mod azure;
 mod chat;
 mod checkbox;
 mod codex;

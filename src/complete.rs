@@ -574,6 +574,7 @@ pub fn pr_items(prs: &[Pr]) -> Vec<Item> {
                         number: p.number,
                         url: p.url.clone(),
                         base: p.base_ref_name.clone(),
+                        head: p.head_ref_name.clone(),
                     },
                 }),
                 insert: p.url.clone(),
