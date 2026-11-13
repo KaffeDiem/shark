@@ -38,6 +38,7 @@ release:
 	plutil -insert LSMinimumSystemVersion -string 11.0 $(APP)/Contents/Info.plist
 	plutil -insert NSHighResolutionCapable -bool YES $(APP)/Contents/Info.plist
 	plutil -insert NSHumanReadableCopyright -string "© Kasper Munch Jensen. GPL-3.0." $(APP)/Contents/Info.plist
+	plutil -insert CFBundleURLTypes -json '[{"CFBundleURLName":"io.github.kaffediem.shark","CFBundleURLSchemes":["shark"]}]' $(APP)/Contents/Info.plist
 	cp LICENSE $(APP)/Contents/Resources/LICENSE
 	@test -n "$(GOPLS_VERSION)" && test -f target/language-tools/gopls/$(GOPLS_VERSION)/gopls || (echo "Run scripts/build-gopls.sh before make release"; exit 1)
 	mkdir -p $(GOPLS)

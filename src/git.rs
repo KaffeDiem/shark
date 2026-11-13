@@ -759,25 +759,34 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
         src,
         &["check-ref-format", &format!("refs/heads/{}", pr.base)],
     )?;
+    Ok(if origin_is(src, &t) {
+        "origin".into()
+    } else {
+        format!("https://{}/{}/{}.git", t.host, t.owner, t.repo)
+    })
+}
+
+/// Whether `src`'s origin is the PR's repository, in its https, scp-style or ssh form. Both
+/// the configured URL and its `insteadOf` expansion count: an alias expands to GitHub, and a
+/// GitHub URL may be rewritten to a mirror.
+pub fn origin_is(src: &Path, t: &crate::pr::Target) -> bool {
     let (host, repo) = (&t.host, format!("{}/{}", t.owner, t.repo));
-    let remote = format!("https://{host}/{repo}.git");
-    let origin = git(src, &["remote", "get-url", "origin"]).unwrap_or_default();
     // GitHub owners and repo names are case-insensitive.
-    let origin = origin
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_ascii_lowercase();
-    let matching_origin = [
+    let forms = [
         format!("https://{host}/{repo}"),
         format!("git@{host}:{repo}"),
         format!("ssh://git@{host}/{repo}"),
     ]
+    .map(|f| f.to_ascii_lowercase());
+    [
+        ["config", "--get", "remote.origin.url"],
+        ["remote", "get-url", "origin"],
+    ]
     .iter()
-    .any(|c| c.to_ascii_lowercase() == origin);
-    Ok(if matching_origin {
-        "origin".into()
-    } else {
-        remote
+    .filter_map(|args| git(src, args).ok())
+    .any(|url| {
+        let url = url.trim_end_matches('/').trim_end_matches(".git");
+        forms.contains(&url.to_ascii_lowercase())
     })
 }
 

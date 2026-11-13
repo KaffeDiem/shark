@@ -92,6 +92,10 @@ Each repository gets its own git worktree. The combined diff, PR links and merge
 
 Use **+ › Branch or pull request…** on Home to choose repositories and a branch or PR for the draft. In the branch/PR picker, `enter` selects the highlighted entry and `alt-enter` uses it as the base of a new branch; only **Start** creates the task. **New task from branch or PR…** in the command palette opens Home's composer with this picker. New branches already checked out elsewhere are refused; Shark does not reuse another task's worktree. Gitignored files matching `.worktreeinclude` are copied into new worktrees; the default pattern is `.env*`.
 
+### Open a pull request from the browser
+
+Shark handles `shark://open?url=<pull request URL>` links. The Chrome extension in `extensions/chrome` adds an **Open in Shark** toolbar button for GitHub pull request pages: load the folder unpacked at `chrome://extensions` with Developer mode on. The PR's repository must be registered in Shark. The task that has the PR opens, whether it created the PR or checked it out. Otherwise Shark starts a `pr/<number>` task on the PR, as **Branch or pull request…** would. Note: links reach the installed `Shark.app`; `cargo run` builds don't register the scheme.
+
 Repository chips in the task header show branch and attachment state. Hover for the path, base and stack position. Their menus contain PR and branch actions, **Reveal in Finder**, **Open in** and path copying. The available external apps come from those installed on your Mac; multiple repositories or projects get a picker.
 
 ### Attach a repository

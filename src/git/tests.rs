@@ -1728,6 +1728,36 @@ fn pr_remote_matches_origin_case_insensitively() {
         pr_remote(&repo.path, &other).unwrap(),
         "https://github.com/owner/fork.git"
     );
+    // An alias origin matches through its `insteadOf` expansion; a rewritten GitHub URL
+    // (a local mirror) still matches as configured.
+    git(
+        &repo.path,
+        &["remote", "set-url", "origin", "gh:owner/repo"],
+    )
+    .unwrap();
+    git(
+        &repo.path,
+        &["config", "url.git@github.com:.insteadOf", "gh:"],
+    )
+    .unwrap();
+    assert_eq!(pr_remote(&repo.path, &same).unwrap(), "origin");
+    let mirror = format!("url.{}.insteadOf", root.join("mirror").display());
+    git(
+        &repo.path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/owner/repo",
+        ],
+    )
+    .unwrap();
+    git(
+        &repo.path,
+        &["config", &mirror, "https://github.com/owner/repo"],
+    )
+    .unwrap();
+    assert_eq!(pr_remote(&repo.path, &same).unwrap(), "origin");
     fs::remove_dir_all(root).unwrap();
 }
 
