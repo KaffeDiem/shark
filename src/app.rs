@@ -39,6 +39,7 @@ mod app_switcher;
 mod ask;
 mod attach;
 mod chats;
+mod deep_link;
 mod differ_host;
 mod draft_picker;
 mod draft_view;

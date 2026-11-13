@@ -591,49 +591,65 @@ fn main() {
     }
     // LaunchServices and the icons take a moment; the first menu shouldn't wait for them.
     std::thread::spawn(apps::installed);
-    application()
-        .with_assets(gpui_kit::assets::AllAssets)
-        .run(|cx| {
-            cx.set_app_identity("io.github.kaffediem.shark", "Shark");
-            set_dock_icon();
-            gpui_kit::init(cx);
-            cx.on_app_quit(|_| async {
-                harness::stop_all();
-                lsp::client::Client::terminate_all().await
-            })
-            .detach();
-            install_fonts(cx);
-            bind_keys(cx);
-            menubar::init(cx);
-            let options = WindowOptions {
-                app_owns_titlebar_drag: true,
-                window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
-                titlebar: Some(TitlebarOptions {
-                    traffic_light_position: Some(point(px(9.), px(15.))),
-                    ..TitleBar::title_bar_options()
-                }),
-                ..Default::default()
-            };
-            let (window, shark) = open_window(options, cx, |window, cx| {
-                cx.new(|cx| app::Shark::new(window, cx))
-            })
-            .unwrap();
-            // Global, not on Shark's root: an open dialog isn't inside Shark, and quitting
-            // from it must still confirm unsaved edits. Deferred, like `menubar::in_window`.
-            let shark = shark.downgrade();
-            cx.on_action(move |_: &menubar::Quit, cx| {
-                let shark = shark.clone();
-                cx.defer(move |cx| {
-                    let asked = window.update(cx, |_, w, cx| {
-                        shark.update(cx, |s, cx| s.quit_or_warn(w, cx))
-                    });
-                    if !matches!(asked, Ok(Ok(()))) {
-                        cx.quit()
-                    }
+    // `shark://` links (the browser extension) arrive on the app delegate without an `App`;
+    // the channel carries them to the window, buffering those that launched Shark.
+    let (links_tx, links_rx) = async_channel::unbounded::<String>();
+    let app = application().with_assets(gpui_kit::assets::AllAssets);
+    app.on_open_urls(move |urls| urls.into_iter().for_each(|u| _ = links_tx.try_send(u)));
+    app.run(move |cx| {
+        cx.set_app_identity("io.github.kaffediem.shark", "Shark");
+        set_dock_icon();
+        gpui_kit::init(cx);
+        cx.on_app_quit(|_| async {
+            harness::stop_all();
+            lsp::client::Client::terminate_all().await
+        })
+        .detach();
+        install_fonts(cx);
+        bind_keys(cx);
+        menubar::init(cx);
+        let options = WindowOptions {
+            app_owns_titlebar_drag: true,
+            window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                traffic_light_position: Some(point(px(9.), px(15.))),
+                ..TitleBar::title_bar_options()
+            }),
+            ..Default::default()
+        };
+        let (window, shark) = open_window(options, cx, |window, cx| {
+            cx.new(|cx| app::Shark::new(window, cx))
+        })
+        .unwrap();
+        // Global, not on Shark's root: an open dialog isn't inside Shark, and quitting
+        // from it must still confirm unsaved edits. Deferred, like `menubar::in_window`.
+        let shark = shark.downgrade();
+        let links = shark.clone();
+        cx.on_action(move |_: &menubar::Quit, cx| {
+            let shark = shark.clone();
+            cx.defer(move |cx| {
+                let asked = window.update(cx, |_, w, cx| {
+                    shark.update(cx, |s, cx| s.quit_or_warn(w, cx))
                 });
+                if !matches!(asked, Ok(Ok(()))) {
+                    cx.quit()
+                }
             });
-            cx.activate(true);
         });
+        cx.spawn(async move |cx| {
+            while let Ok(link) = links_rx.recv().await {
+                cx.update(|cx| {
+                    cx.activate(true);
+                    let _ = window.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        links.update(cx, |s, cx| s.open_link(&link, window, cx))
+                    });
+                });
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
 }
 
 #[cfg(all(test, feature = "test-support"))]

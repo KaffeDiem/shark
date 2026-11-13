@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Open in Shark",
+  "version": "1.0",
+  "description": "Opens the current GitHub pull request in Shark: its existing task, or a new one.",
+  "permissions": ["activeTab", "scripting"],
+  "action": {
+    "default_title": "Open in Shark",
+    "default_icon": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "background": { "service_worker": "background.js" }
+}
