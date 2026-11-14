@@ -40,6 +40,14 @@ pub fn init(cx: &mut App) {
     cx.set_menus(menus());
 }
 
+/// Makes the menu read Resume Team while the team on screen is paused. Cheap to call often.
+pub fn sync(team_paused: bool, cx: &mut App) {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SHOWN.swap(team_paused, std::sync::atomic::Ordering::Relaxed) != team_paused {
+        cx.set_menus(menus_for(team_paused));
+    }
+}
+
 /// Deferred: action handlers run inside the window's update, which can't be re-entered.
 fn in_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut App) + 'static) {
     if let Some(window) = cx.active_window() {
@@ -58,6 +66,10 @@ fn menu(name: &'static str, items: Vec<MenuItem>) -> Menu {
 }
 
 pub fn menus() -> Vec<Menu> {
+    menus_for(false)
+}
+
+fn menus_for(team_paused: bool) -> Vec<Menu> {
     let sep = MenuItem::separator;
     vec![
         menu(
@@ -89,6 +101,18 @@ pub fn menus() -> Vec<Menu> {
                 sep(),
                 MenuItem::action("Add Repo…", AddRepo),
                 MenuItem::action("Attach Repository…", AddRepoToTask),
+                sep(),
+                MenuItem::action("New Team…", NewTeam),
+                MenuItem::action("Give Goal to…", GiveGoal),
+                MenuItem::action(
+                    if team_paused {
+                        "Resume Team"
+                    } else {
+                        "Pause Team"
+                    },
+                    PauseTeam,
+                ),
+                MenuItem::action("Open Team…", OpenTeam),
                 sep(),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::action("Close Chat", CloseChat),

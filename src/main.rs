@@ -37,6 +37,7 @@ mod stack;
 mod state;
 mod sync;
 mod task_composer;
+mod team;
 mod theme;
 mod title;
 mod transcript;
@@ -185,6 +186,20 @@ actions!(
 // The Git conversation (src/features/git/mod.rs): `e`, `r` and `c` on the cursor.
 actions!(shark, [EditDescription, ReplyToThread, CommentOnPr]);
 
+// Teams: the palette's Teams group, and `1` `2` `3` on a team's page.
+actions!(
+    shark,
+    [
+        NewTeam,
+        GiveGoal,
+        PauseTeam,
+        OpenTeam,
+        TeamGoals,
+        TeamAgents,
+        TeamActivity
+    ]
+);
+
 // The Artifacts list: `a`, `p`, `r`, cmd-c, cmd-backspace and cmd-f.
 actions!(
     shark,
@@ -265,14 +280,14 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str = "(Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || ArtifactsFeature || VimNormal) && !TaskPeek";
+    const NAV: &str = "(Sidebar || Home || TeamList || GoalList || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || ArtifactsFeature || VimNormal) && !TaskPeek";
     const TREE: &str = "(FileTree || Sidebar) && !TaskPeek";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "(Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || ArtifactsFeature || Features) && !TaskPeek";
-    const ARROWS: &str = "(Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (ArtifactsFeature && !Input) || (Diff && !Vim)) && !TaskPeek";
+    const MOVE: &str = "(Sidebar || Home || TeamList || GoalList || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || ArtifactsFeature || Features) && !TaskPeek";
+    const ARROWS: &str = "(Sidebar || Home || TeamList || GoalList || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (ArtifactsFeature && !Input) || (Diff && !Vim)) && !TaskPeek";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -292,6 +307,9 @@ fn bind_keys(cx: &mut App) {
         // Home: esc goes back to the task (or stops an Ask Shark answer); tab switches
         // the prompt between new task and Ask Shark; i/a jump from the list to it.
         KeyBinding::new("escape", CancelEdit, Some("HomeView && !Input")),
+        // A team's page, as Home; the goal list closes its peek card.
+        KeyBinding::new("escape", CancelEdit, Some("TeamPage && !Input")),
+        KeyBinding::new("escape", CancelEdit, Some("GoalList")),
         KeyBinding::new(
             "i",
             FocusComposer,
@@ -311,8 +329,12 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "space",
             TogglePeek,
-            Some("(Sidebar || (Home && !Input)) && !TaskPeek"),
+            Some("(Sidebar || ((Home || TeamList || GoalList) && !Input)) && !TaskPeek"),
         ),
+        // A team's page: its three views.
+        KeyBinding::new("1", TeamGoals, Some("TeamList && !Input")),
+        KeyBinding::new("2", TeamAgents, Some("TeamList && !Input")),
+        KeyBinding::new("3", TeamActivity, Some("TeamList && !Input")),
         KeyBinding::new("escape", CancelEdit, Some("Sidebar")),
         KeyBinding::new("cmd-d", PasteAgentIcon, Some("AgentEditor")),
         KeyBinding::new("b", ToggleBacklog, Some("Sidebar || (Home && !Input)")),
@@ -376,7 +398,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "enter",
             Confirm,
-            Some("(Sidebar || Home || Transcript || FileTree || Queue || Features) && !TaskPeek"),
+            Some("(Sidebar || Home || TeamList || GoalList || Transcript || FileTree || Queue || Features) && !TaskPeek"),
         ),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),
@@ -621,6 +643,11 @@ fn main() {
             cx.new(|cx| app::Shark::new(window, cx))
         })
         .unwrap();
+        // The menu bar's Pause Team reads Resume Team while the shown team is paused.
+        cx.observe(&shark, |s, cx| {
+            menubar::sync(s.read(cx).shown_team_paused(), cx)
+        })
+        .detach();
         // Global, not on Shark's root: an open dialog isn't inside Shark, and quitting
         // from it must still confirm unsaved edits. Deferred, like `menubar::in_window`.
         let shark = shark.downgrade();

@@ -24,6 +24,15 @@ belong to this change. Never commit secrets or build output; if such files show 
 `git pull --rebase origin {branch}` and push again.",
     },
     Prompt {
+        id: "team_commit",
+        title: "Commit a goal's task",
+        repos: "repos of the finished task",
+        default: "Your task is finished. Commit its changes locally in: {repos}. In each repo review the diff and stage \
+the files that belong to this task. Never commit secrets or build output; if such files show up, add them to \
+.gitignore instead. Write a concise commit message in the repo's style and commit on `{branch}`. Do not push \
+and do not open a pull request: the user does that. Leave the worktree clean, then reply with the commit hashes.",
+    },
+    Prompt {
         id: "conflicts",
         title: "Resolve conflicts",
         repos: "repos with unresolved conflicts",

@@ -5,6 +5,17 @@ use super::*;
 use crate::chat::HandoffTarget;
 use crate::menu::Entry;
 
+/// Writes chat `id`'s transcript (and plan, if any) to the task's attachments as
+/// `<title> transcript.md`; returns its path in the task. Reads from disk, so off the UI thread.
+pub(super) fn write_transcript(dir: &Path, id: &str, title: &str) -> Result<String, String> {
+    let plan = crate::plan::handoff_text(id);
+    let path = crate::transcript::transcript_path(id);
+    let md = crate::transcript::markdown(&path, title, plan.as_deref())
+        .ok_or("this chat's transcript couldn't be read")?;
+    let file = crate::complete::file_name(title);
+    crate::complete::attach_bytes(dir, &format!("{file} transcript.md"), md.as_bytes())
+}
+
 impl Shark {
     /// The next agent of the chat's agent, for the bar after a finished turn.
     pub(super) fn handoff_target(&self, meta: &ChatMeta) -> Option<HandoffTarget> {
@@ -211,22 +222,13 @@ impl Shark {
         };
         let (dir, task, to, fast) = (ws.dir(), task.to_string(), to.to_string(), source.fast);
         let instance = ws.instance_id.clone();
-        let file = crate::complete::file_name(&title);
         let written = cx.background_executor().spawn(async move {
-            let plan = crate::plan::handoff_text(&source.id);
-            let md = crate::transcript::markdown(
-                &crate::transcript::transcript_path(&source.id),
-                &title,
-                plan.as_deref(),
-            )
-            .ok_or("this chat's transcript couldn't be read")?;
-            crate::complete::attach_bytes(&dir, &format!("{file} transcript.md"), md.as_bytes())
-                .map(|path| {
-                    // A second handoff of the same chat gets `… transcript (1).md`.
-                    let name = std::path::Path::new(&path).file_name().unwrap_or_default();
-                    let label = name.to_string_lossy().into_owned();
-                    (path, label)
-                })
+            write_transcript(&dir, &source.id, &title).map(|path| {
+                // A second handoff of the same chat gets `… transcript (1).md`.
+                let name = std::path::Path::new(&path).file_name().unwrap_or_default();
+                let label = name.to_string_lossy().into_owned();
+                (path, label)
+            })
         });
         cx.spawn_in(window, async move |this, cx| {
             let written = written.await;

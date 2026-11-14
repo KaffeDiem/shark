@@ -474,6 +474,16 @@ impl GitSync {
         r.pr = answer.map(|a| a.map(|()| None));
     }
 
+    /// Puts every repo on its own branch with nothing else known, as a first probe would.
+    #[cfg(all(test, feature = "test-support"))]
+    pub fn set_on_branch(&mut self) {
+        for r in &mut self.repos {
+            if let Ok(local) = &mut r.local {
+                local.branch = Some(r.branch.clone());
+            }
+        }
+    }
+
     /// Gives `repo` open PR `number`, whose head is ours when `pushed`.
     #[cfg(all(test, feature = "test-support"))]
     pub fn set_pr(&mut self, repo: &str, number: u64, pushed: bool) {

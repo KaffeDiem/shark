@@ -14,6 +14,8 @@ pub(super) const NEEDS_REPO: &str = "This task has no repository, so it stays in
     one to build.";
 pub(super) const ATTACHING: &str = "A repository is still attaching or needs a decision in the \
     header, so this agent can't build yet.";
+pub(super) const GOAL_LOCKED: &str = "A goal's lead stays in Plan mode: it plans and summarises, and \
+    the team's agents build. Approve the plan to start its tasks.";
 pub(super) const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
     have none of that chat's context: read the code it touches before you change it.";
 
@@ -58,6 +60,10 @@ impl Chat {
     /// through here. Says what's missing and has the app offer Attach repository. Returns
     /// whether it refused.
     pub fn refuse_unready(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ws.goal.is_some() {
+            self.push(Block::Info(GOAL_LOCKED.into()), cx);
+            return true;
+        }
         let refused = !self.ws.ready();
         if refused && !self.ws.attaching.is_empty() {
             self.push(Block::Info(ATTACHING.into()), cx);
@@ -99,6 +105,9 @@ impl Chat {
             why
         } else if self.busy {
             "the agent is still working; approve when the turn ends (ctrl-c stops it)"
+        } else if self.ws.goal.is_some() {
+            // Approve and start: the app runs the plan; nothing is sent and plan mode stays.
+            return cx.emit(ChatEvent::ApproveGoal);
         } else if self.refuse_unready(cx) {
             return;
         } else {

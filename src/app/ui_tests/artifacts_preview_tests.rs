@@ -1,11 +1,9 @@
 //! The Artifacts preview pane on its own: one file, drawn by type.
-use super::UI_LOCK;
+// Through `super`, as the other UI tests: a `gpui_kit::*` glob beside the builtin `test` is
+// ambiguous under the rendering harness (`tests/rendering.rs`).
+use super::*;
 use crate::features::artifacts::preview::{Content, Preview};
 use crate::media::Lru;
-use core::prelude::v1::test;
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::*;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::SystemTime;
 

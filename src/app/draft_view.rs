@@ -196,6 +196,10 @@ impl Shark {
                         self.home.draft.repos =
                             TaskDraft::for_agent(&self.state, slug.as_deref()).repos;
                     }
+                    // An `@agent` typed over a picked team takes its place.
+                    if slug.is_some() {
+                        self.home.draft_team = None;
+                    }
                     self.home.draft_agent = slug;
                     self.refresh_draft_sources(cx);
                 }
@@ -230,6 +234,8 @@ impl Shark {
         let prompt = self.home.prompt.clone();
         let placeholder = if self.home.asking {
             "Ask how to do something in Shark".into()
+        } else if self.draft_for_team() {
+            "Describe the goal; enter starts planning".into()
         } else if let Some(issue) = self.home.draft.issues.first() {
             format!("Add notes, or press Enter to plan {}", issue.identifier)
         } else if let Some(a) = self.home.draft_agent.as_deref().and_then(|s| self.agent(s)) {
@@ -251,6 +257,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.draft_for_team() {
+            return;
+        }
         let draft = &mut self.home.draft;
         if draft.starting {
             return;
@@ -374,7 +383,11 @@ impl Shark {
     }
 
     pub(super) fn draft_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.home_shown() || self.home.draft.starting || self.home.asking {
+        if !self.home_shown()
+            || self.home.draft.starting
+            || self.home.asking
+            || self.draft_for_team()
+        {
             return;
         }
         self.draft_add_picker(self.draft_control_position("draft-add", window), window, cx);
@@ -389,7 +402,11 @@ impl Shark {
     }
 
     pub(super) fn change_draft_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.home_shown() || self.home.draft.starting || self.home.asking {
+        if !self.home_shown()
+            || self.home.draft.starting
+            || self.home.asking
+            || self.draft_for_team()
+        {
             return;
         }
         let draft = &self.home.draft;
@@ -468,7 +485,7 @@ impl Shark {
     }
 
     pub(super) fn toggle_draft_plan(&mut self, cx: &mut Context<Self>) {
-        if self.home.asking {
+        if self.home.asking || self.draft_for_team() {
             return;
         }
         let draft = &mut self.home.draft;
@@ -520,7 +537,7 @@ impl Shark {
     }
 
     pub(super) fn draft_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home.draft.starting || self.home.asking {
+        if self.home.draft.starting || self.home.asking || self.draft_for_team() {
             return;
         }
         let (model, effort) = self
@@ -671,6 +688,32 @@ impl Shark {
         cx.notify();
     }
 
+    /// Whether the draft gives a goal to a team instead of starting a task: a picked team
+    /// that still exists.
+    pub(super) fn draft_for_team(&self) -> bool {
+        (self.home.draft_team.as_deref()).is_some_and(|s| self.team(s).is_some())
+    }
+
+    /// Enter with a team picked: its lead starts planning the prompt as a goal. The prompt and
+    /// the pick clear once the goal is being created; the open task stays as it is.
+    pub(super) fn give_draft_goal(
+        &mut self,
+        slug: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.home.prompt.read(cx).value().trim().to_string();
+        let creating = self.creating.len();
+        self.give_goal(slug, &text, window, cx);
+        if self.creating.len() > creating {
+            self.home.draft_team = None;
+            self.home
+                .prompt
+                .update(cx, |p, cx| p.set_value("", window, cx));
+            self.focus_draft(window, cx);
+        }
+    }
+
     pub(super) fn pick_draft_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -694,6 +737,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.draft_for_team() {
+            return;
+        }
         let draft = &mut self.home.draft;
         if draft.starting {
             return;
@@ -888,6 +934,10 @@ impl Shark {
 
     pub(super) fn draft_chip_stops(&self) -> Vec<DraftStop> {
         let draft = &self.home.draft;
+        // A goal takes only its team: no repositories, issues or files.
+        if self.draft_for_team() {
+            return vec![DraftStop::Agent];
+        }
         std::iter::once(DraftStop::Agent)
             .chain(
                 draft
@@ -907,6 +957,9 @@ impl Shark {
 
     pub(super) fn draft_stops(&self) -> Vec<DraftStop> {
         let chips = self.draft_chip_stops();
+        if self.draft_for_team() {
+            return chips;
+        }
         let mut visible: Vec<_> = chips.iter().take(self.home.tray_shown).cloned().collect();
         if visible.len() < chips.len() {
             visible.push(DraftStop::More);
@@ -1127,6 +1180,7 @@ impl Shark {
             self.home.tray_focus.is_focused(window) && self.home.tray_stop.as_ref() == Some(stop)
         };
         let quiet = self.menu.is_some() || self.draft_picker.is_some();
+        let team = self.home.draft_team.as_deref().and_then(|s| self.team(s));
         let mut chips = Vec::new();
         let mut first_chip = None;
         if !asking {
@@ -1135,10 +1189,15 @@ impl Shark {
                 .draft_agent
                 .as_deref()
                 .and_then(|slug| self.agent(slug));
-            let label = picked.map_or("Agent", |a| a.name.as_str()).to_string();
+            let label = match (team, picked) {
+                (Some(t), _) => t.name.clone(),
+                (_, Some(a)) => a.name.clone(),
+                _ => "Agent".into(),
+            };
             first_chip = Some((IconName::AtSign, label.clone()));
-            let button = match picked {
-                Some(a) => Button::new("home-agent-picker")
+            let identity = team.map(|t| &t.icon).or(picked.map(|a| &a.icon));
+            let button = match identity {
+                Some(icon) => Button::new("home-agent-picker")
                     .ghost()
                     .flex_none()
                     .h(px(26.))
@@ -1149,15 +1208,21 @@ impl Shark {
                     .child(
                         h_flex()
                             .gap_1p5()
-                            .child(super::agent_icon_view::agent_icon(&a.icon))
+                            .child(super::agent_icon_view::agent_icon(icon))
                             .child(div().min_w_0().truncate().child(label.clone())),
                     ),
                 None => draft_chip("home-agent-picker", IconName::AtSign, label.clone())
                     .text_color(theme.muted_foreground),
             };
             let button = button
-                .accessibility_label(label)
-                .tooltip("Pick an agent, or type @")
+                .accessibility_label(match team {
+                    Some(_) => format!("Team {label}"),
+                    None => label,
+                })
+                .tooltip(match team {
+                    Some(_) => "Pick an agent or team",
+                    None => "Pick an agent or team, or type @",
+                })
                 .disabled(draft.starting)
                 .selected(selected(&DraftStop::Agent))
                 .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx)));
@@ -1166,7 +1231,7 @@ impl Shark {
                 crate::ui::toolbar("home-agent-picker", button),
             ));
         }
-        if !asking {
+        if !asking && team.is_none() {
             for (i, repo) in draft.repos.iter().enumerate() {
                 let stop = DraftStop::Repo(repo.repo.name.clone());
                 let changed = default_agent.is_some_and(|a| !a.repos.contains(&repo.repo.name));
@@ -1334,6 +1399,8 @@ impl Shark {
                     "Adding files…"
                 } else if draft.starting {
                     "Starting…"
+                } else if team.is_some() {
+                    "Give goal ↵"
                 } else {
                     "Start ↵"
                 })
@@ -1357,7 +1424,9 @@ impl Shark {
             .gap_1()
             .track_focus(&self.home.tray_focus)
             .on_key_down(cx.listener(|s, e, w, cx| s.draft_tray_key(e, w, cx)));
-        if !asking {
+        if team.is_some() {
+            footer = footer.children(chips).child(div().flex_1());
+        } else if !asking {
             let disconnected = draft
                 .issues
                 .iter()
