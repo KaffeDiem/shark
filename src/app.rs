@@ -46,6 +46,7 @@ mod draft_view;
 mod editor_pane;
 mod features;
 mod file_changes;
+mod goal;
 mod handoff;
 mod home;
 mod icon_picker;
@@ -72,6 +73,11 @@ mod task;
 mod task_draft;
 mod task_facts;
 mod task_picker;
+mod team;
+mod team_agents;
+mod team_look;
+mod team_page;
+mod team_settings;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
 mod usage;
@@ -86,6 +92,8 @@ use sidebar::{SideRow, move_submenu};
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
     Chat,
+    /// A goal task's first tab: its plan as tasks (`goal.rs`).
+    Goal,
     Feature(Feature),
     /// The full-width file editor; only while `editor` is set.
     File,
@@ -98,6 +106,8 @@ enum Pane {
     Chat,
     /// The chat's plan pane, right of its transcript.
     Plan,
+    /// The Goal tab's task list.
+    Goal,
     Feature(Feature, FeatureFocus),
     Editor,
     Features,
@@ -194,9 +204,18 @@ pub struct Shark {
     /// When the last dependency check started.
     deps_at: Option<std::time::Instant>,
     pub(crate) home: home::Home,
+    /// The team whose page is shown, a destination like Home: `home.on` is set with it.
+    team_page: Option<team_page::TeamPage>,
+    /// The Goal tab's list, and the row under its cursor by key.
+    goal_focus: FocusHandle,
+    goal_sel: Option<String>,
+    /// The goal whose brief shows in full on its tab; the others show three lines.
+    goal_brief: Option<String>,
     linear: linear_connection::Linear,
     /// Running run scripts by task (cmd-r); dropping one stops them.
     runs: HashMap<String, crate::scripts::Running>,
+    /// Looks for goal work to start while nothing else reports in (`advance_goals`).
+    _goal_tick: Option<gpui_kit::Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -249,6 +268,16 @@ impl Shark {
                 }
             }
             s.restore_last_open(window, cx);
+            // No turn survives a restart: rows that were mid-turn settle before anything starts.
+            s.settle_goals(window, cx);
+            s._goal_tick = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(team::TICK).await;
+                    if this.update_in(cx, |s, w, cx| s.advance_goals(w, cx)).is_err() {
+                        break;
+                    }
+                }
+            }));
             if !s.home_shown() {
                 s.refresh_home(None, cx);
             }
@@ -415,7 +444,12 @@ impl Shark {
             linear: Default::default(),
             deps_at: None,
             home,
+            team_page: None,
+            goal_focus: cx.focus_handle(),
+            goal_sel: None,
+            goal_brief: None,
             runs: HashMap::new(),
+            _goal_tick: None,
             _subs,
         }
     }
@@ -516,6 +550,7 @@ impl Shark {
             self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
+        self.team_page = None;
         // Turns that ended under Home are seen now.
         if let (true, Some(name)) = (self.home.on, &self.active) {
             self.attn.opened(name);
@@ -534,6 +569,10 @@ impl Shark {
                     focus.focus(window, cx);
                 }
             }
+            Tab::Goal => match self.active_task().is_some_and(|t| t.goal.is_some()) {
+                true => self.goal_focus.focus(window, cx),
+                false => return self.show(Tab::Chat, window, cx),
+            },
             Tab::Feature(feature) => self.activate_feature(feature, window, cx),
             Tab::File => match &self.editor {
                 Some(e) => crate::editor::focus(e, window, cx),
@@ -594,6 +633,7 @@ impl Shark {
                     v.push(Pane::Plan);
                 }
             }
+            Tab::Goal => v.push(Pane::Goal),
             Tab::Feature(feature) => v.extend(
                 self.feature_focus_targets(feature, cx)
                     .into_iter()
@@ -614,6 +654,9 @@ impl Shark {
         if self.right_rail_shown() && self.features_focus.is_focused(window) {
             return Some(Pane::Features);
         }
+        if self.team_shown().is_some() {
+            return self.team_page_focused(window, cx).then_some(Pane::Home);
+        }
         if self.home_shown() {
             return self.home.has_focus(window, cx).then_some(Pane::Home);
         }
@@ -621,6 +664,9 @@ impl Shark {
             return self
                 .focused_feature(feature, window, cx)
                 .map(|target| Pane::Feature(feature, target));
+        }
+        if self.tab == Tab::Goal {
+            return (self.goal_focus.contains_focused(window, cx)).then_some(Pane::Goal);
         }
         if self
             .editor
@@ -646,7 +692,9 @@ impl Shark {
         match pane {
             Pane::Sidebar => self.sidebar_focus.focus(window, cx),
             Pane::Features => self.features_focus.focus(window, cx),
+            Pane::Home if self.team_shown().is_some() => self.focus_team_page(window, cx),
             Pane::Home => self.home.focus.focus(window, cx),
+            Pane::Goal => self.goal_focus.focus(window, cx),
             Pane::Feature(feature, target) => self.focus_feature(feature, target, window, cx),
             Pane::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -820,6 +868,9 @@ impl Shark {
     }
 
     fn render_main(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.team_shown().is_some() {
+            return self.render_team_page(window, cx);
+        }
         if self.home_shown() {
             return self.render_home(window, cx);
         }
@@ -840,6 +891,7 @@ impl Shark {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(theme.border)
+                    .children(self.render_goal_chip(cx))
                     .child(self.render_run(cx))
                     .child(attachments)
                     .child(
@@ -864,13 +916,14 @@ impl Shark {
                         },
                     ),
             )
-            .child(self.render_tab(cx))
+            .child(self.render_tab(window, cx))
             .into_any_element()
     }
 
     /// The shown tab's content, below the header (or Zen's bar).
-    fn render_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_tab(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match self.tab {
+            Tab::Goal => self.render_goal_tab(window, cx),
             // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
             Tab::Chat => div()
                 .flex_1()
@@ -891,7 +944,7 @@ impl Shark {
 
     /// Zen (cmd-.): the shown tab alone on the content background. Its bar keeps the traffic
     /// lights clear, drags the window and holds the tab's own controls (Diff's).
-    fn render_zen(&self, cx: &mut Context<Self>) -> Div {
+    fn render_zen(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let controls = self.render_feature_controls(cx);
         let zen = v_flex()
             .size_full()
@@ -915,7 +968,12 @@ impl Shark {
                     .children(controls),
             )
             .children(self.render_unsaved(cx))
-            .child(v_flex().flex_1().min_h_0().child(self.render_tab(cx)));
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_tab(window, cx)),
+            );
         h_flex()
             .size_full()
             .child(self.interaction_content(zen.into_any_element(), cx))
@@ -995,6 +1053,10 @@ impl Render for Shark {
                 cx.listener(|this, _: &CycleOpenApp, w, cx| this.cycle_open_app(false, w, cx)),
             )
             .on_action(cx.listener(|this, _: &OpenTaskPicker, w, cx| this.open_task_picker(w, cx)))
+            .on_action(cx.listener(|this, _: &NewTeam, w, cx| this.new_team_dialog(w, cx)))
+            .on_action(cx.listener(|this, _: &GiveGoal, w, cx| this.give_goal_to(w, cx)))
+            .on_action(cx.listener(|this, _: &PauseTeam, w, cx| this.pause_team(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenTeam, w, cx| this.open_team_picker(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
             .on_action(cx.listener(|this, _: &AddRepoToTask, w, cx| this.pick_repo_for_task(w, cx)))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
@@ -1160,7 +1222,7 @@ impl Render for Shark {
             .children(self.render_draft_picker(window, cx))
             .when(self.zen_shown(), |d| d.bg(cx.theme().background))
             .child(match self.zen_shown() {
-                true => self.render_zen(cx),
+                true => self.render_zen(window, cx),
                 false => {
                     // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
                     let island = div()

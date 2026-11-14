@@ -62,8 +62,11 @@ impl Shark {
             let editor = tab.editor.read(cx);
             editor.external.then(|| TabId::File(editor.path.clone()))
         });
-        (ws.tab_order.iter())
+        // A goal's tab is implicit and always first; it is never in the saved order.
+        (ws.goal.iter().map(|_| &TabId::Goal))
+            .chain(ws.tab_order.iter().filter(|id| **id != TabId::Goal))
             .filter(|id| match id {
+                TabId::Goal => true,
                 TabId::Chat(id) => ws.chats.iter().any(|c| &c.id == id),
                 TabId::Diff => Feature::Diff.is_open(ws),
                 TabId::Git => Feature::Git.is_open(ws),
@@ -79,6 +82,7 @@ impl Shark {
     fn current_tab_id(&self, ws: &Task, cx: &App) -> Option<TabId> {
         Some(match self.tab {
             Tab::Chat => TabId::Chat(ws.chats.get(ws.active_chat)?.id.clone()),
+            Tab::Goal => TabId::Goal,
             Tab::Feature(feature) => feature.tab_id(),
             Tab::File => TabId::File(self.editor.as_ref()?.read(cx).path.clone()),
         })
@@ -160,6 +164,11 @@ impl Shark {
                     },
                     ChatEvent::AgentMenu => this.chat_agent_menu(chat.clone(), window, cx),
                     ChatEvent::NeedsRepo => this.offer_attach(&name, window, cx),
+                    ChatEvent::ApproveGoal => this.approve_goal(&name, window, cx),
+                    ChatEvent::ReassignRow { key, agent } => {
+                        this.reassign_draft_row(&name, key, agent, cx)
+                    }
+                    ChatEvent::RemoveRow(key) => this.remove_draft_row(&name, key, cx),
                     ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                     ChatEvent::Picked => {
                         this.record_interaction(&name, cx);
@@ -183,11 +192,15 @@ impl Shark {
                             artifacts.update(cx, |a, cx| a.refresh(window, cx));
                             this.sync_artifact_chats(&name, cx);
                         }
-                        if this.home_shown() || this.active_chat() != Some(chat) {
+                        // A turn Shark asked for isn't unread: its goal reports.
+                        if this.goal_drives(&name, &id) {
+                            this.unread.remove(&id);
+                        } else if this.home_shown() || this.active_chat() != Some(chat) {
                             this.unread.insert(id.clone());
                         }
                         this.refresh_home(Some(&name), cx);
                         this.turn_done(&name, &id, cx);
+                        this.goal_turn_done(&name, &id, window, cx);
                         if let Some(ws) = this.task(&name) {
                             let dir = ws.dir();
                             let c = chat.read(cx);
@@ -370,6 +383,7 @@ impl Shark {
         let chat = (ws.chats.iter()).position(|c| matches!(&id, TabId::Chat(i) if *i == c.id));
         match (id, chat) {
             (TabId::Chat(_), Some(ix)) => self.select_chat(ix, window, cx),
+            (TabId::Goal, _) => self.show(Tab::Goal, window, cx),
             (TabId::Diff, _) => self.show(Tab::Feature(Feature::Diff), window, cx),
             (TabId::Git, _) => self.show(Tab::Feature(Feature::Git), window, cx),
             (TabId::Artifacts, _) => self.show(Tab::Feature(Feature::Artifacts), window, cx),
@@ -424,6 +438,7 @@ impl Shark {
             Tab::File => self.close_file(window, cx),
             Tab::Feature(feature) => self.close_feature(feature, window, cx),
             Tab::Chat => self.close_chat(window, cx),
+            Tab::Goal => {} // a goal keeps its tab
         }
     }
 
@@ -454,6 +469,7 @@ impl Shark {
                         this.close_chat_by_id(&task, id, w, cx);
                     }
                 }
+                TabId::Goal => {}
                 TabId::Diff => this.close_feature(Feature::Diff, w, cx),
                 TabId::Git => this.close_feature(Feature::Git, w, cx),
                 TabId::Artifacts => this.close_feature(Feature::Artifacts, w, cx),
@@ -1010,6 +1026,29 @@ impl Shark {
                 )
             })
             .collect();
+        if ws.goal.is_some() {
+            let on = self.tab == Tab::Goal;
+            pills.push((
+                TabId::Goal,
+                pill("goal-tab", on, theme)
+                    .aria_label("Goal")
+                    .pl_2p5()
+                    .pr_2p5()
+                    .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Goal, w, cx)))
+                    .child(ctrl_chip(ctrl_held, 0).unwrap_or_else(|| {
+                        Icon::new(IconName::Target)
+                            .with_size(px(14.))
+                            .into_any_element()
+                    }))
+                    .child(
+                        tab_label("Goal".into(), on, theme)
+                            .id("tab-label")
+                            .test_support(),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            ));
+        }
         for feature in Feature::ALL {
             if let Some(ix) = tabs.iter().position(|t| *t == feature.tab_id()) {
                 pills.push((

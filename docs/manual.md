@@ -1,8 +1,8 @@
 # Shark manual
 
-Shark is a native macOS app for running coding agents in isolated tasks. Start a task when you have work, guide its chats, review the result and take it through to merge. You choose when tasks start and which changes ship.
+Shark is a native macOS app for running coding agents in isolated tasks. Start a task when you have work, guide its chats, review the result and take it through to merge. You choose when tasks start and which changes ship. A team starts only the tasks of a plan you approved.
 
-A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. An **agent** is a preset for a chat: a name, icon, instructions, skills and default model settings. Each chat has at most one agent. **Sections** group tasks in the sidebar and on Home; they never change a chat's agent. Claude and Codex are the **harnesses** that run a chat.
+A **task** is one piece of work, with its own branches, worktrees, chats, changes and review state. An **agent** is a preset for a chat: a name, icon, instructions, skills and default model settings. Each chat has at most one agent. **Sections** group tasks in the sidebar and on Home; they never change a chat's agent. A **team** is a lead plus other agents that work on a **goal** you give them; see [Teams](#teams). Claude and Codex are the **harnesses** that run a chat.
 
 Use `cmd-k` for the complete command list and current shortcuts. This guide covers the workflow and behaviors that matter when using it. See the [README](../README.md) for installation, [Git workflows](git-feature.md) for the Git view, and [Language intelligence](language-intelligence.md) for editor tooling.
 
@@ -30,7 +30,7 @@ Home's composer starts tasks; `enter` or `cmd-enter` starts and `shift-enter` ad
 
 Use the composer's **+** (`cmd-i`) to add Linear issues, repositories, a branch or PR, or files. These choices add removable pills without starting the task, so an issue and an existing branch or PR can be combined. Repository pills begin with the agent's defaults; edit their branch or remove them for this task. The model chip shows the value that will run and offers a reset after an override. `cmd-/` opens its menu, and `shift-tab` toggles Plan. Without repositories, Plan stays on. **Start** also works with empty text: an attached issue supplies its planning request; otherwise the new task opens an empty chat. Home's `tab` still toggles Ask Shark when no completion is open; Ask hides the task controls.
 
-Several tasks can use one agent, including in the same repository. Each has separate worktrees, and tasks stay encapsulated: a chat is never told about other tasks.
+Several tasks can use one agent, including in the same repository. Each has separate worktrees, and tasks stay encapsulated: a chat is never told about other tasks. A task that belongs to a goal is told its goal, its own brief and the result of the tasks it comes after. It is told nothing about other tasks.
 
 A chat's agent instructions reach Claude as an addition to its system prompt and Codex as developer instructions, on every start and resume. The task's `CLAUDE.md` and `AGENTS.md` describe only the task and its repositories, because every chat of the task reads them. Existing chats receive changed instructions with their next normal message. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
 
@@ -38,7 +38,7 @@ Deleting an agent removes its instructions and skills folder after confirmation.
 
 ### Handing a chat to another agent
 
-Once a chat has started, its agent button lists the other agents under **Hand off to**. The chat tab and task menus and `cmd-k` offer **Hand off to…** as well. Set an agent's **Hands off to** to its usual next agent: when its chat finishes a turn, **Hand off to <agent>** appears above the composer; click it or press `cmd-alt-enter`. **Other…** picks another agent. Dismiss the bar with ×; it returns after the next turn.
+Once a chat has started, its agent button lists the other agents under **Hand off to**. The chat tab and task menus and `cmd-k` offer **Hand off to…** as well. Set an agent's **Hands off to** to its usual next agent: when its chat finishes a turn, **Hand off to <agent>** appears above the composer; click it or press `cmd-alt-enter`. **Other…** picks another agent. Dismiss the bar with ×; it returns after the next turn. In a task that belongs to a team's goal, an agent with **Hands off to** set hands over by itself when its turn ends, if the next agent is on the team.
 
 Handing off opens a new chat tab, as `cmd-t` does, on the receiving agent with its model and thinking defaults. The source chat's full transcript, and its plan if it has one, is attached to the new composer as a file, the way a pasted image is: `.context/attachments/<chat title> transcript.md`. Add your instructions and send, or remove the chip to start without it. Tool output is left out of the transcript; the changed files are in the task folder. The task, its repositories and its other chats stay as they are.
 
@@ -79,6 +79,69 @@ The sidebar lists Home, then your sections with their tasks, then ungrouped task
 Expanded sidebar tasks have two lines: title and age, then the current action/activity/issue/repository fact with PR checks or line counts. The narrow rail shows status icons only. The line counts (`+N −M`) cover tracked files only; untracked files are not counted, and the task card labels them “tracked”. Press `space` on a task in Sidebar or Home to peek at its chats, repositories, checks, issue and dev server; arrows browse, including past section headers, and `esc` closes the card wherever focus is. Hovering a row also opens the card. **Regenerate title** is available in the task menu, command palette and peek card.
 
 `cmd-0` opens Home; from Home it returns to the active task. `esc` leaves an overview for the active task, or returns to Home if none is active. The task picker (`cmd-shift-o`) searches task titles and repositories. With no query it selects the most recent task from Home, or the most recent other task while a task is open. The app switcher (`cmd-o`, held) cycles tasks until you release Command.
+
+## Teams
+
+A **team** is a lead agent plus other agents, with repositories, an approval setting and limits. You give a team a **goal**. The lead reads the code and writes a plan: a list of tasks, each with an agent and the tasks it comes after. You approve the plan, and Shark then starts the tasks in order, each as an ordinary task with its own branch and worktrees. When every task is finished you review the diffs, create the PRs and merge, as with any task. Teams run only while Shark is open, and nothing is pushed or merged without you.
+
+### Create a team
+
+Press `cmd-k` and choose **New team…**; once a team exists, the **+** on the sidebar's **Teams** header does the same. Give it a name, pick the lead, the other agents and the repositories, then **Create team**. Any agent can be the lead, because Shark adds the planning instructions. The lead needs repositories to read and at least one other agent. The team opens on its page with a composer and no goals. Approval and limits start at their defaults; change them later.
+
+### Give a goal
+
+Describe the goal in the team's composer and press `enter`, or pick the team in Home's agent picker. The lead reads the repositories in plan mode and the goal shows **Planning**. The lead stays in plan mode and never edits code.
+
+The lead submits a plan, and the goal shows **Plan to approve**. The plan pane shows the lead's prose and, under it, the tasks as rows: key, title, agent and the tasks it comes after. Use a row's menu to give it another agent, remove a row, or reply to the lead for a new version. If the lead's plan cannot run, for example a task names an agent that is not on the team, the pane lists the problem, Shark asks the lead once to fix it, and **Approve and start** stays unavailable until every row reads. A plan with more tasks than the team's task limit cannot be approved until you remove rows or raise the limit.
+
+Press `a` or choose **Approve and start**. Shark starts every task that comes after nothing, up to the running limit, and starts the rest as the ones before them finish. The lead is not woken for each finished task; it takes a turn when you reply, when a task is stuck and to write the closing summary. A later plan from the lead that adds or changes a queued task shows as **Plan to approve** again; Shark keeps running the tasks you approved until you approve it.
+
+### Watch and steer
+
+The sidebar shows each team with its status and, under it, its open goals with progress such as 3/6. Tasks of a goal are not sidebar rows. Open the goal to see them on its **Goal** tab, grouped as Needs you, Running, Queued, Ready for review and Done. A task of a goal appears on Home only while it needs you.
+
+The team page has three views, switched with `1`, `2` and `3`: **Goals**, **Agents** and **Activity**. Agents shows who is doing what and lets you pause one agent in this team. Activity lists what happened while you were away.
+
+Open any task to see the ordinary task view, with a chip at the start of its header, `Team › Goal › T2`, that opens the goal. You can message its agent, read its diff or take over. Use **Start now** on a queued task to start it once the tasks before it are finished, whatever the limits say. **Remove from plan** drops a queued task, or stops a started one and keeps its task. **Pause** on the goal or team starts nothing new and lets running turns finish. **Stop** interrupts every running chat of the goal.
+
+Shark starts tasks in the background. It does not open them, change the task you are looking at or take focus.
+
+### What needs you
+
+A team's items appear in Home's **Needs you** group, at the top of the team and goal pages and under `cmd-j`:
+
+- **Plan to approve**: a goal plan, or a task's plan when you approve every task.
+- **Question to answer**: an agent asked something. Answer in the question card and the agent continues.
+- **Limit reached**: the goal used its agent time. Choose **Add 1 h** to give this goal 60 more minutes, or **Keep paused**.
+- **Stuck**: a turn failed, was interrupted, or a commit was rejected. Choose **Retry**, or **Remove from plan**. Nothing after a stuck task starts.
+- **Review to continue**: you approve every task, and a task is finished. Review it in Differ, then choose **Mark reviewed** on its row; the tasks after it then start.
+- **Reply to the lead**: the goal is still planning and the lead stopped without a plan. Open the lead's chat and answer it.
+- **Reply to the agent**: you approve every task, and a task's agent stopped without a plan. Open the task and answer it.
+
+### Limits
+
+Change them from the limits chip on the team page.
+
+- **Running at once**: chats in a turn at once. The default is 3.
+- **Allowance floor**: when a harness has less than this percent of your plan allowance left, Shark starts nothing for it until the window resets, and the goal says when. If the allowance cannot be read, starts also wait. A floor of 0 turns the check off. The default is 20.
+- **Agent time per goal**: the minutes agents of the goal may work. At the limit the goal pauses and running turns finish. The default is 180.
+- **Tasks per goal**: the most tasks a plan may have. The default is 8.
+
+Limits count what Shark can measure. There are no dollar figures. Work stops while Shark is closed.
+
+### Review and finish
+
+When every task is finished the goal shows **Ready for review**, and the lead writes a summary. Shark commits each task's work locally when its turn ends, on the task's branch, and never pushes it. A task that comes after another in the same repository starts from that task's local branch.
+
+Review each task in Differ. **Create draft PRs** on the goal pushes the finished tasks and creates their PRs, parents first, so stacked tasks become stacked PRs. A stacked task's PR targets its parent's branch, which has to exist on GitHub first. Merge with the git button. When the last PR merges, the goal offers **Merged · finish goal**, and it moves to the team's finished goals with its summary and PR links.
+
+After a restart no turn is running and none resumes. A task that was committed and clean counts as finished; any other task that was mid-turn shows **Stuck** with **Retry**. The rest of the plan continues.
+
+### Change the team
+
+Use the Agents view to add an agent, create one with **New agent…**, make another agent the lead, pause an agent in this team or remove one. **You approve** has two settings: **Goal plan** (the default) and **Goal plan and every task**. The second starts each task in plan mode and holds the tasks after a finished task until you review it. Use it for work you want to follow closely. If an agent has **Hands off to** set and the next agent is on the team, it hands over by itself inside a goal's task.
+
+Delete a team from the team page or `cmd-k` once its goals are finished or stopped. Its goals stay as ordinary tasks. Each team keeps its activity in `~/Library/Application Support/shark/teams/<slug>/activity.jsonl`.
 
 ## Repositories, branches and setup
 
@@ -184,7 +247,7 @@ Right-click a file for the same actions and more, including **Reveal in Finder**
 
 ## Git, PRs and merging
 
-The git button shows the next step across the task's repositories: commit and push, fix checks, address review, merge or delete the completed task. Its menu exposes other git actions. Steps needing judgment send a request to the selected chat's queue and preserve the composer draft. Mechanical steps run directly. A waiting state opens the relevant PR instead of starting work.
+The git button shows the next step across the task's repositories: commit and push, fix checks, address review, merge or delete the completed task. Its menu exposes other git actions. Steps needing judgment send a request to the selected chat's queue and preserve the composer draft. Mechanical steps run directly. Git steps are yours to start. The one exception is the local commit when a goal's task finishes; see [Teams](#teams). A waiting state opens the relevant PR instead of starting work.
 
 Shark refreshes git and PR state in the background, retains the last successful result on network errors, and rechecks before direct changes. Direct git writes wait until every chat in the task is idle. Merge, force push and task deletion ask first. Multi-repository merge follows the task's chosen order and stops at the first failure.
 
@@ -243,11 +306,12 @@ The footer's **Usage** panel shows Claude and Codex allowance and reset times. G
 | Show Artifacts | `cmd-shift-a` |
 | Run repository scripts | `cmd-r` |
 | Next task needing attention | `cmd-j` |
+| Approve and start a goal plan | `a` |
 | Move task to Backlog / active (task lists) | `b` |
 | Sidebar rail / Zen mode | `cmd-b` / `cmd-.` |
 
 Lists use arrows, Home/End and Enter; Vim mode adds `j/k` and `gg/G`. Home's task list uses `i`/`a` to reach the prompt; `b` parks or resumes the selected task there and in the sidebar. Expand Backlog to navigate its rows with the same list keys. Pane-navigation keys (`cmd-alt-←/→`) reach the sidebar, tab and Features rail. The palette and menus expose less frequent actions with their active shortcuts.
 
-Shark stores state, transcripts, plans, comments and Linear snapshots under `~/Library/Application Support/shark/`. Agent skills live there too. Worktrees remain under `~/shark/workspaces/`; the older directory name and serialized `workspaces` fields are retained for existing installations. Do not move worktrees manually: their git metadata refers to their locations.
+Shark stores state, transcripts, plans, comments, team activity and Linear snapshots under `~/Library/Application Support/shark/`. Agent skills live there too. Worktrees remain under `~/shark/workspaces/`; the older directory name and serialized `workspaces` fields are retained for existing installations. Do not move worktrees manually: their git metadata refers to their locations.
 
 On restart, Shark restores the saved task and tabs, or Home, and resumes saved chat sessions where the harness still has them. Interrupted turns are marked interrupted. File tabs reopen from disk; queues are not restored. If a model session is unavailable, the next message starts a fresh conversation. Root `CLAUDE.md` and `AGENTS.md` describe attached repositories and current agent instructions, so both harnesses start from the same task context.

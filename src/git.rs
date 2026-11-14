@@ -209,6 +209,61 @@ pub fn create_task_with_sources(
     agent: Option<AgentLink>,
     fresh_repos: &[String],
 ) -> Result<Task, String> {
+    create_task_planned(
+        dir,
+        name,
+        branch,
+        repos,
+        prs,
+        parents,
+        title,
+        agent,
+        fresh_repos,
+        &[],
+    )
+}
+
+/// A task Shark starts from a goal's plan row: a new branch in every repo, from the trunk, or for
+/// `local_parents` `(repo, branch)` from that local branch's tip, pushed or not. The parent's
+/// branch is its base: the diff compares against it and its PR targets it.
+pub fn create_row_task(
+    dir: &Path,
+    name: &str,
+    branch: &str,
+    repos: &[Repo],
+    local_parents: &[(String, String)],
+    title: &str,
+    agent: Option<AgentLink>,
+) -> Result<Task, String> {
+    let fresh: Vec<String> = repos.iter().map(|r| r.name.clone()).collect();
+    let repos: Vec<(Repo, String)> = repos.iter().map(|r| (r.clone(), branch.into())).collect();
+    create_task_planned(
+        dir,
+        name,
+        branch,
+        &repos,
+        &[],
+        &[],
+        title,
+        agent,
+        &fresh,
+        local_parents,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_task_planned(
+    dir: &Path,
+    name: &str,
+    branch: &str,
+    repos: &[(Repo, String)],
+    prs: &[(String, PullRequest)],
+    parents: &[(String, String)],
+    title: &str,
+    agent: Option<AgentLink>,
+    fresh_repos: &[String],
+    local_parents: &[(String, String)],
+) -> Result<Task, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
     }
@@ -223,6 +278,9 @@ pub fn create_task_with_sources(
     let plans = crate::proc::par_map(repos, |(r, b)| {
         match prs.iter().find(|(name, _)| name == &r.name) {
             Some((_, pr)) => plan_pr_worktree(b, r, pr),
+            None if let Some((_, p)) = local_parents.iter().find(|(n, _)| n == &r.name) => {
+                plan_local_child(b, r, p)
+            }
             None if fresh_repos.contains(&r.name) => {
                 let base = parents.iter().find(|(n, _)| n == &r.name);
                 plan_fresh(b, r, base.map_or("", |(_, b)| b.as_str()))
@@ -670,6 +728,19 @@ pub fn resolve_base(src: &Path, base: &str) -> String {
     }
 }
 
+/// A branch that must be new: one of that name here or on origin is refused.
+fn refuse_existing(branch: &str, r: &Repo) -> Result<(), String> {
+    let taken = has_ref(&r.path, &format!("refs/heads/{branch}"))
+        || has_ref(&r.path, &format!("refs/remotes/origin/{branch}"));
+    match taken {
+        true => Err(format!(
+            "{}: branch `{branch}` already exists; pick another name",
+            r.name
+        )),
+        false => Ok(()),
+    }
+}
+
 /// `plan_worktree` for a branch that must be new: `branch` existing here or on origin is refused
 /// before anything is made. Fetches, so it blocks.
 fn plan_fresh(branch: &str, r: &Repo, base: &str) -> Result<Plan, String> {
@@ -679,14 +750,7 @@ fn plan_fresh(branch: &str, r: &Repo, base: &str) -> Result<Plan, String> {
     // Best effort, as in `plan_worktree`; offline, the last fetch's refs are checked.
     let args = ["fetch", "--quiet", "--prune", "origin"];
     let _ = cmd_bounded(&r.path, "git", &args, 30);
-    if has_ref(&r.path, &format!("refs/heads/{branch}"))
-        || has_ref(&r.path, &format!("refs/remotes/origin/{branch}"))
-    {
-        return Err(format!(
-            "{}: branch `{branch}` already exists; pick another name",
-            r.name
-        ));
-    }
+    refuse_existing(branch, r)?;
     let base = resolve_base(&r.path, base);
     let tip = git(
         &r.path,
@@ -696,6 +760,19 @@ fn plan_fresh(branch: &str, r: &Repo, base: &str) -> Result<Plan, String> {
     Ok(Plan {
         tip: (base != resolve_base(&r.path, "")).then_some(tip),
         ..Plan::new(base.clone(), Some(base))
+    })
+}
+
+/// A new branch on the tip of the local branch `p`, which origin may not have yet. `p` itself is
+/// the base (`origin/<p>` could be missing or older), so the diff shows only this branch's work.
+fn plan_local_child(branch: &str, r: &Repo, p: &str) -> Result<Plan, String> {
+    let _ = git(&r.path, &["worktree", "prune"]);
+    refuse_existing(branch, r)?;
+    let tip = ref_oid(&r.path, &format!("refs/heads/{p}^{{commit}}"))
+        .ok_or_else(|| format!("{}: `{p}` isn't a branch here", r.name))?;
+    Ok(Plan {
+        tip: Some(tip.clone()),
+        ..Plan::new(p.into(), Some(tip))
     })
 }
 
@@ -1591,6 +1668,18 @@ pub fn delete_merged_branches(ws: &Task, merged: &[(String, String)]) -> Vec<Str
         })
         .map(|r| r.name.clone())
         .collect()
+}
+
+/// Deletes the branches of a removed goal's task that never got a commit: the lead only reads.
+/// A leftover one would make a later task of the same name look already merged.
+pub fn delete_empty_branches(ws: &Task) {
+    for r in &ws.repos {
+        let b = ws.branch_of(r);
+        let at = format!("refs/heads/{b}");
+        if git(&r.src, &["merge-base", "--is-ancestor", &at, &r.base]).is_ok() {
+            let _ = git(&r.src, &["branch", "-D", b]);
+        }
+    }
 }
 
 /// The commit the diff of `repo_dir` compares against: HEAD when only uncommitted changes show,

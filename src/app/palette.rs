@@ -366,7 +366,7 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
     Row::key(
         "Interrupt agent",
-        IconName::Square,
+        IconName::CircleX,
         &StopAgent,
         "stop cancel",
     ),
@@ -695,6 +695,79 @@ pub(super) const COMMANDS: &[Row] = &[
         &DeleteSection,
         "group remove tasks stay",
     ),
+    Row::key(
+        "New team…",
+        IconName::Users,
+        &NewTeam,
+        "agents lead create group",
+    ),
+    Row::key(
+        "Give a goal to…",
+        IconName::Target,
+        &GiveGoal,
+        "team plan lead describe",
+    ),
+    Row::key(
+        "Pause team",
+        IconName::Pause,
+        &PauseTeam,
+        "team resume stop starting",
+    ),
+    Row::key(
+        "Open team…",
+        IconName::Users,
+        &OpenTeam,
+        "team goals agents activity",
+    ),
+    Row(
+        "Rename team…",
+        IconName::Pencil,
+        None,
+        "team name",
+        Some(|s, w, cx| s.rename_shown_team(w, cx)),
+    ),
+    Row(
+        "Delete team…",
+        IconName::Trash,
+        None,
+        "team remove",
+        Some(|s, w, cx| s.delete_shown_team(w, cx)),
+    ),
+    Row(
+        "Pause goal",
+        IconName::Pause,
+        None,
+        "goal stop starting",
+        Some(|s, w, cx| s.with_open_goal(w, cx, Shark::pause_goal)),
+    ),
+    Row(
+        "Resume goal",
+        IconName::Play,
+        None,
+        "goal carry on",
+        Some(|s, w, cx| s.with_open_goal(w, cx, Shark::resume_goal)),
+    ),
+    Row(
+        "Stop goal…",
+        IconName::Square,
+        None,
+        "goal end cancel",
+        Some(|s, w, cx| s.with_open_goal(w, cx, Shark::confirm_stop_goal)),
+    ),
+    Row(
+        "Add 1 h",
+        IconName::Clock,
+        None,
+        "goal agent time hour more",
+        Some(|s, w, cx| s.with_open_goal(w, cx, Shark::add_goal_hour)),
+    ),
+    Row(
+        "Keep paused",
+        IconName::CirclePause,
+        None,
+        "goal agent time limit",
+        Some(|s, w, cx| s.with_open_goal(w, cx, Shark::keep_goal_paused)),
+    ),
     Row(
         "Go to Home",
         IconName::House,
@@ -862,6 +935,24 @@ const NEED_TASK: &[&str] = &[
     "Reveal in Finder",
 ];
 
+/// Rows that need a team to exist.
+const TEAM_ROWS: &[&str] = &[
+    "Give a goal to…",
+    "Pause team",
+    "Open team…",
+    "Rename team…",
+    "Delete team…",
+];
+
+/// Rows that act on the open goal; left out unless the goal's state allows them.
+const GOAL_ROWS: &[&str] = &[
+    "Pause goal",
+    "Resume goal",
+    "Stop goal…",
+    "Add 1 h",
+    "Keep paused",
+];
+
 /// Rows about Linear; left out while nobody uses it (`linear_in_use`).
 const NEED_LINEAR: &[&str] = &[
     "Start from Linear issue…",
@@ -881,6 +972,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("Files and diff", "Open file…"),
     ("Git", "Run next git step"),
     ("Sections", "New section…"),
+    ("Teams", "New team…"),
     ("View", "Go to Home"),
     ("Shark", "Settings"),
 ];
@@ -1031,6 +1123,7 @@ impl Shark {
         let no_target = target.is_none();
         let mut apps = available_apps(target.as_ref());
         let no_linear = !self.linear_in_use();
+        let paused_team = self.shown_team_paused();
         for (ix, Row(label, icon, action, words, _)) in COMMANDS.iter().enumerate() {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
@@ -1040,6 +1133,8 @@ impl Shark {
                     && NEED_TASK.contains(label)
                     && !(*label == "Attach Linear issue…" && self.home_shown()))
                 || (*label == "Show all repositories" && self.home.repo_filter.is_none())
+                || (TEAM_ROWS.contains(label) && self.state.teams.is_empty())
+                || (GOAL_ROWS.contains(label) && !self.goal_row_applies(label))
                 || (*label == "Move task to backlog"
                     && target
                         .as_ref()
@@ -1067,10 +1162,15 @@ impl Shark {
             }
             rows.push(Pick::Cmd(ix));
             let key = action.and_then(|a| shortcut(a, window));
-            let item = row_item(*label, *icon, key).keywords(words.split_whitespace());
+            // A paused team's row offers to resume it.
+            let (label, icon) = match (*label, paused_team) {
+                ("Pause team", true) => ("Resume team", IconName::Play),
+                _ => (*label, *icon),
+            };
+            let item = row_item(label, icon, key).keywords(words.split_whitespace());
             let group = &mut groups.last_mut().expect("COMMANDS starts a group").1;
             group.push(item);
-            if *label == "Reveal in Finder" {
+            if label == "Reveal in Finder" {
                 for app in apps.drain(..) {
                     rows.push(Pick::App(app));
                     group.push(app_item(app).keywords(["app", "open", "task"]));
@@ -1122,7 +1222,14 @@ mod tests {
                 "{heading}: no row {first}"
             );
         }
-        let gated = [CLAUDE_ONLY, CODEX_ONLY, NEED_TASK, NEED_LINEAR];
+        let gated = [
+            CLAUDE_ONLY,
+            CODEX_ONLY,
+            NEED_TASK,
+            NEED_LINEAR,
+            TEAM_ROWS,
+            GOAL_ROWS,
+        ];
         for label in gated.into_iter().flatten() {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }

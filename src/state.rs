@@ -26,6 +26,9 @@ pub struct State {
     pub tasks: Vec<Task>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<Agent>,
+    /// Teams of agents, in sidebar order; their goals are tasks (`Task::goal`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<Team>,
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
@@ -311,6 +314,208 @@ impl From<&Agent> for AgentLink {
     }
 }
 
+/// A lead and other agents that work on goals together.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct Team {
+    pub slug: String,
+    pub name: String,
+    pub icon: AgentIcon,
+    /// The agent that plans and summarises; it never edits code.
+    pub lead: String,
+    /// Agent slugs, the lead excluded.
+    pub agents: Vec<String>,
+    pub repos: Vec<String>,
+    /// You approve every task's plan too, and review a task before those after it start.
+    pub approve_tasks: bool,
+    pub limits: Limits,
+    pub paused: bool,
+    /// Agents whose queued rows wait in this team.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paused_agents: Vec<String>,
+    /// Folded in the sidebar.
+    pub collapsed: bool,
+}
+
+impl Team {
+    /// The lead first, then the others.
+    pub fn members(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.lead.as_str()).chain(self.agents.iter().map(String::as_str))
+    }
+}
+
+/// What bounds a team; all of it is something Shark can measure.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Limits {
+    /// Chats in a turn at once.
+    pub running: u8,
+    /// Percent of the plan allowance below which nothing starts.
+    pub floor: u8,
+    /// Agent time per goal, in minutes.
+    pub minutes: u32,
+    /// Tasks per goal.
+    pub tasks: u8,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            running: 3,
+            floor: 20,
+            minutes: 180,
+            tasks: 8,
+        }
+    }
+}
+
+/// What a team was asked for. It lives on the lead's task, which gives the lead a directory,
+/// worktrees to read, a chat and plan versions.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct Goal {
+    pub team: String,
+    pub brief: String,
+    /// The team's agents when the goal started, the lead first.
+    pub roster: Vec<AgentLink>,
+    /// The team's task limit, for the lead's note.
+    pub max_tasks: u8,
+    /// The approved plan. It changes only when the user approves or edits it.
+    pub rows: Vec<Row>,
+    /// The lead's latest plan, parsed and waiting for approval.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub draft: Vec<Row>,
+    /// What reading the latest plan turned up: lines that are no task, or no tasks at all.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<String>,
+    /// Why the draft can't be approved: `unread`, then what `team::check` says of it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+    /// The fingerprint of the plan last read into `draft`. A later turn without a new plan
+    /// leaves the draft, and the user's edits to it, alone.
+    pub parsed: u64,
+    /// Shark asked the lead to fix `problems`; it asks once per goal.
+    pub asked_fix: bool,
+    pub state: GoalState,
+    /// Agent time used by all its tasks, in seconds.
+    pub secs: u64,
+    /// Minutes added to the team's limit for this goal (**Add 1 h**).
+    pub extra_minutes: u32,
+    /// The lead was asked for the closing summary.
+    pub summary_asked: bool,
+    pub summary: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalState {
+    /// The lead is writing the plan.
+    #[default]
+    Planning,
+    /// The first plan waits for approval.
+    Review,
+    Running,
+    Paused(Why),
+    /// Every task is finished.
+    Ready,
+    Done,
+    Stopped,
+}
+
+impl GoalState {
+    /// Not finished and not stopped: it shows among the team's open goals.
+    pub fn open(self) -> bool {
+        !matches!(self, GoalState::Done | GoalState::Stopped)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Why {
+    You,
+    /// The goal's agent time is used.
+    Time,
+}
+
+/// One task of a plan. It costs nothing until it starts.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct Row {
+    /// `T1`.
+    pub key: String,
+    pub title: String,
+    pub brief: String,
+    pub agent: String,
+    pub repos: Vec<String>,
+    /// Keys of the rows it comes after.
+    pub after: Vec<String>,
+    /// Once started.
+    pub task: Option<TaskRef>,
+    pub state: RowState,
+    /// The agent's last reply, for the rows that come after.
+    pub result: Option<String>,
+    /// The chat doing its work: the task's first, or the one a handoff opened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
+    /// The agent that takes over next; `advance_goals` starts it when the limits allow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
+    /// Why it failed, in a few words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// It failed in its commit turn: Retry asks for the commit again, not for more work.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub commit_failed: bool,
+    /// The user looked at the finished work; under `Team::approve_tasks` rows after it wait for this.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reviewed: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RowState {
+    #[default]
+    Queued,
+    Started,
+    /// The work turn ended with changes; the commit turn runs.
+    Committing,
+    Finished,
+    /// Removed after it started, or its task was deleted.
+    Skipped,
+    Failed,
+}
+
+impl RowState {
+    /// Nothing more will happen to it without the user.
+    pub fn settled(self) -> bool {
+        matches!(self, RowState::Finished | RowState::Skipped)
+    }
+
+    /// Its agent may be in a turn.
+    pub fn live(self) -> bool {
+        matches!(self, RowState::Started | RowState::Committing)
+    }
+}
+
+/// Task names are reused, so a row names the instance too.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct TaskRef {
+    pub name: String,
+    pub instance_id: String,
+}
+
+/// What a task started from a plan row knows of its goal: `Task::context` reads only the task.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct Part {
+    /// `Task::name` of the goal.
+    pub goal: String,
+    pub goal_title: String,
+    pub key: String,
+    /// Each row it comes after, as its key and result, copied at start.
+    pub after: Vec<(String, String)>,
+}
+
 pub fn agent_skills_dir(slug: &str) -> PathBuf {
     support_dir().join("agents").join(slug).join("skills")
 }
@@ -386,6 +591,12 @@ pub struct Task {
     /// task; `normalize_tabs` keeps chat and feature tabs in step with their open/closed state.
     #[serde(default)]
     pub tab_order: Vec<TabId>,
+    /// Set on the lead's task of a team goal: the brief, the approved plan and how far it got.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<Goal>,
+    /// Set on a task Shark started from a goal's plan row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<Part>,
 }
 
 /// A tab's identity in the strip, stable across reordering.
@@ -398,6 +609,9 @@ pub enum TabId {
     Artifacts,
     /// `repo/rel/path`, as in the diff.
     File(String),
+    /// A goal task's first tab. Implicit: never in `tab_order`, so an older build still reads
+    /// the file (`normalize_tabs` drops it).
+    Goal,
 }
 
 /// What `Task::remove_chat` took out of the lists.
@@ -447,6 +661,8 @@ impl Default for Task {
             artifacts_pinned: Vec::new(),
             viewed: HashMap::new(),
             tab_order: Vec::new(),
+            goal: None,
+            part: None,
         }
     }
 }
@@ -593,6 +809,11 @@ pub const NEW_TASK: &str = "New agent";
 /// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
 pub const REPO_CONTEXT: &str = "repo:";
 pub const AGENT_CONTEXT: &str = "agent:";
+/// A goal's lead gets its team under `team:<slug>`; a task of a goal gets `goal:<name>` and one
+/// `after:<key>` per row it comes after. None is in a root doc, so each goes with a message.
+pub const TEAM_CONTEXT: &str = "team:";
+pub const GOAL_CONTEXT: &str = "goal:";
+pub const AFTER_CONTEXT: &str = "after:";
 
 /// The key prefix of a Linear issue in `Task::context`, before its UUID. Unlike repositories
 /// these are in no root doc, so every session gets them with its first normal turn.
@@ -913,6 +1134,34 @@ impl Task {
                 },
             );
         }
+        let mut note = |key: String, text: String| {
+            let fingerprint = crate::files::fingerprint(&text);
+            notes.insert(key, ContextNote { text, fingerprint });
+        };
+        if let Some(goal) = &self.goal {
+            let repos: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+            note(
+                format!("{TEAM_CONTEXT}{}", goal.team),
+                crate::team::lead_note(goal, &repos),
+            );
+        }
+        if let Some(part) = &self.part {
+            note(
+                format!("{GOAL_CONTEXT}{}", part.goal),
+                format!(
+                    "[shark] This task is {} of the goal \"{}\". Do this task only; other tasks of the goal are someone else's.",
+                    part.key, part.goal_title
+                ),
+            );
+            for (key, result) in &part.after {
+                note(
+                    format!("{AFTER_CONTEXT}{key}"),
+                    format!(
+                        "[shark] This task comes after {key}, whose work is already on your branch. Its agent reported:\n{result}"
+                    ),
+                );
+            }
+        }
         notes
     }
 
@@ -998,6 +1247,7 @@ impl Task {
                 TabId::Git => git,
                 TabId::Artifacts => artifacts,
                 TabId::File(_) => true,
+                TabId::Goal => false,
             };
             live && seen.insert(t.clone())
         });

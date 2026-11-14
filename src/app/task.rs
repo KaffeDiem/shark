@@ -219,6 +219,10 @@ impl Shark {
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
         self.select_chat(ws.active_chat, window, cx);
+        // A goal opens on its plan; the lead's chat is the tab beside it.
+        if ws.goal.is_some() {
+            self.show(Tab::Goal, window, cx);
+        }
         if changed {
             self.unpark_sessions(window, cx);
             self.restore_file_tabs(window, cx);
@@ -226,7 +230,7 @@ impl Shark {
     }
 
     /// Creates `ws`'s GitSync, and the subscriptions that route its events, if it has none.
-    fn ensure_sync(&mut self, ws: &Task, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_sync(&mut self, ws: &Task, window: &mut Window, cx: &mut Context<Self>) {
         if self.syncs.contains_key(&ws.name) {
             return;
         }
@@ -959,6 +963,7 @@ impl Shark {
                 self.show(Tab::Feature(Feature::Artifacts), window, cx)
             }
             "home" => self.enter_home(window, cx),
+            "chat" if self.tab == Tab::Goal => self.show(Tab::Chat, window, cx),
             _ => {}
         }
     }
@@ -970,6 +975,7 @@ impl Shark {
             Tab::Feature(Feature::Diff) => "diff",
             Tab::Feature(Feature::Git) => "git",
             Tab::Feature(Feature::Artifacts) => "artifacts",
+            Tab::Goal => "goal",
             Tab::Chat | Tab::File => "chat",
         };
         let open = self.active.clone().map(|n| (n, tab.to_string()));
@@ -1409,6 +1415,9 @@ impl Shark {
         if let Some(msg) = self.chats_at_work(&name, cx) {
             return notify_err(window, cx, msg);
         }
+        if !self.goal_tasks(&name).is_empty() {
+            return self.archive_goal(name, force, window, cx);
+        }
         let heading = match force {
             true => format!("Force delete {title}?"),
             false => format!("Delete {title}?"),
@@ -1605,8 +1614,14 @@ impl Shark {
                             None,
                         );
                     }
-                    let removed = git::remove_task(&ws, &dir, force)
-                        .map(|()| git::delete_merged_branches(&ws, &merged));
+                    let removed = git::remove_task(&ws, &dir, force).map(|()| {
+                        // A lead only reads: its branch has no commits, and a leftover one would
+                        // make a later task of this name look already merged.
+                        if ws.goal.is_some() && !force {
+                            git::delete_empty_branches(&ws);
+                        }
+                        git::delete_merged_branches(&ws, &merged)
+                    });
                     (scripts, removed, None)
                 })
                 .await;
@@ -1674,6 +1689,9 @@ impl Shark {
                 let repoless = self.task(name).is_some_and(|w| w.repos.is_empty());
                 let before = self.cursors(cx);
                 self.forget_task_views(name, cx);
+                if let Some(gone) = self.task(name).cloned() {
+                    self.task_left_goal(&gone);
+                }
                 self.state.remove_task(name);
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));

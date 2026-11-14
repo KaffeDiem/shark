@@ -71,7 +71,7 @@ async fn unreadable_plans_are_protected_on_add_approve_and_retry(cx: &mut TestAp
             fs::write(&path, b"corrupt plan contents").unwrap();
         }
         cx.update(|cx| {
-            let plan = cx.new(|cx| crate::plan::PlanPane::new("protected-plan", cx));
+            let plan = cx.new(|cx| crate::plan::PlanPane::new("protected-plan", false, cx));
             plan.update(cx, |p, cx| {
                 assert!(p.storage_error().is_some());
                 p.add("p2".into(), "# New plan in memory".into(), cx);

@@ -18,9 +18,10 @@
 |---|---|
 | **Task** | One piece of work, with separate branches, worktrees, conversations and review state. |
 | **Agent** | A preset for a chat: name, icon, instructions, skills and default model settings. Pick one per chat, the way you pick a model. |
+| **Team** | A lead agent plus other agents, with repositories and limits. Give it a goal: the lead writes a plan of tasks, you approve it, and Shark runs each task on its own branch and commits finished work locally. You review, push and merge. |
 | **Section** | Optional grouping of tasks in the sidebar and on Home. Moving a task between sections never changes its chats' agents. |
 
-You start each task and decide what ships. Chats of one task share its worktrees; each chat can have its own agent. Shark does not schedule or automatically start work.
+You start each task and decide what ships. Chats of one task share its worktrees; each chat can have its own agent. Shark does not schedule work. A team starts the tasks of a plan you approved.
 
 Hand a chat from Designer to Planner to Coder: the next agent opens in a new chat tab with the full transcript attached, in the same task folder.
 

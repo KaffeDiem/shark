@@ -104,13 +104,13 @@ impl Shark {
 
     pub(super) fn usage_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
-        if self.usage_due.is_none()
-            || (window.is_window_active() && self.usage_due.is_some_and(|due| due <= now))
-        {
+        // A running goal starts tasks behind another window too, and needs the allowance for it.
+        let watching = window.is_window_active() || self.goals_running();
+        if self.usage_due.is_none() || (watching && self.usage_due.is_some_and(|due| due <= now)) {
             self.refresh_usage(cx);
             self.usage_due = Some(now + POLL_INTERVAL);
         }
-        if !window.is_window_active() {
+        if !watching {
             self.usage_poll = None;
         } else if self.usage_poll.is_none() {
             let delay = self.usage_due.unwrap().saturating_duration_since(now);
@@ -530,7 +530,7 @@ fn even_pace(p: f64) -> String {
     format!(" · Even pace: {}% left", p.round())
 }
 
-fn local_time(seconds: f64) -> String {
+pub(super) fn local_time(seconds: f64) -> String {
     let formatter = NSDateFormatter::new();
     formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
     formatter.setTimeStyle(NSDateFormatterStyle::ShortStyle);

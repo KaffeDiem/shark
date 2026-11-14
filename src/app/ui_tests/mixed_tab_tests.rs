@@ -47,6 +47,7 @@ fn element(id: &TabId) -> SharedString {
         TabId::Git => "git-tab".into(),
         TabId::Artifacts => "artifacts-tab".into(),
         TabId::File(path) => format!("file-tab-{path}"),
+        TabId::Goal => "goal-tab".into(),
     }
     .into()
 }
