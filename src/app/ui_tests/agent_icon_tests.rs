@@ -19,7 +19,7 @@ async fn icon_picker_search_applies_and_escape_restores_sidebar(cx: &mut TestApp
     let (window, shark) = boot(cx, agents(), WindowOptions::default());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.sidebar_focus.focus(w, cx);
-        s.pick_agent_icon("designer", w, cx);
+        s.pick_agent_icon(Some("designer"), w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
@@ -33,7 +33,7 @@ async fn icon_picker_search_applies_and_escape_restores_sidebar(cx: &mut TestApp
         assert!(s.icon_picker.is_none());
     });
     assert_eq!(State::load().agents[0].icon, AgentIcon::from("star"));
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.pick_agent_icon("designer", w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.pick_agent_icon(Some("designer"), w, cx));
     press_in(window)(cx, &["escape"]);
     cx.update_window(window, |_, w, cx| {
         assert!(shark.read(cx).icon_picker.is_none());
@@ -91,8 +91,8 @@ async fn replacing_open_icon_picker_restores_original_focus(cx: &mut TestAppCont
     let (window, shark) = boot(cx, agents(), WindowOptions::default());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.sidebar_focus.focus(w, cx);
-        s.pick_agent_icon("designer", w, cx);
-        s.pick_agent_icon("designer", w, cx);
+        s.pick_agent_icon(Some("designer"), w, cx);
+        s.pick_agent_icon(Some("designer"), w, cx);
     });
     press_in(window)(cx, &["escape"]);
     cx.update_window(window, |_, w, cx| {
@@ -162,7 +162,7 @@ async fn paste_image_bytes_and_finder_file_reach_crop_then_persist(cx: &mut Test
         ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())).into(),
     ] {
         cx.update(|cx| cx.write_to_clipboard(item));
-        on_app(window, shark.clone())(cx, &|s, w, cx| s.paste_agent_icon("designer", w, cx));
+        on_app(window, shark.clone())(cx, &|s, w, cx| s.paste_agent_icon(Some("designer"), w, cx));
         cx.run_until_parked();
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
