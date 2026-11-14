@@ -23,6 +23,7 @@ mod attention_tests;
 mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;
+mod deep_link_tests;
 mod differ_review_fixes_tests;
 mod draft_picker_tests;
 mod draft_settings_tests;

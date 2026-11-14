@@ -34,7 +34,7 @@ brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
 brew install --cask KaffeDiem/shark/shark
 ```
 
-Or [Download Shark 0.1.40](https://github.com/KaffeDiem/shark/releases/download/v0.1.40/Shark-0.1.40.dmg) for Apple Silicon and drag it to Applications. The app isn't notarized: after first launch, allow it in System Settings → Privacy & Security → Open Anyway.
+Or [Download Shark 0.1.42](https://github.com/KaffeDiem/shark/releases/download/v0.1.42/Shark-0.1.42.dmg) for Apple Silicon and drag it to Applications. The app isn't notarized: after first launch, allow it in System Settings → Privacy & Security → Open Anyway.
 
 Needs `git`, signed-in `gh` and `claude` on your login shell's PATH. For Codex models, also install `codex` and run `codex login`.
 
@@ -46,7 +46,7 @@ Needs `git`, signed-in `gh` and `claude` on your login shell's PATH. For Codex m
 4. **Review and ship.** Open **Differ** (`cmd-shift-d`) to inspect changes and send comments back to a chat. Use **Git** (`cmd-shift-g`) for PR discussions and the git menu to create, update and merge PRs.
 5. **Finish the task.** Delete it when done; this removes its conversations, plans and worktrees. Agents stay available for the next chat.
 
-For existing branches or PRs, use **New task from branch or PR…** in `cmd-k`. A selected agent carries through to its first chat. Every command and its shortcut is discoverable in `cmd-k`.
+For existing branches or PRs, use **New task from branch or PR…** in `cmd-k`, or the [Chrome extension](extensions/chrome) on a GitHub PR page. A selected agent carries through to its first chat. Every command and its shortcut is discoverable in `cmd-k`.
 
 ## Documentation
 
