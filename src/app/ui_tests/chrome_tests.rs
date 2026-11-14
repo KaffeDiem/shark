@@ -332,6 +332,10 @@ pub(crate) fn render_pixels() {
         super::super::usage::render_pixels(&mut cx);
         return;
     }
+    if std::env::var_os("SHARK_RENDER_README").is_some() {
+        super::readme_pixels::render_pixels(&mut cx);
+        return;
+    }
     if std::env::var_os("SHARK_RENDER_TEAMS_ONLY").is_some() {
         super::team_pixels::render_pixels(&mut cx);
         return;

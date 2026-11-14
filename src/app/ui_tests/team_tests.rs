@@ -1328,3 +1328,25 @@ async fn deleting_a_team_or_goal_leaves_ordinary_tasks(cx: &mut TestAppContext) 
         assert!(crate::team::activity("growth").is_empty());
     });
 }
+
+#[gpui_kit::test]
+async fn home_lists_a_goal_at_work_as_running(cx: &mut TestAppContext) {
+    use crate::app::home::Bucket;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (f, _home) = start(cx, 3);
+    let (goal, lead) = f.planned(cx, "## Tasks\n- T1 @coder [api]: One\n").await;
+    let bucket = |s: &Shark, cx: &App| {
+        let rows = s.home_rows(cx);
+        let row = rows.iter().find(|r| s.state.tasks[r.ix].name == goal);
+        row.map(|r| r.bucket)
+    };
+    // A plan to approve is yours; once approved the goal is at work though its lead is idle.
+    f.on(cx, |s, w, cx| {
+        assert_eq!(bucket(s, cx), Some(Bucket::Needs));
+        s.approve_goal(&goal, w, cx);
+        assert!(!lead.read(cx).busy);
+        assert_eq!(bucket(s, cx), Some(Bucket::Running), "its tasks run");
+        s.pause_goal(&goal, w, cx);
+        assert_ne!(bucket(s, cx), Some(Bucket::Running), "paused isn't running");
+    });
+}

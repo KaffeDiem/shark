@@ -595,10 +595,20 @@ impl Shark {
                 let (bucket, label) = if self.state.tasks[ix].backlog {
                     (Bucket::Backlog, waiting.map(str::to_string))
                 } else {
-                    // A goal shows the highest of its own attention and its tasks'.
-                    let attn = match self.state.tasks[ix].goal {
+                    // A goal shows the highest of its own attention and its tasks'. What needs
+                    // you comes first; else it is running while its lead plans or its tasks work.
+                    let goal = self.state.tasks[ix].goal.as_ref();
+                    let attn = match goal {
                         Some(_) => self.goal_attention(name, cx),
                         None => self.attention_of(name, cx),
+                    };
+                    let running = match goal {
+                        Some(_) if matches!(attn, Attn::Needs(_)) => 0,
+                        Some(g) => usize::from(matches!(
+                            g.state,
+                            crate::state::GoalState::Planning | crate::state::GoalState::Running
+                        )),
+                        None => running,
                     };
                     bucket(running, &attn, waiting)
                 };

@@ -5,7 +5,7 @@ use super::team_page::TeamView;
 use super::*;
 use crate::state::{AgentLink, Goal, GoalState, Row, RowState, Team, Why};
 
-fn row(key: &str, title: &str, agent: &str, after: &[&str], state: RowState) -> Row {
+pub(super) fn row(key: &str, title: &str, agent: &str, after: &[&str], state: RowState) -> Row {
     Row {
         key: key.into(),
         title: title.into(),
@@ -19,7 +19,7 @@ fn row(key: &str, title: &str, agent: &str, after: &[&str], state: RowState) -> 
     }
 }
 
-fn goal_task(name: &str, title: &str, goal: Goal) -> Task {
+pub(super) fn goal_task(name: &str, title: &str, goal: Goal) -> Task {
     let mut task = Task {
         name: name.into(),
         title: title.into(),
