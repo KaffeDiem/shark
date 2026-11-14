@@ -132,9 +132,11 @@ fn allowed(words: &[String], glob: bool) -> bool {
     };
     let none = |bad: fn(&str) -> bool| !glob && !args.iter().any(|a| bad(a));
     match cmd {
-        // uniq's second operand is a file it writes.
+        // uniq's second operand is a file it writes, and after `--` even `-x` is an operand.
         "sort" | "uniq" => none(|a| {
             !a.starts_with('-')
+                || a == "-"
+                || a == "--"
                 || (!a.starts_with("--") && a.contains('o'))
                 || long(a, "output")
                 || long(a, "compress-program")
@@ -256,6 +258,8 @@ mod tests {
             ("git log -- *.rs", false),
             ("uniq /dev/null f", false),
             ("uniq -c f", false),
+            ("echo x | uniq -- - -x", false),
+            ("uniq - -x", false),
             ("sort -o f x", false),
             ("sort -ro f", false),
             ("sort --out=f", false),
