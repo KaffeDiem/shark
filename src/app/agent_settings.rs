@@ -45,7 +45,7 @@ fn defaults(a: &Agent) -> (Option<String>, Option<String>) {
 }
 
 /// The model chip's label, also Settings › Agents' rows: "App default", "Opus · App default".
-pub(super) fn defaults_label(a: &Agent) -> String {
+pub(crate) fn defaults_label(a: &Agent) -> String {
     match defaults(a) {
         (None, None) => "App default".into(),
         (m, e) => format!(
@@ -187,11 +187,11 @@ impl Shark {
         Ok(slug)
     }
 
-    pub(super) fn new_agent_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_agent_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.agent_dialog(None, None, window, cx);
     }
 
-    pub(super) fn open_agent(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_agent(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.agent(slug).is_some() {
             self.agent_dialog(Some(slug), None, window, cx);
         }
@@ -535,8 +535,13 @@ impl Shark {
                         );
                     }
                 }
-                // The agent's dialog under this confirmation has nothing left to show.
-                window.defer(cx, |w, cx| w.close_all_dialogs(cx));
+                // The confirmation is closed; the agent's dialog under it has nothing left to show.
+                // Only that one goes, so Settings › Agents stays open beneath it.
+                if (s.agent_editor.as_ref().and_then(|e| e.upgrade()))
+                    .is_some_and(|e| e.read(cx).slug.as_deref() == Some(slug.as_str()))
+                {
+                    window.defer(cx, |w, cx| w.close_dialog(cx));
+                }
                 cx.notify();
             },
             window,
