@@ -664,6 +664,10 @@ async fn a_task_hands_off_inside_its_goal_and_a_failure_reaches_the_lead(cx: &mu
         assert!(sent[0].contains("transcript.md"));
         assert_eq!(s.task(&task.name).unwrap().chats.len(), 2);
         assert_eq!(s.active, None, "nothing was shown");
+        // The Agents view credits T1 to whoever has it now.
+        let team = s.team("growth").unwrap();
+        assert_eq!(s.agent_line(team, "designer", cx).text, "T1 running");
+        assert_eq!(s.agent_line(team, "coder", cx).text, "T2 running");
         chat
     });
     // The designer names coder next, who already worked here: no loop, the row finishes.

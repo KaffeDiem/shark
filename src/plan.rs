@@ -240,6 +240,12 @@ impl PlanPane {
             .map(|i| i + 1)
     }
 
+    /// The markdown on screen.
+    #[cfg(test)]
+    pub(crate) fn shown_md(&self, cx: &App) -> String {
+        self.md.read(cx).rendered_text().source().to_string()
+    }
+
     pub fn latest(&self) -> Option<&Version> {
         self.versions.last()
     }
@@ -250,15 +256,22 @@ impl PlanPane {
         cx.notify();
     }
 
-    /// The goal's plan rows, problems and roster, as the app has them.
+    /// The goal's plan rows, problems and roster, as the app has them; `goal` is false once
+    /// the task no longer has one (its team was deleted), and the pane builds again.
     pub fn set_goal(
         &mut self,
+        goal: bool,
         rows: Vec<Row>,
         editable: bool,
         problems: Vec<String>,
         roster: Vec<AgentLink>,
         cx: &mut Context<Self>,
     ) {
+        if self.goal != goal {
+            self.goal = goal;
+            self.md.update(cx, |m, cx| m.set_scrollable(!goal, cx));
+            self.rebuild(cx);
+        }
         if (&self.rows, self.editable, &self.problems, &self.roster)
             != (&rows, editable, &problems, &roster)
         {
@@ -300,8 +313,9 @@ impl PlanPane {
         let Some(new) = self.versions.get(self.shown) else {
             return;
         };
-        let goal = self.goal;
-        let text = |v: &str| if goal { prose(v) } else { v }.to_string();
+        // Only the latest version has rows to show its tasks; older ones keep theirs.
+        let rows = self.goal && self.shown + 1 == self.versions.len();
+        let text = |v: &str| if rows { prose(v) } else { v }.to_string();
         let r = match (self.changes, self.shown.checked_sub(1)) {
             (true, Some(prev)) => redline(
                 &text(&self.versions[prev].text),

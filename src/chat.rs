@@ -519,6 +519,11 @@ impl Chat {
         cx.notify();
     }
 
+    /// How long the running turn has taken; background tasks alone are no turn.
+    fn turn_secs(&self) -> u64 {
+        (self.started.filter(|_| self.busy)).map_or(0, |t| t.elapsed().as_secs())
+    }
+
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
@@ -885,7 +890,11 @@ impl Chat {
     /// A goal's plan rows (the draft while one waits), problems and roster for its plan pane,
     /// which can't see the app.
     fn hand_goal(&self, cx: &mut Context<Self>) {
-        let Some(g) = &self.ws.goal else { return };
+        let Some(g) = &self.ws.goal else {
+            return (self.plan).update(cx, |p, cx| {
+                p.set_goal(false, vec![], false, vec![], vec![], cx)
+            });
+        };
         let rows = if g.draft.is_empty() {
             &g.rows
         } else {
@@ -893,8 +902,9 @@ impl Chat {
         };
         let (rows, problems, roster) = (rows.clone(), g.problems.clone(), g.roster.clone());
         let editable = !g.draft.is_empty();
-        self.plan
-            .update(cx, |p, cx| p.set_goal(rows, editable, problems, roster, cx));
+        self.plan.update(cx, |p, cx| {
+            p.set_goal(true, rows, editable, problems, roster, cx)
+        });
     }
 
     /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
@@ -1056,6 +1066,8 @@ impl Chat {
     /// Forgets the claude session and stops the agent; the next send starts a new conversation.
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
         let was_working = self.working();
+        // The cut-off turn's time still counts toward a goal's limit.
+        let secs = self.turn_secs();
         self.meta.session_id = None;
         cx.emit(ChatEvent::Meta);
         self.reader = None; // its Exited would be about the old process
@@ -1067,7 +1079,7 @@ impl Chat {
         if was_working {
             self.keep_reply();
             self.handoff_dismissed = false;
-            (self.last_outcome, self.last_secs) = (Some(Outcome::Interrupted), 0);
+            (self.last_outcome, self.last_secs) = (Some(Outcome::Interrupted), secs);
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -1217,12 +1229,12 @@ impl Chat {
             Ev::Exited(msg) => {
                 self.drop_process(cx);
                 if self.busy {
+                    self.last_secs = self.turn_secs();
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
                     self.keep_reply();
                     self.handoff_dismissed = false;
                     self.last_outcome = Some(Outcome::Exited);
-                    self.last_secs = self.started.map_or(0, |t| t.elapsed().as_secs());
                     cx.emit(ChatEvent::TurnDone);
                 } else {
                     let first = msg.lines().next().unwrap_or_default();
@@ -4635,10 +4647,22 @@ done
 
                 c.meta.session_id = Some("s2".into());
                 (c.busy, c.last_reply) = (true, "old".into());
+                c.started = Some(Instant::now() - std::time::Duration::from_secs(90));
                 c.new_conversation(cx);
                 assert_eq!(c.last_reply, "");
                 assert_eq!(c.meta.session_id, None);
                 assert!(!c.working());
+                // A goal's time limit counts the turn it cut short.
+                assert!((90..95).contains(&c.last_secs), "{}", c.last_secs);
+
+                // Only background processes: no turn, so no time.
+                c.background = vec![harness::BackgroundTask {
+                    id: "b".into(),
+                    kind: "local_bash".into(),
+                    description: String::new(),
+                }];
+                c.new_conversation(cx);
+                assert_eq!(c.last_secs, 0);
             })
         });
     }

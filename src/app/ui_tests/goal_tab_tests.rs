@@ -297,6 +297,64 @@ async fn plain_plan_pane_still_offers_build(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// An older version of a goal's plan keeps its Tasks section: only the latest one shows its
+/// tasks as rows instead.
+#[gpui_kit::test]
+async fn an_older_goal_plan_shows_its_tasks(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (f, _home) = start(cx, 3);
+    let (goal, lead) = f.planned(cx, PLAN).await;
+    let chat = lead.clone();
+    f.on(cx, |_, _, cx| {
+        chat.update(cx, |c, cx| {
+            let (id, text) = ("plan-2".to_string(), THREE.to_string());
+            c.play(crate::harness::Ev::Plan { id, text }, cx)
+        })
+    });
+    f.end_turn(cx, &lead, "", 1);
+    f.on(cx, |s, w, cx| {
+        s.open_task_named(&goal, w, cx);
+        s.select_chat(0, w, cx);
+    });
+    let plan = lead.read_with(cx, |c, _| c.plan.clone());
+    let shown = |f: &Fixture, cx: &mut TestAppContext| {
+        let plan = plan.clone();
+        f.frame(cx);
+        f.on(cx, |_, _, cx| plan.read(cx).shown_md(cx))
+    };
+    let latest = shown(&f, cx);
+    assert!(!latest.contains("Tasks"), "the latest shows rows: {latest}");
+    assert!(f.has(cx, ("plan-row-agent", 0usize)));
+    f.on(cx, |_, _, cx| plan.update(cx, |p, cx| p.show(0, cx)));
+    let older = shown(&f, cx);
+    assert!(older.contains("## Tasks"), "{older}");
+    assert!(older.contains("Add cursor pagination"), "{older}");
+}
+
+/// A goal whose team is deleted becomes an ordinary task: its plan pane builds again.
+#[gpui_kit::test]
+async fn a_deleted_teams_goal_plan_pane_builds_again(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (f, _home) = start(cx, 3);
+    let (goal, lead) = f.planned(cx, PLAN).await;
+    f.on(cx, |s, w, cx| {
+        s.open_task_named(&goal, w, cx);
+        s.select_chat(0, w, cx);
+    });
+    assert!(f.has(cx, ("plan-row-agent", 0usize)));
+    f.goal_state(cx, &goal, GoalState::Stopped);
+    f.on(cx, |s, _, cx| s.delete_team("growth", cx).unwrap());
+    assert!(!f.has(cx, ("plan-row-agent", 0usize)), "no goal rows");
+    cx.update_window(f.window, |_, w, _| {
+        assert!(w.try_find_by_label("Build in new chat").is_some());
+        assert!(w.try_find_by_label("Approve and start").is_none());
+    })
+    .unwrap();
+    let plan = lead.read_with(cx, |c, _| c.plan.clone());
+    let md = f.on(cx, |_, _, cx| plan.read(cx).shown_md(cx));
+    assert!(md.contains("## Tasks"), "the whole plan shows: {md}");
+}
+
 /// Space on a started row draws the card on the tab; escape closes it and the list has focus.
 #[gpui_kit::test]
 async fn space_peeks_the_cursor_row_on_the_goal_tab(cx: &mut TestAppContext) {

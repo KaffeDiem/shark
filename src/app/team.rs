@@ -155,6 +155,14 @@ impl Shark {
             .filter(|t| t.instance_id == at.instance_id)
     }
 
+    /// Who works the row now: its chat's agent, which a handoff changes, else its assignee.
+    pub(crate) fn row_worker<'a>(&'a self, row: &'a Row) -> &'a str {
+        (self.row_task(row).zip(row.chat.as_ref()))
+            .and_then(|(t, id)| t.chats.iter().find(|c| &c.id == id))
+            .and_then(|c| c.agent.as_deref())
+            .unwrap_or(&row.agent)
+    }
+
     /// Saves a goal whose rows or state changed. Its chats read neither, so they aren't told.
     fn goal_changed(&mut self, _name: &str, cx: &mut Context<Self>) {
         let _ = self.state.save();
@@ -170,7 +178,9 @@ impl Shark {
 
     /// Logs what a row's agent did.
     fn log_row(&self, goal: &str, key: &str, what: impl Into<String>) {
-        let who = self.row(goal, key).map(|r| self.agent_name(&r.agent));
+        let who = self
+            .row(goal, key)
+            .map(|r| self.agent_name(self.row_worker(r)));
         self.log_goal(goal, key, &who.unwrap_or_default(), what);
     }
 
@@ -1838,6 +1848,10 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let Some(goal) = self.goal(name) else { return };
+        let all: Vec<Task> = (goal.rows.iter())
+            .filter_map(|r| self.row_task(r))
+            .cloned()
+            .collect();
         let tasks: Vec<Task> = (team::in_order(&goal.rows).into_iter())
             .filter(|r| r.state == RowState::Finished)
             .filter_map(|r| self.row_task(r))
@@ -1862,17 +1876,26 @@ impl Shark {
             let results = (cx.background_executor())
                 .spawn(async move {
                     let new = crate::pr::NewPr::new("", true);
-                    (tasks.iter())
-                        .map(|t| {
-                            let made = crate::pr::create_linked_prs(t, &t.dir(), &[], &new);
-                            (t.display_title().into_owned(), made)
+                    (tasks.into_iter())
+                        .map(|mut t| {
+                            // Stacked on a task that changed nothing: that one opens no PR.
+                            let moves = crate::pr::unchanged_bases(&t, &t.dir(), &all);
+                            for (repo, _, base) in &moves {
+                                let r = t.repos.iter_mut().find(|r| &r.name == repo).unwrap();
+                                r.base = base.clone();
+                            }
+                            let made = crate::pr::create_linked_prs(&t, &t.dir(), &[], &new);
+                            (t.name.clone(), t.display_title().into_owned(), moves, made)
                         })
                         .collect::<Vec<_>>()
                 })
                 .await;
             this.update_in(cx, |s, window, cx| {
                 let (mut made, mut errors) = (0, vec![]);
-                for (title, result) in results {
+                for (name, title, moves, result) in results {
+                    if !moves.is_empty() {
+                        s.set_base(&name, &moves, false, window, cx);
+                    }
                     match result {
                         Ok((prs, warning)) => {
                             made += prs.len();

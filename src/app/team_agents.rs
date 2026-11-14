@@ -4,8 +4,8 @@ use crate::state::{GoalState, RowState, Team};
 use std::rc::Rc;
 
 /// What an agent is doing in a team, from the team's open goals.
-struct AgentLine {
-    text: String,
+pub(super) struct AgentLine {
+    pub(super) text: String,
     needs: bool,
     /// The task it is working in, for **Open its task**.
     task: Option<String>,
@@ -13,7 +13,7 @@ struct AgentLine {
 
 impl Shark {
     /// Idle, `T2 running`, Needs you, or Paused in this team.
-    fn agent_line(&self, team: &Team, slug: &str, cx: &App) -> AgentLine {
+    pub(super) fn agent_line(&self, team: &Team, slug: &str, cx: &App) -> AgentLine {
         let line = |text: &str, needs, task| AgentLine {
             text: text.into(),
             needs,
@@ -28,7 +28,7 @@ impl Shark {
                     needs.get_or_insert(goal.name.clone());
                 }
             }
-            for row in g.rows.iter().filter(|r| r.agent == slug) {
+            for row in g.rows.iter().filter(|r| self.row_worker(r) == slug) {
                 let live = matches!(row.state, RowState::Started | RowState::Committing);
                 let Some(task) = self.row_task(row).filter(|_| live) else {
                     continue;

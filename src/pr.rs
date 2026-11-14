@@ -215,6 +215,36 @@ pub fn create_linked_prs(
     Ok((prs, warning))
 }
 
+/// A goal's task stacked on another that changed nothing in a repo: that branch never reaches
+/// GitHub, so the repo's PR targets what the other was based on, up a chain of such tasks.
+/// `goal` holds the goal's tasks; returns `(repo, old, new)` for each base that moves.
+pub fn unchanged_bases(ws: &Task, dir: &Path, goal: &[Task]) -> Vec<(String, String, String)> {
+    let mut moves = vec![];
+    for r in &ws.repos {
+        let wt = dir.join(&r.name);
+        let mut base = r.base.as_str();
+        // Bounded by the goal's size: a cycle of bases can't loop forever.
+        for _ in goal {
+            let under = (goal.iter())
+                .flat_map(|t| t.repos.iter().map(move |p| (t, p)))
+                .find(|(t, p)| p.name == r.name && t.branch_of(p) == base);
+            let Some((_, p)) = under else { break };
+            let ahead = git(
+                &wt,
+                &["rev-list", "--count", &format!("{}..{base}", p.base)],
+            );
+            if ahead.as_deref() != Ok("0") {
+                break;
+            }
+            base = &p.base;
+        }
+        if base != r.base {
+            moves.push((r.name.clone(), r.base.clone(), base.to_string()));
+        }
+    }
+    moves
+}
+
 /// Rewrites each PR's body to link the others; the warning lists the repos that failed.
 fn link_prs(dir: &Path, prs: &[(String, String)]) -> Option<String> {
     let mut failed = vec![];
@@ -358,9 +388,85 @@ mod tests {
 
     /// A goal's stacked task starts on its parent's local branch, which is its base. Its PR
     /// targets that branch, so the parent has to be on GitHub first, with all its commits.
+    /// A commit as user `t`.
+    fn commit(dir: &Path, args: &[&str]) {
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        git(dir, &[&id, args].concat()).unwrap();
+    }
+
+    /// An `api` repo under `root` with one commit on `main`, pushed to a bare origin.
+    fn pushed_repo(root: &Path) -> crate::state::Repo {
+        let (origin, src) = (root.join("api.git"), root.join("src/api"));
+        std::fs::create_dir_all(&src).unwrap();
+        git(root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]).unwrap();
+        commit(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &src,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .unwrap();
+        git(&src, &["push", "-q", "origin", "main"]).unwrap();
+        crate::git::add_repo(&src, &[]).unwrap()
+    }
+
+    /// A parent that changed nothing in a repo never reaches GitHub there: its child's PR
+    /// targets what the parent was based on, up a chain of such parents.
+    #[test]
+    fn a_child_of_unchanged_parents_targets_their_base() {
+        use crate::git::{create_row_task, create_task};
+        use std::fs;
+        #[cfg(feature = "test-support")]
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("shark-pr-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = pushed_repo(&root);
+        let repos = std::slice::from_ref(&repo);
+        let on = crate::git::on_branch(repos, "first");
+        let first = create_task(&root.join("ws/first"), "first", "first", &on).unwrap();
+        let row = |name: &str, parent: &str| {
+            let parents = [("api".to_string(), parent.to_string())];
+            create_row_task(
+                &root.join("ws").join(name),
+                name,
+                name,
+                repos,
+                &parents,
+                "",
+                None,
+            )
+            .unwrap()
+        };
+        let (second, third) = (row("second", "first"), row("third", "second"));
+        commit(
+            &root.join("ws/third/api"),
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        );
+        let tasks = [first.clone(), second.clone(), third.clone()];
+        let trunk = first.repos[0].base.clone();
+        let moves = |t: &Task| unchanged_bases(t, &root.join("ws").join(&t.name), &tasks);
+        assert_eq!(
+            moves(&third),
+            [("api".to_string(), "second".to_string(), trunk.clone())]
+        );
+        assert_eq!(moves(&first), [], "a trunk base stays");
+        // The first one did work: the chain stops at its branch, which its PR pushes.
+        commit(
+            &root.join("ws/first/api"),
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        assert_eq!(
+            moves(&third),
+            [("api".to_string(), "second".to_string(), "first".to_string())]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_stacked_goal_task_waits_for_its_parent_on_github() {
-        use crate::git::{add_repo, create_row_task, create_task};
+        use crate::git::{create_row_task, create_task};
         use std::fs;
         #[cfg(feature = "test-support")]
         let _lock = crate::app::ui_tests::UI_LOCK
@@ -368,26 +474,11 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("shark-pr-stack-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let c = |dir: &Path, args: &[&str]| {
-            let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
-            git(dir, &[&id, args].concat()).unwrap()
-        };
-        let (origin, src) = (root.join("api.git"), root.join("src/api"));
-        fs::create_dir_all(&src).unwrap();
-        git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-        git(&src, &["init", "-q", "-b", "main"]).unwrap();
-        c(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(
-            &src,
-            &["remote", "add", "origin", &origin.to_string_lossy()],
-        )
-        .unwrap();
-        git(&src, &["push", "-q", "origin", "main"]).unwrap();
-        let repo = add_repo(&src, &[]).unwrap();
+        let repo = pushed_repo(&root);
         let parent_dir = root.join("ws/parent");
         let on = crate::git::on_branch(std::slice::from_ref(&repo), "parent");
         create_task(&parent_dir, "parent", "parent", &on).unwrap();
-        c(
+        commit(
             &parent_dir.join("api"),
             &["commit", "-q", "--allow-empty", "-m", "one"],
         );
@@ -406,7 +497,7 @@ mod tests {
             tip(&parent_dir.join("api")),
             "from its local tip"
         );
-        c(
+        commit(
             &child_dir.join("api"),
             &["commit", "-q", "--allow-empty", "-m", "two"],
         );
@@ -420,7 +511,7 @@ mod tests {
         refused("the parent was never pushed");
         // Pushed, then moved on locally: the unpushed commit would land in the child's PR.
         git(&parent_dir.join("api"), &["push", "-q", "origin", "parent"]).unwrap();
-        c(
+        commit(
             &parent_dir.join("api"),
             &["commit", "-q", "--allow-empty", "-m", "three"],
         );
