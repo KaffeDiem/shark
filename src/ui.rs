@@ -115,6 +115,15 @@ pub(crate) fn key_footer(hints: &[(&str, &'static str)], action: Option<AnyEleme
         .children(action)
 }
 
+/// `1 h 12 m`.
+pub(crate) fn hm(secs: u64) -> String {
+    match (secs / 3600, secs % 3600 / 60) {
+        (0, m) => format!("{m} m"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} m"),
+    }
+}
+
 /// The "s" of `n` things.
 pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
@@ -699,4 +708,17 @@ pub(crate) fn open_headed<T: 'static>(
             }))
     });
     palette.update(cx, |p, cx| p.focus(window, cx));
+}
+
+#[cfg(test)]
+mod hm_tests {
+    use super::hm;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro
+
+    #[test]
+    fn agent_time_reads_in_hours_and_minutes() {
+        assert_eq!(hm(0), "0 m");
+        assert_eq!(hm(72 * 60), "1 h 12 m");
+        assert_eq!(hm(3 * 3600), "3 h");
+    }
 }

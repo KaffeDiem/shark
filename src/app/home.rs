@@ -173,6 +173,8 @@ pub(crate) struct Home {
     pub(super) composer: Entity<TaskComposer>,
     pub(super) draft: TaskDraft,
     pub(super) draft_agent: Option<String>,
+    /// The team the prompt gives a goal to, instead of starting a task for an agent.
+    pub(super) draft_team: Option<String>,
     pub(super) tray_focus: FocusHandle,
     pub(super) tray_stop: Option<super::draft_view::DraftStop>,
     pub(super) tray_shown: usize,
@@ -218,6 +220,7 @@ impl Home {
             composer,
             draft: TaskDraft::default(),
             draft_agent: None,
+            draft_team: None,
             tray_focus: cx.focus_handle(),
             tray_stop: None,
             tray_shown: usize::MAX,
@@ -292,6 +295,7 @@ impl Shark {
         self.close_peek(cx);
         self.peek.restore = None; // Explicit navigation chooses Home's focus.
         self.draft_picker = None;
+        self.team_page = None;
         self.home.on = true;
         self.zen = false;
         self.remember_open();
@@ -310,6 +314,9 @@ impl Shark {
         // The card's button went away with the card: back to the list that showed it.
         if let Some(home) = self.peek.restore.take() {
             return self.focus_peek_list(home, window, cx);
+        }
+        if self.team_shown().is_some() {
+            return self.focus_team_page(window, cx);
         }
         match (self.home_shown(), self.home_rows(cx).is_empty()) {
             (true, true) => self.home.prompt.update(cx, |p, cx| p.focus(window, cx)),
@@ -412,13 +419,25 @@ impl Shark {
         }
     }
 
+    /// The tasks that can have a row on Home: all but a goal's tasks that don't need you.
+    fn home_tasks<'a>(&'a self, cx: &'a App) -> impl Iterator<Item = &'a Task> {
+        self.state
+            .tasks
+            .iter()
+            .filter(move |t| self.home_listed(t, cx))
+    }
+
+    fn home_listed(&self, t: &Task, cx: &App) -> bool {
+        t.goal.is_some()
+            || self.team_of(t).is_none()
+            || matches!(self.attention_of(&t.name, cx), Attn::Needs(_))
+    }
+
     pub(super) fn home_hidden(&self, cx: &App) -> (usize, usize) {
         let Some(filter) = self.home.repo_filter.as_ref() else {
             return (0, 0);
         };
-        self.state
-            .tasks
-            .iter()
+        self.home_tasks(cx)
             .filter(|t| !repo_matches(t, filter))
             .fold((0, 0), |(n, needs), t| {
                 (
@@ -438,16 +457,12 @@ impl Shark {
         let mut filters = vec![None];
         filters.extend(self.state.repos.iter().filter_map(|repo| {
             let filter = RepoFilter::Repo(repo.name.clone());
-            self.state
-                .tasks
-                .iter()
+            self.home_tasks(cx)
                 .any(|t| repo_matches(t, &filter))
                 .then_some(Some(filter))
         }));
         if self
-            .state
-            .tasks
-            .iter()
+            .home_tasks(cx)
             .any(|t| repo_matches(t, &RepoFilter::NoRepo))
         {
             filters.push(Some(RepoFilter::NoRepo));
@@ -462,9 +477,7 @@ impl Shark {
                     .into();
                 let checked = filter == &self.home.repo_filter;
                 let (n, needs) = self
-                    .state
-                    .tasks
-                    .iter()
+                    .home_tasks(cx)
                     .filter(|t| filter.as_ref().is_none_or(|f| repo_matches(t, f)))
                     .fold((0, 0), |(n, needs), t| {
                         (
@@ -571,7 +584,9 @@ impl Shark {
         let mut rows: Vec<HomeRow> = (0..self.state.tasks.len())
             .filter(|&ix| {
                 let task = &self.state.tasks[ix];
-                self.home_task_matches(task) && (!task.backlog || self.home.backlog_open)
+                self.home_listed(task, cx)
+                    && self.home_task_matches(task)
+                    && (!task.backlog || self.home.backlog_open)
             })
             .map(|ix| {
                 let name = &self.state.tasks[ix].name;
@@ -580,7 +595,12 @@ impl Shark {
                 let (bucket, label) = if self.state.tasks[ix].backlog {
                     (Bucket::Backlog, waiting.map(str::to_string))
                 } else {
-                    bucket(running, &self.attention_of(name, cx), waiting)
+                    // A goal shows the highest of its own attention and its tasks'.
+                    let attn = match self.state.tasks[ix].goal {
+                        Some(_) => self.goal_attention(name, cx),
+                        None => self.attention_of(name, cx),
+                    };
+                    bucket(running, &attn, waiting)
                 };
                 HomeRow { ix, bucket, label }
             })
@@ -589,9 +609,11 @@ impl Shark {
         if self.home.group_tasks {
             // Sections, their tasks and then Ungrouped, in the sidebar's order.
             let order = self.ws_order(true);
-            rows.sort_by_key(|r| {
+            // Goals and their tasks come last, under Ungrouped, so no heading shows twice.
+            rows.sort_by_cached_key(|r| {
                 (
                     r.bucket == Bucket::Backlog,
+                    self.team_of(&self.state.tasks[r.ix]).is_some(),
                     order.iter().position(|&ix| ix == r.ix),
                 )
             });
@@ -713,6 +735,9 @@ impl Shark {
             }
             return;
         }
+        if let Some(slug) = (self.home.draft_team.clone()).filter(|_| self.draft_for_team()) {
+            return self.give_draft_goal(&slug, window, cx);
+        }
         self.submit_task_draft(window, cx);
     }
 
@@ -738,6 +763,7 @@ impl Shark {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.home.draft_team = None;
         let text = self.home.prompt.read(cx).value();
         let (_, body) = agent_prompt(text.trim(), &self.state.agents);
         let value = match slug {
@@ -775,20 +801,41 @@ impl Shark {
         let selected = slug
             .and_then(|slug| agents.iter().position(|a| a.slug == slug))
             .map_or(0, |i| i + 1);
+        // Teams follow the agents; a team isn't an agent slug, so it has its own draft field.
+        let teams = self.state.teams.clone();
+        let selected = match self.home.draft_team.as_deref() {
+            Some(t) => teams
+                .iter()
+                .position(|x| x.slug == t)
+                .map_or(0, |i| agents.len() + i + 1),
+            None => selected,
+        };
         let mut rows = vec![CommandItem::new().label("No agent").icon(IconName::AtSign)];
         rows.extend(
             agents
                 .iter()
                 .map(|agent| super::agent_icon_view::command(agent)),
         );
+        rows.extend(teams.iter().map(|team| {
+            let (icon, name) = (team.icon.clone(), team.name.clone());
+            CommandItem::new().label(name.clone()).child(move |_, _| {
+                h_flex()
+                    .gap(px(10.))
+                    .child(super::agent_icon_view::agent_icon(&icon))
+                    .child(format!("{name} (team)"))
+            })
+        }));
         rows.push(CommandItem::new().label("New agent…").icon(IconName::Plus));
         open_menu(
             cx.entity().downgrade(),
-            "Start the task with an agent…",
+            "Start the task with an agent or team…",
             rows,
             selected,
             move |s, i, w, cx| match i.checked_sub(1) {
-                Some(i) if i == agents.len() => {
+                Some(i) if (agents.len()..agents.len() + teams.len()).contains(&i) => {
+                    s.set_home_team(&teams[i - agents.len()].slug, w, cx)
+                }
+                Some(i) if i == agents.len() + teams.len() => {
                     let then = Rc::new(
                         |s: &mut Shark, slug: &str, w: &mut Window, cx: &mut Context<Shark>| {
                             s.set_home_agent(Some(slug), w, cx)
@@ -801,6 +848,16 @@ impl Shark {
             window,
             cx,
         );
+    }
+
+    /// Home's prompt gives a goal to team `slug` on Enter, with no agent mentioned.
+    pub(super) fn set_home_team(&mut self, slug: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if self.team(slug).is_none() {
+            return;
+        }
+        self.set_home_agent(None, w, cx);
+        self.home.draft_team = Some(slug.into());
+        self.focus_draft(w, cx);
     }
 
     /// Agents matching the `@` Home's prompt starts with, while that mention is being typed:
@@ -952,7 +1009,8 @@ impl Shark {
         let theme = cx.theme();
         let modifiers = window.modifiers();
         let cmd_held = modifiers.platform && modifiers.number_of_modifiers() == 1;
-        let selected = self.home_shown();
+        // A team's page shows over Home; its own row is the open destination then.
+        let selected = self.home_shown() && self.team_shown().is_none();
         side_row(theme)
             .text_color(theme.sidebar_foreground)
             .id("home-row")
@@ -1248,9 +1306,7 @@ impl Shark {
     pub(super) fn render_ws_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.home_rows(cx);
         let backlog = self
-            .state
-            .tasks
-            .iter()
+            .home_tasks(cx)
             .filter(|t| t.backlog && self.home_task_matches(t))
             .count();
         let theme = cx.theme();
@@ -1539,6 +1595,14 @@ impl Shark {
             n => format!("{n} chats"),
         };
         let status = Some(facts.line.clone());
+        // A goal's progress, or the goal a task belongs to.
+        let goal_note = match (&w.goal, &w.part) {
+            (Some(g), _) => Some(crate::team::progress(g))
+                .filter(|p| p.1 > 0)
+                .map(|(d, n)| format!("{d}/{n}")),
+            (_, Some(p)) if self.team_of(w).is_some() => Some(p.goal_title.clone()),
+            _ => None,
+        };
         // The agents its chats use, first use first.
         let agents: Vec<_> = (w.chat_agents().into_iter())
             .filter_map(|slug| self.agent(slug))
@@ -1562,7 +1626,14 @@ impl Shark {
             )
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!(
-                "Open task {title}{}: {detail}",
+                "Open task {title}{}{}: {detail}",
+                goal_note
+                    .as_deref()
+                    .map(|g| match w.goal {
+                        Some(_) => format!(", {g} tasks"),
+                        None => format!(", goal {g}"),
+                    })
+                    .unwrap_or_default(),
                 status
                     .as_deref()
                     .map(|s| format!(", {s}"))
@@ -1610,6 +1681,15 @@ impl Shark {
                     .font_weight(FontWeight::MEDIUM)
                     .child(title),
             )
+            .children(goal_note.map(|g| {
+                div()
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(g)
+            }))
             .children(status.map(|l| {
                 div()
                     .flex_none()

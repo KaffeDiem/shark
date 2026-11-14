@@ -184,11 +184,15 @@ impl Shark {
                 })
                 .unwrap_or_default()
         } else {
+            // Teams, goals and their tasks don't move by drag.
             self.side_rows(false)
                 .into_iter()
-                .map(|row| match row {
-                    SideRow::Task(i) => Item::Task(self.state.tasks[i].name.clone()),
-                    SideRow::Section(i) => Item::Section(i),
+                .filter_map(|row| match row {
+                    SideRow::Task(i) if self.team_of(&self.state.tasks[i]).is_none() => {
+                        Some(Item::Task(self.state.tasks[i].name.clone()))
+                    }
+                    SideRow::Section(i) => Some(Item::Section(i)),
+                    _ => None,
                 })
                 .collect()
         }

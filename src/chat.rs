@@ -112,6 +112,15 @@ pub enum ChatEvent {
     Asking,
     /// `refuse_unready` said no: the app offers Attach repository.
     NeedsRepo,
+    /// Approve in a goal's lead chat: the app starts the plan's tasks; the lead stays in plan mode.
+    ApproveGoal,
+    /// The plan pane's agent menu on a goal's plan row.
+    ReassignRow {
+        key: String,
+        agent: String,
+    },
+    /// The plan pane's remove button on a goal's plan row.
+    RemoveRow(String),
     /// A review card's "Review changes" row: show the diff.
     ShowChanges,
     /// A review card's comment link: show that comment in the diff.
@@ -123,6 +132,17 @@ pub enum ChatEvent {
         ids: Vec<u64>,
         turn: usize,
     },
+}
+
+/// How a chat's last turn ended. `TurnDone` carries nothing and also fires when the process
+/// goes, and Codex reports an interrupted turn as a clean result, so the chat keeps this.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Outcome {
+    Ended,
+    Failed,
+    Interrupted,
+    /// The process went away mid-turn.
+    Exited,
 }
 
 pub struct Chat {
@@ -158,6 +178,10 @@ pub struct Chat {
     /// The reply of the turn that ended last, and that turn's number (see `turns`).
     pub last_reply: String,
     pub last_turn: usize,
+    /// How the turn that ended last went, and the seconds it took. Claude's seconds include the
+    /// time it waited on answers to its questions.
+    pub last_outcome: Option<Outcome>,
+    pub last_secs: u64,
     /// Vim keys in the composer (`State::vim`); it starts each message in Insert mode.
     pub vim: Vim,
     pub vim_on: bool,
@@ -282,7 +306,8 @@ impl Chat {
     ) -> Self {
         // Every chat passes here, new, reopened or restored: none starts out of Plan mode
         // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
-        meta.plan |= ws.repos.is_empty();
+        // A goal's lead plans for its whole life (`refuse_unready`).
+        meta.plan |= ws.repos.is_empty() || ws.goal.is_some();
         let composer = cx.new(|cx| {
             crate::task_composer::textarea(window, cx, 1)
                 .placeholder("Message the agent (@ to add files, / for skills)")
@@ -323,7 +348,14 @@ impl Chat {
             .iter()
             .flat_map(|r| complete::cached_repo_prs(&r.name, &r.src, false))
             .collect::<Vec<_>>();
-        let plan = cx.new(|cx| PlanPane::new(&meta.id, cx));
+        let goal = ws.goal.is_some();
+        let plan = cx.new(|cx| PlanPane::new(&meta.id, goal, cx));
+        let _plan_sub = cx.subscribe(&plan, |_, _, ev: &plan::PlanEvent, cx| {
+            cx.emit(match ev.clone() {
+                plan::PlanEvent::Reassign { key, agent } => ChatEvent::ReassignRow { key, agent },
+                plan::PlanEvent::Remove(key) => ChatEvent::RemoveRow(key),
+            })
+        });
         let plan_open = meta.plan;
         let mut chat = Chat {
             ws,
@@ -348,6 +380,8 @@ impl Chat {
             composer,
             last_reply: String::new(),
             last_turn: 0,
+            last_outcome: None,
+            last_secs: 0,
             vim: insert_mode(),
             vim_on,
             vim_took: None,
@@ -394,8 +428,9 @@ impl Chat {
             plan_open,
             dropping: None,
             plan,
-            _subs: vec![_sub, _keys],
+            _subs: vec![_sub, _keys, _plan_sub],
         };
+        chat.hand_goal(cx);
         // Warm both sources now so the first `@` or `/` doesn't wait.
         chat.reindex(cx);
         chat.reprobe(cx);
@@ -847,6 +882,21 @@ impl Chat {
             .count()
     }
 
+    /// A goal's plan rows (the draft while one waits), problems and roster for its plan pane,
+    /// which can't see the app.
+    fn hand_goal(&self, cx: &mut Context<Self>) {
+        let Some(g) = &self.ws.goal else { return };
+        let rows = if g.draft.is_empty() {
+            &g.rows
+        } else {
+            &g.draft
+        };
+        let (rows, problems, roster) = (rows.clone(), g.problems.clone(), g.roster.clone());
+        let editable = !g.draft.is_empty();
+        self.plan
+            .update(cx, |p, cx| p.set_goal(rows, editable, problems, roster, cx));
+    }
+
     /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
     /// the agent hears of it with its next normal turn (`pending_context`). Ending the attachment
     /// hold sends what waited for it, unless a git step still holds it.
@@ -854,6 +904,7 @@ impl Chat {
         let grew = ws.repos.len() != self.ws.repos.len();
         let released = self.attach_hold && ws.attaching.is_empty();
         self.ws = ws.clone();
+        self.hand_goal(cx);
         self.attach_hold = !ws.attaching.is_empty();
         if grew {
             self.reindex(cx);
@@ -1016,6 +1067,7 @@ impl Chat {
         if was_working {
             self.keep_reply();
             self.handoff_dismissed = false;
+            (self.last_outcome, self.last_secs) = (Some(Outcome::Interrupted), 0);
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -1169,6 +1221,8 @@ impl Chat {
                     self.blocks.push(Block::Info(msg));
                     self.keep_reply();
                     self.handoff_dismissed = false;
+                    self.last_outcome = Some(Outcome::Exited);
+                    self.last_secs = self.started.map_or(0, |t| t.elapsed().as_secs());
                     cx.emit(ChatEvent::TurnDone);
                 } else {
                     let first = msg.lines().next().unwrap_or_default();
@@ -1414,6 +1468,12 @@ impl Chat {
             }
             self.keep_reply();
             self.handoff_dismissed = false;
+            self.last_outcome = Some(match (cut, is_error) {
+                (true, _) => Outcome::Interrupted,
+                (false, true) => Outcome::Failed,
+                (false, false) => Outcome::Ended,
+            });
+            self.last_secs = secs;
             cx.emit(ChatEvent::TurnDone);
         }
     }

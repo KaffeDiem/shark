@@ -143,7 +143,17 @@ pub fn create_linked_prs(
             ));
         }
         // A stacked branch's PR merges into its parent, which must be on GitHub.
-        if !crate::git::has_ref(&wt, &r.base) {
+        // A goal's stacked task has its parent's local branch as base: GitHub needs it too.
+        // Told by the base being a local branch: the task may no longer belong to its goal.
+        let local = crate::git::has_ref(&wt, &format!("refs/heads/{}", r.base));
+        let on_origin = match local {
+            true => format!("origin/{}", r.base),
+            false => r.base.clone(),
+        };
+        // And all of it: commits the parent hasn't pushed would land in this PR.
+        let pushed = on_origin == r.base
+            || git(&wt, &["merge-base", "--is-ancestor", &r.base, &on_origin]).is_ok();
+        if !crate::git::has_ref(&wt, &on_origin) || !pushed {
             let b = crate::git::short(&r.base);
             return Err(format!(
                 "{}: its base `{b}` isn't on GitHub; push it first (from its task), or Change base…",
@@ -344,6 +354,78 @@ mod tests {
             NewPr::new("Just a title", false).args("b", "main").len(),
             fill.len() + 2
         );
+    }
+
+    /// A goal's stacked task starts on its parent's local branch, which is its base. Its PR
+    /// targets that branch, so the parent has to be on GitHub first, with all its commits.
+    #[test]
+    fn a_stacked_goal_task_waits_for_its_parent_on_github() {
+        use crate::git::{add_repo, create_row_task, create_task};
+        use std::fs;
+        #[cfg(feature = "test-support")]
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("shark-pr-stack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let c = |dir: &Path, args: &[&str]| {
+            let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+            git(dir, &[&id, args].concat()).unwrap()
+        };
+        let (origin, src) = (root.join("api.git"), root.join("src/api"));
+        fs::create_dir_all(&src).unwrap();
+        git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]).unwrap();
+        c(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &src,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .unwrap();
+        git(&src, &["push", "-q", "origin", "main"]).unwrap();
+        let repo = add_repo(&src, &[]).unwrap();
+        let parent_dir = root.join("ws/parent");
+        let on = crate::git::on_branch(std::slice::from_ref(&repo), "parent");
+        create_task(&parent_dir, "parent", "parent", &on).unwrap();
+        c(
+            &parent_dir.join("api"),
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        let child_dir = root.join("ws/child");
+        let parents = [("api".to_string(), "parent".to_string())];
+        let repos = std::slice::from_ref(&repo);
+        let child =
+            create_row_task(&child_dir, "child", "child", repos, &parents, "", None).unwrap();
+        assert_eq!(
+            child.repos[0].base, "parent",
+            "the PR's --base is the parent's branch"
+        );
+        let tip = |dir: &Path| git(dir, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            tip(&child_dir.join("api")),
+            tip(&parent_dir.join("api")),
+            "from its local tip"
+        );
+        c(
+            &child_dir.join("api"),
+            &["commit", "-q", "--allow-empty", "-m", "two"],
+        );
+        let refused = |why: &str| {
+            let e = create_linked_prs(&child, &child_dir, &[], &NewPr::new("", true)).unwrap_err();
+            assert!(
+                e.contains("its base `parent` isn't on GitHub"),
+                "{why}: {e}"
+            );
+        };
+        refused("the parent was never pushed");
+        // Pushed, then moved on locally: the unpushed commit would land in the child's PR.
+        git(&parent_dir.join("api"), &["push", "-q", "origin", "parent"]).unwrap();
+        c(
+            &parent_dir.join("api"),
+            &["commit", "-q", "--allow-empty", "-m", "three"],
+        );
+        refused("the parent has commits GitHub lacks");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Creation asks gh about origin like polling does (`--repo`), and a failed link step still

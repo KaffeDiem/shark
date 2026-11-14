@@ -84,6 +84,7 @@ impl Shark {
     ) {
         match home {
             true => self.home.focus.focus(window, cx),
+            false if self.goal_tab_shown() => self.goal_focus.focus(window, cx),
             false => self.sidebar_focus.focus(window, cx),
         }
     }
@@ -99,7 +100,9 @@ impl Shark {
             return self.close_peek(cx);
         }
         let home = self.home.focus.is_focused(window);
-        let task = if home {
+        let task = if home && self.team_shown().is_some() {
+            self.team_cursor_task(cx)
+        } else if home {
             let rows = self.home_rows(cx);
             self.home_cursor(&rows)
                 .map(|i| self.state.tasks[rows[i].ix].name.clone())
