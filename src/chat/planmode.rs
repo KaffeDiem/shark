@@ -7,8 +7,9 @@ pub(super) const PLAN_SHOWN: &str = "The user now sees this plan in the app's pl
     the plan. If they ask for changes, update the plan file and call ExitPlanMode again.";
 pub(super) const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-tab). Carry on, or \
     suggest it in your reply.";
-pub(super) const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
-    without it, or tell the user what to run.";
+pub(super) const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Plan \
+    mode runs read-only commands: use one command or pipe, `git -C <dir>` instead of `cd … && git`, \
+    no redirects or `$()`, and the Read tool for files.";
 pub(super) const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
 pub(super) const NEEDS_REPO: &str = "This task has no repository, so it stays in Plan mode. Attach \
     one to build.";

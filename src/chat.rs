@@ -9,6 +9,7 @@ mod model;
 mod planmode;
 mod question;
 mod queue;
+mod readonly;
 mod review;
 mod side;
 mod tools;
@@ -1429,6 +1430,7 @@ impl Chat {
             "EnterPlanMode" => Some(ENTER_PLAN),
             // Plan mode asks for these too, and planning needs the web.
             "WebSearch" | "WebFetch" => None,
+            "Bash" if input["command"].as_str().is_some_and(readonly::read_only) => None,
             _ => Some(NEEDS_APPROVAL),
         };
         if let Some(a) = &mut self.harness
@@ -2939,15 +2941,19 @@ exec cat >>"$0.stdin"
                 })
             })
         };
-        // The web runs with its input as asked; other tools stay refused.
+        // The web and read-only Bash run with their input as asked; other tools stay refused.
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                for (id, tool) in [
-                    ("web-1", "WebSearch"),
-                    ("web-2", "WebFetch"),
-                    ("bash-1", "Bash"),
+                for (id, tool, input) in [
+                    ("web-1", "WebSearch", serde_json::json!({"query": "web-1"})),
+                    ("web-2", "WebFetch", serde_json::json!({"query": "web-2"})),
+                    (
+                        "bash-1",
+                        "Bash",
+                        serde_json::json!({"command": "git log -5"}),
+                    ),
+                    ("bash-2", "Bash", serde_json::json!({"command": "rm -rf x"})),
                 ] {
-                    let input = serde_json::json!({"query": id});
                     let (request_id, tool, tool_use_id) = (id.into(), tool.into(), id.into());
                     c.apply(
                         Ev::Permission {
@@ -2980,7 +2986,13 @@ exec cat >>"$0.stdin"
             assert_eq!(r["behavior"], "allow", "{r}");
             assert_eq!(r["updatedInput"]["query"], id, "{r}");
         }
-        assert_eq!(replied("bash-1")["message"], NEEDS_APPROVAL);
+        let r = replied("bash-1");
+        assert_eq!(r["behavior"], "allow", "{r}");
+        assert_eq!(
+            r["updatedInput"],
+            serde_json::json!({"command": "git log -5"})
+        );
+        assert_eq!(replied("bash-2")["message"], NEEDS_APPROVAL);
         submit(cx, "t1", "# Cache\n\nUse a map.\n");
         submit(cx, "t2", "# Cache\n\nUse an LRU map.\n");
         act(cx, &|_, _| {});
