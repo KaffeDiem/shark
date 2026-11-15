@@ -326,6 +326,11 @@ pub(crate) fn render_pixels() {
         || std::env::var_os("SHARK_RENDER_SIDEBAR_ONLY").is_some()
     {
         super::navigation_pixels::render_pixels(&mut cx);
+        super::stack_sidebar_tests::render_pixels(&mut cx);
+        return;
+    }
+    if std::env::var_os("SHARK_RENDER_STACKS_ONLY").is_some() {
+        super::stack_sidebar_tests::render_pixels(&mut cx);
         return;
     }
     if std::env::var_os("SHARK_RENDER_USAGE_ONLY").is_some() {

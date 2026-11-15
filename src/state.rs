@@ -54,6 +54,10 @@ pub struct State {
     /// Sidebar groups of tasks, in display order; ungrouped tasks follow them.
     #[serde(default)]
     pub sections: Vec<Section>,
+    /// Each repo's default branch (`origin/main`) by repo name, as its last probe found it:
+    /// the sidebar draws stacks at launch, before any task's probe.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trunks: BTreeMap<String, String>,
     /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
     #[serde(default)]
     pub stay_awake: bool,

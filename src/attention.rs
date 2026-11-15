@@ -162,6 +162,9 @@ fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
                 .await;
             let ok = this.update(cx, |s, cx| {
                 let active = s.active.clone();
+                if s.learn_stacks(&repos, &Default::default()) {
+                    cx.notify();
+                }
                 s.attn
                     .record(&name, active.as_deref(), label, repos, gh, Instant::now());
                 s.refresh_attention(cx);

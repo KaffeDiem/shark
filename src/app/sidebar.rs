@@ -1,4 +1,5 @@
 //! The sidebar: Home, sections and their tasks, ungrouped tasks, the cursor.
+use super::sidebar_stack::{SideStack, StackPlace};
 use super::*;
 use gpui_kit::component::Selectable as _;
 use std::time::Duration;
@@ -56,13 +57,21 @@ struct StatusIcon {
     bucket: home::Bucket,
     foreground: Hsla,
     animate: bool,
+    /// A stacked task whose PR merged shows `GitMerge` while idle.
+    merged: bool,
 }
 
 impl RenderOnce for StatusIcon {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let value = SharedString::from(format!("{:?}", self.bucket));
         let animate = changed(self.id, value.clone(), self.animate, window, cx);
-        match status_icon(self.bucket, self.foreground, cx.theme()) {
+        let icon = match (self.merged, self.bucket) {
+            (true, home::Bucket::Idle) => {
+                Some(Icon::new(IconName::GitMerge).text_color(self.foreground))
+            }
+            _ => status_icon(self.bucket, self.foreground, cx.theme()),
+        };
+        match icon {
             Some(icon) if animate => icon
                 .with_size(ISZ)
                 .with_animation(
@@ -173,7 +182,7 @@ pub(super) const UNGROUPED: &str = "Ungrouped";
 
 /// "Move to section" in a task's right-click menu; ends with "New section…", which moves it there.
 pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
-    let current = this.section_of(ws);
+    let current = this.shown_section(ws);
     let mut entries = vec![];
     for (i, sec) in this.state.sections.iter().enumerate() {
         let ws = ws.to_string();
@@ -251,6 +260,8 @@ pub(super) struct Cursors {
     section: Option<String>,
     /// The team's slug.
     team: Option<String>,
+    /// A PR row's stack (by its bottom task) and number.
+    pr: Option<(String, u64)>,
     home: Option<usize>,
 }
 
@@ -263,6 +274,8 @@ pub(super) enum SideRow {
     Task(usize),
     /// Index into `state.teams`.
     Team(usize),
+    /// A PR in a stack without a task here: the stack's bottom task's index, the PR's number.
+    Pr(usize, u64),
 }
 
 pub(super) fn drag_chip(label: SharedString, cx: &App) -> Div {
@@ -286,7 +299,7 @@ const ISZ: Pixels = px(16.);
 pub(super) const DETAIL_FADE: f32 = 0.7;
 
 /// A row of the sidebar's lists.
-fn sidebar_row(rail: bool, theme: &Theme) -> Div {
+pub(super) fn sidebar_row(rail: bool, theme: &Theme) -> Div {
     side_row(theme)
         .text_color(theme.sidebar_foreground)
         .when(rail, rail_button)
@@ -300,6 +313,15 @@ pub(super) fn rail_button<E: Styled>(e: E) -> E {
         .px_0()
         .justify_center()
         .rounded(px(8.))
+}
+
+/// The stack a sidebar row is drawn in.
+pub(super) fn stack_at<'a>(stacks: &'a [SideStack], row: &SideRow) -> Option<&'a SideStack> {
+    match *row {
+        SideRow::Task(ix) => stacks.iter().find(|s| s.has(ix)),
+        SideRow::Pr(anchor, _) => stacks.iter().find(|s| s.anchor == anchor),
+        _ => None,
+    }
 }
 
 impl Shark {
@@ -385,11 +407,26 @@ impl Shark {
 
     /// Sidebar rows top to bottom: each team, then its goals (each followed by its tasks)
     /// unless it is folded (and not `unfold`); each section, then its tasks unless it is
-    /// folded; then the tasks in no section. Without `unfold`, Backlog (except the open
-    /// task), the repository filter, finished goals and the tasks of goals (except the open
-    /// task) hide task rows; team and section headers always stay.
+    /// folded; then the tasks in no section. A stack is drawn where its bottom task is, newest
+    /// on top, with its PRs without a task and (outside the rail) its Backlog tasks. Without
+    /// `unfold`, Backlog (except the open task), the repository filter, finished goals and
+    /// the tasks of goals (except the open task) hide task rows; team and section headers
+    /// always stay.
     pub(super) fn side_rows(&self, unfold: bool) -> Vec<SideRow> {
+        self.side_rows_in(unfold, &self.side_stacks())
+    }
+
+    /// [`Self::side_rows`] with the stacks already worked out.
+    pub(super) fn side_rows_in(&self, unfold: bool, stacks: &[SideStack]) -> Vec<SideRow> {
         let tasks = &self.state.tasks;
+        // Global task search uses unfolded rows and keeps every repository reachable.
+        let shown = |ix: usize| {
+            let task = &tasks[ix];
+            unfold
+                || (self.sidebar_task_matches(task)
+                    && (!task.backlog || self.active.as_deref() == Some(&task.name))
+                    && self.listed(task))
+        };
         let mut rows = vec![];
         for (i, team) in self.state.teams.iter().enumerate() {
             rows.push(SideRow::Team(i));
@@ -400,45 +437,45 @@ impl Shark {
             for (gx, goal) in
                 goals.filter(|(_, t)| t.goal.as_ref().is_some_and(|g| g.team == team.slug))
             {
-                rows.push(SideRow::Task(gx));
+                rows.extend(shown(gx).then_some(SideRow::Task(gx)));
                 let parts = tasks.iter().enumerate();
                 rows.extend(
                     parts
-                        .filter(|(_, t)| t.part.as_ref().is_some_and(|p| p.goal == goal.name))
+                        .filter(|(px, t)| {
+                            t.part.as_ref().is_some_and(|p| p.goal == goal.name) && shown(*px)
+                        })
                         .map(|(px, _)| SideRow::Task(px)),
                 );
             }
         }
+        let emit = |rows: &mut Vec<SideRow>, ix: usize| match stacks.iter().find(|s| s.has(ix)) {
+            None => rows.extend(shown(ix).then_some(SideRow::Task(ix))),
+            Some(st) if st.anchor == ix && st.members().any(shown) => {
+                for (node, t) in st.col.nodes.iter().zip(&st.tasks).rev() {
+                    match (t, &node.pr) {
+                        (Some(t), _) if shown(*t) || !self.rail => rows.push(SideRow::Task(*t)),
+                        (None, Some(p)) if !self.rail => rows.push(SideRow::Pr(ix, p.number)),
+                        _ => {}
+                    }
+                }
+            }
+            // The rest of a stack is drawn with its bottom task.
+            Some(_) => {}
+        };
+        let solo = |ix: &usize| self.team_of(&tasks[*ix]).is_none();
         for (i, s) in self.state.sections.iter().enumerate() {
             rows.push(SideRow::Section(i));
             if unfold || !s.collapsed {
-                rows.extend(
-                    s.tasks
-                        .iter()
-                        .filter_map(|n| tasks.iter().position(|t| &t.name == n))
-                        .filter(|&ix| self.team_of(&tasks[ix]).is_none())
-                        .map(SideRow::Task),
-                );
+                (s.tasks.iter())
+                    .filter_map(|n| tasks.iter().position(|t| &t.name == n))
+                    .filter(solo)
+                    .for_each(|ix| emit(&mut rows, ix));
             }
         }
-        rows.extend(
-            (0..tasks.len())
-                .filter(|&ix| {
-                    self.section_of(&tasks[ix].name).is_none() && self.team_of(&tasks[ix]).is_none()
-                })
-                .map(SideRow::Task),
-        );
-        rows.retain(|row| match row {
-            SideRow::Task(ix) => {
-                let task = &tasks[*ix];
-                // Global task search uses unfolded rows and keeps every repository reachable.
-                unfold
-                    || (self.sidebar_task_matches(task)
-                        && (!task.backlog || self.active.as_deref() == Some(&task.name))
-                        && self.listed(task))
-            }
-            SideRow::Section(_) | SideRow::Team(_) => true,
-        });
+        (0..tasks.len())
+            .filter(|&ix| self.section_of(&tasks[ix].name).is_none())
+            .filter(solo)
+            .for_each(|ix| emit(&mut rows, ix));
         rows
     }
 
@@ -446,7 +483,8 @@ impl Shark {
     pub(super) fn cursor_section(&self) -> Option<usize> {
         match self.sel {
             SideRow::Section(i) => (i < self.state.sections.len()).then_some(i),
-            SideRow::Task(ix) => self.section_of(&self.state.tasks.get(ix)?.name),
+            SideRow::Task(ix) => self.shown_section(&self.state.tasks.get(ix)?.name),
+            SideRow::Pr(ix, _) => self.section_of(&self.state.tasks.get(ix)?.name),
             SideRow::Team(_) => None,
         }
     }
@@ -456,7 +494,7 @@ impl Shark {
         match self.sel {
             SideRow::Team(i) => (i < self.state.teams.len()).then_some(i),
             SideRow::Task(ix) => self.team_of(self.state.tasks.get(ix)?),
-            SideRow::Section(_) => None,
+            SideRow::Section(_) | SideRow::Pr(..) => None,
         }
     }
 
@@ -509,6 +547,7 @@ impl Shark {
                 SideRow::Team(i) => self.state.teams.get(i).map(|t| t.slug.clone()),
                 _ => None,
             },
+            pr: self.pr_cursor(),
             home: self.home_at(&self.home_rows(cx)),
         }
     }
@@ -522,10 +561,15 @@ impl Shark {
             (before.team.as_ref()).and_then(|c| self.state.teams.iter().position(|t| &t.slug == c));
         let moved = (before.ws.as_deref().filter(|c| *c != name))
             .and_then(|c| self.state.tasks.iter().position(|w| w.name == c));
+        let pr = before
+            .pr
+            .and_then(|p| self.pr_row(p))
+            .filter(|r| rows.contains(r));
         self.sel = match (section, team, moved) {
             (Some(i), _, _) => SideRow::Section(i),
             (_, Some(i), _) => SideRow::Team(i),
             (_, _, Some(ix)) => SideRow::Task(ix),
+            _ if pr.is_some() => pr.unwrap_or(SideRow::Task(0)),
             _ => before
                 .side
                 .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
@@ -541,11 +585,16 @@ impl Shark {
 
     /// Tasks in sidebar order, folded ones only with `unfold`; cmd-N opens the Nth visible.
     pub(crate) fn ws_order(&self, unfold: bool) -> Vec<usize> {
-        self.side_rows(unfold)
-            .into_iter()
+        self.order_of(&self.side_rows(unfold), unfold)
+    }
+
+    /// [`Self::ws_order`] of rows already built.
+    fn order_of(&self, rows: &[SideRow], unfold: bool) -> Vec<usize> {
+        rows.iter()
+            .copied()
             .filter_map(|r| match r {
                 SideRow::Task(ix) if unfold || !self.state.tasks[ix].backlog => Some(ix),
-                SideRow::Task(_) | SideRow::Section(_) | SideRow::Team(_) => None,
+                SideRow::Task(_) | SideRow::Section(_) | SideRow::Team(_) | SideRow::Pr(..) => None,
             })
             .collect()
     }
@@ -564,7 +613,8 @@ impl Shark {
     }
 
     fn move_sel(&mut self, nav: Nav, cx: &mut Context<Self>) {
-        let rows = self.side_rows(false);
+        let stacks = self.side_stacks();
+        let rows = self.side_rows_in(false, &stacks);
         if rows.is_empty() {
             return;
         }
@@ -579,10 +629,18 @@ impl Shark {
             false,
         );
         // The scrolled list holds the Teams header and the team rows (when there are teams),
-        // then the Tasks header, then the rest.
+        // then the Tasks header, then the rest; a stack is one child.
         let teams = rows.iter().take_while(|r| self.in_team_block(r)).count();
-        self.sidebar_scroll
-            .scroll_to_item(to + 1 + usize::from(teams > 0 && to >= teams));
+        let child = (1..=to)
+            .filter(|&i| {
+                let same = |r: &SideRow| stack_at(&stacks, r).map(|s| s.anchor);
+                same(&rows[i]).is_none() || same(&rows[i]) != same(&rows[i - 1])
+            })
+            .count();
+        let child = child + 1 + usize::from(teams > 0 && to >= teams);
+        if !self.scroll_to_stack_row(&rows, to, child) {
+            self.sidebar_scroll.scroll_to_item(child);
+        }
         cx.notify();
     }
 
@@ -591,7 +649,7 @@ impl Shark {
         match row {
             SideRow::Team(_) => true,
             SideRow::Task(ix) => self.team_of(&self.state.tasks[*ix]).is_some(),
-            SideRow::Section(_) => false,
+            SideRow::Section(_) | SideRow::Pr(..) => false,
         }
     }
 
@@ -639,29 +697,56 @@ impl Shark {
 
     pub(super) fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
         // Goals and their tasks belong to a team, not a section.
+        let mates = self.stack_mates(ws);
         if to.is_some_and(|i| i >= self.state.sections.len())
-            || self.section_of(ws) == to
+            || mates.iter().all(|m| self.section_of(m) == to)
             || self.task(ws).is_some_and(|t| self.team_of(t).is_some())
         {
             return;
         }
-        self.state.move_to_section(ws, to);
+        // A stack lives in one section.
+        for m in &mates {
+            self.state.move_to_section(m, to);
+        }
         let _ = self.state.save();
         self.record_interaction(ws, cx);
         self.fix_sel();
         cx.notify();
     }
 
-    /// Dropping a task on another takes its slot, in its section or among the ungrouped.
+    /// A PR row under the cursor, by its stack's bottom task's name: indices shift.
+    fn pr_cursor(&self) -> Option<(String, u64)> {
+        match self.sel {
+            SideRow::Pr(ix, n) => Some((self.state.tasks.get(ix)?.name.clone(), n)),
+            _ => None,
+        }
+    }
+
+    fn pr_row(&self, (name, n): (String, u64)) -> Option<SideRow> {
+        let ix = self.state.tasks.iter().position(|t| t.name == name)?;
+        Some(SideRow::Pr(ix, n))
+    }
+
+    /// Dropping a task on another takes its slot, in its section or among the ungrouped. A
+    /// stack is one slot: it is dragged by its bottom task, and the rest follow its section.
     pub(super) fn drop_task(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
+        let mates = self.stack_mates(ws);
         // The task under the cursor, so the reorder that shifts indices can put it back.
         let cursor = match self.sel {
             SideRow::Task(ix) => self.state.tasks.get(ix).map(|w| w.name.clone()),
             _ => None,
         };
+        let pr = self.pr_cursor();
         self.state.drop_task(ws, target);
+        let section = self.section_of(ws);
+        for m in &mates {
+            self.state.move_to_section(m, section);
+        }
         if let Some(ix) = cursor.and_then(|n| self.state.tasks.iter().position(|w| w.name == n)) {
             self.sel = SideRow::Task(ix);
+        }
+        if let Some(row) = pr.and_then(|p| self.pr_row(p)) {
+            self.sel = row;
         }
         let _ = self.state.save();
         self.fix_sel();
@@ -851,7 +936,7 @@ impl Shark {
                 return notify_err(window, cx, "Goals and their tasks stay with their team");
             }
             let ws = ws.name;
-            let current = s.section_of(&ws);
+            let current = s.shown_section(&ws);
             let n = s.state.sections.len();
             let mut items: Vec<CommandItem> = (s.state.sections)
                 .iter()
@@ -892,13 +977,16 @@ impl Shark {
         })
     }
 
-    /// A task's row; `order` is the visible tasks, whose first nine have a cmd-N.
-    fn ws_row(
+    /// A task's row; `order` is the visible tasks, whose first nine have a cmd-N. `stack` is
+    /// its place in a stack, if it is in one.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ws_row(
         &self,
         ix: usize,
         w: &Task,
         indent: f32,
         order: &[usize],
+        stack: Option<StackPlace>,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -938,6 +1026,7 @@ impl Shark {
             .unwrap_or_default();
         let row_label = [
             w.display_title().into_owned(),
+            stack.as_ref().map(|p| p.label.clone()).unwrap_or_default(),
             facts.line.to_string(),
             code_label,
             facts.time.to_string(),
@@ -976,6 +1065,7 @@ impl Shark {
                     bucket: facts.bucket,
                     foreground,
                     animate,
+                    merged: stack.as_ref().is_some_and(|p| p.merged),
                 }
                 .into_any_element(),
             })
@@ -1013,7 +1103,7 @@ impl Shark {
                 .min_w_0()
                 .truncate()
                 .text_xs()
-                .text_color(if facts.warning {
+                .text_color(if facts.warning || facts.caution {
                     theme.warning_foreground
                 } else if facts.failed {
                     theme.danger_foreground
@@ -1024,8 +1114,6 @@ impl Shark {
             animate: animate && facts.running == 0,
             rise: false,
         };
-        let ws = w.clone();
-        let name = w.name.clone();
         sidebar_row(rail, theme)
             .id(ix)
             .relative()
@@ -1037,35 +1125,13 @@ impl Shark {
             .map(|d| cursor_row(d, true, selected, focused, theme))
             .when(!bright, |d| d.bg(theme.transparent))
             .text_color(foreground)
-            .on_hover(
-                cx.listener(move |s, over: &bool, _, cx| s.peek_hover(&name, false, *over, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |s, _, _, cx| {
-                    s.sel = SideRow::Task(ix);
-                    cx.notify();
-                }),
-            )
-            .on_click(cx.listener(move |s, _, window, cx| {
-                s.close_peek(cx);
-                s.open_task(ix, window, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |s, e: &MouseDownEvent, w, cx| {
-                    s.sel = SideRow::Task(ix);
-                    let entries = ws_menu(s, &ws, cx);
-                    s.close_peek(cx);
-                    s.show_menu(e.position, entries, w, cx);
-                }),
-            )
+            .map(|d| self.task_row_events(d, ix, w, cx))
             .map(|d| {
-                self.reorder_source(
-                    d,
-                    reorder::Item::Task(w.name.clone()),
-                    w.display_title().into_owned().into(),
-                )
+                let (item, label) = match stack {
+                    Some(p) => (p.drag, p.drag_label),
+                    None => (w.name.clone(), w.display_title().into_owned().into()),
+                };
+                self.reorder_source(d, reorder::Item::Task(item), label)
             })
             .when(self.peek.row.as_deref() == Some(&w.name) && !bright, |d| {
                 let hover = side_hover(theme);
@@ -1139,6 +1205,39 @@ impl Shark {
                 )
             })
             .into_any_element()
+    }
+
+    /// A task row's pointer: hover peeks, press puts the cursor on it, click opens it, a
+    /// right click opens its menu.
+    pub(super) fn task_row_events<E: StatefulInteractiveElement>(
+        &self,
+        d: E,
+        ix: usize,
+        task: &Task,
+        cx: &Context<Self>,
+    ) -> E {
+        let (ws, name) = (task.clone(), task.name.clone());
+        d.on_hover(cx.listener(move |s, over: &bool, _, cx| s.peek_hover(&name, false, *over, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |s, _, _, cx| {
+                    s.sel = SideRow::Task(ix);
+                    cx.notify();
+                }),
+            )
+            .on_click(cx.listener(move |s, _, window, cx| {
+                s.close_peek(cx);
+                s.open_task(ix, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                    s.sel = SideRow::Task(ix);
+                    let entries = ws_menu(s, &ws, cx);
+                    s.close_peek(cx);
+                    s.show_menu(e.position, entries, w, cx);
+                }),
+            )
     }
 
     /// A section's header: icon, name and fold chevron. Folded, it shows one fact on the right:
@@ -1417,8 +1516,7 @@ impl Shark {
         .collect::<Vec<_>>()
         .join(" \u{b7} ");
         let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
-        let (name, tip) = (task.name.clone(), title.clone());
-        let ws = task.clone();
+        let tip = title.clone();
         sidebar_row(rail, theme)
             .relative()
             .id(("goal", ix))
@@ -1428,29 +1526,7 @@ impl Shark {
             .when(!rail, |d| d.ml(px(32.)))
             .map(|d| cursor_row(d, active, selected, focused, theme))
             .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-            .on_hover(
-                cx.listener(move |s, over: &bool, _, cx| s.peek_hover(&name, false, *over, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |s, _, _, cx| {
-                    s.sel = SideRow::Task(ix);
-                    cx.notify();
-                }),
-            )
-            .on_click(cx.listener(move |s, _, window, cx| {
-                s.close_peek(cx);
-                s.open_task(ix, window, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |s, e: &MouseDownEvent, w, cx| {
-                    s.sel = SideRow::Task(ix);
-                    let entries = ws_menu(s, &ws, cx);
-                    s.close_peek(cx);
-                    s.show_menu(e.position, entries, w, cx);
-                }),
-            )
+            .map(|d| self.task_row_events(d, ix, task, cx))
             .child(div().size(ISZ).flex_none().child(match nth {
                 Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
                 _ => look.icon(16.),
@@ -1489,12 +1565,29 @@ impl Shark {
                 .text_color(theme.sidebar_foreground)
                 .child(t)
         };
-        let order = self.ws_order(false);
+        let stacks = self.side_stacks();
+        let rows = self.side_rows_in(false, &stacks);
+        let order = self.order_of(&rows, false);
         let accent = theme.sidebar_accent;
         let (mut team_items, mut items): (Vec<AnyElement>, Vec<AnyElement>) = (vec![], vec![]);
         // The Teams header and the team rows come first, in the same scrolled list.
         let has_teams = !self.state.teams.is_empty();
-        for row in self.side_rows(false) {
+        let mut at = 0;
+        while at < rows.len() {
+            let row = rows[at];
+            if let Some(st) = stack_at(&stacks, &row) {
+                let n = rows[at..]
+                    .iter()
+                    .take_while(|r| stack_at(&stacks, r).is_some_and(|s| s.anchor == st.anchor))
+                    .count();
+                items.push(self.reorder_item(
+                    self.stack_block(st, &rows[at..at + n], &order, window, cx),
+                    reorder::Item::Task(self.state.tasks[st.anchor].name.clone()),
+                ));
+                at += n;
+                continue;
+            }
+            at += 1;
             match row {
                 SideRow::Section(i) => items.push(self.reorder_item(
                     self.section_row(i, &self.state.sections[i], window, cx),
@@ -1508,17 +1601,19 @@ impl Shark {
                             team_items.push(self.side_goal_row(ix, task, &order, window, cx))
                         }
                         (Some(_), false) => {
-                            team_items.push(self.ws_row(ix, task, 48., &order, window, cx))
+                            team_items.push(self.ws_row(ix, task, 48., &order, None, window, cx))
                         }
                         (None, _) => {
                             let indent = self.section_of(&task.name).map_or(0., |_| 32.);
                             items.push(self.reorder_item(
-                                self.ws_row(ix, task, indent, &order, window, cx),
+                                self.ws_row(ix, task, indent, &order, None, window, cx),
                                 reorder::Item::Task(task.name.clone()),
                             ));
                         }
                     }
                 }
+                // Drawn by `stack_block`.
+                SideRow::Pr(..) => {}
             }
         }
         let new_section_menu = |add_repo: bool| {
@@ -1631,7 +1726,8 @@ impl Shark {
             .on_action(cx.listener(|s, _: &TogglePeek, w, cx| s.toggle_peek(w, cx)))
             .on_action(cx.listener(|s, _: &CancelEdit, _, cx| s.close_peek(cx)))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
-                if !this.side_rows(false).contains(&this.sel) {
+                let stacks = this.side_stacks();
+                if !this.side_rows_in(false, &stacks).contains(&this.sel) {
                     return;
                 }
                 match this.sel {
@@ -1640,6 +1736,11 @@ impl Shark {
                         this.open_task(ix, window, cx);
                     }
                     SideRow::Section(i) => this.toggle_section(i, cx),
+                    SideRow::Pr(anchor, number) => {
+                        if let Some(url) = Shark::stack_pr(&stacks, anchor, number) {
+                            cx.open_url(&url);
+                        }
+                    }
                     SideRow::Team(i) => {
                         if let Some(slug) = this.state.teams.get(i).map(|t| t.slug.clone()) {
                             this.close_peek(cx);
