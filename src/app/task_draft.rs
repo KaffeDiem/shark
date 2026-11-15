@@ -213,11 +213,48 @@ pub(super) fn discard_staged_files(paths: &[PathBuf]) {
 }
 
 impl Shark {
+    /// Creates the task of `draft`. With an OpenRouter key and a new branch to name, the
+    /// prompt's title comes first, so it names the branch too.
     pub(super) fn start_task_draft(
         &mut self,
         draft: TaskDraft,
         agent: Option<AgentLink>,
         finished: Finished,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let names_branch = draft.issues.is_empty()
+            && !draft.text.trim().is_empty()
+            && (draft.repos.iter()).any(|r| matches!(r.branch, BranchSpec::New { .. }))
+            && self.openrouter_key != Some(None);
+        if !names_branch {
+            return self.create_task_draft(draft, agent, finished, None, window, cx);
+        }
+        let key = self.read_openrouter_key(cx);
+        let prompt = draft.text.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let generated = match key.await {
+                Some(key) => {
+                    let quick = async move { crate::title::generate_quick(&key, &prompt).ok() };
+                    cx.background_executor().spawn(quick).await
+                }
+                None => None,
+            };
+            this.update_in(cx, |s, w, cx| {
+                s.create_task_draft(draft, agent, finished, generated, w, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Creates the task of `draft`, titled `generated` when OpenRouter titled it already.
+    pub(super) fn create_task_draft(
+        &mut self,
+        draft: TaskDraft,
+        agent: Option<AgentLink>,
+        finished: Finished,
+        generated: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -236,54 +273,76 @@ impl Shark {
             finished(self, false, window, cx);
             return;
         }
-        let title = draft
-            .issues
-            .first()
-            .map(|s| crate::chat::title_of(&s.title))
+        let issue = draft.issues.first();
+        let title = (generated.clone())
+            .or_else(|| issue.map(|s| crate::chat::title_of(&s.title)))
             .unwrap_or_else(|| crate::chat::title_of(&draft.text));
-        let source = draft
-            .issues
-            .first()
-            .map(|s| s.identifier.as_str())
-            .unwrap_or(&title);
-        let source = crate::state::slug(source);
-        let prefix = agent
-            .as_ref()
+        let source = crate::state::branch_slug(issue, &title);
+        let agent_prefix = (agent.as_ref())
             .map(|a| format!("{}/", a.slug))
             .unwrap_or_default();
-        let prefix = format!(
-            "{prefix}{}",
-            if source.is_empty() { "task" } else { &source }
-        );
         let with_repos = !draft.repos.is_empty();
-        let sea = crate::state::task_name(interaction::now_ms(), |sea| {
-            let name = if with_repos {
-                format!("{prefix}-{sea}").replace('/', "-")
-            } else {
-                sea.to_string()
-            };
-            self.creating.contains_key(&name)
-                || self.task(&name).is_some()
-                || tasks_dir().join(&name).exists()
-                || crate::transcript::transcript_path(&name).exists()
-        });
-        let branch = format!("{prefix}-{sea}");
-        let name = if with_repos {
-            branch.replace('/', "-")
+        let taken = |name: &str| {
+            self.creating.contains_key(name)
+                || self.task(name).is_some()
+                || tasks_dir().join(name).exists()
+                || crate::transcript::transcript_path(name).exists()
+        };
+        // A branch of the name in a repo getting a new one, here or on origin.
+        // ponytail: one local for-each-ref per new repo on the UI thread.
+        let has_branch = |b: &str| {
+            (draft.repos.iter())
+                .filter(|r| matches!(r.branch, BranchSpec::New { .. }))
+                .any(|r| {
+                    let (local, origin) = (
+                        format!("refs/heads/{b}"),
+                        format!("refs/remotes/origin/{b}"),
+                    );
+                    let args = ["for-each-ref", "--count=1", "--format=x", &local, &origin];
+                    git::git(&r.repo.path, &args).is_ok_and(|o| !o.trim().is_empty())
+                })
+        };
+        let plain = format!("{agent_prefix}{source}");
+        let (name, branch) = if with_repos
+            && !source.is_empty()
+            && !taken(&plain.replace('/', "-"))
+            && !has_branch(&plain)
+        {
+            (plain.replace('/', "-"), plain)
         } else {
-            sea
+            let prefix = match source.is_empty() {
+                true => format!("{agent_prefix}task"),
+                false => plain,
+            };
+            let sea = crate::state::task_name(interaction::now_ms(), |sea| {
+                taken(&match with_repos {
+                    true => format!("{prefix}-{sea}").replace('/', "-"),
+                    false => sea.to_string(),
+                })
+            });
+            let branch = format!("{prefix}-{sea}");
+            let name = if with_repos {
+                branch.replace('/', "-")
+            } else {
+                sea
+            };
+            (name, branch)
         };
         let (model, effort) = draft.defaults(&self.state, agent.as_ref().map(|a| a.slug.as_str()));
         self.creating
             .insert(name.clone(), agent.as_ref().map(|a| a.slug.clone()));
         let pending = name.clone();
         let staged_files = draft.files.clone();
-        let titling = draft
-            .issues
-            .first()
-            .map(|i| format!("{}: {}", i.identifier, i.title))
-            .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.clone()))
-            .or_else(|| draft.repos.iter().find_map(|r| r.pr_label.clone()));
+        // A title OpenRouter gave already isn't asked for again.
+        let titling = match generated {
+            Some(_) => None,
+            None => (draft.issues.first())
+                .map(|i| format!("{}: {}", i.identifier, i.title))
+                .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.clone()))
+                .or_else(|| draft.repos.iter().find_map(|r| r.pr_label.clone())),
+        };
+        // Its first tab takes it too, as `auto_title` would have done.
+        let titled = generated.map(|_| title.clone());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -294,7 +353,7 @@ impl Shark {
                 .await;
             this.update_in(cx, |s, window, cx| {
                 s.creating.remove(&pending);
-                let (ws, prompt) = match result {
+                let (mut ws, prompt) = match result {
                     Ok(result) => result,
                     Err(e) => {
                         notify_err(window, cx, e);
@@ -303,6 +362,9 @@ impl Shark {
                         return;
                     }
                 };
+                if let (Some(title), Some(tab)) = (&titled, ws.chats.first_mut()) {
+                    tab.title = title.clone();
+                }
                 s.state.tasks.push(ws.clone());
                 let previous_repos = std::mem::replace(
                     &mut s.state.last_repos,
@@ -342,6 +404,9 @@ impl Shark {
                 s.record_interaction(&ws.name, cx);
                 if let Some(text) = &titling {
                     s.auto_title(&ws.name, text, cx);
+                }
+                if titled.is_some() {
+                    s.title_sources.insert(ws.name.clone(), "OpenRouter");
                 }
                 let ws = s.task(&ws.name).cloned().unwrap_or(ws);
                 let chat = s.ensure_chat(&ws, &ws.chats[0], window, cx);
