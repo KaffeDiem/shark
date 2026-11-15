@@ -43,8 +43,8 @@ impl Drag {
         matches!(self.source, Item::Tab(..))
     }
 
-    fn valid(&self, shark: &Shark, cx: &App) -> bool {
-        let current = shark.reorder_items(self.horizontal(), cx);
+    /// The source is still one of `current` (`reorder_items`) and the sections are unchanged.
+    fn valid(&self, shark: &Shark, current: &[Item]) -> bool {
         current.contains(&self.source)
             && (self.horizontal()
                 || self.sections
@@ -110,8 +110,10 @@ impl Render for Drag {
 
 impl Shark {
     pub(super) fn prune_reorder(&self, cx: &App) {
+        // A superset is enough: drop targets are checked against `reorder_items` on the move.
         let mut current = self.reorder_items(true, cx);
-        current.extend(self.reorder_items(false, cx));
+        current.extend((self.state.tasks.iter()).map(|t| Item::Task(t.name.clone())));
+        current.extend((0..self.state.sections.len()).map(Item::Section));
         current.push(Item::Ungrouped);
         let mut state = self.reorder.borrow_mut();
         state.bounds.retain(|key, _| current.contains(key));
@@ -173,7 +175,7 @@ impl Shark {
         .into_any_element()
     }
 
-    fn reorder_items(&self, horizontal: bool, cx: &App) -> Vec<Item> {
+    pub(super) fn reorder_items(&self, horizontal: bool, cx: &App) -> Vec<Item> {
         if horizontal {
             self.active_task()
                 .map(|ws| {
@@ -184,17 +186,26 @@ impl Shark {
                 })
                 .unwrap_or_default()
         } else {
-            // Teams, goals and their tasks don't move by drag.
-            self.side_rows(false)
-                .into_iter()
-                .filter_map(|row| match row {
-                    SideRow::Task(i) if self.team_of(&self.state.tasks[i]).is_none() => {
-                        Some(Item::Task(self.state.tasks[i].name.clone()))
+            // Teams, goals and their tasks don't move by drag; a stack moves as one item, its
+            // bottom task's, even where that row isn't drawn (the rail hides Backlog).
+            let stacks = self.side_stacks();
+            let mut items: Vec<Item> = vec![];
+            for row in self.side_rows_in(false, &stacks) {
+                let item = match row {
+                    SideRow::Task(i) | SideRow::Pr(i, _) => {
+                        let at = (stacks.iter().find(|s| s.has(i) || s.anchor == i))
+                            .map_or(i, |s| s.anchor);
+                        (self.team_of(&self.state.tasks[at]).is_none())
+                            .then(|| Item::Task(self.state.tasks[at].name.clone()))
                     }
                     SideRow::Section(i) => Some(Item::Section(i)),
-                    _ => None,
-                })
-                .collect()
+                    SideRow::Team(_) => None,
+                };
+                if let Some(item) = item.filter(|it| items.last() != Some(it)) {
+                    items.push(item);
+                }
+            }
+            items
         }
     }
 
@@ -203,7 +214,7 @@ impl Shark {
         let area = drag.scroll.bounds();
         let mut order = self.reorder_items(horizontal, cx);
         let mut state = self.reorder.borrow_mut();
-        if !drag.valid(self, cx) {
+        if !drag.valid(self, &order) {
             state.target = None;
             state.offsets.clear();
             drop(state);
@@ -345,11 +356,12 @@ impl Shark {
         let target = self.reorder.borrow_mut().target.take();
         self.reorder.borrow_mut().source = None;
         self.reorder.borrow_mut().offsets.clear();
-        if drag.valid(self, cx)
+        let current = self.reorder_items(drag.horizontal(), cx);
+        if drag.valid(self, &current)
             && drag.scroll.bounds().contains(&window.mouse_position())
-            && target.as_ref().is_some_and(|key| {
-                *key == Item::Ungrouped || self.reorder_items(drag.horizontal(), cx).contains(key)
-            })
+            && target
+                .as_ref()
+                .is_some_and(|key| *key == Item::Ungrouped || current.contains(key))
         {
             match (&drag.source, target) {
                 (Item::Tab(ws, from), Some(Item::Tab(other, to))) if *ws == other => {

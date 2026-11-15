@@ -67,6 +67,7 @@ mod reorder;
 pub(crate) mod repo_settings;
 mod run;
 mod sidebar;
+mod sidebar_stack;
 mod skill_import;
 mod storage;
 mod task;
@@ -143,6 +144,9 @@ pub struct Shark {
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashMap<String, Option<String>>,
+    /// Each repo's open PRs, as the last GitSync of a task with it listed them: the sidebar's
+    /// stacks run through PRs without a task.
+    stack_prs: HashMap<String, Vec<crate::prs::Pr>>,
     /// The OpenRouter key for task titles: `None` until the Keychain is first read.
     pub(crate) openrouter_key: Option<Option<String>>,
     titling: HashSet<String>,
@@ -394,6 +398,7 @@ impl Shark {
             chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
             creating: HashMap::new(),
+            stack_prs: HashMap::new(),
             openrouter_key: None,
             titling: HashSet::new(),
             chat_titling: HashSet::new(),

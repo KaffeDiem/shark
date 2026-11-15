@@ -82,9 +82,273 @@ pub fn chain(
     (down, ix)
 }
 
+/// A stack as the sidebar draws it: one repo's `chain`, trunk side first, ending in `base`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Column {
+    pub repo: String,
+    /// Each has a task or an open PR.
+    pub nodes: Vec<Node>,
+    /// What the bottom node lands on, e.g. `main`; a fork's is the branch it shares.
+    pub base: String,
+}
+
+/// A sidebar task for [`columns`]: its name and `(repo, branch, base)` per repo.
+pub type Listed<'a> = (&'a str, Vec<(&'a str, &'a str, &'a str)>);
+
+/// The sidebar's stacks. `tasks` in sidebar order; a task joins one stack, in its first repo
+/// (of `only`, when set) with one. The chain from the bottom claims shared parents before a
+/// fork does; a fork keeps what is above them and lands on the last shared branch. A lone task
+/// counts only off the trunk, as on `release-2`.
+pub fn columns<'a>(
+    tasks: &[Listed],
+    trunk: impl Fn(&str) -> Option<&'a str>,
+    prs: impl Fn(&str) -> &'a [Pr],
+    only: Option<&str>,
+) -> Vec<Column> {
+    use std::collections::{HashMap, HashSet};
+    /// What `chain` needs of one repo, and the branches something is stacked on.
+    struct Repo<'a> {
+        trunk: &'a str,
+        local: Vec<(String, String, String)>,
+        open: &'a [Pr],
+        parents: HashSet<String>,
+    }
+    let mut by_repo: HashMap<&str, Repo> = HashMap::new();
+    for (_, repos) in tasks {
+        for &(repo, ..) in repos {
+            if by_repo.contains_key(repo) || only.is_some_and(|o| o != repo) {
+                continue;
+            }
+            let Some(t) = trunk(repo).filter(|t| !t.is_empty()) else {
+                continue;
+            };
+            let local: Vec<(String, String, String)> = (tasks.iter())
+                .filter_map(|(n, rs)| {
+                    let (_, b, base) = rs.iter().find(|r| r.0 == repo)?;
+                    Some((n.to_string(), b.to_string(), base.to_string()))
+                })
+                .collect();
+            let open = prs(repo);
+            let parents = (local.iter().filter_map(|l| parent_of(&l.2, t)))
+                .chain(
+                    (open.iter().filter(|p| !p.is_cross_repository))
+                        .map(|p| p.base_ref_name.as_str()),
+                )
+                .map(String::from)
+                .collect();
+            let r = Repo {
+                trunk: t,
+                local,
+                open,
+                parents,
+            };
+            by_repo.insert(repo, r);
+        }
+    }
+    // Each task's stack is in its first repo where it has a parent or a child. Most tasks
+    // are on the trunk with nothing on them: they have none, and no chain is walked.
+    let home: HashMap<&str, (&str, &str)> = (tasks.iter())
+        .filter_map(|(name, repos)| {
+            let (repo, branch, _) = repos.iter().find(|&&(repo, branch, base)| {
+                by_repo.get(repo).is_some_and(|r| {
+                    parent_of(base, r.trunk).is_some() || r.parents.contains(branch)
+                })
+            })?;
+            Some((*name, (*repo, *branch)))
+        })
+        .collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut out = vec![];
+    for (name, _) in tasks {
+        let Some(&(repo, branch)) = home.get(name).filter(|_| !taken.contains(*name)) else {
+            continue;
+        };
+        let Repo {
+            trunk: t,
+            local,
+            open,
+            ..
+        } = &by_repo[repo];
+        let (nodes, _) = chain(branch, t, local, open);
+        if nodes.len() < 2 {
+            continue;
+        }
+        // A task is free here until a stack takes it, and only in its own repo.
+        let free = |n: &Node, taken: &HashSet<String>| {
+            n.ws.as_ref().is_none_or(|w| {
+                !taken.contains(w) && home.get(w.as_str()).is_some_and(|h| h.0 == repo)
+            })
+        };
+        let base_of = |n: &Node| match (&n.ws, &n.pr) {
+            (Some(w), _) => (local.iter().find(|l| &l.0 == w))
+                .map(|l| crate::git::short(&l.2).to_string())
+                .unwrap_or_default(),
+            (None, Some(p)) => p.base_ref_name.clone(),
+            (None, None) => n.branch.clone(),
+        };
+        let mut claim = |nodes: &[Node], at: usize, taken: &mut HashSet<String>| {
+            let (mut lo, mut hi) = (at, at);
+            while lo > 0 && free(&nodes[lo - 1], taken) {
+                lo -= 1;
+            }
+            while hi + 1 < nodes.len() && free(&nodes[hi + 1], taken) {
+                hi += 1;
+            }
+            // A branch with neither task nor open PR ends the chain and is its base.
+            let unknown = |n: &Node| n.ws.is_none() && n.pr.is_none();
+            let (lo, base) = match lo {
+                0 if unknown(&nodes[0]) => (1, nodes[0].branch.clone()),
+                0 => (0, base_of(&nodes[0])),
+                _ => (lo, nodes[lo - 1].branch.clone()),
+            };
+            let run = &nodes[lo..=hi];
+            if run.iter().all(|n| n.ws.is_none()) || (run.len() < 2 && base == crate::git::short(t))
+            {
+                return;
+            }
+            taken.extend(run.iter().filter_map(|n| n.ws.clone()));
+            out.push(Column {
+                repo: repo.to_string(),
+                nodes: run.to_vec(),
+                base,
+            });
+        };
+        // The chain from the bottom claims shared parents before a fork does.
+        let me = |ns: &[Node]| ns.iter().position(|n| n.ws.as_deref() == Some(*name));
+        if nodes[0].ws.as_deref() != Some(*name) {
+            let (primary, _) = chain(&nodes[0].branch, t, local, open);
+            let first = primary
+                .iter()
+                .position(|n| n.ws.is_some() && free(n, &taken));
+            if let (None, Some(at)) = (me(&primary), first) {
+                claim(&primary, at, &mut taken);
+            }
+        }
+        if let Some(at) = me(&nodes) {
+            claim(&nodes, at, &mut taken);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cols<'a>(
+        tasks: &'a [(&'a str, &'a str, &'a str)],
+        prs: &[Pr],
+    ) -> Vec<(Vec<String>, String)> {
+        let listed: Vec<Listed> = (tasks.iter())
+            .map(|(n, b, base)| (*n, vec![("api", *b, *base)]))
+            .collect();
+        columns(&listed, |_| Some("origin/main"), |_| prs, None)
+            .into_iter()
+            .map(|c| (c.nodes.into_iter().map(|n| n.branch).collect(), c.base))
+            .collect()
+    }
+
+    fn col(nodes: &[&str], base: &str) -> (Vec<String>, String) {
+        (nodes.iter().map(|n| n.to_string()).collect(), base.into())
+    }
+
+    /// One stack per chain, whichever member comes first; ordinary tasks get none.
+    #[test]
+    fn columns_group_a_chain_once() {
+        let tasks = [
+            ("ui", "ui", "origin/api"),
+            ("plain", "plain", "origin/main"),
+            ("api", "api", "origin/main"),
+            ("wiring", "wiring", "origin/ui"),
+        ];
+        assert_eq!(cols(&tasks, &[]), [col(&["api", "ui", "wiring"], "main")]);
+    }
+
+    /// A lone task off the trunk is a stack; an unknown parent becomes the base row.
+    #[test]
+    fn columns_show_a_non_trunk_base() {
+        let tasks = [("hotfix", "hotfix", "origin/release-2")];
+        assert_eq!(cols(&tasks, &[]), [col(&["hotfix"], "release-2")]);
+        let tasks = [("lone", "lone", "origin/main")];
+        assert!(cols(&tasks, &[]).is_empty());
+    }
+
+    /// A colleague's PR between two tasks joins them; the base is the bottom PR's.
+    #[test]
+    fn columns_keep_pr_rows() {
+        let tasks = [("ui", "ui", "origin/models"), ("api", "api", "origin/main")];
+        let prs = [pr(7, "models", "api")];
+        assert_eq!(cols(&tasks, &prs), [col(&["api", "models", "ui"], "main")]);
+        let tasks = [("ui", "ui", "origin/models")];
+        let prs = [pr(7, "models", "release")];
+        assert_eq!(cols(&tasks, &prs), [col(&["models", "ui"], "release")]);
+    }
+
+    /// Two tasks on one parent: the first child keeps the parents, the second lands on
+    /// the shared branch, whichever is listed first.
+    #[test]
+    fn columns_split_forks() {
+        let tasks = [
+            ("emails", "emails", "origin/api"),
+            ("api", "api", "origin/main"),
+            ("wiring", "wiring", "origin/api"),
+        ];
+        // `chain` follows the first local child: emails.
+        assert_eq!(
+            cols(&tasks, &[]),
+            [col(&["api", "emails"], "main"), col(&["wiring"], "api")]
+        );
+        let tasks = [tasks[2], tasks[1], tasks[0]];
+        assert_eq!(
+            cols(&tasks, &[]),
+            [col(&["api", "wiring"], "main"), col(&["emails"], "api")]
+        );
+    }
+
+    /// A task stacked in two repos shows in its first; the filter picks the repo.
+    #[test]
+    fn columns_pick_the_first_stacked_repo() {
+        let listed: Vec<Listed> = vec![
+            (
+                "both",
+                vec![
+                    ("ios", "both", "origin/main"),
+                    ("api", "both", "origin/base"),
+                ],
+            ),
+            ("base", vec![("api", "base", "origin/main")]),
+            ("top", vec![("ios", "top", "origin/both")]),
+        ];
+        let names = |only| {
+            columns(&listed, |_| Some("origin/main"), |_| &[], only)
+                .into_iter()
+                .map(|c| (c.repo, c.nodes.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(None), [("ios".to_string(), 2)]);
+        assert_eq!(names(Some("api")), [("api".to_string(), 2)]);
+        // Listing order doesn't change it: base, listed first, doesn't claim both for api.
+        let reordered = vec![listed[1].clone(), listed[0].clone(), listed[2].clone()];
+        let got: Vec<_> = columns(&reordered, |_| Some("origin/main"), |_| &[], None)
+            .into_iter()
+            .map(|c| {
+                (
+                    c.repo,
+                    c.nodes.into_iter().map(|n| n.branch).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [(
+                "ios".to_string(),
+                vec!["both".to_string(), "top".to_string()]
+            )]
+        );
+        // An unknown trunk shows no stack in that repo.
+        let none = columns(&listed, |_| None, |_| &[], None);
+        assert!(none.is_empty());
+    }
 
     fn pr(n: u64, head: &str, base: &str) -> Pr {
         Pr {

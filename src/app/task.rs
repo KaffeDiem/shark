@@ -248,6 +248,10 @@ impl Shark {
         let name = ws.name.clone();
         self._subs
             .push(cx.observe_in(&sync, window, move |s, sync, w, cx| {
+                let g = sync.read(cx);
+                if s.learn_stacks(g.repos().unwrap_or_default(), &g.stack_prs) {
+                    cx.notify();
+                }
                 if s.active_sync() == Some(&sync) {
                     s.configure_differ(cx);
                     s.configure_git(w, cx);
@@ -854,6 +858,7 @@ impl Shark {
                         ws.fill_models(&model, effort.as_ref());
                         let name = ws.name.clone();
                         s.state.tasks.push(ws.clone());
+                        s.settle_in_stack(&name);
                         if let Some(agent) = ws.agents.first().cloned() {
                             // Settings may have changed while the worktrees were created.
                             let docs = s
@@ -1692,6 +1697,7 @@ impl Shark {
                 if let Some(gone) = self.task(name).cloned() {
                     self.task_left_goal(&gone);
                 }
+                self.hand_over_slot(name);
                 self.state.remove_task(name);
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));

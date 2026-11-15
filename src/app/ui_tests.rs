@@ -44,6 +44,7 @@ mod repo_menu_tests;
 mod repo_settings_tests;
 mod sidebar_tests;
 mod skill_import_tests;
+mod stack_sidebar_tests;
 mod storage_tests;
 mod tab_tests;
 mod task_picker_tests;

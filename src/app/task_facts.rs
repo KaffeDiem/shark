@@ -6,6 +6,8 @@ pub(super) struct TaskFacts<'a> {
     pub bucket: Bucket,
     pub line: String,
     pub warning: bool,
+    /// The line warns without needing you, as "Parent PR closed".
+    pub caution: bool,
     pub failed: bool,
     pub running: usize,
     pub time: String,
@@ -50,6 +52,7 @@ impl Shark {
                 .to_string()
         };
         let repos = self.overview_repos(&task.name, cx);
+        let link = (repos.into_iter().flatten()).find_map(super::sidebar_stack::link_fact);
         let repo_line = || {
             let Some(first) = task.repos.first() else {
                 return "No repository".into();
@@ -115,6 +118,8 @@ impl Shark {
             )
         } else if task.backlog {
             "Backlog".into()
+        } else if let Some((fact, _)) = &link {
+            fact.clone()
         } else if let Some(issue) = task.primary_issue() {
             format!("{} · {}", issue.identifier, issue.status)
         } else {
@@ -132,6 +137,7 @@ impl Shark {
                 .get(&task.name)
                 .and_then(|t| t.elapsed().ok())
         });
+        let caution = link.is_some_and(|(fact, warn)| warn && fact == line);
         TaskFacts {
             bucket: if task.backlog {
                 Bucket::Backlog
@@ -140,6 +146,7 @@ impl Shark {
             },
             line,
             warning: needs.is_some(),
+            caution,
             failed: needs.is_none()
                 && task.attaching.is_empty()
                 && running == 0
