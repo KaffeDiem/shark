@@ -20,6 +20,28 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CACHE = ROOT / "target" / "language-tool-check"
 
 
+def authorize(request):
+    """Authenticate only GitHub API requests, never the redirected asset download."""
+    if request.full_url.startswith("https://api.github.com/") and os.environ.get("GH_TOKEN"):
+        request.add_unredirected_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
+    return request
+
+
+class ApiRedirects(urllib.request.HTTPRedirectHandler):
+    """A renamed repository redirects within the API; without the token that hop is rate limited."""
+
+    def redirect_request(self, request, *args):
+        redirected = super().redirect_request(request, *args)
+        # Only an authenticated API hop passes the token on; other hosts cannot aim it at the API.
+        if redirected and request.has_header("Authorization"):
+            authorize(redirected)
+        return redirected
+
+
+REDIRECTS = ApiRedirects()
+urllib.request.install_opener(urllib.request.build_opener(REDIRECTS))
+
+
 def relative(name):
     normalized = posixpath.normpath(name)
     if name.startswith("/") or normalized == ".." or normalized.startswith("../"):
@@ -92,10 +114,7 @@ def install_once(artifact):
         deadline = time.monotonic() + 180
         if not artifact["url"].startswith("https://"):
             raise ValueError("artifact URL must use HTTPS")
-        request = urllib.request.Request(artifact["url"], headers={"Accept": "application/octet-stream"})
-        if request.host == "api.github.com" and os.environ.get("GH_TOKEN"):
-            # Authenticate only the API request, never the redirected asset download.
-            request.add_unredirected_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
+        request = authorize(urllib.request.Request(artifact["url"], headers={"Accept": "application/octet-stream"}))
         with urllib.request.urlopen(request, timeout=30) as response, archive.open("xb") as output:
             if not response.url.startswith("https://"):
                 raise ValueError("artifact redirected outside HTTPS")
@@ -232,9 +251,14 @@ def self_test():
                         install(dict(artifact, url=url))
                         request = download.call_args.args[0]
                         assert request.has_header("Authorization") == authorized
-                        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
-                            request, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/tool")
-                        assert not redirected.has_header("Authorization")
+                        # A renamed repository redirects within the API before the asset host.
+                        for target, kept in [("https://api.github.com/repositories/1/releases/assets/1", authorized),
+                                             ("http://api.github.com/repositories/1/releases/assets/1", False),
+                                             ("https://api.github.com.example.invalid/tool", False),
+                                             ("https://release-assets.githubusercontent.com/tool", False)]:
+                            redirected = REDIRECTS.redirect_request(request, None, 301, "Moved", {}, target)
+                            assert redirected.has_header("Authorization") == kept, target
+                            assert "Authorization" not in redirected.headers
                     shutil.rmtree(root / "cache")
             with patch("urllib.request.urlopen", side_effect=unavailable) as request:
                 try:
