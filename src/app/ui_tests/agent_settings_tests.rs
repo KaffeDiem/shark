@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::{Agent, AgentLink};
+use crate::state::{Agent, AgentIcon, AgentLink};
 
 /// Clicks the open menu's row labelled `label`.
 fn click_menu_row(w: &mut Window, label: &str, cx: &mut App) {
@@ -56,9 +56,14 @@ async fn new_agent_dialog_creates_on_create_or_enter_and_cancels_cleanly(cx: &mu
     cx.update_window(window, |_, w, cx| {
         assert!(dialog_shown(w, cx));
         assert_eq!(w.find("agent-create").disabled(), Some(true));
-        for id in ["agent-icon", "agent-skills", "agent-next", "agent-delete"] {
+        for id in ["agent-skills", "agent-next", "agent-delete"] {
             assert!(w.try_find(id).is_none(), "{id} waits for the agent");
         }
+        assert_eq!(w.find("agent-icon").bounds().size, size(px(40.), px(40.)));
+        assert_eq!(
+            w.find("agent-model").label(),
+            Some("Model and thinking: app default")
+        );
         w.click("agent-instructions", cx);
         w.input("Always use Mobbin", cx);
         w.click("agent-name", cx);
@@ -160,12 +165,7 @@ async fn edit_agent_dialog_saves_at_once_and_done_closes(cx: &mut TestAppContext
     cx.update_window(window, |_, w, cx| {
         assert!(dialog_shown(w, cx));
         assert_eq!(w.find("agent-icon").bounds().size, size(px(40.), px(40.)));
-        for id in [
-            "agent-create",
-            "agent-model",
-            "agent-effort",
-            "agent-attach",
-        ] {
+        for id in ["agent-create", "agent-effort", "agent-attach"] {
             assert!(w.try_find(id).is_none(), "{id} in the edit dialog");
         }
         assert_eq!(w.find("agent-skills").label(), Some("0 skills"));
@@ -217,6 +217,192 @@ async fn edit_agent_dialog_saves_at_once_and_done_closes(cx: &mut TestAppContext
         ),
         ("designer", "Design team", "New instructions")
     );
+}
+
+fn icon_files() -> usize {
+    fs::read_dir(crate::state::support_dir().join("agent-icons")).map_or(0, |d| d.count())
+}
+
+fn editor(shark: &Entity<Shark>, cx: &App) -> Entity<super::agent_settings::AgentEditor> {
+    shark
+        .read(cx)
+        .agent_editor
+        .clone()
+        .unwrap()
+        .upgrade()
+        .unwrap()
+}
+
+/// A new agent holds the icon, model and thinking picked before Create, writes nothing to the
+/// state until then, and Create saves them all.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn new_agent_holds_icon_and_model_until_create(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("agent-icon", cx);
+        assert!(shark.read(cx).icon_picker.is_some());
+        w.render_frame(cx);
+        w.click(("agent-icon-choice", 1usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let icon = cx
+        .update_window(window, |_, w, cx| {
+            assert!(shark.read(cx).icon_picker.is_none());
+            assert!(dialog_shown(w, cx), "a pick keeps the dialog");
+            assert!(
+                shark.read(cx).state.agents.is_empty(),
+                "nothing before Create"
+            );
+            let icon = editor(&shark, cx).read(cx).pending.icon.clone();
+            assert_ne!(icon, AgentIcon::default());
+            w.click("agent-model", cx);
+            click_menu_row(w, "Opus", cx);
+            icon
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("agent-model", cx);
+        click_menu_row(w, "Low", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
+        assert_eq!(
+            w.find("agent-model").label(),
+            Some("Model Opus, thinking low")
+        );
+        assert!(shark.read(cx).state.agents.is_empty());
+        w.click("agent-name", cx);
+        w.input("Designer", cx);
+        w.render_frame(cx);
+        w.click("agent-create", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for a in [
+        cx.read(|cx| shark.read(cx).state.agents[0].clone()),
+        State::load().agents[0].clone(),
+    ] {
+        assert_eq!(
+            (
+                a.slug.as_str(),
+                &a.icon,
+                a.model.as_deref(),
+                a.effort.as_deref()
+            ),
+            ("designer", &icon, Some("opus"), Some("low"))
+        );
+    }
+}
+
+/// ⌘D pastes an image into a new agent. A second image replaces the first file, and Cancel
+/// leaves no image behind.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn cancelled_new_agent_leaves_no_image(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let press = press_in(window);
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
+    for color in [[200, 30, 70, 255], [20, 160, 90, 255]] {
+        let mut png = std::io::Cursor::new(vec![]);
+        image::RgbaImage::from_pixel(24, 36, image::Rgba(color))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let image = Image::from_bytes(ImageFormat::Png, png.into_inner());
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_image(&image)));
+        press(cx, &["cmd-d"]);
+        cx.run_until_parked();
+        press(cx, &["enter"]);
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert!(shark.read(cx).icon_picker.is_none());
+            let pending = &editor(&shark, cx).read(cx).pending.icon;
+            assert!(matches!(pending, AgentIcon::Image { .. }), "{pending:?}");
+        });
+        assert_eq!(icon_files(), 1, "one held image at a time");
+    }
+    cx.update_window(window, |_, w, cx| w.click("agent-cancel", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
+    assert!(cx.read(|cx| shark.read(cx).state.agents.is_empty()));
+    assert_eq!(icon_files(), 0, "Cancel removes the held image");
+}
+
+/// The model chip saves an existing agent's pick at once: a model drops a thinking level it
+/// can't run, and Follow app default clears both. ⌘/ opens the same menu.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_model_chip_saves_and_clears_unsupported_thinking(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![Agent {
+                model: Some("codex:gpt-6.1-sol".into()),
+                effort: Some("ultra".into()),
+                ..designer()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let defaults = |cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            let a = &shark.read(cx).state.agents[0];
+            (a.model.clone(), a.effort.clone())
+        })
+    };
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            w.find("agent-model").label(),
+            Some("Model GPT-6.1 Sol, thinking ultra")
+        );
+        w.click("agent-model", cx);
+    })
+    .unwrap();
+    // The menu takes focus a tick after it opens and hands it back when it closes.
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| click_menu_row(w, "Opus", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(defaults(cx), (Some("opus".into()), None));
+    assert_eq!(State::load().agents[0].model.as_deref(), Some("opus"));
+    press_in(window)(cx, &["cmd-/"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx));
+        assert_eq!(
+            w.find("agent-model").label(),
+            Some("Model Opus, thinking app default")
+        );
+        click_menu_row(w, "Follow app default", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(defaults(cx), (None, None));
+    cx.update_window(window, |_, w, cx| {
+        assert!(dialog_shown(w, cx), "a pick keeps the dialog");
+        assert_eq!(
+            w.find("agent-model").label(),
+            Some("Model and thinking: app default")
+        );
+    })
+    .unwrap();
 }
 
 /// The skills and handoff menus open above the agent dialog: clicking their rows, or dismissing

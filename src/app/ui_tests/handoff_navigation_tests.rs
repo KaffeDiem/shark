@@ -250,7 +250,7 @@ async fn handoff_target_follows_receiver_name_and_icon_edits(cx: &mut TestAppCon
             .unwrap();
         assert_eq!(target.name, "Implementation planner");
     });
-    on_app(window, shark.clone())(cx, &|s, w, cx| s.pick_agent_icon("planner", w, cx));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.pick_agent_icon(Some("planner"), w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.input("star", cx);

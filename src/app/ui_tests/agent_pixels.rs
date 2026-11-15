@@ -48,19 +48,18 @@ fn check_dialog_layout(w: &Window, new: bool) {
         name.left() >= body.left() + px(40.),
         "the avatar sits left of the name"
     );
-    let mut ids = vec!["agent-name", "agent-instructions"];
+    let avatar = w.find("agent-icon").bounds();
+    assert!(avatar.right() <= name.left() && avatar.top() <= name.bottom());
+    let mut ids = vec![
+        "agent-icon",
+        "agent-name",
+        "agent-instructions",
+        "agent-model",
+    ];
     if new {
         ids.extend(["agent-cancel", "agent-create"]);
     } else {
-        let avatar = w.find("agent-icon").bounds();
-        assert!(avatar.right() <= name.left() && avatar.top() <= name.bottom());
-        ids.extend([
-            "agent-icon",
-            "agent-skills",
-            "agent-next",
-            "agent-delete",
-            "agent-done",
-        ]);
+        ids.extend(["agent-skills", "agent-next", "agent-delete", "agent-done"]);
     }
     for id in ids {
         let b = w.find(id);
@@ -161,13 +160,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     }
     let cases: &[(&str, Setup)] = &[
         ("agent-icon-picker-symbols", |s, w, cx| {
-            s.pick_agent_icon("designer", w, cx);
+            s.pick_agent_icon(Some("designer"), w, cx);
         }),
         ("agent-icon-picker-emoji", |s, w, cx| {
             s.state.agents[0].icon = crate::state::AgentIcon::Emoji {
                 value: "🐧".into()
             };
-            s.pick_agent_icon("designer", w, cx);
+            s.pick_agent_icon(Some("designer"), w, cx);
         }),
         ("agent-icon-picker-image", |s, w, cx| {
             let image = image::RgbaImage::from_fn(120, 180, |x, y| {
@@ -175,7 +174,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             });
             let path = crate::state::support_dir().join("crop-preview.png");
             image.save(&path).unwrap();
-            s.pick_agent_icon("designer", w, cx);
+            s.pick_agent_icon(Some("designer"), w, cx);
             s.icon_picker
                 .as_ref()
                 .unwrap()

@@ -2,8 +2,8 @@
 //! skills and handoff.
 use super::menus::on_shark;
 use super::*;
-use crate::models::efforts;
-use crate::state::Agent;
+use crate::models::{EFFORT, MODELS, effort_label, efforts, model_label};
+use crate::state::{Agent, AgentIcon};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Textarea, TextareaState};
 use std::cell::{Cell, RefCell};
@@ -25,6 +25,51 @@ fn repo_defaults(state: &State, agent: &Agent) -> (String, Option<String>) {
         ..Default::default()
     };
     state.defaults_for(&task, None)
+}
+
+/// Whether the agent's thinking level runs on its model, its own or the inherited one.
+fn effort_runs(state: &State, a: &Agent) -> bool {
+    let model = a.model.clone().unwrap_or_else(|| repo_defaults(state, a).0);
+    a.effort
+        .as_deref()
+        .is_none_or(|e| efforts(&model).contains(&e))
+}
+
+/// An agent's model and thinking as people read them; a model `MODELS` lacks counts as unset.
+fn defaults(a: &Agent) -> (Option<String>, Option<String>) {
+    let model = a.model.as_deref().filter(|m| MODELS.contains(m));
+    (
+        model.map(model_label),
+        a.effort.as_deref().map(effort_label),
+    )
+}
+
+/// The model chip's label, also Settings › Agents' rows: "App default", "Opus · App default".
+pub(super) fn defaults_label(a: &Agent) -> String {
+    match defaults(a) {
+        (None, None) => "App default".into(),
+        (m, e) => format!(
+            "{} · {}",
+            m.as_deref().unwrap_or("App default"),
+            e.as_deref().unwrap_or("App default")
+        ),
+    }
+}
+
+/// `defaults_label` in words: "Model Opus, thinking app default".
+fn defaults_words(a: &Agent) -> String {
+    match defaults(a) {
+        (None, None) => "Model and thinking: app default".into(),
+        (m, e) => format!(
+            "Model {}, thinking {}",
+            m.as_deref().unwrap_or("app default"),
+            e.map_or("app default".into(), |e| e.to_lowercase())
+        ),
+    }
+}
+
+fn below(b: Bounds<Pixels>) -> Point<Pixels> {
+    point(b.left(), b.bottom() + px(4.))
 }
 
 fn create_skills_folder(slug: &str) -> std::io::Result<PathBuf> {
@@ -59,17 +104,22 @@ fn reveal_skills(slug: &str, window: &mut Window, cx: &mut App) {
     }
 }
 
-/// A control whose menu hangs from it, as dropdowns do.
+/// A control whose menu hangs from it, as dropdowns do. `at` receives its bounds. A click
+/// leaves focus on the dialog, so it first moves into `editor`: the menu hands focus back
+/// there, where ⌘/ and ⌘D reach the editor.
 fn menu_button(
     id: &'static str,
     button: Button,
+    at: Rc<Cell<Bounds<Pixels>>>,
+    editor: FocusHandle,
     open: impl Fn(Point<Pixels>, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let at = Rc::new(Cell::<Bounds<Pixels>>::default());
     let click = at.clone();
     let button = button.on_click(move |_, w, cx| {
-        let b = click.get();
-        open(point(b.left(), b.bottom() + px(4.)), w, cx)
+        if !editor.contains_focused(w, cx) {
+            editor.focus(w, cx);
+        }
+        open(below(click.get()), w, cx)
     });
     div()
         .relative()
@@ -196,18 +246,10 @@ impl Shark {
         let draft_defaults = (self.home.draft_agent.as_deref() == Some(slug))
             .then(|| self.home.draft.defaults(&self.state, Some(slug)));
         f(&mut self.state.agents[i]);
-        let a = &self.state.agents[i];
-        let model = a
-            .model
-            .clone()
-            .unwrap_or_else(|| repo_defaults(&self.state, a).0);
-        let a = &mut self.state.agents[i];
-        if a.effort
-            .as_deref()
-            .is_some_and(|e| !efforts(&model).contains(&e))
-        {
-            a.effort = None;
+        if !effort_runs(&self.state, &self.state.agents[i]) {
+            self.state.agents[i].effort = None;
         }
+        let a = &self.state.agents[i];
         let next_changed = old_next != a.next;
         let identity_changed = old_identity != (a.name.clone(), a.icon.clone());
         let changed_defaults = (old_defaults.0 != a.model, old_defaults.1 != a.effort);
@@ -512,6 +554,10 @@ pub(crate) struct AgentEditor {
     pub(super) name: Entity<InputState>,
     pub(super) instructions: Entity<TextareaState>,
     pub(super) skills: Vec<String>,
+    /// A new agent's icon, model and thinking until Create.
+    pub(super) pending: Agent,
+    /// The model chip's bounds, where ⌘/ opens its menu.
+    model_at: Rc<Cell<Bounds<Pixels>>>,
     focus: FocusHandle,
     /// Shark's icon picker opens below the avatar it finds here.
     anchors: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
@@ -552,6 +598,8 @@ impl AgentEditor {
             slug,
             name,
             instructions,
+            pending: Agent::default(),
+            model_at: Rc::default(),
             focus: cx.focus_handle(),
             anchors,
             then,
@@ -576,6 +624,14 @@ impl AgentEditor {
                 _ => {}
             }),
         );
+        // Cancel, Escape and an outside click all drop the dialog: a held image goes with it.
+        // After Create the agent uses it, so it stays.
+        this._subs.push(cx.on_release_in(window, |this, w, cx| {
+            let icon = std::mem::take(&mut this.pending.icon);
+            (this.shark)
+                .update(cx, |s, cx| s.drop_unused_icon(&icon, w, cx))
+                .ok();
+        }));
         this._subs.push(
             cx.subscribe_in(&this.instructions, window, |this, field, ev, w, cx| {
                 if let InputEvent::Change = ev
@@ -605,6 +661,102 @@ impl AgentEditor {
         self.shark
             .update(cx, |s, cx| s.update_agent(&slug, f, cx))
             .ok();
+    }
+
+    /// A new agent's icon, until Create; returns the one it replaces.
+    pub(super) fn hold_icon(&mut self, icon: AgentIcon, cx: &mut Context<Self>) -> AgentIcon {
+        cx.notify();
+        std::mem::replace(&mut self.pending.icon, icon)
+    }
+
+    /// Model and thinking: saved at once on an existing agent, held on a new one.
+    fn set_defaults(&mut self, f: impl FnOnce(&mut Agent), cx: &mut Context<Self>) {
+        if self.slug.is_some() {
+            return self.update(cx, f);
+        }
+        f(&mut self.pending);
+        if let Some(shark) = self.shark.upgrade()
+            && !effort_runs(&shark.read(cx).state, &self.pending)
+        {
+            self.pending.effort = None;
+        }
+        cx.notify();
+    }
+
+    /// Follow app default, the models, then the levels the model (stored or inherited) runs.
+    fn model_menu(&mut self, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shark) = self.shark.upgrade() else {
+            return;
+        };
+        let state = &shark.read(cx).state;
+        let agent = match &self.slug {
+            Some(slug) => state.agents.iter().find(|a| &a.slug == slug),
+            None => Some(&self.pending),
+        };
+        let Some(agent) = agent else {
+            return;
+        };
+        let (app_model, app_effort) = repo_defaults(state, agent);
+        let model = agent.model.as_deref().filter(|m| MODELS.contains(m));
+        let effort = agent.effort.clone();
+        let this = cx.entity().downgrade();
+        let pick = |f: fn(&mut Agent, &'static str), value: &'static str| {
+            let this = this.clone();
+            move |_: &mut Window, cx: &mut App| {
+                this.update(cx, |e, cx| e.set_defaults(|a| f(a, value), cx))
+                    .ok();
+            }
+        };
+        let mut entries = vec![
+            menu::item(
+                None,
+                "Follow app default",
+                pick(|a, _| (a.model, a.effort) = (None, None), ""),
+            )
+            .hint(format!(
+                "{} · {}",
+                model_label(&app_model),
+                effort_label(app_effort.as_deref().unwrap_or(EFFORT))
+            ))
+            .checked(model.is_none() && effort.is_none()),
+            Entry::Sep,
+        ];
+        entries.extend(MODELS.iter().map(|&id| {
+            menu::item(
+                None,
+                model_label(id),
+                pick(|a, m| a.model = Some(m.into()), id),
+            )
+            .hint(if crate::codex::is_codex(Some(id)) {
+                "Codex"
+            } else {
+                ""
+            })
+            .checked(model == Some(id))
+        }));
+        entries.push(Entry::Sep);
+        entries.extend(efforts(model.unwrap_or(&app_model)).iter().map(|&level| {
+            menu::item(
+                None,
+                effort_label(level),
+                pick(|a, l| a.effort = Some(l.into()), level),
+            )
+            .hint(if matches!(level, "max" | "ultra") {
+                "slower"
+            } else {
+                ""
+            })
+            .checked(effort.as_deref() == Some(level))
+        }));
+        let sel = entries
+            .iter()
+            .position(|e| matches!(e, Entry::Item { checked: true, .. }));
+        shark.update(cx, |s, cx| {
+            s.show_menu(pos, entries, window, cx);
+            if let (Some((m, _)), Some(sel)) = (&s.menu, sel) {
+                m.update(cx, |m, _| m.select(sel));
+            }
+        });
     }
 
     /// Chats and their tasks follow the agent once typing pauses. Detached, so closing the
@@ -643,11 +795,19 @@ impl AgentEditor {
         let Some(shark) = self.shark.upgrade() else {
             return;
         };
+        let pending = self.pending.clone();
         let created = shark.update(cx, |s, cx| {
             let slug = s.create_named_agent(&name, cx)?;
-            if !instructions.trim().is_empty() {
-                s.update_agent(&slug, |a| a.instructions = instructions, cx);
-            }
+            s.update_agent(
+                &slug,
+                |a| {
+                    if !instructions.trim().is_empty() {
+                        a.instructions = instructions;
+                    }
+                    (a.icon, a.model, a.effort) = (pending.icon, pending.model, pending.effort);
+                },
+                cx,
+            );
             Ok::<_, String>(slug)
         });
         match created {
@@ -723,45 +883,38 @@ impl Render for AgentEditor {
             .map(|a| a.name.clone());
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let avatar = match &agent {
-            None => super::agent_icon_view::agent_icon(&Default::default())
-                .size(px(40.))
-                .into_any_element(),
-            Some(agent) => {
-                let (slug, at, weak) =
-                    (agent.slug.clone(), self.anchors.clone(), self.shark.clone());
-                let key = slug.clone();
-                div()
-                    .relative()
-                    .flex_none()
-                    .child(
-                        Button::new("agent-icon")
-                            .accessibility_label("Change agent icon")
-                            .ghost()
-                            .p_0()
-                            .size(px(40.))
-                            .child(super::agent_icon_view::agent_icon(&agent.icon).size(px(40.)))
-                            .tooltip("Change icon · ⌘D pastes an image")
-                            .on_click(move |_, w, cx| {
-                                weak.update(cx, |s, cx| s.pick_agent_icon(&slug, w, cx))
-                                    .ok();
-                            }),
-                    )
-                    .child(
-                        canvas(
-                            move |b, _, _| {
-                                at.borrow_mut().insert(key.clone(), b);
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full(),
-                    )
-                    .into_any_element()
-            }
-        };
+        let icon = agent.as_ref().map_or(&self.pending.icon, |a| &a.icon);
+        let (slug, at, weak) = (self.slug.clone(), self.anchors.clone(), self.shark.clone());
+        // A new agent's anchor is "", which no slug is.
+        let key = slug.clone().unwrap_or_default();
+        let avatar = div()
+            .relative()
+            .flex_none()
+            .child(
+                Button::new("agent-icon")
+                    .accessibility_label("Change agent icon")
+                    .ghost()
+                    .p_0()
+                    .size(px(40.))
+                    .child(super::agent_icon_view::agent_icon(icon).size(px(40.)))
+                    .tooltip("Change icon · ⌘D pastes an image")
+                    .on_click(move |_, w, cx| {
+                        weak.update(cx, |s, cx| s.pick_agent_icon(slug.as_deref(), w, cx))
+                            .ok();
+                    }),
+            )
+            .child(
+                canvas(
+                    move |b, _, _| {
+                        at.borrow_mut().insert(key.clone(), b);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
         let identity = h_flex().gap_3().child(avatar).child(
             v_flex()
                 .flex_1()
@@ -799,39 +952,57 @@ impl Render for AgentEditor {
                     .text_color(muted)
                     .child("Chats with this agent get these in their system prompt."),
             );
-        let chips = agent.map(|agent| {
-            let chip =
-                |id: &'static str, label: String, icon: Option<IconName>, tip: &'static str| {
-                    Button::new(id)
-                        .ghost()
-                        .accessibility_label(label.clone())
-                        .tooltip(tip)
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .children(icon.map(|i| Icon::new(i).with_size(px(14.))))
-                                .child(div().max_w(px(240.)).truncate().child(label))
-                                .child(Icon::new(IconName::ChevronDown).with_size(px(12.))),
-                        )
+        let chip = |id: &'static str, label: String, icon: Option<IconName>, tip: &'static str| {
+            Button::new(id)
+                .ghost()
+                .accessibility_label(label.clone())
+                .tooltip(tip)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .children(icon.map(|i| Icon::new(i).with_size(px(14.))))
+                        .child(div().max_w(px(240.)).truncate().child(label))
+                        .child(Icon::new(IconName::ChevronDown).with_size(px(12.))),
+                )
+        };
+        let shown = agent.as_ref().unwrap_or(&self.pending);
+        let editor = cx.entity().downgrade();
+        let open_model = move |pos, w: &mut Window, cx: &mut App| {
+            editor.update(cx, |e, cx| e.model_menu(pos, w, cx)).ok();
+        };
+        let model = chip(
+            "agent-model",
+            defaults_label(shown),
+            None,
+            "Model and thinking for new chats with this agent",
+        )
+        .accessibility_label(defaults_words(shown));
+        let chips = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .ml(px(-8.))
+            .child(menu_button(
+                "agent-model",
+                model,
+                self.model_at.clone(),
+                self.focus.clone(),
+                open_model,
+            ))
+            .when_some(agent, |row, agent| {
+                let count = self.skills.len();
+                let skills = format!("{count} {}", if count == 1 { "skill" } else { "skills" });
+                let next = format!("Hands off to {}", next.as_deref().unwrap_or("nobody"));
+                let (weak, slug) = (self.shark.clone(), agent.slug.clone());
+                let open_skills = move |pos, w: &mut Window, cx: &mut App| {
+                    weak.update(cx, |s, cx| s.agent_skills_menu(&slug, pos, w, cx))
+                        .ok();
                 };
-            let count = self.skills.len();
-            let skills = format!("{count} {}", if count == 1 { "skill" } else { "skills" });
-            let next = format!("Hands off to {}", next.as_deref().unwrap_or("nobody"));
-            let (weak, slug) = (self.shark.clone(), agent.slug.clone());
-            let open_skills = move |pos, w: &mut Window, cx: &mut App| {
-                weak.update(cx, |s, cx| s.agent_skills_menu(&slug, pos, w, cx))
-                    .ok();
-            };
-            let (weak, slug) = (self.shark.clone(), agent.slug.clone());
-            let open_next = move |pos, w: &mut Window, cx: &mut App| {
-                weak.update(cx, |s, cx| s.agent_next_menu(&slug, pos, w, cx))
-                    .ok();
-            };
-            h_flex()
-                .flex_wrap()
-                .gap_1()
-                .ml(px(-8.))
-                .child(menu_button(
+                let (weak, slug) = (self.shark.clone(), agent.slug.clone());
+                let open_next = move |pos, w: &mut Window, cx: &mut App| {
+                    weak.update(cx, |s, cx| s.agent_next_menu(&slug, pos, w, cx))
+                        .ok();
+                };
+                row.child(menu_button(
                     "agent-skills",
                     chip(
                         "agent-skills",
@@ -839,14 +1010,18 @@ impl Render for AgentEditor {
                         Some(IconName::BookOpen),
                         "This agent's skills",
                     ),
+                    Rc::default(),
+                    self.focus.clone(),
                     open_skills,
                 ))
                 .child(menu_button(
                     "agent-next",
                     chip("agent-next", next, None, "Suggest handing finished work to"),
+                    Rc::default(),
+                    self.focus.clone(),
                     open_next,
                 ))
-        });
+            });
         let (weak, slug) = (self.shark.clone(), self.slug.clone());
         v_flex()
             .id("agent-editor")
@@ -854,15 +1029,16 @@ impl Render for AgentEditor {
             .track_focus(&self.focus)
             .test_support()
             .on_action(move |_: &PasteAgentIcon, w, cx| {
-                if let Some(slug) = &slug {
-                    weak.update(cx, |s, cx| s.paste_agent_icon(slug, w, cx))
-                        .ok();
-                }
+                weak.update(cx, |s, cx| s.paste_agent_icon(slug.as_deref(), w, cx))
+                    .ok();
             })
+            .on_action(cx.listener(|this, _: &PickModel, w, cx| {
+                this.model_menu(below(this.model_at.get()), w, cx)
+            }))
             .gap_4()
             .child(identity)
             .child(instructions)
-            .children(chips)
+            .child(chips)
             .into_any_element()
     }
 }
