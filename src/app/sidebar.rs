@@ -1103,7 +1103,10 @@ impl Shark {
                 .min_w_0()
                 .truncate()
                 .text_xs()
-                .text_color(if facts.warning || facts.caution {
+                // A needed action reads in the title's colour: its icon already carries the warning.
+                .text_color(if facts.warning {
+                    foreground
+                } else if facts.caution {
                     theme.warning_foreground
                 } else if facts.failed {
                     theme.danger_foreground

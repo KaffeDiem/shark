@@ -209,7 +209,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                         },
                                     ));
                                 }
-                                // The required action occupies the fixed second line.
+                                // The required action occupies the fixed second line in the
+                                // title's colour: the icon alone carries the warning colour.
                                 if ix == 3 {
                                     checks.push((
                                         "needs-you step",
@@ -217,7 +218,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                             point(b.left() + px(32.), b.top() + px(24.)),
                                             size(b.size.width - px(40.), px(16.)),
                                         ),
-                                        warning,
+                                        fg,
                                     ));
                                 }
                             }
