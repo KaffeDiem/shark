@@ -1,8 +1,10 @@
 //! Settings dialog (cmd-,): general (stay awake, Vim mode, repo skills), appearance (mode, light
-//! and dark theme, fonts), the git button's agent prompts, the repositories and the Linear
-//! connection. Preferences apply immediately.
+//! and dark theme, fonts), the git button's agent prompts, the agents, the repositories and the
+//! Linear connection. Preferences apply immediately.
 use crate::SwitchField;
 use crate::app::Shark;
+use crate::app::agent_icon_view::agent_icon;
+use crate::app::agent_settings::defaults_label;
 use crate::app::linear_connection::LinearPage;
 use crate::app::repo_settings::ReposPage;
 use crate::prompts::{self, PROMPTS};
@@ -10,14 +12,14 @@ use crate::state::{Appearance, State};
 use crate::theme::{THEMES, theme_configs};
 use crate::ui::{caption, card, dialog, faint, mode_pills, row, section};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme, IndexPath, Sizable as _, Theme, ThemeConfig, WindowExt, h_flex, try_parse_color,
-    v_flex,
+    ActiveTheme, Icon, IndexPath, Sizable as _, Theme, ThemeConfig, WindowExt, h_flex,
+    try_parse_color, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -722,6 +724,99 @@ impl Settings {
                     )
             }))
     }
+
+    /// One row per agent, opening its dialog over Settings, as repositories do; then New agent….
+    fn render_agents(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let agents = (self.shark.upgrade())
+            .map(|s| s.read(cx).state.agents.clone())
+            .unwrap_or_default();
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let rows: Vec<AnyElement> = (agents.iter().enumerate())
+            .map(|(ix, a)| {
+                let (summary, slug) = (defaults_label(a), a.slug.clone());
+                let open = cx.listener(move |this, _, w, cx| {
+                    (this.shark)
+                        .update(cx, |s, cx| s.open_agent(&slug, w, cx))
+                        .ok();
+                });
+                // A button, so Tab reaches it and Enter opens it; the separator sits outside its
+                // own border.
+                div()
+                    .when(ix > 0, |d| d.border_t_1().border_color(theme.border))
+                    .child(
+                        Button::new(("agent-row", ix))
+                            .ghost()
+                            .rounded(ButtonRounded::None)
+                            .w_full()
+                            .h(px(48.))
+                            .px_3()
+                            .accessibility_label(format!("{}, @{}, {summary}", a.name, a.slug))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_3()
+                                    .child(agent_icon(&a.icon).size(px(24.)))
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(div().text_sm().truncate().child(a.name.clone()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .truncate()
+                                                    .child(format!("@{}", a.slug)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(summary),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::ChevronRight)
+                                            .with_size(px(14.))
+                                            .text_color(muted),
+                                    ),
+                            )
+                            .on_click(open),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let empty = rows.is_empty();
+        v_flex()
+            .gap_3()
+            .when(!empty, |d| {
+                d.child(card(theme).overflow_hidden().children(rows))
+            })
+            .when(empty, |d| {
+                d.child(
+                    div()
+                        .id("agents-empty")
+                        .test_support()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("No agents yet. New agent… makes one with its own instructions, icon and model."),
+                )
+            })
+            .child(
+                h_flex().child(
+                    Button::new("new-agent")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Plus)
+                        .label("New agent…")
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.shark.update(cx, |s, cx| s.new_agent_dialog(w, cx)).ok();
+                        })),
+                ),
+            )
+    }
 }
 
 /// Settings pages: nav icon, then title and the one line under it.
@@ -742,6 +837,13 @@ const PAGES: &[(IconName, (&str, &str))] = &[
         ),
     ),
     (
+        IconName::Bot,
+        (
+            "Agents",
+            "Click one for its instructions, icon, model and skills",
+        ),
+    ),
+    (
         IconName::FolderGit2,
         (
             "Repositories",
@@ -754,9 +856,10 @@ const PAGES: &[(IconName, (&str, &str))] = &[
     ),
 ];
 
-/// The Repositories page's index in `PAGES`.
-const REPOS: usize = 3;
-const LINEAR: usize = 4;
+/// Pages' indices in `PAGES`.
+const AGENTS: usize = 3;
+const REPOS: usize = 4;
+const LINEAR: usize = 5;
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
 fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
@@ -820,6 +923,7 @@ impl Render for Settings {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_appearance(cx).into_any_element(),
             2 => self.render_prompts(cx).into_any_element(),
+            AGENTS => self.render_agents(cx).into_any_element(),
             REPOS => self.repos.clone().into_any_element(),
             LINEAR => self.linear.clone().into_any_element(),
             _ => unreachable!("unknown settings page"),

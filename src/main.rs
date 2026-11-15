@@ -429,9 +429,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", RunScripts, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
-        // Enter is for the focused control. The dialog's OK would close Settings first, hiding a
-        // rejected key's message.
-        KeyBinding::new("enter", NoAction, Some("LinearPage")),
+        // Enter is for the focused control: an Agents row, a Linear key. The dialog's OK would
+        // swallow it, or close Settings first and hide a rejected key's message.
+        KeyBinding::new("enter", NoAction, Some("Settings")),
         KeyBinding::new("cmd-/", PickModel, None),
         KeyBinding::new("cmd-i", AddToDraft, Some("HomePrompt")),
         KeyBinding::new("cmd-shift-b", ChangeDraftBranch, Some("HomePrompt")),
