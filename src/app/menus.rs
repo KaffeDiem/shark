@@ -279,7 +279,7 @@ pub(super) fn stacks(this: &Shark, ws: &Task, cx: &App) -> Vec<RepoStack> {
                     Some((w.name.clone(), w.branch_of(wr).to_string(), wr.base.clone()))
                 })
                 .collect();
-            let prs = sync.stack_prs.get(&r.name).map_or(&[][..], Vec::as_slice);
+            let prs = (this.stack_prs.get(&r.name)).map_or(&[][..], |l| l.prs.as_slice());
             let (nodes, me) = crate::stack::chain(ws.branch_of(r), trunk, &local, prs);
             (nodes.len() > 1).then(|| RepoStack {
                 repo: r.name.clone(),

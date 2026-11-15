@@ -1186,6 +1186,12 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
                 ));
             }
             let l = local()?;
+            if l.restack {
+                return Err(format!(
+                    "still carries its merged parent's commits; restack onto `{}` first",
+                    p.base
+                ));
+            }
             // Merge exactly what this task has: clean, pushed, and GitHub's head matching.
             if l.changed > 0 || l.remote != Some((0, 0)) || p.head != l.head {
                 return Err(
@@ -2040,6 +2046,16 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         );
         r.base = "origin/old-parent".into();
         assert!(step_args(&Kind::Merge, &r).unwrap().is_some());
+    }
+
+    /// GitHub retargets a child onto the trunk when its parent merges, and the task follows; its
+    /// branch still carries the parent's commits until it is restacked, so it can't merge yet.
+    #[test]
+    fn merge_refuses_a_branch_that_still_carries_its_merged_parent() {
+        let mut r = repo("api", clean(1), Some(pr("CLEAN", Checks::Passing)));
+        r.local.as_mut().unwrap().restack = true;
+        let error = step_args(&Kind::Merge, &r).unwrap_err();
+        assert!(error.contains("restack"), "{error}");
     }
 
     /// The real thing: a linked worktree from `create_workspace` against a bare origin.

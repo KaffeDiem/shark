@@ -123,7 +123,7 @@ impl Shark {
         let cols = crate::stack::columns(
             &listed,
             |r| self.state.trunks.get(r).map(String::as_str),
-            |r| self.stack_prs.get(r).map_or(&[], Vec::as_slice),
+            |r| self.stack_prs.get(r).map_or(&[], |l| l.prs.as_slice()),
             only,
         );
         cols.into_iter()
@@ -191,11 +191,13 @@ impl Shark {
     }
 
     /// Keeps what a probe found that stacks need: the trunks (saved when they change) and
-    /// each repo's open PRs. Whether anything changed.
+    /// each repo's open PRs, unless older than the ones kept. A task follows its PR's base
+    /// when GitHub retargeted it. Whether anything changed.
     pub(crate) fn learn_stacks(
         &mut self,
         repos: &[crate::sync::Repo],
-        prs: &HashMap<String, Vec<crate::prs::Pr>>,
+        prs: &HashMap<String, crate::prs::OpenPrs>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let mut trunk = false;
         for r in repos {
@@ -210,14 +212,84 @@ impl Shark {
         if trunk {
             let _ = self.state.save();
         }
-        let mut listed = false;
+        let mut changed = trunk;
         for (repo, list) in prs {
-            if self.stack_prs.get(repo) != Some(list) {
-                self.stack_prs.insert(repo.clone(), list.clone());
-                listed = true;
+            if !self.stack_prs_news(repo, list) {
+                continue;
+            }
+            changed |= self.stack_prs.get(repo).is_none_or(|h| h.prs != list.prs);
+            self.stack_prs.insert(repo.clone(), list.clone());
+            // The disk cache may be older than what a task last followed.
+            let Some(at) = list.at else { continue };
+            let seen = (self.state.tasks.iter())
+                .flat_map(|t| t.repos.iter().map(move |r| (t, r)))
+                .filter(|(_, r)| r.name == *repo)
+                .filter_map(|(t, r)| {
+                    let pr = crate::stack::own_pr(&list.prs, t.branch_of(r))?;
+                    Some((t.name.clone(), r.name.clone(), pr.base_ref_name.clone()))
+                })
+                .collect();
+            changed |= self.follow_prs(seen, at, cx);
+        }
+        changed
+    }
+
+    /// Whether `list` is newer than `repo`'s open PRs kept; the disk cache only when none is.
+    pub(crate) fn stack_prs_news(&self, repo: &str, list: &crate::prs::OpenPrs) -> bool {
+        self.stack_prs.get(repo).is_none_or(|h| h.at < list.at)
+    }
+
+    /// Whether `repo`'s open PRs are due for listing: none from gh yet, or not lately.
+    pub(crate) fn stack_prs_due(&self, repo: &str, now: std::time::Instant) -> bool {
+        (self.stack_prs.get(repo).and_then(|l| l.at))
+            .is_none_or(|t| now.duration_since(t) >= crate::sync::FETCH_EVERY)
+    }
+
+    /// GitHub said at `at` that each `(task, repo)`'s open PR targets `base`. An answer older
+    /// than one already heard is dropped; a base GitHub changed is the task's from now on,
+    /// as if set with "Only target". Whether a task moved.
+    fn follow_prs(
+        &mut self,
+        seen: Vec<(String, String, String)>,
+        at: std::time::Instant,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut moved: Vec<String> = vec![];
+        for (task, repo, base) in seen {
+            let key = (task.clone(), repo.clone());
+            let before = match self.pr_seen.get(&key) {
+                Some((t, _)) if *t >= at => continue,
+                b => b.map(|(_, b)| b.clone()),
+            };
+            self.pr_seen.insert(key, (at, base.clone()));
+            let Some(r) =
+                (self.task_mut(&task)).and_then(|t| t.repos.iter_mut().find(|r| r.name == repo))
+            else {
+                continue;
+            };
+            if crate::stack::follows(&r.base, before.as_deref(), &base) {
+                r.base = format!("origin/{base}");
+                if !moved.contains(&task) {
+                    moved.push(task);
+                }
             }
         }
-        trunk || listed
+        if moved.is_empty() {
+            return false;
+        }
+        let _ = self.state.save();
+        for name in &moved {
+            let Some(ws) = self.task(name).cloned() else {
+                continue;
+            };
+            let _ = git::write_claude_md(&ws);
+            if let Some(sync) = self.syncs.get(name).cloned() {
+                sync.update(cx, |g, cx| g.set_task(ws, cx));
+            }
+            self.publish_task(name, cx);
+            self.refresh_diff_if_active(name, cx);
+        }
+        true
     }
 
     /// The URL of the PR a PR row stands for.

@@ -71,6 +71,27 @@ impl Pr {
     }
 }
 
+/// A repo's open PRs and when gh was asked for them; `at` is `None` for the on-disk cache.
+#[derive(Clone, Debug)]
+pub struct OpenPrs {
+    pub at: Option<std::time::Instant>,
+    pub prs: Vec<Pr>,
+}
+
+impl From<Vec<Pr>> for OpenPrs {
+    fn from(prs: Vec<Pr>) -> Self {
+        OpenPrs { at: None, prs }
+    }
+}
+
+/// `repo`'s open PRs on origin, which owns its branches, stamped with when gh was asked.
+pub fn fetch_open_prs(repo: &str, src: &Path) -> Option<OpenPrs> {
+    let at = Some(std::time::Instant::now());
+    let origin = crate::pr::origin_repo(src);
+    let prs = list_prs(repo, src, true, origin.as_deref()).ok()?;
+    Some(OpenPrs { at, prs })
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Author {
     pub login: String,
@@ -91,12 +112,22 @@ const PR_ARGS: [&str; 10] = [
 
 /// Recent PRs for chat, or open PRs for checkout; successful fetches replace this repo's cache.
 pub fn fetch_repo_prs(repo: &str, src: &Path, open: bool) -> Result<Vec<Pr>, String> {
+    list_prs(repo, src, open, None)
+}
+
+/// `gh pr list` for [`fetch_repo_prs`], in `origin` when given.
+fn list_args(open: bool, origin: Option<&str>) -> Vec<&str> {
     let mut args = PR_ARGS;
     if open {
         args[3] = "open";
         // shortcut: at most 1000 open PRs, paginate when repositories exceed this limit.
         args[5] = "1000";
     }
+    crate::pr::with_repo(args.to_vec(), origin)
+}
+
+fn list_prs(repo: &str, src: &Path, open: bool, origin: Option<&str>) -> Result<Vec<Pr>, String> {
+    let args = list_args(open, origin);
     let json = crate::git::cmd_bounded(src, "gh", &args, 15).or_else(|e| match e {
         _ if e.contains("none of the git remotes") => Ok("[]".into()),
         _ => Err(pr_error(&e)),
@@ -202,6 +233,18 @@ mod tests {
         assert!(cached_repo_prs("api", &src, true).is_empty());
         fs::remove_file(prs_path(&src, false)).unwrap();
         fs::remove_file(prs_path(&src, true)).unwrap();
+    }
+
+    /// Stacks list origin's PRs: gh may default to a fork's upstream, whose same-named
+    /// branches aren't this repo's.
+    #[test]
+    fn open_prs_are_origins() {
+        let args = list_args(true, Some("https://github.com/me/fork"));
+        assert!(
+            args.ends_with(&["--repo", "https://github.com/me/fork"]),
+            "{args:?}"
+        );
+        assert!(!list_args(false, None).contains(&"--repo"));
     }
 
     #[test]
