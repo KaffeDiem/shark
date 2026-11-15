@@ -630,6 +630,37 @@ fn a_pr_retargeted_on_github_moves_its_task(cx: &mut TestAppContext) {
     });
 }
 
+/// A review checkout of #1089 (`pr/1089` on its private base) is #1089's row in the stack,
+/// on the PR's head branch, rather than floating alone while #1089 shows again as a PR row.
+#[gpui_kit::test]
+fn a_review_checkout_joins_its_prs_stack(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let review = ix(s, "anchor");
+        let t = &mut s.state.tasks[review];
+        t.name = "pr-1089".into();
+        t.branch = "pr/1089".into();
+        t.repos[0].base = "refs/shark/pull/1089/base".into();
+        s.learn_stacks(&[], &listed(github(), Instant::now()), cx);
+        assert_eq!(
+            shown(s),
+            one_stack(&["tiger-shark", "anchor", "tab-view"], "dev")
+        );
+        let tasks = &s.side_stacks()[0].tasks;
+        assert_eq!(
+            tasks[1],
+            Some(ix(s, "pr-1089")),
+            "#1089 is the review task's row"
+        );
+        assert_eq!(
+            base_of(s, "pr-1089"),
+            "refs/shark/pull/1089/base",
+            "base untouched"
+        );
+    });
+}
+
 /// GitHub's answers apply in the order gh gave them: an older list, or the disk cache, never
 /// replaces a newer one, whichever task's GitSync reports it last.
 #[gpui_kit::test]
