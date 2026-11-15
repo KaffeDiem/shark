@@ -45,7 +45,7 @@ pub(super) struct Probed {
     /// Per repo, a stacked one's parent PR; `None` when not asked.
     pub(super) parents: Vec<Option<Result<Option<Pr>, String>>>,
     /// Per `job.stack` repo, its open PRs; `None` when gh failed.
-    pub(super) stack_prs: Vec<(String, Option<Vec<crate::prs::Pr>>)>,
+    pub(super) stack_prs: Vec<(String, Option<crate::prs::OpenPrs>)>,
     pub(super) fetched: bool,
     pub(super) fetch_error: Option<String>,
 }
@@ -187,10 +187,7 @@ pub(super) fn run_job(job: &Job) -> Probed {
     // stacked repos and ones with an open PR if that shows up in gh's rate limit.
     let stack_prs = match job.fetch {
         true => par_map(&job.stack, |(name, src)| {
-            (
-                name.clone(),
-                crate::prs::fetch_repo_prs(name, src, true).ok(),
-            )
+            (name.clone(), crate::prs::fetch_open_prs(name, src))
         }),
         false => vec![],
     };

@@ -144,9 +144,12 @@ pub struct Shark {
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashMap<String, Option<String>>,
-    /// Each repo's open PRs, as the last GitSync of a task with it listed them: the sidebar's
+    /// Each repo's open PRs, the newest list from any GitSync or background check: the sidebar's
     /// stacks run through PRs without a task.
-    stack_prs: HashMap<String, Vec<crate::prs::Pr>>,
+    stack_prs: HashMap<String, crate::prs::OpenPrs>,
+    /// `(task, repo)` → when GitHub last said the task's open PR targets which base; a change
+    /// is a retarget on GitHub, which the task follows.
+    pr_seen: HashMap<(String, String), (std::time::Instant, String)>,
     /// The OpenRouter key for task titles: `None` until the Keychain is first read.
     pub(crate) openrouter_key: Option<Option<String>>,
     titling: HashSet<String>,
@@ -399,6 +402,7 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashMap::new(),
             stack_prs: HashMap::new(),
+            pr_seen: HashMap::new(),
             openrouter_key: None,
             titling: HashSet::new(),
             chat_titling: HashSet::new(),

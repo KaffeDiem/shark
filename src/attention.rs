@@ -143,26 +143,41 @@ fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
                 let last = (s.attn.checked.get(&name)).map(|c| c.repos.clone());
                 // Backing off skips gh only: local git state keeps refreshing.
                 let gh = s.attn.paused_until.is_none_or(|t| now >= t);
+                // The open PRs of its repos too, unless a GitSync listed them lately: stacks
+                // in repos no open task has must follow GitHub as well.
+                let lists: Vec<_> = (ws.repos.iter())
+                    .filter(|r| gh && s.stack_prs_due(&r.name, now))
+                    .map(|r| (r.name.clone(), r.src.clone()))
+                    .collect();
                 Some((
                     ws,
                     last.unwrap_or_default(),
                     gh,
                     s.state.reviewed.get(&name).cloned().unwrap_or_default(),
+                    lists,
                 ))
             }) else {
                 break;
             };
-            let Some((ws, last, gh, reviewed)) = next else {
+            let Some((ws, last, gh, reviewed, lists)) = next else {
                 continue;
             };
             let name = ws.name.clone();
-            let (label, repos) = cx
+            let (label, repos, lists) = cx
                 .background_executor()
-                .spawn(async move { sync::check_in_background(&ws, &last, gh, &reviewed) })
+                .spawn(async move {
+                    let (label, repos) = sync::check_in_background(&ws, &last, gh, &reviewed);
+                    let lists: HashMap<_, _> = (lists.iter())
+                        .filter_map(|(n, src)| {
+                            Some((n.clone(), crate::prs::fetch_open_prs(n, src)?))
+                        })
+                        .collect();
+                    (label, repos, lists)
+                })
                 .await;
             let ok = this.update(cx, |s, cx| {
                 let active = s.active.clone();
-                if s.learn_stacks(&repos, &Default::default()) {
+                if s.learn_stacks(&repos, &lists, cx) {
                     cx.notify();
                 }
                 s.attn

@@ -63,6 +63,12 @@ fn pr(number: u64, head: &str, base: &str) -> crate::prs::Pr {
     .unwrap()
 }
 
+/// `api`'s open PRs as gh listed them at `at`.
+fn listed(prs: Vec<crate::prs::Pr>, at: Instant) -> HashMap<String, crate::prs::OpenPrs> {
+    let at = Some(at);
+    [("api".to_string(), crate::prs::OpenPrs { at, prs })].into()
+}
+
 fn ix(s: &Shark, name: &str) -> usize {
     s.state.tasks.iter().position(|t| t.name == name).unwrap()
 }
@@ -81,7 +87,7 @@ fn a_stack_sits_where_its_bottom_task_is(cx: &mut TestAppContext) {
         assert_eq!(s.ws_order(false), vec![0, 4, 1, 3, 2]);
         // A colleague's PR on wiring tops the stack as a cursor stop of its own.
         s.stack_prs
-            .insert("api".into(), vec![pr(9, "polish", "wiring")]);
+            .insert("api".into(), vec![pr(9, "polish", "wiring")].into());
         assert_eq!(
             rows(s),
             vec![Sec(0), T(0), Pr(3, 9), T(4), T(1), T(3), T(2)]
@@ -186,7 +192,7 @@ fn stack_rows_render_rail_base_and_labels(cx: &mut TestAppContext) {
     let (window, shark) = booted(cx);
     on_app(window, shark.clone())(cx, &|s, _, _| {
         s.stack_prs
-            .insert("api".into(), vec![pr(9, "polish", "wiring")]);
+            .insert("api".into(), vec![pr(9, "polish", "wiring")].into());
         s.state.tasks[1].backlog = true;
     });
     cx.update_window(window, |_, w, cx| {
@@ -289,18 +295,18 @@ fn stacked_facts_name_the_parent(cx: &mut TestAppContext) {
 fn probes_teach_trunks_and_prs(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = booted(cx);
-    on_app(window, shark.clone())(cx, &|s, _, _| {
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
         s.state.trunks.clear();
         let t = s.state.tasks[3].clone();
         let mut repo = crate::sync::Repo::fresh(&t.repos[0], &t);
-        let prs: HashMap<_, _> = [("api".to_string(), vec![pr(9, "polish", "wiring")])].into();
+        let prs = listed(vec![pr(9, "polish", "wiring")], Instant::now());
         assert!(
-            !s.learn_stacks(&[repo.clone()], &HashMap::new()),
+            !s.learn_stacks(&[repo.clone()], &HashMap::new(), cx),
             "no trunk yet"
         );
         repo.local.as_mut().unwrap().trunk = "origin/main".into();
-        assert!(s.learn_stacks(&[repo.clone()], &prs));
-        assert!(!s.learn_stacks(&[repo], &prs));
+        assert!(s.learn_stacks(&[repo.clone()], &prs, cx));
+        assert!(!s.learn_stacks(&[repo], &prs, cx));
         assert_eq!(s.state.trunks["api"], "origin/main");
         assert_eq!(State::load().trunks["api"], "origin/main", "saved");
         assert_eq!(rows(s)[2], Pr(3, 9));
@@ -345,7 +351,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         s.state.sections = checkout();
                         s.state.trunks = [("api".into(), "origin/main".into())].into();
                         s.stack_prs
-                            .insert("api".into(), vec![pr(9, "polish", "wiring")]);
+                            .insert("api".into(), vec![pr(9, "polish", "wiring")].into());
                         // wiring is behind ui: the segment under it is dashed.
                         let wiring = s.state.tasks[4].clone();
                         let mut repo = crate::sync::Repo::fresh(&wiring.repos[0], &wiring);
@@ -476,7 +482,7 @@ fn stack_regressions(cx: &mut TestAppContext) {
 
         // A PR row under the cursor follows its stack when indices shift.
         s.stack_prs
-            .insert("api".into(), vec![pr(9, "polish", "top")]);
+            .insert("api".into(), vec![pr(9, "polish", "top")].into());
         s.sel = Pr(ix(s, "api"), 9);
         s.state.tasks.push(task("z", "Z", "origin/main"));
         s.drop_task("z", "readme", cx);
@@ -550,4 +556,201 @@ fn keyboard_scrolls_inside_a_tall_stack(cx: &mut TestAppContext) {
         .unwrap();
         cx.update(|cx| assert_eq!(shark.read(cx).sel, T(i)));
     }
+}
+
+/// GitHub's stack `dev ← tiger-shark ← anchor ← tab-view`, where tab-view's task was cut from
+/// tiger-shark and its PR later retargeted onto anchor on GitHub.
+fn retargeted(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
+    test_home();
+    let state = State {
+        tasks: vec![
+            task("tiger-shark", "Flatten", "origin/dev"),
+            task("anchor", "Overview tasks", "origin/tiger-shark"),
+            task("tab-view", "Tab view", "origin/tiger-shark"),
+        ],
+        trunks: [("api".to_string(), "origin/dev".to_string())].into(),
+        ..Default::default()
+    };
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.run_until_parked();
+    (window, shark)
+}
+
+fn github() -> Vec<crate::prs::Pr> {
+    vec![
+        pr(1069, "tiger-shark", "dev"),
+        pr(1089, "anchor", "tiger-shark"),
+        pr(1096, "tab-view", "anchor"),
+    ]
+}
+
+/// `(branches, base)` of each sidebar stack.
+fn shown(s: &Shark) -> Vec<(Vec<String>, String)> {
+    (s.side_stacks().iter())
+        .map(|st| {
+            let branches = st.col.nodes.iter().map(|n| n.branch.clone()).collect();
+            (branches, st.col.base.clone())
+        })
+        .collect()
+}
+
+fn base_of(s: &Shark, task: &str) -> String {
+    s.state.tasks[ix(s, task)].repos[0].base.clone()
+}
+
+fn one_stack(branches: &[&str], base: &str) -> Vec<(Vec<String>, String)> {
+    let branches = branches.iter().map(|b| b.to_string()).collect();
+    vec![(branches, base.to_string())]
+}
+
+/// A PR retargeted on GitHub moves its task in the sidebar: the task follows the PR's base,
+/// saved, rather than keeping the base it was cut from.
+#[gpui_kit::test]
+fn a_pr_retargeted_on_github_moves_its_task(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        assert!(s.learn_stacks(&[], &listed(github(), Instant::now()), cx));
+        assert_eq!(base_of(s, "tab-view"), "origin/anchor");
+        assert_eq!(
+            State::load().tasks[2].repos[0].base,
+            "origin/anchor",
+            "saved"
+        );
+        assert_eq!(
+            shown(s),
+            one_stack(&["tiger-shark", "anchor", "tab-view"], "dev")
+        );
+        // Retargeted onto the trunk (as GitHub does when the parent merges): it leaves.
+        let mut moved = github();
+        moved[2].base_ref_name = "dev".into();
+        assert!(s.learn_stacks(&[], &listed(moved, Instant::now()), cx));
+        assert_eq!(base_of(s, "tab-view"), "origin/dev");
+        assert_eq!(shown(s), one_stack(&["tiger-shark", "anchor"], "dev"));
+    });
+}
+
+/// GitHub's answers apply in the order gh gave them: an older list, or the disk cache, never
+/// replaces a newer one, whichever task's GitSync reports it last.
+#[gpui_kit::test]
+fn an_older_pr_list_never_replaces_a_newer_one(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let old = Instant::now();
+        let mut before = github();
+        before[2].base_ref_name = "tiger-shark".into();
+        let new = Instant::now();
+        assert!(s.learn_stacks(&[], &listed(github(), new), cx));
+        assert!(!s.learn_stacks(&[], &listed(before.clone(), old), cx));
+        let cached: HashMap<_, _> = [("api".to_string(), before.into())].into();
+        assert!(!s.learn_stacks(&[], &cached, cx));
+        assert_eq!(s.stack_prs["api"].prs, github());
+        assert_eq!(base_of(s, "tab-view"), "origin/anchor");
+    });
+}
+
+/// A base changed in Shark waits for GitHub to retarget the PR: answers that still show the
+/// old base don't undo it, and one that shows a new base is GitHub's retarget.
+#[gpui_kit::test]
+fn a_base_set_in_shark_survives_until_github_catches_up(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        let mut before = github();
+        before[2].base_ref_name = "tiger-shark".into();
+        s.learn_stacks(&[], &listed(before.clone(), Instant::now()), cx);
+        assert_eq!(base_of(s, "tab-view"), "origin/tiger-shark");
+        // An answer gh started before the change lands after it.
+        let started = Instant::now();
+        let moves = [(
+            "api".to_string(),
+            "origin/tiger-shark".to_string(),
+            "origin/dev".to_string(),
+        )];
+        s.set_base("tab-view", &moves, false, w, cx);
+        s.learn_stacks(&[], &listed(before.clone(), started), cx);
+        assert_eq!(base_of(s, "tab-view"), "origin/dev");
+        s.learn_stacks(&[], &listed(before, Instant::now()), cx);
+        assert_eq!(
+            base_of(s, "tab-view"),
+            "origin/dev",
+            "the retarget is pending"
+        );
+        assert!(!shown(s).iter().any(|(b, _)| b.contains(&"tab-view".into())));
+        s.learn_stacks(&[], &listed(github(), Instant::now()), cx);
+        assert_eq!(
+            base_of(s, "tab-view"),
+            "origin/anchor",
+            "retargeted on GitHub"
+        );
+    });
+}
+
+/// Only an unambiguous PR of the task's own branch moves it: not a fork's PR with the same
+/// branch name, not two open PRs of one branch, not a review checkout's private base.
+#[gpui_kit::test]
+fn only_the_branchs_own_pr_moves_a_task(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let mut fork = github();
+        fork[2].is_cross_repository = true;
+        s.learn_stacks(&[], &listed(fork, Instant::now()), cx);
+        assert_eq!(base_of(s, "tab-view"), "origin/tiger-shark", "a fork's PR");
+        let mut twice = github();
+        twice.push(pr(1100, "tab-view", "dev"));
+        s.learn_stacks(&[], &listed(twice, Instant::now()), cx);
+        assert_eq!(base_of(s, "tab-view"), "origin/tiger-shark", "ambiguous");
+        let review = ix(s, "tab-view");
+        s.state.tasks[review].repos[0].base = "refs/shark/pull/1096/base".into();
+        s.learn_stacks(&[], &listed(github(), Instant::now()), cx);
+        assert_eq!(base_of(s, "tab-view"), "refs/shark/pull/1096/base");
+    });
+}
+
+/// The background check lists the open PRs of a task's repos when no GitSync did lately, so
+/// stacks in repos no open task has follow GitHub too.
+#[gpui_kit::test]
+fn background_checks_list_prs_no_gitsync_listed_lately(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let now = Instant::now();
+        assert!(s.stack_prs_due("api", now), "nothing listed");
+        s.stack_prs.insert("api".into(), github().into());
+        assert!(s.stack_prs_due("api", now), "only the disk cache");
+        s.learn_stacks(&[], &listed(github(), now), cx);
+        assert!(!s.stack_prs_due("api", now));
+        let later = now + crate::sync::FETCH_EVERY;
+        assert!(s.stack_prs_due("api", later));
+    });
+}
+
+/// A retarget that failed on GitHub doesn't leave the task on a base GitHub never took: the
+/// next answer is followed again.
+#[gpui_kit::test]
+fn a_failed_retarget_follows_github_again(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = retargeted(cx);
+    let app = on_app(window, shark.clone());
+    app(cx, &|s, w, cx| {
+        s.learn_stacks(&[], &listed(github(), Instant::now()), cx);
+        let t = &s.state.tasks[ix(s, "tab-view")];
+        assert!(
+            !t.dir().exists(),
+            "gh can't run here, so the retarget fails"
+        );
+        let moves = [(
+            "api".to_string(),
+            "origin/anchor".to_string(),
+            "origin/dev".to_string(),
+        )];
+        s.set_base("tab-view", &moves, false, w, cx);
+    });
+    cx.run_until_parked();
+    app(cx, &|s, _, cx| {
+        s.learn_stacks(&[], &listed(github(), Instant::now()), cx);
+        assert_eq!(base_of(s, "tab-view"), "origin/anchor");
+    });
 }

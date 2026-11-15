@@ -19,6 +19,25 @@ pub fn parent_of<'a>(base: &'a str, trunk: &str) -> Option<&'a str> {
         .filter(|p| !p.is_empty())
 }
 
+/// `branch`'s open PR among `prs`: not a fork's of the same name, and none when two disagree.
+pub fn own_pr<'a>(prs: &'a [Pr], branch: &str) -> Option<&'a Pr> {
+    let mut own = (prs.iter()).filter(|p| !p.is_cross_repository && p.head_ref_name == branch);
+    let first = own.next()?;
+    own.all(|p| p.base_ref_name == first.base_ref_name)
+        .then_some(first)
+}
+
+/// Whether a task with base `saved` follows its PR to `now`, GitHub's base for it: when GitHub
+/// changed it since `before` (`None`: not seen yet), so a base set here that GitHub hasn't caught
+/// up with stays. Only an `origin/…` base: a review checkout's `refs/shark/…` is its GitSync's to
+/// replace, and another remote's isn't GitHub's to say.
+pub fn follows(saved: &str, before: Option<&str>, now: &str) -> bool {
+    !now.is_empty()
+        && saved.starts_with("origin/")
+        && crate::git::short(saved) != now
+        && before != Some(now)
+}
+
 /// `me`'s stack in one repo, trunk side first, and `me`'s index in it. `local` is
 /// `(task, branch, base)` for every task with this repo; `prs` are its open PRs.
 /// The chain ends at the trunk, at a branch nothing more is known about, or where it would
@@ -495,5 +514,35 @@ mod tests {
             names(&chain("b", "origin/main", &local, &prs)),
             (vec!["b"], 0)
         );
+    }
+
+    /// A task follows GitHub only on news: a base GitHub changed, not one it hasn't caught up
+    /// with, and never a review checkout's private base.
+    #[test]
+    fn tasks_follow_only_a_retarget_on_github() {
+        assert!(
+            follows("origin/a", None, "b"),
+            "first answer, already moved"
+        );
+        assert!(follows("origin/a", Some("a"), "b"), "retargeted");
+        assert!(!follows("origin/b", Some("a"), "b"), "already there");
+        assert!(
+            !follows("origin/c", Some("a"), "a"),
+            "set here, GitHub not there yet"
+        );
+        assert!(!follows("origin/a", None, ""), "no base");
+        assert!(!follows("refs/shark/pull/1/base", None, "main"));
+        assert!(
+            !follows("upstream/main", None, "main"),
+            "only origin's branches"
+        );
+        let prs = [pr(1, "a", "main"), pr(2, "b", "a")];
+        assert_eq!(own_pr(&prs, "b").map(|p| p.number), Some(2));
+        assert_eq!(own_pr(&prs, "c"), None);
+        let mut fork = pr(3, "c", "main");
+        fork.is_cross_repository = true;
+        assert_eq!(own_pr(&[fork], "c"), None);
+        let twice = [pr(1, "a", "main"), pr(4, "a", "b")];
+        assert_eq!(own_pr(&twice, "a"), None, "two bases: ambiguous");
     }
 }

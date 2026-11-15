@@ -249,7 +249,12 @@ impl Shark {
         self._subs
             .push(cx.observe_in(&sync, window, move |s, sync, w, cx| {
                 let g = sync.read(cx);
-                if s.learn_stacks(g.repos().unwrap_or_default(), &g.stack_prs) {
+                let repos = g.repos().unwrap_or_default().to_vec();
+                let prs: HashMap<_, _> = (g.stack_prs.iter())
+                    .filter(|(r, l)| s.stack_prs_news(r, l))
+                    .map(|(r, l)| (r.clone(), l.clone()))
+                    .collect();
+                if s.learn_stacks(&repos, &prs, cx) {
                     cx.notify();
                 }
                 if s.active_sync() == Some(&sync) {
@@ -1299,6 +1304,23 @@ impl Shark {
             }
         }
         let ws = slot.clone();
+        // GitHub's answers from before now, and later ones still on the old base, are the
+        // retarget not having landed yet; the task doesn't follow them back.
+        let now = std::time::Instant::now();
+        // Each moved repo's PR in the repo's list, for a task without a GitSync.
+        let listed: Vec<Option<crate::prs::Pr>> = (moves.iter())
+            .map(|(repo, ..)| {
+                let r = ws.repos.iter().find(|r| &r.name == repo)?;
+                crate::stack::own_pr(&self.stack_prs.get(repo)?.prs, ws.branch_of(r)).cloned()
+            })
+            .collect();
+        for ((repo, old, _), pr) in moves.iter().zip(&listed) {
+            let key = (name.to_string(), repo.clone());
+            let base = (self.pr_seen.get(&key).map(|s| s.1.clone()))
+                .or_else(|| pr.as_ref().map(|p| p.base_ref_name.clone()))
+                .unwrap_or_else(|| crate::git::short(old).to_string());
+            self.pr_seen.insert(key, (now, base));
+        }
         self.record_interaction(&ws.name, cx);
         let _ = self.state.save();
         let _ = git::write_claude_md(&ws);
@@ -1306,40 +1328,59 @@ impl Shark {
             .map(|(r, o, n)| format!("`{r}` now targets `{n}` (was `{o}`)"))
             .collect::<Vec<_>>()
             .join(", ");
+        // An open task's PR as its GitSync knows it, else the repo's listed PRs.
+        let prs: Vec<(PathBuf, String, String)> = (moves.iter().zip(listed))
+            .filter_map(|((r, _, n), pr)| {
+                let url = (sync.as_ref())
+                    .and_then(|s| s.read(cx).pr_for(r).map(|p| p.0.url))
+                    .or(pr.map(|p| p.url))?;
+                Some((ws.dir().join(r), url, crate::git::short(n).to_string()))
+            })
+            .collect();
         self.publish_task(name, cx);
         if let Some(sync) = &sync {
-            let prs: Vec<(PathBuf, String, String)> = (moves.iter())
-                .filter_map(|(r, _, n)| {
-                    let url = sync.read(cx).pr_for(r)?.0.url;
-                    let b = crate::git::short(n).to_string();
-                    Some((ws.dir().join(r), url, b))
-                })
-                .collect();
             sync.update(cx, |g, cx| g.set_task(ws.clone(), cx));
-            if !prs.is_empty() {
-                cx.spawn_in(window, async move |_, cx| {
-                    let errs = (cx.background_executor())
-                        .spawn(async move {
-                            (prs.iter())
-                                .filter_map(|(wt, url, b)| {
-                                    let args = ["pr", "edit", url.as_str(), "--base", b.as_str()];
-                                    git::cmd_bounded(wt, "gh", &args, 30).err()
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .await;
-                    if !errs.is_empty() {
-                        cx.update(|w, cx| {
-                            notify_err(w, cx, format!("Retargeting PRs: {}", errs.join("; ")))
-                        })
-                        .ok();
+        }
+        if !prs.is_empty() {
+            let name = name.to_string();
+            cx.spawn_in(window, async move |this, cx| {
+                let failed = (cx.background_executor())
+                    .spawn(async move {
+                        (prs.into_iter())
+                            .filter_map(|(wt, url, b)| {
+                                let args = ["pr", "edit", url.as_str(), "--base", b.as_str()];
+                                let e = git::cmd_bounded(&wt, "gh", &args, 30).err()?;
+                                Some((wt, b, e))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                if failed.is_empty() {
+                    return;
+                }
+                this.update_in(cx, |s, w, cx| {
+                    // GitHub kept the old base: its next answer is followed again, unless
+                    // the base changed here once more since.
+                    for (wt, b, _) in &failed {
+                        let repo = wt.file_name().map(|n| n.to_string_lossy().into_owned());
+                        let Some(repo) = repo else { continue };
+                        let still = (s
+                            .task(&name)
+                            .and_then(|t| t.repos.iter().find(|r| r.name == repo)))
+                        .is_some_and(|r| crate::git::short(&r.base) == b);
+                        if still {
+                            s.pr_seen.remove(&(name.clone(), repo));
+                        }
                     }
+                    let errs: Vec<&str> = failed.iter().map(|f| f.2.as_str()).collect();
+                    notify_err(w, cx, format!("Retargeting PRs: {}", errs.join("; ")))
                 })
-                .detach();
-            }
-            if rebase {
-                sync.update(cx, |g, cx| g.rebase_onto(moves, window, cx));
-            }
+                .ok();
+            })
+            .detach();
+        }
+        if rebase && let Some(sync) = &sync {
+            sync.update(cx, |g, cx| g.rebase_onto(moves, window, cx));
         }
         self.refresh_diff_if_active(name, cx);
         window.push_notification(format!("New base: {changed}"), cx);
@@ -1672,6 +1713,7 @@ impl Shark {
         self.artifacts.remove(name);
         self.attach_results.remove(name);
         self.attn.forget(name);
+        self.pr_seen.retain(|(t, _), _| t != name);
         self.differ.update(cx, |d, _| d.forget_task(name));
     }
 

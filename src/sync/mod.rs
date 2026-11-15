@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 /// `git status` per repo. ponytail: polling, not FSEvents; watch .git if huge repos make this slow.
 const LOCAL_EVERY: Duration = Duration::from_secs(3);
-const FETCH_EVERY: Duration = Duration::from_secs(180);
+pub(crate) const FETCH_EVERY: Duration = Duration::from_secs(180);
 /// On window activation, fetch only if the last one is older than this.
 const FETCH_ON_FOCUS: Duration = Duration::from_secs(60);
 const PR_EVERY: Duration = Duration::from_secs(60);
@@ -108,7 +108,7 @@ pub struct GitSync {
     poll: Option<gpui_kit::Task<()>>,
     /// Open PRs per repo, for the stack around this task's branches; from the disk cache
     /// the New task dialog shares, refreshed with each fetch.
-    pub stack_prs: std::collections::HashMap<String, Vec<crate::prs::Pr>>,
+    pub stack_prs: std::collections::HashMap<String, crate::prs::OpenPrs>,
     /// The git menu, open under the chevron, whose bounds the last paint recorded.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     chevron: Rc<Cell<Bounds<Pixels>>>,
@@ -156,7 +156,7 @@ impl GitSync {
             .map(|r| {
                 (
                     r.name.clone(),
-                    crate::prs::cached_repo_prs(&r.name, &r.src, true),
+                    crate::prs::cached_repo_prs(&r.name, &r.src, true).into(),
                 )
             })
             .collect();
