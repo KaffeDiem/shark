@@ -1505,13 +1505,13 @@ async fn primary_changes_leave_branches_and_titles_alone(cx: &mut TestAppContext
     }
     assert_eq!(
         task_of(cx, &shark).default_branch(),
-        format!("eng-1-{name}")
+        format!("eng-1-issue-1-{name}")
     );
 
     on(cx, &|s, _, cx| s.make_primary(&name, &issue_ref(3), cx));
     let ws = task_of(cx, &shark);
     assert_eq!(ids(&ws), ["uuid-3", "uuid-1", "uuid-2"]);
-    assert_eq!(ws.default_branch(), format!("eng-3-{name}"));
+    assert_eq!(ws.default_branch(), format!("eng-3-issue-3-{name}"));
     assert_eq!(ws.title, "My title");
 
     let branch = ws.default_branch();
@@ -1913,7 +1913,7 @@ async fn starting_from_an_issue_adds_to_the_tray_then_plans_without_repos(cx: &m
         ("Renamed", &ws.branch)
     );
     assert_eq!(ids(&after), ["uuid-7"]);
-    assert_eq!(after.default_branch(), format!("eng-7-{name}"));
+    assert_eq!(after.default_branch(), format!("eng-7-issue-7-{name}"));
 }
 
 #[gpui_kit::test]

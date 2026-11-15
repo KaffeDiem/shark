@@ -525,6 +525,25 @@ impl Shark {
         self.request_title(name, None, &prompt, Some(window.window_handle()), cx);
     }
 
+    /// The OpenRouter key, read from the Keychain the first time; `None` without one.
+    pub(super) fn read_openrouter_key(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Task<Option<String>> {
+        let cached = self.openrouter_key.clone();
+        let read = (cached.is_none()).then(|| cx.read_credentials(crate::title::KEYCHAIN));
+        cx.spawn(async move |this, cx| match (cached, read) {
+            (Some(key), _) => key,
+            (None, Some(read)) => {
+                let key = crate::title::key_from(read.await);
+                (this.update(cx, |s, _| s.openrouter_key.get_or_insert(key).clone()))
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        })
+    }
+
     pub(super) fn request_title(
         &mut self,
         name: &str,
@@ -574,24 +593,11 @@ impl Shark {
             }
             self.chat_title_errors.remove(id);
         }
-        let cached = self.openrouter_key.clone();
-        let read = cached
-            .is_none()
-            .then(|| cx.read_credentials(crate::title::KEYCHAIN));
+        let key = self.read_openrouter_key(cx);
         let (name, prompt) = (name.to_string(), prompt.to_string());
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let key = match (cached, read) {
-                (Some(key), _) => key,
-                (None, Some(read)) => {
-                    let key = crate::title::key_from(read.await);
-                    this.update(cx, |s, _| s.openrouter_key.get_or_insert(key).clone())
-                        .ok()
-                        .flatten()
-                }
-                _ => None,
-            };
-            let result = match key {
+            let result = match key.await {
                 Some(key) => Some(
                     cx.background_executor()
                         .spawn(async move {

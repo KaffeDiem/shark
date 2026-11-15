@@ -1032,6 +1032,15 @@ pub fn task_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
         .expect("numbers outlast the agents")
 }
 
+/// A branch's words for a task: a Linear issue's id and the first words of its title, else
+/// `title`'s.
+pub fn branch_slug(issue: Option<&crate::linear::Snapshot>, title: &str) -> String {
+    match issue {
+        Some(i) => slug(&format!("{} {}", i.identifier, i.title)),
+        None => slug(title),
+    }
+}
+
 /// A short, branch-safe name shared by agent identities and task titles.
 pub fn slug(source: &str) -> String {
     let mut slug = String::new();
@@ -1086,13 +1095,11 @@ impl Task {
         if !self.repos.is_empty() {
             return self.branch.clone();
         }
-        let title = self.display_title();
-        let source = match self.primary_issue() {
-            Some(issue) => &issue.identifier,
-            None if self.title == NEW_TASK => "",
-            None => &title,
+        let title = match self.title == NEW_TASK {
+            true => Cow::Borrowed(""),
+            false => self.display_title(),
         };
-        let title = slug(source);
+        let title = branch_slug(self.primary_issue(), &title);
         match title.is_empty() {
             true => self.name.clone(),
             false => format!(
@@ -2196,11 +2203,12 @@ mod tests {
         ws.linear.attach((&one).into());
         ws.linear.attach((&two).into());
         ws.issues = vec![one, two.clone()];
-        assert_eq!(ws.default_branch(), "eng-1-19a2b");
+        // The issue's id and the first words of its title.
+        assert_eq!(ws.default_branch(), "eng-1-hostile-title-19a2b");
         ws.linear.make_primary(&(&two).into());
-        assert_eq!(ws.default_branch(), "eng-2-19a2b");
+        assert_eq!(ws.default_branch(), "eng-2-hostile-title-19a2b");
         ws.title = NEW_TASK.into();
-        assert_eq!(ws.default_branch(), "eng-2-19a2b");
+        assert_eq!(ws.default_branch(), "eng-2-hostile-title-19a2b");
         let context = ws.context();
         let keys: Vec<&String> = context.keys().collect();
         assert_eq!(keys, ["issue:uuid-1", "issue:uuid-2"]);

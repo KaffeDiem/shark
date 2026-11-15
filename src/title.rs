@@ -52,6 +52,21 @@ impl Drop for Scratch {
 }
 
 pub fn generate(key: &str, prompt: &str) -> Result<String, String> {
+    request(key, prompt, 10, 20, true)
+}
+
+/// [`generate`] for something waiting on it: one try, and a few seconds at most.
+pub fn generate_quick(key: &str, prompt: &str) -> Result<String, String> {
+    request(key, prompt, 3, 6, false)
+}
+
+fn request(
+    key: &str,
+    prompt: &str,
+    connect_secs: u64,
+    max_secs: u64,
+    again: bool,
+) -> Result<String, String> {
     use std::os::unix::fs::DirBuilderExt;
     // Anything else could smuggle a second header line.
     if key.is_empty() || !key.bytes().all(|b| (0x21..0x7f).contains(&b)) {
@@ -68,6 +83,7 @@ pub fn generate(key: &str, prompt: &str) -> Result<String, String> {
     let headers = format!("Content-Type: application/json\nAuthorization: Bearer {key}\n");
     crate::state::write(&dir.0.join("headers"), headers.as_bytes()).map_err(|e| e.to_string())?;
     crate::state::write(&dir.0.join("body"), body(prompt).as_bytes()).map_err(|e| e.to_string())?;
+    let (connect, max) = (connect_secs.to_string(), max_secs.to_string());
     let args = [
         // Must come first: ignores ~/.curlrc, which could add credentials or headers.
         "-q",
@@ -76,9 +92,9 @@ pub fn generate(key: &str, prompt: &str) -> Result<String, String> {
         "--proto",
         "=https",
         "--connect-timeout",
-        "10",
+        &connect,
         "--max-time",
-        "20",
+        &max,
         "--max-filesize",
         "1000000",
         "--user-agent",
@@ -98,12 +114,11 @@ pub fn generate(key: &str, prompt: &str) -> Result<String, String> {
         || {
             let mut c = Command::new("curl");
             c.env_remove("NETRC").env_remove("CURL_HOME");
-            let output = crate::proc::wait_output(c, &dir.0, "curl", &args, 25, false).map_err(
-                |reason| {
+            let output = crate::proc::wait_output(c, &dir.0, "curl", &args, max_secs + 5, false)
+                .map_err(|reason| {
                     let transient = reason.contains("timed out");
                     (reason, transient)
-                },
-            )?;
+                })?;
             if !output.status.success() {
                 return Err((
                     format!(
@@ -125,15 +140,17 @@ pub fn generate(key: &str, prompt: &str) -> Result<String, String> {
             parse(&response).ok_or_else(|| ("OpenRouter sent no title".into(), false))
         },
         || std::thread::sleep(std::time::Duration::from_secs(2)),
+        again,
     )
 }
 
 fn retry(
     mut request: impl FnMut() -> Result<String, (String, bool)>,
     wait: impl FnOnce(),
+    again: bool,
 ) -> Result<String, String> {
     match request() {
-        Err((_, true)) => {
+        Err((_, true)) if again => {
             wait();
             request().map_err(|(reason, _)| reason)
         }
@@ -183,7 +200,8 @@ mod tests {
                         Ok("Title".into())
                     }
                 },
-                || {}
+                || {},
+                true,
             ),
             Ok("Title".into())
         );
@@ -195,11 +213,21 @@ mod tests {
                     calls += 1;
                     Err(("HTTP 401".into(), false))
                 },
-                || panic!("no retry")
+                || panic!("no retry"),
+                true,
             ),
             Err("HTTP 401".into())
         );
         assert_eq!(calls, 1);
+        // Something waits on a quick title: no second try.
+        assert_eq!(
+            retry(
+                || Err(("HTTP 503".into(), true)),
+                || panic!("no retry"),
+                false
+            ),
+            Err("HTTP 503".into())
+        );
     }
 
     #[test]
