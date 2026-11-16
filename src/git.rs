@@ -930,6 +930,14 @@ pub(crate) fn review_ref(n: u64, side: &str) -> String {
 /// (possibly not origin).
 pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Result<(), String> {
     let remote = pr_remote(src, pr)?;
+    if head
+        && crate::azure::parse_pr_url(&pr.url).is_some()
+        && crate::azure::is_cross_repository_pr(src, &pr.url)?
+    {
+        return Err(
+            "Azure DevOps pull requests from forks aren't supported for review checkouts".into(),
+        );
+    }
     let mut specs = vec![format!(
         "+refs/heads/{}:{}",
         pr.base,

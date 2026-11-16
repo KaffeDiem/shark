@@ -599,6 +599,11 @@ pub fn source_branch(wt: &Path, url: &str) -> Result<String, String> {
     Ok(branch_name(str(&remote.get_pr(wt, n)?, "sourceRefName")).into())
 }
 
+pub fn is_cross_repository_pr(wt: &Path, url: &str) -> Result<bool, String> {
+    let (remote, n) = parse_pr_url(url).ok_or("Invalid Azure DevOps pull request URL")?;
+    Ok(!remote.get_pr(wt, n)?["forkSource"].is_null())
+}
+
 /// Updates the PR at `url` with `body`'s fields (`description`, `status`, `isDraft`, `targetRefName`).
 pub fn update(wt: &Path, url: &str, body: Value) -> Result<(), String> {
     let (remote, n) = parse_pr_url(url).ok_or("Invalid Azure DevOps pull request URL")?;
