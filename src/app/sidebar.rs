@@ -1478,10 +1478,18 @@ impl Shark {
                     self.section_row(i, &self.state.sections[i], window, cx),
                     reorder::Item::Section(i),
                 )),
-                SideRow::Overview(i) => items.push(self.overview_row(i, None, window, cx)),
+                SideRow::Overview(i) => items.push(self.reorder_item(
+                    self.overview_row(i, None, window, cx),
+                    reorder::Item::Overview(i),
+                )),
                 SideRow::Task(ix) if self.state.tasks[ix].overview => {
                     let i = self.state.overview_section(&self.state.tasks[ix].name);
-                    items.extend(i.map(|i| self.overview_row(i, Some(ix), window, cx)));
+                    items.extend(i.map(|i| {
+                        self.reorder_item(
+                            self.overview_row(i, Some(ix), window, cx),
+                            reorder::Item::Overview(i),
+                        )
+                    }));
                 }
                 SideRow::Task(ix) => {
                     let task = &self.state.tasks[ix];
@@ -1672,6 +1680,7 @@ impl Shark {
                         self.reorder_item(ws_header.into_any_element(), reorder::Item::Ungrouped),
                     )
                     .children(items)
+                    .child(self.reorder_item(div().into_any_element(), reorder::Item::End))
                     .when(
                         self.state.tasks.is_empty() && self.state.sections.is_empty(),
                         |d| d.child(hint("cmd-n to start one")),

@@ -454,3 +454,47 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             .unwrap();
     }
 }
+
+/// A section's Overview row moves with its header in the preview, to where the drop puts it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn section_drag_moves_its_overview_row(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, fixture(), options());
+    cx.run_until_parked();
+    cx.update(|cx| cx.set_reduce_motion(true));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let source = w
+            .within("sidebar")
+            .find(("section", 0usize))
+            .bounds()
+            .center();
+        let target = w
+            .within("sidebar")
+            .find(("section", 2usize))
+            .bounds()
+            .center();
+        w.pointer_down(source, MouseButton::Left, cx);
+        w.pointer_move(source + point(px(0.), px(8.)), Some(MouseButton::Left), cx);
+        w.pointer_move(target, Some(MouseButton::Left), cx);
+        w.render_frame(cx);
+        let preview: Vec<_> = (0..3usize)
+            .map(|i| w.within("sidebar").find(("overview", i)).bounds())
+            .collect();
+        w.pointer_up(target, MouseButton::Left, cx);
+        w.render_frame(cx);
+        let names: Vec<_> = (shark.read(cx).state.sections.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["Beta section", "Gamma section", "Alpha section"]);
+        // Alpha's Overview was 0 and is now 2; the others moved up one.
+        let after: Vec<_> = [2usize, 0, 1]
+            .into_iter()
+            .map(|i| w.within("sidebar").find(("overview", i)).bounds())
+            .collect();
+        assert_eq!(preview, after);
+    })
+    .unwrap();
+}

@@ -10,6 +10,10 @@ pub(super) enum Item {
     Section(usize),
     /// The Tasks header: dropping a task there takes it out of its section.
     Ungrouped,
+    /// A section's Overview row: it moves with its section and is no drop target.
+    Overview(usize),
+    /// An empty row after the list: where the last row's spacing ends.
+    End,
 }
 
 #[derive(Default)]
@@ -18,6 +22,8 @@ pub(super) struct Reorder {
     offsets: HashMap<Item, Pixels>,
     source: Option<Item>,
     target: Option<Item>,
+    /// The rows `offsets` were laid out for: a list that changed mid-drag lays them out again.
+    laid: Vec<Item>,
 }
 
 #[derive(Clone)]
@@ -25,7 +31,10 @@ pub(super) struct Drag {
     source: Item,
     sections: Vec<String>,
     label: SharedString,
+    /// The pointer from the grabbed row's origin: where GPUI puts the preview's root.
     offset: Point<Pixels>,
+    /// The pointer from the dragged item's origin: a stack's block, not its grabbed row.
+    grab: Point<Pixels>,
     scroll: ScrollHandle,
     state: Rc<RefCell<Reorder>>,
 }
@@ -71,7 +80,7 @@ impl Drag {
         );
         let origin = if self.horizontal() {
             point(
-                (pointer.x - self.offset.x).clamp(area.left(), area.right() - size.width),
+                (pointer.x - self.grab.x).clamp(area.left(), area.right() - size.width),
                 original
                     .top()
                     .clamp(area.top(), area.bottom() - size.height),
@@ -81,7 +90,7 @@ impl Drag {
                 original
                     .left()
                     .clamp(area.left(), area.right() - size.width),
-                (pointer.y - self.offset.y).clamp(area.top(), area.bottom() - size.height),
+                (pointer.y - self.grab.y).clamp(area.top(), area.bottom() - size.height),
             )
         };
         Bounds { origin, size }
@@ -113,14 +122,17 @@ impl Shark {
         // A superset is enough: drop targets are checked against `reorder_items` on the move.
         let mut current = self.reorder_items(true, cx);
         current.extend((self.state.tasks.iter()).map(|t| Item::Task(t.name.clone())));
-        current.extend((0..self.state.sections.len()).map(Item::Section));
-        current.push(Item::Ungrouped);
+        let sections = 0..self.state.sections.len();
+        current.extend(sections.clone().map(Item::Section));
+        current.extend(sections.map(Item::Overview));
+        current.extend([Item::Ungrouped, Item::End]);
         let mut state = self.reorder.borrow_mut();
         state.bounds.retain(|key, _| current.contains(key));
         if !cx.has_active_drag() {
             state.source = None;
             state.target = None;
             state.offsets.clear();
+            state.laid.clear();
         }
     }
     pub(super) fn reorder_source<E: StatefulInteractiveElement>(
@@ -150,13 +162,16 @@ impl Shark {
                 sections,
                 label,
                 offset: Point::default(),
+                grab: Point::default(),
                 scroll,
                 state,
             },
-            |drag, offset, _, cx| {
+            |drag, offset, window, cx| {
                 let mut drag = drag.clone();
-                drag.offset = offset;
                 let mut state = drag.state.borrow_mut();
+                drag.offset = offset;
+                drag.grab = (state.bounds.get(&drag.source))
+                    .map_or(offset, |b| window.mouse_position() - b.origin);
                 state.source = Some(drag.source.clone());
                 state.target = Some(drag.source.clone());
                 state.offsets.clear();
@@ -194,8 +209,13 @@ impl Shark {
                 let item = match row {
                     // An Overview stays its section's first row: it is no item to move or
                     // to drop on.
-                    SideRow::Overview(_) => continue,
-                    SideRow::Task(i) if self.state.tasks[i].overview => continue,
+                    SideRow::Overview(i) => Item::Overview(i),
+                    SideRow::Task(i) if self.state.tasks[i].overview => {
+                        match self.state.overview_section(&self.state.tasks[i].name) {
+                            Some(s) => Item::Overview(s),
+                            None => continue,
+                        }
+                    }
                     SideRow::Task(i) | SideRow::Pr(i, _) => {
                         let at = (stacks.iter().find(|s| s.has(i) || s.anchor == i))
                             .map_or(i, |s| s.anchor);
@@ -252,10 +272,11 @@ impl Shark {
                     .unwrap_or(Ordering::Equal)
             })
             .cloned();
-        if target == state.target {
+        if target == state.target && order == state.laid {
             return;
         }
         state.target = target.clone();
+        state.laid = order.clone();
         state.offsets.clear();
         let Some(target) = target else {
             drop(state);
@@ -303,13 +324,14 @@ impl Shark {
                     Item::Task(to) => preview.drop_task(source, to),
                     Item::Section(i) => preview.move_to_section(source, Some(*i)),
                     Item::Ungrouped => preview.move_to_section(source, None),
-                    Item::Tab(..) => {}
+                    Item::Tab(..) | Item::Overview(_) | Item::End => {}
                 }
-                // Rows hidden by Backlog or the filter have no bounds and are skipped below.
+                // Rows not drawn now (Backlog, the filter, a stack's upper tasks) are skipped below.
                 order.clear();
                 for (i, section) in preview.sections.iter().enumerate() {
                     order.push(Item::Section(i));
                     if !section.collapsed {
+                        order.push(Item::Overview(i));
                         order.extend(section.tasks.iter().cloned().map(Item::Task));
                     }
                 }
@@ -333,22 +355,29 @@ impl Shark {
         };
         let mut next = axis(first, horizontal).0;
         for item in order {
-            if let Some(bounds) = state.bounds.get(&item).copied() {
-                let original = axis(&bounds, horizontal).0;
-                state.offsets.insert(item.clone(), next - original);
-                let pitch = before
-                    .iter()
-                    .position(|key| key == &item)
-                    .and_then(|i| before.get(i + 1))
-                    .and_then(|key| state.bounds.get(key))
-                    .map(|following| axis(following, horizontal).0 - original)
-                    .unwrap_or(if horizontal {
-                        bounds.size.width + px(4.)
-                    } else {
-                        bounds.size.height + px(if self.rail { 16. } else { 2. })
-                    });
-                next += pitch;
-            }
+            // Bounds outlive their rows (a task now inside a stack): only drawn rows count.
+            let Some(at) = before.iter().position(|key| *key == item) else {
+                continue;
+            };
+            let Some(bounds) = state.bounds.get(&item).copied() else {
+                continue;
+            };
+            let original = axis(&bounds, horizontal).0;
+            state.offsets.insert(item, next - original);
+            // A row's pitch is its own height and spacing: up to whatever was drawn after it.
+            let following = match before.get(at + 1) {
+                Some(key) => state.bounds.get(key),
+                None if horizontal => None,
+                None => state.bounds.get(&Item::End),
+            };
+            next += following.map_or(
+                if horizontal {
+                    bounds.size.width + px(4.)
+                } else {
+                    bounds.size.height
+                },
+                |following| axis(following, horizontal).0 - original,
+            );
         }
         drop(state);
         cx.notify();
