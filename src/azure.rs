@@ -179,8 +179,18 @@ impl BodyFile {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("shark-az-{}-{n}.json", std::process::id()));
-        std::fs::write(&path, body.to_string()).map_err(|e| e.to_string())?;
-        Ok(BodyFile(path.to_string_lossy().into_owned()))
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let body_file = BodyFile(path.to_string_lossy().into_owned());
+        file.write_all(body.to_string().as_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(body_file)
     }
 }
 
