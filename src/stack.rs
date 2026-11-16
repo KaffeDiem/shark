@@ -56,6 +56,50 @@ pub fn chain(
     local: &[(String, String, String)],
     prs: &[Pr],
 ) -> (Vec<Node>, usize) {
+    let at = local.iter().position(|l| l.1 == me);
+    let local = on_prs(local.to_vec(), trunk, prs);
+    let me = at.map_or(me, |i| local[i].1.as_str());
+    walk(me, trunk, &local, prs)
+}
+
+/// The open, same-repo PR a review checkout's base `refs/shark/pull/N/base` is of.
+fn review_of<'a>(base: &str, prs: &'a [Pr]) -> Option<&'a Pr> {
+    let n = base
+        .strip_prefix("refs/shark/pull/")?
+        .strip_suffix("/base")?;
+    let n: u64 = n.parse().ok()?;
+    prs.iter().find(|p| p.number == n && !p.is_cross_repository)
+}
+
+/// `local` as stacks see it: a review checkout is on its PR's head branch, based on the PR's
+/// base, so it joins the PR's stack. Not when a task is on that branch: that task is the row.
+fn on_prs(
+    mut local: Vec<(String, String, String)>,
+    trunk: &str,
+    prs: &[Pr],
+) -> Vec<(String, String, String)> {
+    let trunk_name = crate::git::short(trunk);
+    let moves: Vec<(usize, &Pr)> = (local.iter().enumerate())
+        .filter_map(|(i, l)| Some((i, review_of(&l.2, prs)?)))
+        .filter(|(_, p)| !local.iter().any(|l| l.1 == p.head_ref_name))
+        .collect();
+    for (i, p) in moves {
+        local[i].1 = p.head_ref_name.clone();
+        local[i].2 = match p.base_ref_name.as_str() {
+            b if b == trunk_name => trunk.to_string(),
+            b => format!("origin/{b}"),
+        };
+    }
+    local
+}
+
+/// [`chain`] over `local` already [`on_prs`].
+fn walk(
+    me: &str,
+    trunk: &str,
+    local: &[(String, String, String)],
+    prs: &[Pr],
+) -> (Vec<Node>, usize) {
     let trunk_name = crate::git::short(trunk);
     let own: Vec<&Pr> = prs.iter().filter(|p| !p.is_cross_repository).collect();
     let node = |b: &str| Node {
@@ -148,13 +192,14 @@ pub fn columns<'a>(
             let Some(t) = trunk(repo).filter(|t| !t.is_empty()) else {
                 continue;
             };
-            let local: Vec<(String, String, String)> = (tasks.iter())
+            let open = prs(repo);
+            let local = (tasks.iter())
                 .filter_map(|(n, rs)| {
                     let (_, b, base) = rs.iter().find(|r| r.0 == repo)?;
                     Some((n.to_string(), b.to_string(), base.to_string()))
                 })
                 .collect();
-            let open = prs(repo);
+            let local = on_prs(local, t, open);
             let parents = (local.iter().filter_map(|l| parent_of(&l.2, t)))
                 .chain(
                     (open.iter().filter(|p| !p.is_cross_repository))
@@ -175,12 +220,12 @@ pub fn columns<'a>(
     // are on the trunk with nothing on them: they have none, and no chain is walked.
     let home: HashMap<&str, (&str, &str)> = (tasks.iter())
         .filter_map(|(name, repos)| {
-            let (repo, branch, _) = repos.iter().find(|&&(repo, branch, base)| {
-                by_repo.get(repo).is_some_and(|r| {
-                    parent_of(base, r.trunk).is_some() || r.parents.contains(branch)
-                })
-            })?;
-            Some((*name, (*repo, *branch)))
+            repos.iter().find_map(|&(repo, ..)| {
+                let r = by_repo.get(repo)?;
+                let (_, branch, base) = r.local.iter().find(|l| l.0 == *name)?;
+                (parent_of(base, r.trunk).is_some() || r.parents.contains(branch))
+                    .then_some((*name, (repo, branch.as_str())))
+            })
         })
         .collect();
     let mut taken: HashSet<String> = HashSet::new();
@@ -195,7 +240,7 @@ pub fn columns<'a>(
             open,
             ..
         } = &by_repo[repo];
-        let (nodes, _) = chain(branch, t, local, open);
+        let (nodes, _) = walk(branch, t, local, open);
         if nodes.len() < 2 {
             continue;
         }
@@ -242,7 +287,7 @@ pub fn columns<'a>(
         // The chain from the bottom claims shared parents before a fork does.
         let me = |ns: &[Node]| ns.iter().position(|n| n.ws.as_deref() == Some(*name));
         if nodes[0].ws.as_deref() != Some(*name) {
-            let (primary, _) = chain(&nodes[0].branch, t, local, open);
+            let (primary, _) = walk(&nodes[0].branch, t, local, open);
             let first = primary
                 .iter()
                 .position(|n| n.ws.is_some() && free(n, &taken));
@@ -572,5 +617,69 @@ mod tests {
         assert_eq!(own_pr(&[fork], "c"), None);
         let twice = [pr(1, "a", "main"), pr(4, "a", "b")];
         assert_eq!(own_pr(&twice, "a"), None, "two bases: ambiguous");
+    }
+
+    /// The tiger-shark stack: #1089 is open as a review checkout (`pr/1089` on its private
+    /// base), so it is in the stack on its PR's head branch, not floating on its own.
+    fn review_stack() -> (Vec<(String, String, String)>, Vec<Pr>) {
+        let local = vec![
+            task("tiger-shark", "tiger-shark", "origin/main"),
+            task("pr-1089", "pr/1089", "refs/shark/pull/1089/base"),
+            task("tab-view", "tab-view", "origin/anchor"),
+        ];
+        let prs = vec![
+            pr(1069, "tiger-shark", "main"),
+            pr(1089, "anchor", "tiger-shark"),
+            pr(1096, "tab-view", "anchor"),
+        ];
+        (local, prs)
+    }
+
+    #[test]
+    fn chain_puts_a_review_checkout_on_its_prs_branch() {
+        let (local, prs) = review_stack();
+        let stack = ["tiger-shark", "anchor", "tab-view"];
+        for (me, at) in [("pr/1089", 1), ("tab-view", 2), ("tiger-shark", 0)] {
+            let c = chain(me, "origin/main", &local, &prs);
+            assert_eq!(names(&c), (stack.to_vec(), at), "from {me}");
+            assert_eq!(c.0[1].ws.as_deref(), Some("pr-1089"), "from {me}");
+        }
+        // A fork's PR, or one not open, leaves the review checkout where it was.
+        let mut fork = prs.clone();
+        fork[1].is_cross_repository = true;
+        let c = chain("pr/1089", "origin/main", &local, &fork);
+        assert_eq!(names(&c), (vec!["pr/1089"], 0));
+        let c = chain("pr/1089", "origin/main", &local, &prs[..1]);
+        assert_eq!(names(&c), (vec!["pr/1089"], 0));
+    }
+
+    /// A task on the PR's head branch is the PR's row; a review checkout of it stays apart.
+    #[test]
+    fn a_task_on_the_head_branch_keeps_its_row_from_a_review() {
+        let (mut local, prs) = review_stack();
+        local.insert(2, task("anchor", "anchor", "origin/tiger-shark"));
+        for me in ["anchor", "tab-view"] {
+            let c = chain(me, "origin/main", &local, &prs);
+            assert_eq!(c.0[1].ws.as_deref(), Some("anchor"), "from {me}");
+        }
+        let c = chain("pr/1089", "origin/main", &local, &prs);
+        assert_eq!(names(&c), (vec!["pr/1089"], 0));
+    }
+
+    #[test]
+    fn columns_put_a_review_checkout_in_its_prs_stack() {
+        let (local, prs) = review_stack();
+        let tasks: Vec<(&str, &str, &str)> = (local.iter())
+            .map(|(n, b, base)| (n.as_str(), b.as_str(), base.as_str()))
+            .collect();
+        assert_eq!(
+            cols(&tasks, &prs),
+            vec![col(&["tiger-shark", "anchor", "tab-view"], "main")]
+        );
+        // The review task alone still finds its stack.
+        assert_eq!(
+            cols(&tasks[1..2], &prs),
+            vec![col(&["tiger-shark", "anchor", "tab-view"], "main")]
+        );
     }
 }
