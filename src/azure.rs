@@ -53,8 +53,9 @@ impl Remote {
             None if host == "dev.azure.com" => p.remove(0).to_string(),
             None => return None,
         };
-        if p.first()
-            .is_some_and(|s| s.eq_ignore_ascii_case("DefaultCollection"))
+        if p.len() == 4
+            && p.first()
+                .is_some_and(|s| s.eq_ignore_ascii_case("DefaultCollection"))
         {
             p.remove(0);
         }
