@@ -106,11 +106,10 @@ impl Shark {
         let grouped: HashSet<&str> = (self.state.sections.iter())
             .flat_map(|s| s.tasks.iter().map(String::as_str))
             .collect();
-        // Sidebar order: the sections', then the ungrouped. Goals and their tasks stay out.
+        // Sidebar order: the sections', then the ungrouped.
         let order = (self.state.sections.iter())
             .flat_map(|s| s.tasks.iter().filter_map(|n| ix.get(n.as_str()).copied()))
-            .chain((0..tasks.len()).filter(|i| !grouped.contains(tasks[*i].name.as_str())))
-            .filter(|&i| self.team_of(&tasks[i]).is_none());
+            .chain((0..tasks.len()).filter(|i| !grouped.contains(tasks[*i].name.as_str())));
         let listed: Vec<crate::stack::Listed> = order
             .map(|i| {
                 let t = &tasks[i];

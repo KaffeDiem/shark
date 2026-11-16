@@ -324,6 +324,8 @@ fn arrows_keep_browsing_across_section_headers(cx: &mut TestAppContext) {
     let section = |name: &str, task: &str| Section {
         name: name.into(),
         icon: "folder".into(),
+        overview: None,
+        unsent: None,
         collapsed: false,
         tasks: vec![task.into()],
     };
@@ -342,8 +344,10 @@ fn arrows_keep_browsing_across_section_headers(cx: &mut TestAppContext) {
             s.side_rows(false),
             [
                 SideRow::Section(0),
+                SideRow::Overview(0),
                 SideRow::Task(0),
                 SideRow::Section(1),
+                SideRow::Overview(1),
                 SideRow::Task(1)
             ]
         );
@@ -357,6 +361,12 @@ fn arrows_keep_browsing_across_section_headers(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.sel, SideRow::Section(1));
         assert!(s.peek.task.is_none(), "no card on a header");
+    });
+    press_in(window)(cx, &["down"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.sel, SideRow::Overview(1));
+        assert!(s.peek.task.is_none(), "nor on an Overview nobody opened");
     });
     press_in(window)(cx, &["down"]);
     cx.read(|cx| {

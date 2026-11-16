@@ -182,7 +182,8 @@ pub(super) const UNGROUPED: &str = "Ungrouped";
 
 /// "Move to section" in a task's right-click menu; ends with "New section…", which moves it there.
 pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
-    let current = this.shown_section(ws);
+    // An Overview is in its section too, and moves out of it like a task.
+    let current = (this.shown_section(ws)).or_else(|| this.state.overview_section(ws));
     let mut entries = vec![];
     for (i, sec) in this.state.sections.iter().enumerate() {
         let ws = ws.to_string();
@@ -218,7 +219,19 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
 /// Right-click menu of a section header.
 pub(super) fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
     let collapsed = this.state.sections.get(i).is_some_and(|s| s.collapsed);
-    vec![
+    let running = match i < this.state.sections.len() {
+        true => this.section_readout(i, cx).0,
+        false => 0,
+    };
+    let stop = (running > 0).then(|| {
+        menu::item(
+            IconName::Square,
+            "Stop all",
+            on_shark(cx, move |s, _, cx| s.stop_section(i, cx)),
+        )
+        .hint(format!("{running} running"))
+    });
+    let mut entries = vec![
         menu::item(
             if collapsed {
                 IconName::ChevronDown
@@ -244,12 +257,15 @@ pub(super) fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<E
             on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
         ),
         Entry::Sep,
-        menu::item(
-            IconName::Trash,
-            "Delete section",
-            on_shark(cx, move |s, w, cx| s.delete_section(i, w, cx)),
-        ),
-    ]
+    ];
+    // Every running chat in the section, its Overview's included.
+    entries.extend(stop.into_iter().flat_map(|stop| [stop, Entry::Sep]));
+    entries.push(menu::item(
+        IconName::Trash,
+        "Delete section",
+        on_shark(cx, move |s, w, cx| s.delete_section(i, w, cx)),
+    ));
+    entries
 }
 
 /// Cursor state taken by [`Shark::cursors`]: sidebar row, its task's or section's name,
@@ -258,8 +274,6 @@ pub(super) struct Cursors {
     side: Option<usize>,
     ws: Option<String>,
     section: Option<String>,
-    /// The team's slug.
-    team: Option<String>,
     /// A PR row's stack (by its bottom task) and number.
     pr: Option<(String, u64)>,
     home: Option<usize>,
@@ -270,10 +284,11 @@ pub(super) struct Cursors {
 pub(super) enum SideRow {
     /// Index into `state.sections`.
     Section(usize),
-    /// Index into `state.tasks`. A goal's task is a row under its team.
+    /// A section's Overview that was never opened, so it has no task yet: the section's index.
+    /// Once opened it is its task's row.
+    Overview(usize),
+    /// Index into `state.tasks`.
     Task(usize),
-    /// Index into `state.teams`.
-    Team(usize),
     /// A PR in a stack without a task here: the stack's bottom task's index, the PR's number.
     Pr(usize, u64),
 }
@@ -384,34 +399,10 @@ impl Shark {
             .position(|s| s.tasks.iter().any(|w| w == ws))
     }
 
-    /// The team (an index into `state.teams`) of a goal's task or of a task of a goal.
-    pub(super) fn team_of(&self, task: &Task) -> Option<usize> {
-        let slug = match (&task.goal, &task.part) {
-            (Some(goal), _) => &goal.team,
-            (_, Some(part)) => &self.goal(&part.goal)?.team,
-            _ => return None,
-        };
-        self.state.teams.iter().position(|t| &t.slug == slug)
-    }
-
-    /// Whether a task row shows in the sidebar's lists: a goal until it is done or stopped,
-    /// a task of a goal never. The open task always does.
-    fn listed(&self, task: &Task) -> bool {
-        self.active.as_deref() == Some(&task.name)
-            || match (self.team_of(task), &task.goal) {
-                (None, _) => true,
-                (Some(_), Some(goal)) => goal.state.open(),
-                (Some(_), None) => false,
-            }
-    }
-
-    /// Sidebar rows top to bottom: each team, then its goals (each followed by its tasks)
-    /// unless it is folded (and not `unfold`); each section, then its tasks unless it is
-    /// folded; then the tasks in no section. A stack is drawn where its bottom task is, newest
+    /// Sidebar rows top to bottom: each section, then its tasks unless it is folded; then the tasks in no section. A stack is drawn where its bottom task is, newest
     /// on top, with its PRs without a task and (outside the rail) its Backlog tasks. Without
-    /// `unfold`, Backlog (except the open task), the repository filter, finished goals and
-    /// the tasks of goals (except the open task) hide task rows; team and section headers
-    /// always stay.
+    /// `unfold`, Backlog (except the open task) and the repository filter hide task rows; section
+    /// headers always stay.
     pub(super) fn side_rows(&self, unfold: bool) -> Vec<SideRow> {
         self.side_rows_in(unfold, &self.side_stacks())
     }
@@ -424,30 +415,9 @@ impl Shark {
             let task = &tasks[ix];
             unfold
                 || (self.sidebar_task_matches(task)
-                    && (!task.backlog || self.active.as_deref() == Some(&task.name))
-                    && self.listed(task))
+                    && (!task.backlog || self.active.as_deref() == Some(&task.name)))
         };
         let mut rows = vec![];
-        for (i, team) in self.state.teams.iter().enumerate() {
-            rows.push(SideRow::Team(i));
-            if !unfold && team.collapsed {
-                continue;
-            }
-            let goals = tasks.iter().enumerate();
-            for (gx, goal) in
-                goals.filter(|(_, t)| t.goal.as_ref().is_some_and(|g| g.team == team.slug))
-            {
-                rows.extend(shown(gx).then_some(SideRow::Task(gx)));
-                let parts = tasks.iter().enumerate();
-                rows.extend(
-                    parts
-                        .filter(|(px, t)| {
-                            t.part.as_ref().is_some_and(|p| p.goal == goal.name) && shown(*px)
-                        })
-                        .map(|(px, _)| SideRow::Task(px)),
-                );
-            }
-        }
         let emit = |rows: &mut Vec<SideRow>, ix: usize| match stacks.iter().find(|s| s.has(ix)) {
             None => rows.extend(shown(ix).then_some(SideRow::Task(ix))),
             Some(st) if st.anchor == ix && st.members().any(shown) => {
@@ -462,19 +432,23 @@ impl Shark {
             // The rest of a stack is drawn with its bottom task.
             Some(_) => {}
         };
-        let solo = |ix: &usize| self.team_of(&tasks[*ix]).is_none();
         for (i, s) in self.state.sections.iter().enumerate() {
             rows.push(SideRow::Section(i));
             if unfold || !s.collapsed {
+                // The Overview is the section's first row, whatever the filters: it is a chat
+                // over the tasks, not one of them. The rail has no room for it.
+                let overview = (self.state.overview_of(i))
+                    .and_then(|n| tasks.iter().position(|t| t.name == n));
+                if !self.rail {
+                    rows.push(overview.map_or(SideRow::Overview(i), SideRow::Task));
+                }
                 (s.tasks.iter())
                     .filter_map(|n| tasks.iter().position(|t| &t.name == n))
-                    .filter(solo)
                     .for_each(|ix| emit(&mut rows, ix));
             }
         }
         (0..tasks.len())
-            .filter(|&ix| self.section_of(&tasks[ix].name).is_none())
-            .filter(solo)
+            .filter(|&ix| !tasks[ix].overview && self.section_of(&tasks[ix].name).is_none())
             .for_each(|ix| emit(&mut rows, ix));
         rows
     }
@@ -482,34 +456,14 @@ impl Shark {
     /// The section under the sidebar cursor, or the cursor task's section.
     pub(super) fn cursor_section(&self) -> Option<usize> {
         match self.sel {
-            SideRow::Section(i) => (i < self.state.sections.len()).then_some(i),
-            SideRow::Task(ix) => self.shown_section(&self.state.tasks.get(ix)?.name),
+            SideRow::Section(i) | SideRow::Overview(i) => {
+                (i < self.state.sections.len()).then_some(i)
+            }
+            SideRow::Task(ix) => {
+                let name = &self.state.tasks.get(ix)?.name;
+                (self.shown_section(name)).or_else(|| self.state.overview_section(name))
+            }
             SideRow::Pr(ix, _) => self.section_of(&self.state.tasks.get(ix)?.name),
-            SideRow::Team(_) => None,
-        }
-    }
-
-    /// The team under the sidebar cursor, or the cursor goal's or task's team.
-    fn cursor_team(&self) -> Option<usize> {
-        match self.sel {
-            SideRow::Team(i) => (i < self.state.teams.len()).then_some(i),
-            SideRow::Task(ix) => self.team_of(self.state.tasks.get(ix)?),
-            SideRow::Section(_) | SideRow::Pr(..) => None,
-        }
-    }
-
-    pub(super) fn toggle_team(&mut self, i: usize, cx: &mut Context<Self>) {
-        self.set_team_collapsed(i, self.state.teams.get(i).is_some_and(|t| !t.collapsed), cx);
-    }
-
-    pub(super) fn set_team_collapsed(&mut self, i: usize, collapsed: bool, cx: &mut Context<Self>) {
-        if let Some(t) = self.state.teams.get_mut(i)
-            && t.collapsed != collapsed
-        {
-            t.collapsed = collapsed;
-            let _ = self.state.save();
-            self.fix_sel();
-            cx.notify();
         }
     }
 
@@ -543,10 +497,6 @@ impl Shark {
                 SideRow::Section(i) => self.state.sections.get(i).map(|s| s.name.clone()),
                 _ => None,
             },
-            team: match self.sel {
-                SideRow::Team(i) => self.state.teams.get(i).map(|t| t.slug.clone()),
-                _ => None,
-            },
             pr: self.pr_cursor(),
             home: self.home_at(&self.home_rows(cx)),
         }
@@ -557,18 +507,15 @@ impl Shark {
         let rows = self.side_rows(false);
         let section = (before.section.as_ref())
             .and_then(|c| self.state.sections.iter().position(|s| &s.name == c));
-        let team =
-            (before.team.as_ref()).and_then(|c| self.state.teams.iter().position(|t| &t.slug == c));
         let moved = (before.ws.as_deref().filter(|c| *c != name))
             .and_then(|c| self.state.tasks.iter().position(|w| w.name == c));
         let pr = before
             .pr
             .and_then(|p| self.pr_row(p))
             .filter(|r| rows.contains(r));
-        self.sel = match (section, team, moved) {
-            (Some(i), _, _) => SideRow::Section(i),
-            (_, Some(i), _) => SideRow::Team(i),
-            (_, _, Some(ix)) => SideRow::Task(ix),
+        self.sel = match (section, moved) {
+            (Some(i), _) => SideRow::Section(i),
+            (_, Some(ix)) => SideRow::Task(ix),
             _ if pr.is_some() => pr.unwrap_or(SideRow::Task(0)),
             _ => before
                 .side
@@ -594,20 +541,21 @@ impl Shark {
             .copied()
             .filter_map(|r| match r {
                 SideRow::Task(ix) if unfold || !self.state.tasks[ix].backlog => Some(ix),
-                SideRow::Task(_) | SideRow::Section(_) | SideRow::Team(_) | SideRow::Pr(..) => None,
+                SideRow::Task(_) | SideRow::Section(_) | SideRow::Overview(_) | SideRow::Pr(..) => {
+                    None
+                }
             })
             .collect()
     }
 
     /// Keeps the cursor on a visible row; a task hidden by folding or filtering hands it to
-    /// its team's or section's header.
+    /// its section's header.
     pub(super) fn fix_sel(&mut self) {
         let rows = self.side_rows(false);
         if rows.contains(&self.sel) {
             return;
         }
-        self.sel = (self.cursor_team().map(SideRow::Team))
-            .or(self.cursor_section().map(SideRow::Section))
+        self.sel = (self.cursor_section().map(SideRow::Section))
             .or(rows.first().copied())
             .unwrap_or(SideRow::Task(0));
     }
@@ -628,29 +576,18 @@ impl Shark {
             },
             false,
         );
-        // The scrolled list holds the Teams header and the team rows (when there are teams),
-        // then the Tasks header, then the rest; a stack is one child.
-        let teams = rows.iter().take_while(|r| self.in_team_block(r)).count();
+        // The scrolled list holds the Tasks header, then one child per row; a stack is one child.
         let child = (1..=to)
             .filter(|&i| {
                 let same = |r: &SideRow| stack_at(&stacks, r).map(|s| s.anchor);
                 same(&rows[i]).is_none() || same(&rows[i]) != same(&rows[i - 1])
             })
             .count();
-        let child = child + 1 + usize::from(teams > 0 && to >= teams);
+        let child = child + 1;
         if !self.scroll_to_stack_row(&rows, to, child) {
             self.sidebar_scroll.scroll_to_item(child);
         }
         cx.notify();
-    }
-
-    /// Whether a row is a team's or one of its goals' (or their tasks').
-    fn in_team_block(&self, row: &SideRow) -> bool {
-        match row {
-            SideRow::Team(_) => true,
-            SideRow::Task(ix) => self.team_of(&self.state.tasks[*ix]).is_some(),
-            SideRow::Section(_) | SideRow::Pr(..) => false,
-        }
     }
 
     /// Section actions hit the header under the sidebar cursor, else the section of the task
@@ -682,13 +619,9 @@ impl Shark {
         }
     }
 
-    /// Left folds the cursor's team or section and parks the cursor on its header.
+    /// Left folds the cursor's section and parks the cursor on its header.
     fn collapse_at_cursor(&mut self, cx: &mut Context<Self>) {
-        if let Some(i) = self.cursor_team() {
-            self.sel = SideRow::Team(i);
-            self.set_team_collapsed(i, true, cx);
-            cx.notify();
-        } else if let Some(i) = self.cursor_section() {
+        if let Some(i) = self.cursor_section() {
             self.sel = SideRow::Section(i);
             self.set_collapsed(i, true, cx);
             cx.notify();
@@ -696,12 +629,11 @@ impl Shark {
     }
 
     pub(super) fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
-        // Goals and their tasks belong to a team, not a section.
         let mates = self.stack_mates(ws);
-        if to.is_some_and(|i| i >= self.state.sections.len())
-            || mates.iter().all(|m| self.section_of(m) == to)
-            || self.task(ws).is_some_and(|t| self.team_of(t).is_some())
-        {
+        // An Overview is in none of the sections' lists: moving it anywhere ends that.
+        let placed = self.state.overview_section(ws).is_none()
+            && mates.iter().all(|m| self.section_of(m) == to);
+        if to.is_some_and(|i| i >= self.state.sections.len()) || placed {
             return;
         }
         // A stack lives in one section.
@@ -759,12 +691,17 @@ impl Shark {
             return;
         }
         let cursor = match self.sel {
-            SideRow::Section(j) => self.state.sections.get(j).map(|s| s.name.clone()),
+            SideRow::Section(j) | SideRow::Overview(j) => {
+                self.state.sections.get(j).map(|s| s.name.clone())
+            }
             _ => None,
         };
         move_item(&mut self.state.sections, from, to);
         if let Some(j) = cursor.and_then(|c| self.state.sections.iter().position(|s| s.name == c)) {
-            self.sel = SideRow::Section(j);
+            self.sel = match self.sel {
+                SideRow::Overview(_) => SideRow::Overview(j),
+                _ => SideRow::Section(j),
+            };
         }
         let _ = self.state.save();
         cx.notify();
@@ -774,11 +711,33 @@ impl Shark {
         if i >= self.state.sections.len() {
             return;
         }
-        let s = self.state.sections.remove(i);
+        // An Overview nobody messaged goes with its section, and rows hold indices: the cursor
+        // follows its task by name, and a section's row the sections that moved up.
+        let open = self.active.clone();
+        let cursor = match self.sel {
+            SideRow::Task(ix) => self.state.tasks.get(ix).map(|t| t.name.clone()),
+            _ => None,
+        };
+        let s = self.state.remove_section(i);
         let _ = self.state.save();
-        if let SideRow::Section(j) = self.sel {
-            self.sel = SideRow::Section(if j > i { j - 1 } else { j });
+        if let Some(draft) = s.unsent.as_ref().filter(|n| self.task(n).is_none()) {
+            self.chats.remove(draft);
+            self.syncs.remove(draft);
         }
+        if open.is_some_and(|name| self.task(&name).is_none()) {
+            self.active = None;
+            self.enter_home(window, cx);
+        }
+        let up = |j: usize| if j > i { j - 1 } else { j };
+        self.sel = match self.sel {
+            SideRow::Section(j) => SideRow::Section(up(j)),
+            SideRow::Overview(j) => SideRow::Overview(up(j)),
+            SideRow::Task(ix) => {
+                let at = cursor.and_then(|c| self.state.tasks.iter().position(|t| t.name == c));
+                at.map_or(SideRow::Task(ix), SideRow::Task)
+            }
+            row => row,
+        };
         self.fix_sel();
         window.push_notification(format!("Deleted section {} (its tasks stay)", s.name), cx);
         cx.notify();
@@ -848,12 +807,19 @@ impl Shark {
                                 return false;
                             }
                             let index = if let Some(i) = index {
+                                // Its Overview is titled after it.
+                                let overview = s.state.overview_of(i).map(str::to_string);
+                                if let Some(task) = overview.and_then(|o| s.task_mut(&o)) {
+                                    task.title = overview::overview_title(&name);
+                                }
                                 s.state.sections[i].name = name;
                                 i
                             } else {
                                 s.state.sections.push(Section {
                                     name,
                                     icon: "folder".into(),
+                                    overview: None,
+                                    unsent: None,
                                     collapsed: false,
                                     tasks: vec![],
                                 });
@@ -932,11 +898,8 @@ impl Shark {
     /// Sections, then Ungrouped when it is in one, then "New section…".
     pub(super) fn pick_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_target(window, cx, |s, ws, window, cx| {
-            if s.team_of(&ws).is_some() {
-                return notify_err(window, cx, "Goals and their tasks stay with their team");
-            }
             let ws = ws.name;
-            let current = s.shown_section(&ws);
+            let current = (s.shown_section(&ws)).or_else(|| s.state.overview_section(&ws));
             let n = s.state.sections.len();
             let mut items: Vec<CommandItem> = (s.state.sections)
                 .iter()
@@ -1010,12 +973,7 @@ impl Shark {
         };
         let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
         let pr = facts.repos.into_iter().flatten().find_map(|r| r.pr());
-        let diff = facts.repos.and_then(|rs| {
-            rs.iter().try_fold((0u32, 0u32), |(a, d), r| {
-                let (add, del) = r.local.as_ref().ok()?.diff?;
-                Some((a.saturating_add(add), d.saturating_add(del)))
-            })
-        });
+        let diff = overview::task_diff(facts.repos);
         let code_label = pr
             .map(|p| {
                 let checks = super::peek::checks_text(&p.checks);
@@ -1243,6 +1201,103 @@ impl Shark {
             )
     }
 
+    /// Section `i`'s Overview, its first row: one line where a task has two. A chat's glyph
+    /// until it works or has replied, then the task's own; fainter while nobody has messaged
+    /// it. `ix` is its task once it was opened.
+    fn overview_row(
+        &self,
+        i: usize,
+        ix: Option<usize>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let focused = self.sidebar_focus.is_focused(window);
+        let row = ix.map_or(SideRow::Overview(i), SideRow::Task);
+        let selected = self.sel == row;
+        let task = ix.map(|ix| &self.state.tasks[ix]);
+        let active =
+            !self.home_shown() && task.is_some_and(|t| self.active.as_ref() == Some(&t.name));
+        let bright = active || (selected && focused);
+        let facts = task.filter(|t| !t.unsent).map(|t| self.task_facts(t, cx));
+        let foreground = match &facts {
+            _ if bright => theme.foreground,
+            Some(_) => theme.sidebar_foreground,
+            None => crate::ui::faint(theme),
+        };
+        let icon = match (&facts, task) {
+            (Some(f), Some(t)) if f.bucket != home::Bucket::Idle => StatusIcon {
+                id: format!("status-{}", t.name).into(),
+                bucket: f.bucket,
+                foreground,
+                animate: !cx.reduce_motion(),
+                merged: false,
+            }
+            .into_any_element(),
+            _ => Icon::new(IconName::MessagesSquare)
+                .with_size(ISZ)
+                .into_any_element(),
+        };
+        let time = facts
+            .as_ref()
+            .filter(|f| f.running > 0)
+            .map(|f| f.time.clone());
+        let name = &self.state.sections[i].name;
+        let d = side_row(theme)
+            .id(("overview", i))
+            .test_support()
+            .role(gpui_kit::accesskit::Role::Button)
+            .aria_label(format!("Overview of {name}"))
+            .ml(px(32.))
+            // The open row's pill, the cursor's ring, and a hover for the rest. Not a task
+            // row's hover: that one is its Quick Look card's, and an Overview has no card.
+            .map(|d| cursor_row(d, active, selected, focused, theme))
+            .text_color(foreground)
+            .child(div().size(ISZ).flex_none().child(icon))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                    .child("Overview"),
+            )
+            .when_some(time, |d, time| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.link)
+                        .child(time),
+                )
+            });
+        // Once messaged it is a task like any other to move out or delete.
+        let menu = task.filter(|t| !t.unsent).cloned();
+        d.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |s, _, _, cx| {
+                s.sel = row;
+                cx.notify();
+            }),
+        )
+        .on_click(cx.listener(move |s, _, window, cx| {
+            s.close_peek(cx);
+            s.open_overview(i, window, cx);
+        }))
+        .when_some(menu, |d, task| {
+            d.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                    s.sel = row;
+                    let entries = ws_menu(s, &task, cx);
+                    s.close_peek(cx);
+                    s.show_menu(e.position, entries, w, cx);
+                }),
+            )
+        })
+        .into_any_element()
+    }
+
     /// A section's header: icon, name and fold chevron. Folded, it shows one fact on the right:
     /// how many of its tasks need you, else how many it holds.
     fn section_row(
@@ -1261,10 +1316,16 @@ impl Shark {
             .filter_map(|n| self.task(n))
             .filter(|t| !t.backlog && self.sidebar_task_matches(t))
             .collect();
-        let needs = (tasks.iter())
+        // Its Overview's chat counts as running or waiting, and isn't one of the tasks.
+        let overview = (self.state.overview_of(i))
+            .and_then(|n| self.task(n))
+            .filter(|t| !t.unsent);
+        let needs = (tasks.iter().copied().chain(overview))
             .filter(|t| self.task_facts(t, cx).warning)
             .count();
-        let running: usize = tasks.iter().map(|t| self.running_chats(&t.name, cx)).sum();
+        let running: usize = (tasks.iter().copied().chain(overview))
+            .map(|t| self.running_chats(&t.name, cx))
+            .sum();
         let warning = collapsed && needs > 0;
         let tip: SharedString = sec.name.clone().into();
         let badge = match (collapsed, needs) {
@@ -1371,183 +1432,6 @@ impl Shark {
             .into_any_element()
     }
 
-    /// A team's row: icon, name and fold chevron; on the right its Needs you count and status.
-    fn side_team_row(&self, i: usize, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let (theme, rail) = (cx.theme(), self.rail);
-        let team = &self.state.teams[i];
-        let focused = self.sidebar_focus.is_focused(window);
-        let selected = self.sel == SideRow::Team(i);
-        let shown = self.team_shown() == Some(team.slug.as_str());
-        let status = self.team_status(&team.slug, cx);
-        let needs = match status {
-            super::team::TeamStatus::Needs(n) => n,
-            _ => 0,
-        };
-        let look = super::team_look::team_look_of(status, theme);
-        let label = [team.name.as_str(), look.label.as_ref()].join(" \u{b7} ");
-        let tip: SharedString = label.clone().into();
-        let slug = team.slug.clone();
-        let menu_slug = team.slug.clone();
-        sidebar_row(rail, theme)
-            .relative()
-            .id(("team", i))
-            .test_support()
-            .on_hover(cx.listener(|s, over: &bool, _, cx| {
-                if *over {
-                    s.close_peek(cx);
-                }
-            }))
-            .role(gpui_kit::accesskit::Role::Button)
-            .aria_label(label)
-            .aria_expanded(!team.collapsed)
-            .map(|d| cursor_row(d, shown, selected, focused, theme))
-            .when(shown, |d| d.font_weight(FontWeight::MEDIUM))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.sel = SideRow::Team(i);
-                this.open_team(&slug, window, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                    this.sel = SideRow::Team(i);
-                    let collapsed = this.state.teams.get(i).is_some_and(|t| t.collapsed);
-                    let mut entries = vec![menu::item(
-                        if collapsed {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        },
-                        if collapsed { "Expand" } else { "Collapse" },
-                        on_shark(cx, move |s, _, cx| s.toggle_team(i, cx)),
-                    )];
-                    let more = this.team_menu(&menu_slug, cx);
-                    if !more.is_empty() {
-                        entries.push(Entry::Sep);
-                        entries.extend(more);
-                    }
-                    this.show_menu(e.position, entries, w, cx);
-                }),
-            )
-            .child(super::agent_icon_view::agent_icon(&team.icon))
-            .when(rail && needs > 0, |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .right(px(-8.))
-                        .top(px(10.))
-                        .size(px(12.))
-                        .text_color(theme.warning_foreground)
-                        .child(Icon::new(IconName::CircleAlert).with_size(px(12.))),
-                )
-            })
-            .when(!rail, |d| {
-                d.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(team.name.clone()),
-                )
-                .child(
-                    // The chevron folds the team's goals; the row itself opens its page.
-                    div()
-                        .id(("team-fold", i))
-                        .role(gpui_kit::accesskit::Role::Button)
-                        .aria_label(if team.collapsed {
-                            "Expand team"
-                        } else {
-                            "Collapse team"
-                        })
-                        .flex_none()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_team(i, cx)
-                        }))
-                        .child(
-                            Icon::new(if team.collapsed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .with_size(px(12.)),
-                        ),
-                )
-                .child(div().flex_1())
-                .when(needs > 0, |d| {
-                    d.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.warning_foreground)
-                            .child(needs.to_string()),
-                    )
-                })
-                .child(look.icon(14.))
-            })
-            .when(rail, |d| {
-                d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-            })
-            .into_any_element()
-    }
-
-    /// A goal's row under its team: status icon, title and progress.
-    fn side_goal_row(
-        &self,
-        ix: usize,
-        task: &Task,
-        order: &[usize],
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let (theme, rail) = (cx.theme(), self.rail);
-        let focused = self.sidebar_focus.is_focused(window);
-        let m = window.modifiers();
-        let cmd_held = m.platform && m.number_of_modifiers() == 1;
-        let selected = self.sel == SideRow::Task(ix);
-        let active = !self.home_shown() && self.active.as_ref() == Some(&task.name);
-        let look = self.goal_look(&task.name, cx);
-        let (done, total) = task.goal.as_ref().map_or((0, 0), crate::team::progress);
-        let progress = (total > 0).then(|| format!("{done}/{total}"));
-        let title = task.display_title().into_owned();
-        let label = [
-            Some(title.clone()),
-            Some(look.label.to_string()),
-            (total > 0).then(|| format!("{done} of {total} tasks")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" \u{b7} ");
-        let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
-        let tip = title.clone();
-        sidebar_row(rail, theme)
-            .relative()
-            .id(("goal", ix))
-            .test_support()
-            .role(gpui_kit::accesskit::Role::Button)
-            .aria_label(label)
-            .when(!rail, |d| d.ml(px(32.)))
-            .map(|d| cursor_row(d, active, selected, focused, theme))
-            .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-            .map(|d| self.task_row_events(d, ix, task, cx))
-            .child(div().size(ISZ).flex_none().child(match nth {
-                Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                _ => look.icon(16.),
-            }))
-            .when(!rail, |d| {
-                d.child(div().flex_1().min_w_0().truncate().child(title))
-                    .children(progress.map(|p| div().flex_none().text_xs().child(p)))
-            })
-            .when(
-                self.peek.task.as_deref() == Some(&task.name) && !self.peek.home,
-                |d| d.child(self.render_peek(task, window, cx)),
-            )
-            .when(rail, |d| {
-                d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-            })
-            .into_any_element()
-    }
-
     pub(super) fn render_sidebar(
         &self,
         window: &Window,
@@ -1572,9 +1456,7 @@ impl Shark {
         let rows = self.side_rows_in(false, &stacks);
         let order = self.order_of(&rows, false);
         let accent = theme.sidebar_accent;
-        let (mut team_items, mut items): (Vec<AnyElement>, Vec<AnyElement>) = (vec![], vec![]);
-        // The Teams header and the team rows come first, in the same scrolled list.
-        let has_teams = !self.state.teams.is_empty();
+        let mut items: Vec<AnyElement> = vec![];
         let mut at = 0;
         while at < rows.len() {
             let row = rows[at];
@@ -1596,24 +1478,18 @@ impl Shark {
                     self.section_row(i, &self.state.sections[i], window, cx),
                     reorder::Item::Section(i),
                 )),
-                SideRow::Team(i) => team_items.push(self.side_team_row(i, window, cx)),
+                SideRow::Overview(i) => items.push(self.overview_row(i, None, window, cx)),
+                SideRow::Task(ix) if self.state.tasks[ix].overview => {
+                    let i = self.state.overview_section(&self.state.tasks[ix].name);
+                    items.extend(i.map(|i| self.overview_row(i, Some(ix), window, cx)));
+                }
                 SideRow::Task(ix) => {
                     let task = &self.state.tasks[ix];
-                    match (self.team_of(task), task.goal.is_some()) {
-                        (Some(_), true) => {
-                            team_items.push(self.side_goal_row(ix, task, &order, window, cx))
-                        }
-                        (Some(_), false) => {
-                            team_items.push(self.ws_row(ix, task, 48., &order, None, window, cx))
-                        }
-                        (None, _) => {
-                            let indent = self.section_of(&task.name).map_or(0., |_| 32.);
-                            items.push(self.reorder_item(
-                                self.ws_row(ix, task, indent, &order, None, window, cx),
-                                reorder::Item::Task(task.name.clone()),
-                            ));
-                        }
-                    }
+                    let indent = self.section_of(&task.name).map_or(0., |_| 32.);
+                    items.push(self.reorder_item(
+                        self.ws_row(ix, task, indent, &order, None, window, cx),
+                        reorder::Item::Task(task.name.clone()),
+                    ));
                 }
                 // Drawn by `stack_block`.
                 SideRow::Pr(..) => {}
@@ -1672,33 +1548,6 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu(false));
-        let teams_header = h_flex()
-            .id("teams-header")
-            .test_support()
-            .group("teams-header")
-            .justify_between()
-            .items_end()
-            .child(header("Teams"))
-            .when(!rail, |d| {
-                d.child(
-                    div()
-                        .mr_3()
-                        .invisible()
-                        .group_hover("teams-header", |s| s.visible())
-                        .child(
-                            Button::new("new-team")
-                                .accessibility_label("New team")
-                                .ghost()
-                                .xsmall()
-                                .text_color(theme.sidebar_foreground)
-                                .icon(IconName::Plus)
-                                .tooltip("New team")
-                                .on_click(
-                                    cx.listener(|this, _, w, cx| this.new_team_dialog(w, cx)),
-                                ),
-                        ),
-                )
-            });
         let add_repo_row = sidebar_row(rail, theme)
             .id("add-repo-row")
             .hover(|d| d.bg(side_hover(theme)))
@@ -1739,24 +1588,20 @@ impl Shark {
                         this.open_task(ix, window, cx);
                     }
                     SideRow::Section(i) => this.toggle_section(i, cx),
+                    SideRow::Overview(i) => {
+                        this.close_peek(cx);
+                        this.open_overview(i, window, cx);
+                    }
                     SideRow::Pr(anchor, number) => {
                         if let Some(url) = Shark::stack_pr(&stacks, anchor, number) {
                             cx.open_url(&url);
-                        }
-                    }
-                    SideRow::Team(i) => {
-                        if let Some(slug) = this.state.teams.get(i).map(|t| t.slug.clone()) {
-                            this.close_peek(cx);
-                            this.open_team(&slug, window, cx);
                         }
                     }
                 }
             }))
             .on_action(cx.listener(|this, _: &CollapseDir, _, cx| this.collapse_at_cursor(cx)))
             .on_action(cx.listener(|this, _: &ExpandDir, _, cx| {
-                if let Some(i) = this.cursor_team() {
-                    this.set_team_collapsed(i, false, cx)
-                } else if let Some(i) = this.cursor_section() {
+                if let Some(i) = this.cursor_section() {
                     this.set_collapsed(i, false, cx)
                 }
             }))
@@ -1823,8 +1668,6 @@ impl Shark {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.sidebar_scroll)
-                    .children(has_teams.then_some(teams_header))
-                    .children(team_items)
                     .child(
                         self.reorder_item(ws_header.into_any_element(), reorder::Item::Ungrouped),
                     )

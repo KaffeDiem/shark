@@ -184,8 +184,9 @@ impl Shark {
                     None => s.advance_attachment(&name, window, cx),
                 }
                 if let Some((p, chat)) = then {
-                    chat.update(cx, |c, cx| {
-                        if !(ok && c.ask(&p, window, cx)) {
+                    let sent = chat.update(cx, |c, cx| {
+                        let sent = ok && c.ask(&p, window, cx);
+                        if !sent {
                             c.composer.update(cx, |t, cx| {
                                 // Keep what was typed meanwhile, after the prompt.
                                 let draft = t.value().trim().to_string();
@@ -196,7 +197,17 @@ impl Shark {
                                 t.set_value(text, window, cx)
                             });
                         }
+                        sent
                     });
+                    // A task an Overview started that never got its brief: the Overview hears.
+                    if !sent {
+                        let why = match ok {
+                            true => "its first message didn't go out",
+                            false => "its setup script failed, so its agent wasn't started",
+                        };
+                        let kind = crate::chat::NewsKind::Failed;
+                        s.overview_news(&name, kind, why.into(), window, cx);
+                    }
                 }
             })
             .ok();

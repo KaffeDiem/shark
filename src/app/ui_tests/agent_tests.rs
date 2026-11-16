@@ -1017,6 +1017,8 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         s.state.sections.push(Section {
             name: "Release".into(),
             icon: "folder".into(),
+            overview: None,
+            unsent: None,
             collapsed: false,
             tasks: vec![],
         });

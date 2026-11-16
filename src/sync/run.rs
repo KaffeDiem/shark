@@ -165,6 +165,7 @@ pub(super) fn run_job(job: &Job) -> Probed {
             .map(|mut l| {
                 l.review |= review;
                 l.restack &= known_base;
+                l.parent_pushed = status::local_parent_pushed(wt, saved_base, &l.trunk);
                 l
             })
         });

@@ -201,7 +201,8 @@ impl Shark {
         }
         self.sel = SideRow::Task(ix);
         // Not `set_collapsed`: its cursor repair would run before the task is active.
-        if let Some(i) = self.section_of(&ws.name)
+        let section = (self.section_of(&ws.name)).or_else(|| self.state.overview_section(&ws.name));
+        if let Some(i) = section
             && self.state.sections[i].collapsed
         {
             self.state.sections[i].collapsed = false;
@@ -219,10 +220,6 @@ impl Shark {
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
         self.select_chat(ws.active_chat, window, cx);
-        // A goal opens on its plan; the lead's chat is the tab beside it.
-        if ws.goal.is_some() {
-            self.show(Tab::Goal, window, cx);
-        }
         if changed {
             self.unpark_sessions(window, cx);
             self.restore_file_tabs(window, cx);
@@ -979,7 +976,6 @@ impl Shark {
                 self.show(Tab::Feature(Feature::Artifacts), window, cx)
             }
             "home" => self.enter_home(window, cx),
-            "chat" if self.tab == Tab::Goal => self.show(Tab::Chat, window, cx),
             _ => {}
         }
     }
@@ -991,7 +987,6 @@ impl Shark {
             Tab::Feature(Feature::Diff) => "diff",
             Tab::Feature(Feature::Git) => "git",
             Tab::Feature(Feature::Artifacts) => "artifacts",
-            Tab::Goal => "goal",
             Tab::Chat | Tab::File => "chat",
         };
         let open = self.active.clone().map(|n| (n, tab.to_string()));
@@ -1425,7 +1420,8 @@ impl Shark {
             _ if self.home_shown() => self.home.sel.clone()?,
             _ => self.active.clone()?,
         };
-        let task = self.task(&name)?;
+        // An Overview nobody has messaged is a row, not yet a task to rename, move or attach to.
+        let task = self.task(&name).filter(|t| !t.unsent)?;
         if self.sidebar_focus.is_focused(window) && !self.side_rows(false).contains(&self.sel) {
             return None;
         }
@@ -1463,12 +1459,13 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // An Overview nobody has messaged is a row in its section: no task to delete yet.
+        if self.task(&name).is_some_and(|t| t.unsent) {
+            return notify_err(window, cx, "This Overview has no task to delete yet");
+        }
         let title = self.task_title(&name);
         if let Some(msg) = self.chats_at_work(&name, cx) {
             return notify_err(window, cx, msg);
-        }
-        if !self.goal_tasks(&name).is_empty() {
-            return self.archive_goal(name, force, window, cx);
         }
         let heading = match force {
             true => format!("Force delete {title}?"),
@@ -1666,14 +1663,8 @@ impl Shark {
                             None,
                         );
                     }
-                    let removed = git::remove_task(&ws, &dir, force).map(|()| {
-                        // A lead only reads: its branch has no commits, and a leftover one would
-                        // make a later task of this name look already merged.
-                        if ws.goal.is_some() && !force {
-                            git::delete_empty_branches(&ws);
-                        }
-                        git::delete_merged_branches(&ws, &merged)
-                    });
+                    let removed = git::remove_task(&ws, &dir, force)
+                        .map(|()| git::delete_merged_branches(&ws, &merged));
                     (scripts, removed, None)
                 })
                 .await;
@@ -1742,9 +1733,6 @@ impl Shark {
                 let repoless = self.task(name).is_some_and(|w| w.repos.is_empty());
                 let before = self.cursors(cx);
                 self.forget_task_views(name, cx);
-                if let Some(gone) = self.task(name).cloned() {
-                    self.task_left_goal(&gone);
-                }
                 self.hand_over_slot(name);
                 self.state.remove_task(name);
                 crate::linear::delete_snapshots(name);

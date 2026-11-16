@@ -337,15 +337,18 @@ impl GitSync {
             .iter_mut()
             .filter_map(|saved| {
                 let repo = self.repos.iter().find(|r| r.name == saved.name)?;
-                if saved.base.starts_with("refs/shark/pull/")
-                    && !repo.base.starts_with("refs/shark/pull/")
-                    && repo.local.as_ref().is_ok_and(|l| !l.review)
-                {
-                    let old = std::mem::replace(&mut saved.base, repo.base.clone());
-                    Some((saved.name.clone(), old, repo.base.clone()))
+                let local = repo.local.as_ref().ok()?;
+                let review = |base: &str| base.starts_with("refs/shark/pull/");
+                let new = if review(&saved.base) && !review(&repo.base) && !local.review {
+                    repo.base.clone()
+                } else if local.parent_pushed {
+                    // Cut from a parent that wasn't pushed then and is now.
+                    format!("origin/{}", saved.base)
                 } else {
-                    None
-                }
+                    return None;
+                };
+                let old = std::mem::replace(&mut saved.base, new.clone());
+                Some((saved.name.clone(), old, new))
             })
             .collect();
         if !adopted.is_empty() {
@@ -2468,6 +2471,29 @@ esac
             status::step_args(&Kind::Merge, &repos[0])
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A child cut from its parent's unpushed branch saves the bare branch as its base. Its
+    /// merge waits for the parent's PR all the same.
+    #[test]
+    fn a_child_on_a_local_base_waits_for_its_parent_pr() {
+        let action = Action {
+            label: "Merge".into(),
+            kind: Kind::Merge,
+            repos: vec![],
+            attention: false,
+            reviews: vec![],
+        };
+        let (mut ws, mut p) = stacked_probe();
+        ws.repos[0].base = "parent".into();
+        p.repos = super::worktrees(&ws);
+        let repos = super::execution_repos(&ws, p, &[], &action).unwrap();
+        // The merge runs against the saved base, not the PR's base the display follows.
+        assert!(
+            super::planned_args(&ws, &Kind::Merge, &repos[0])
+                .unwrap_err()
+                .contains("stacked on #1")
         );
     }
 

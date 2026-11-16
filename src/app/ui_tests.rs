@@ -33,12 +33,12 @@ mod drag_tests;
 mod editor_pane_tests;
 mod file_changes_tests;
 mod git_tests;
-mod goal_tab_tests;
 mod home_tests;
 mod issue_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
+mod overview_tests;
 mod peek_review_tests;
 mod readme_pixels;
 mod repo_menu_tests;
@@ -50,10 +50,6 @@ mod storage_tests;
 mod tab_tests;
 mod task_picker_tests;
 mod task_review_tests;
-mod team_page_tests;
-mod team_pixels;
-mod team_sidebar_tests;
-mod team_tests;
 mod tree_pixels;
 mod usage_regression_tests;
 mod usage_tests;
@@ -1143,7 +1139,8 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
     })
     .unwrap();
-    press(cx, &["j", "m"]);
+    // Past the section's Overview row to the task.
+    press(cx, &["j", "j", "m"]);
     cx.run_until_parked();
     press(cx, &["enter"]);
     assert_eq!(sections(cx)[0].tasks, ["kb"]);

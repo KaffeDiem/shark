@@ -115,12 +115,12 @@ pub(crate) fn key_footer(hints: &[(&str, &'static str)], action: Option<AnyEleme
         .children(action)
 }
 
-/// `1 h 12 m`.
+/// `1h 12m`.
 pub(crate) fn hm(secs: u64) -> String {
     match (secs / 3600, secs % 3600 / 60) {
-        (0, m) => format!("{m} m"),
-        (h, 0) => format!("{h} h"),
-        (h, m) => format!("{h} h {m} m"),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
     }
 }
 
@@ -717,8 +717,8 @@ mod hm_tests {
 
     #[test]
     fn agent_time_reads_in_hours_and_minutes() {
-        assert_eq!(hm(0), "0 m");
-        assert_eq!(hm(72 * 60), "1 h 12 m");
-        assert_eq!(hm(3 * 3600), "3 h");
+        assert_eq!(hm(0), "0m");
+        assert_eq!(hm(72 * 60), "1h 12m");
+        assert_eq!(hm(3 * 3600), "3h");
     }
 }

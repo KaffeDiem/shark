@@ -34,6 +34,8 @@ fn checkout() -> Vec<Section> {
     vec![Section {
         name: "Checkout".into(),
         icon: "folder".into(),
+        overview: None,
+        unsent: None,
         collapsed: false,
         tasks: vec!["fix".into(), "api".into()],
     }]
@@ -73,8 +75,11 @@ fn ix(s: &Shark, name: &str) -> usize {
     s.state.tasks.iter().position(|t| t.name == name).unwrap()
 }
 
+/// The sidebar's rows without the sections' Overview rows: these tests are about stacks.
 fn rows(s: &Shark) -> Vec<SideRow> {
-    s.side_rows(false)
+    let mut rows = s.side_rows(false);
+    rows.retain(|r| !matches!(r, SideRow::Overview(_)));
+    rows
 }
 
 #[gpui_kit::test]

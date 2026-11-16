@@ -223,10 +223,10 @@ pub fn create_task_with_sources(
     )
 }
 
-/// A task Shark starts from a goal's plan row: a new branch in every repo, from the trunk, or for
+/// A task Shark starts for `repos`: a new branch in every repo, from the trunk, or for
 /// `local_parents` `(repo, branch)` from that local branch's tip, pushed or not. The parent's
 /// branch is its base: the diff compares against it and its PR targets it.
-pub fn create_row_task(
+pub fn create_stacked_task(
     dir: &Path,
     name: &str,
     branch: &str,
@@ -1487,8 +1487,23 @@ fn listed(repo: &str) -> String {
 /// Where agents put what isn't code. Claude's plan files go there too (`plansDirectory`).
 const CONTEXT_NOTE: &str = "Keep plans, notes, research and temporary files in `.context/` inside this directory: plans in `.context/plans/`, everything else in `.context/scratch/`. Never write them elsewhere, including your home folder. `.context` is deleted with the task and never committed. Files the user attaches are in `.context/attachments/`.\n\n";
 
+/// An Overview's notes, in its task: what must outlast one chat. A handoff passes it on.
+pub const OVERVIEW_NOTES: &str = ".context/overview.md";
+
+/// The directory and root docs of an Overview's task, made when its first message goes out.
+pub fn create_overview_dir(ws: &Task) -> Result<(), String> {
+    let dir = ws.dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    write_root_docs(ws, &dir)
+}
+
 fn header(ws: &Task) -> String {
-    if ws.repos.is_empty() {
+    if ws.overview {
+        format!(
+            "# Overview `{}`\n\nThis is the Overview chat of a section in Shark: it oversees that section's tasks. This directory is NOT a git repo and holds no code. The `shark` tools read, start, message and stop the section's tasks; `read_task` gives each task's worktree paths, which is where the code is.\n\nKeep what must outlast this chat in `{OVERVIEW_NOTES}`: a later chat starts from that file and from `read_task`.\n\n{CONTEXT_NOTE}",
+            ws.name
+        )
+    } else if ws.repos.is_empty() {
         format!(
             "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n{CONTEXT_NOTE}",
             ws.name
@@ -1668,18 +1683,6 @@ pub fn delete_merged_branches(ws: &Task, merged: &[(String, String)]) -> Vec<Str
         })
         .map(|r| r.name.clone())
         .collect()
-}
-
-/// Deletes the branches of a removed goal's task that never got a commit: the lead only reads.
-/// A leftover one would make a later task of the same name look already merged.
-pub fn delete_empty_branches(ws: &Task) {
-    for r in &ws.repos {
-        let b = ws.branch_of(r);
-        let at = format!("refs/heads/{b}");
-        if git(&r.src, &["merge-base", "--is-ancestor", &at, &r.base]).is_ok() {
-            let _ = git(&r.src, &["branch", "-D", b]);
-        }
-    }
 }
 
 /// The commit the diff of `repo_dir` compares against: HEAD when only uncommitted changes show,

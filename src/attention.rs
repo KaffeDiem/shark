@@ -131,9 +131,9 @@ fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
             cx.background_executor().timer(TICK).await;
             let Ok(next) = this.update(cx, |s, cx| {
                 s.refresh_attention(cx);
-                // With no repos there's nothing to check; a goal's task never has a PR.
+                // With no repos there's nothing to check.
                 let names: Vec<String> = (s.state.tasks.iter())
-                    .filter(|w| !w.repos.is_empty() && w.goal.is_none())
+                    .filter(|w| !w.repos.is_empty())
                     .map(|w| w.name.clone())
                     .filter(|n| !s.busy(n, cx))
                     .collect();
@@ -220,10 +220,6 @@ impl Shark {
         if self.asking_chat(name, cx) {
             return Some(crate::transcript::QUESTION.into());
         }
-        // A goal's plan, limit or stuck task, and a task's plan under the stricter approval.
-        if let Some(label) = self.goal_needs(name, cx) {
-            return Some(label);
-        }
         if let Some(label) = self.attach_needs(name) {
             return Some(label);
         }
@@ -258,11 +254,6 @@ impl Shark {
     }
 
     pub(crate) fn turn_done(&mut self, name: &str, chat: &str, cx: &mut Context<Self>) {
-        // A turn Shark asked for in a goal's task ends quietly: it isn't unread and says
-        // nothing. What needs the user is announced below; the goal reports when its plan is done.
-        if self.goal_drives(name, chat) {
-            return self.refresh_attention(cx);
-        }
         // Home covers the open task: its turns end unseen.
         let shown = self.active.as_deref() == Some(name) && !self.home_shown();
         if !shown {
@@ -291,9 +282,8 @@ impl Shark {
                 continue;
             }
             // Nothing known yet (never opened, not checked): no baseline to compare against.
-            // A goal's needs come from its own state, which is always known.
             let known = self.attn.checked.contains_key(name) || self.syncs.contains_key(name);
-            if !known && self.goal(name).is_none() {
+            if !known {
                 continue;
             }
             let on_screen = self.active.as_ref() == Some(name) && self.attn.window_active;
@@ -307,13 +297,6 @@ impl Shark {
         }
         set_badge(count);
         cx.notify();
-    }
-
-    /// Marks `name` as finished unseen, unless it is on screen.
-    pub(crate) fn unseen(&mut self, name: &str) {
-        if self.active.as_deref() != Some(name) || self.home_shown() {
-            self.attn.unread.insert(name.to_string());
-        }
     }
 
     /// Opens the next task after the open one (in sidebar order) that needs you.

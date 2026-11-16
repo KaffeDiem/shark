@@ -26,6 +26,8 @@ fn fixture(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
             sections: vec![Section {
                 name: "Folded".into(),
                 icon: "folder".into(),
+                overview: None,
+                unsent: None,
                 collapsed: true,
                 tasks: vec!["recent".into()],
             }],

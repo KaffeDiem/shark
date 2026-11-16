@@ -9,15 +9,30 @@ pub(super) const ENTER_PLAN: &str = "Only the user turns plan mode on in this ap
     suggest it in your reply.";
 pub(super) const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
     without it, or tell the user what to run.";
+pub(crate) const PLAN_ONLY: &str = "Plan mode is on, so this doesn't run: editing files, and \
+    starting, messaging or stopping tasks, wait until the user approves the plan. Put it in the \
+    plan.";
 pub(super) const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
 pub(super) const NEEDS_REPO: &str = "This task has no repository, so it stays in Plan mode. Attach \
     one to build.";
 pub(super) const ATTACHING: &str = "A repository is still attaching or needs a decision in the \
     header, so this agent can't build yet.";
-pub(super) const GOAL_LOCKED: &str = "A goal's lead stays in Plan mode: it plans and summarises, and \
-    the team's agents build. Approve the plan to start its tasks.";
 pub(super) const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
     have none of that chat's context: read the code it touches before you change it.";
+
+/// Why a tool the agent asked about doesn't run; `None` runs it. Plan mode holds back only what
+/// changes things: file edits, and the Overview's tools that act on tasks. Commands, the web,
+/// other MCP servers and `read_task` run as they do outside it. codex asks only to leave its
+/// sandbox, which nobody here can grant.
+pub(super) fn refusal(tool: &str, plan: bool, codex: bool) -> Option<&'static str> {
+    match tool {
+        "EnterPlanMode" => Some(ENTER_PLAN),
+        _ if codex => Some(NEEDS_APPROVAL),
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" if plan => Some(PLAN_ONLY),
+        _ if plan && crate::mcp::acts(tool) => Some(PLAN_ONLY),
+        _ => None,
+    }
+}
 
 /// The approved plan as `.context/plans/<title> plan.md` in the task, replacing an earlier copy.
 fn write_plan_copy(task: &std::path::Path, title: &str, text: &str) -> std::io::Result<()> {
@@ -60,10 +75,6 @@ impl Chat {
     /// through here. Says what's missing and has the app offer Attach repository. Returns
     /// whether it refused.
     pub fn refuse_unready(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.ws.goal.is_some() {
-            self.push(Block::Info(GOAL_LOCKED.into()), cx);
-            return true;
-        }
         let refused = !self.ws.ready();
         if refused && !self.ws.attaching.is_empty() {
             self.push(Block::Info(ATTACHING.into()), cx);
@@ -105,9 +116,6 @@ impl Chat {
             why
         } else if self.busy {
             "the agent is still working; approve when the turn ends (ctrl-c stops it)"
-        } else if self.ws.goal.is_some() {
-            // Approve and start: the app runs the plan; nothing is sent and plan mode stays.
-            return cx.emit(ChatEvent::ApproveGoal);
         } else if self.refuse_unready(cx) {
             return;
         } else {
@@ -181,6 +189,44 @@ impl Chat {
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn plan_mode_refuses_only_edits_and_acting_on_tasks() {
+        let edits = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+        let acts = [
+            "mcp__shark__spawn_task",
+            "mcp__shark__message_task",
+            "mcp__shark__stop_task",
+        ];
+        let runs = [
+            "Bash",
+            "WebSearch",
+            "WebFetch",
+            "mcp__shark__read_task",
+            "mcp__linear__save_issue",
+        ];
+        for tool in edits.into_iter().chain(acts) {
+            assert_eq!(refusal(tool, true, false), Some(PLAN_ONLY), "{tool}");
+            assert_eq!(
+                refusal(tool, false, false),
+                None,
+                "{tool} outside plan mode"
+            );
+        }
+        for tool in runs {
+            assert_eq!(refusal(tool, true, false), None, "{tool}");
+        }
+        // Only the user turns plan mode on, in either mode.
+        assert_eq!(refusal("EnterPlanMode", false, false), Some(ENTER_PLAN));
+        // codex's requests are to leave its sandbox; plan mode's stays read-only.
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ] {
+            assert_eq!(refusal(method, true, true), Some(NEEDS_APPROVAL));
+            assert_eq!(refusal(method, false, true), Some(NEEDS_APPROVAL));
+        }
+    }
 
     #[test]
     fn plan_copy_lands_in_context_plans_and_is_overwritten() {

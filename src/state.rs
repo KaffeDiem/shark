@@ -22,13 +22,10 @@ pub struct State {
     #[serde(skip)]
     pub save_error: std::cell::RefCell<Option<String>>,
     pub repos: Vec<Repo>,
-    #[serde(rename = "workspaces")]
+    #[serde(rename = "workspaces", serialize_with = "sent_tasks")]
     pub tasks: Vec<Task>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<Agent>,
-    /// Teams of agents, in sidebar order; their goals are tasks (`Task::goal`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub teams: Vec<Team>,
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
@@ -157,6 +154,13 @@ pub struct Section {
     pub name: String,
     /// Lucide icon name from `app::sidebar::SECTION_ICONS`, e.g. `folder`.
     pub icon: String,
+    /// The task that is this section's Overview chat, once it was messaged. It is not one of
+    /// `tasks`, which are what it oversees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    /// Its Overview before the first message (`Task::unsent`): opened, and not saved.
+    #[serde(skip)]
+    pub unsent: Option<String>,
     #[serde(default)]
     pub collapsed: bool,
     /// Task names, in the order they were added.
@@ -318,208 +322,6 @@ impl From<&Agent> for AgentLink {
     }
 }
 
-/// A lead and other agents that work on goals together.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
-#[serde(default)]
-pub struct Team {
-    pub slug: String,
-    pub name: String,
-    pub icon: AgentIcon,
-    /// The agent that plans and summarises; it never edits code.
-    pub lead: String,
-    /// Agent slugs, the lead excluded.
-    pub agents: Vec<String>,
-    pub repos: Vec<String>,
-    /// You approve every task's plan too, and review a task before those after it start.
-    pub approve_tasks: bool,
-    pub limits: Limits,
-    pub paused: bool,
-    /// Agents whose queued rows wait in this team.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub paused_agents: Vec<String>,
-    /// Folded in the sidebar.
-    pub collapsed: bool,
-}
-
-impl Team {
-    /// The lead first, then the others.
-    pub fn members(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.lead.as_str()).chain(self.agents.iter().map(String::as_str))
-    }
-}
-
-/// What bounds a team; all of it is something Shark can measure.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default)]
-pub struct Limits {
-    /// Chats in a turn at once.
-    pub running: u8,
-    /// Percent of the plan allowance below which nothing starts.
-    pub floor: u8,
-    /// Agent time per goal, in minutes.
-    pub minutes: u32,
-    /// Tasks per goal.
-    pub tasks: u8,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Limits {
-            running: 3,
-            floor: 20,
-            minutes: 180,
-            tasks: 8,
-        }
-    }
-}
-
-/// What a team was asked for. It lives on the lead's task, which gives the lead a directory,
-/// worktrees to read, a chat and plan versions.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
-#[serde(default)]
-pub struct Goal {
-    pub team: String,
-    pub brief: String,
-    /// The team's agents when the goal started, the lead first.
-    pub roster: Vec<AgentLink>,
-    /// The team's task limit, for the lead's note.
-    pub max_tasks: u8,
-    /// The approved plan. It changes only when the user approves or edits it.
-    pub rows: Vec<Row>,
-    /// The lead's latest plan, parsed and waiting for approval.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub draft: Vec<Row>,
-    /// What reading the latest plan turned up: lines that are no task, or no tasks at all.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unread: Vec<String>,
-    /// Why the draft can't be approved: `unread`, then what `team::check` says of it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub problems: Vec<String>,
-    /// The fingerprint of the plan last read into `draft`. A later turn without a new plan
-    /// leaves the draft, and the user's edits to it, alone.
-    pub parsed: u64,
-    /// Shark asked the lead to fix `problems`; it asks once per goal.
-    pub asked_fix: bool,
-    pub state: GoalState,
-    /// Agent time used by all its tasks, in seconds.
-    pub secs: u64,
-    /// Minutes added to the team's limit for this goal (**Add 1 h**).
-    pub extra_minutes: u32,
-    /// The lead was asked for the closing summary.
-    pub summary_asked: bool,
-    pub summary: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalState {
-    /// The lead is writing the plan.
-    #[default]
-    Planning,
-    /// The first plan waits for approval.
-    Review,
-    Running,
-    Paused(Why),
-    /// Every task is finished.
-    Ready,
-    Done,
-    Stopped,
-}
-
-impl GoalState {
-    /// Not finished and not stopped: it shows among the team's open goals.
-    pub fn open(self) -> bool {
-        !matches!(self, GoalState::Done | GoalState::Stopped)
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Why {
-    You,
-    /// The goal's agent time is used.
-    Time,
-}
-
-/// One task of a plan. It costs nothing until it starts.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
-#[serde(default)]
-pub struct Row {
-    /// `T1`.
-    pub key: String,
-    pub title: String,
-    pub brief: String,
-    pub agent: String,
-    pub repos: Vec<String>,
-    /// Keys of the rows it comes after.
-    pub after: Vec<String>,
-    /// Once started.
-    pub task: Option<TaskRef>,
-    pub state: RowState,
-    /// The agent's last reply, for the rows that come after.
-    pub result: Option<String>,
-    /// The chat doing its work: the task's first, or the one a handoff opened.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat: Option<String>,
-    /// The agent that takes over next; `advance_goals` starts it when the limits allow.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub handoff: Option<String>,
-    /// Why it failed, in a few words.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// It failed in its commit turn: Retry asks for the commit again, not for more work.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub commit_failed: bool,
-    /// The user looked at the finished work; under `Team::approve_tasks` rows after it wait for this.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub reviewed: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum RowState {
-    #[default]
-    Queued,
-    Started,
-    /// The work turn ended with changes; the commit turn runs.
-    Committing,
-    Finished,
-    /// Removed after it started, or its task was deleted.
-    Skipped,
-    Failed,
-}
-
-impl RowState {
-    /// Nothing more will happen to it without the user.
-    pub fn settled(self) -> bool {
-        matches!(self, RowState::Finished | RowState::Skipped)
-    }
-
-    /// Its agent may be in a turn.
-    pub fn live(self) -> bool {
-        matches!(self, RowState::Started | RowState::Committing)
-    }
-}
-
-/// Task names are reused, so a row names the instance too.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
-pub struct TaskRef {
-    pub name: String,
-    pub instance_id: String,
-}
-
-/// What a task started from a plan row knows of its goal: `Task::context` reads only the task.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
-#[serde(default)]
-pub struct Part {
-    /// `Task::name` of the goal.
-    pub goal: String,
-    pub goal_title: String,
-    pub key: String,
-    /// Each row it comes after, as its key and result, copied at start.
-    pub after: Vec<(String, String)>,
-}
-
 pub fn agent_skills_dir(slug: &str) -> PathBuf {
     support_dir().join("agents").join(slug).join("skills")
 }
@@ -595,12 +397,15 @@ pub struct Task {
     /// task; `normalize_tabs` keeps chat and feature tabs in step with their open/closed state.
     #[serde(default)]
     pub tab_order: Vec<TabId>,
-    /// Set on the lead's task of a team goal: the brief, the approved plan and how far it got.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub goal: Option<Goal>,
-    /// Set on a task Shark started from a goal's plan row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub part: Option<Part>,
+    /// A section's Overview chat (`Section::overview`): it has no repositories of its own and
+    /// leaves Plan mode all the same. Read from the sections on load; not saved here.
+    #[serde(skip)]
+    pub overview: bool,
+    /// An Overview nobody has messaged yet (`Section::unsent`). It isn't saved and has no
+    /// directory until its first message goes out, so one that was only looked at leaves
+    /// nothing behind.
+    #[serde(skip)]
+    pub unsent: bool,
 }
 
 /// A tab's identity in the strip, stable across reordering.
@@ -613,8 +418,7 @@ pub enum TabId {
     Artifacts,
     /// `repo/rel/path`, as in the diff.
     File(String),
-    /// A goal task's first tab. Implicit: never in `tab_order`, so an older build still reads
-    /// the file (`normalize_tabs` drops it).
+    /// Legacy value from the removed Teams feature: read and dropped by `normalize_tabs`.
     Goal,
 }
 
@@ -665,10 +469,15 @@ impl Default for Task {
             artifacts_pinned: Vec::new(),
             viewed: HashMap::new(),
             tab_order: Vec::new(),
-            goal: None,
-            part: None,
+            overview: false,
+            unsent: false,
         }
     }
+}
+
+/// Saves every task but an Overview nobody has messaged yet (`Task::unsent`).
+fn sent_tasks<S: serde::Serializer>(tasks: &[Task], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(tasks.iter().filter(|t| !t.unsent))
 }
 
 /// One conversation: its own claude process, session and transcript.
@@ -813,11 +622,6 @@ pub const NEW_TASK: &str = "New agent";
 /// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
 pub const REPO_CONTEXT: &str = "repo:";
 pub const AGENT_CONTEXT: &str = "agent:";
-/// A goal's lead gets its team under `team:<slug>`; a task of a goal gets `goal:<name>` and one
-/// `after:<key>` per row it comes after. None is in a root doc, so each goes with a message.
-pub const TEAM_CONTEXT: &str = "team:";
-pub const GOAL_CONTEXT: &str = "goal:";
-pub const AFTER_CONTEXT: &str = "after:";
 
 /// The key prefix of a Linear issue in `Task::context`, before its UUID. Unlike repositories
 /// these are in no root doc, so every session gets them with its first normal turn.
@@ -1079,9 +883,10 @@ impl Task {
     }
 
     /// Whether it has a repository to build in; plan mode can't end without one. An attachment
-    /// counts until it is done: set up, or continued past a failed setup.
+    /// counts until it is done: set up, or continued past a failed setup. An Overview builds
+    /// through its section's tasks, so it needs none.
     pub fn ready(&self) -> bool {
-        !self.repos.is_empty() && self.attaching.is_empty()
+        (self.overview || !self.repos.is_empty()) && self.attaching.is_empty()
     }
 
     /// The primary attached issue, as last retrieved.
@@ -1144,34 +949,6 @@ impl Task {
                     text,
                 },
             );
-        }
-        let mut note = |key: String, text: String| {
-            let fingerprint = crate::files::fingerprint(&text);
-            notes.insert(key, ContextNote { text, fingerprint });
-        };
-        if let Some(goal) = &self.goal {
-            let repos: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
-            note(
-                format!("{TEAM_CONTEXT}{}", goal.team),
-                crate::team::lead_note(goal, &repos),
-            );
-        }
-        if let Some(part) = &self.part {
-            note(
-                format!("{GOAL_CONTEXT}{}", part.goal),
-                format!(
-                    "[shark] This task is {} of the goal \"{}\". Do this task only; other tasks of the goal are someone else's.",
-                    part.key, part.goal_title
-                ),
-            );
-            for (key, result) in &part.after {
-                note(
-                    format!("{AFTER_CONTEXT}{key}"),
-                    format!(
-                        "[shark] This task comes after {key}, whose work is already on your branch. Its agent reported:\n{result}"
-                    ),
-                );
-            }
         }
         notes
     }
@@ -1539,6 +1316,7 @@ impl State {
             }
         }
         state.chat_agents_migrated = true;
+        state.link_overviews();
         if migrated_instances || migrate_agents || linked {
             let _ = state.save_at(path);
         }
@@ -1583,8 +1361,87 @@ impl State {
         }
     }
 
+    /// Marks each section's Overview task (`Task::overview`), and forgets what no longer
+    /// holds: an Overview whose task is gone, an unsent one whose section is.
+    fn link_overviews(&mut self) {
+        let State {
+            sections, tasks, ..
+        } = self;
+        let named = |s: &Section, t: &Task| {
+            s.overview.as_ref() == Some(&t.name) || s.unsent.as_ref() == Some(&t.name)
+        };
+        tasks.retain(|t| !t.unsent || sections.iter().any(|s| named(s, t)));
+        // One section per Overview, and an Overview is never one of the tasks it oversees.
+        let mut taken: Vec<String> = vec![];
+        for s in sections.iter_mut() {
+            let gone = |n: &mut String| !tasks.iter().any(|t| &t.name == n) || taken.contains(n);
+            s.overview.take_if(gone);
+            s.unsent.take_if(gone);
+            taken.extend(s.overview.iter().chain(&s.unsent).cloned());
+        }
+        for s in sections.iter_mut() {
+            s.tasks.retain(|n| !taken.contains(n));
+        }
+        for t in tasks.iter_mut() {
+            t.overview = sections.iter().any(|s| named(s, t));
+        }
+    }
+
+    /// The name of section `i`'s Overview task, messaged or not.
+    pub fn overview_of(&self, i: usize) -> Option<&str> {
+        let s = self.sections.get(i)?;
+        s.overview.as_deref().or(s.unsent.as_deref())
+    }
+
+    /// The section task `name` is the Overview of, messaged or not.
+    pub fn overview_section(&self, name: &str) -> Option<usize> {
+        (0..self.sections.len()).find(|&i| self.overview_of(i) == Some(name))
+    }
+
+    /// Section `i`'s Overview is opened for the first time: `task` joins the tasks, unsaved
+    /// until its first message.
+    pub fn draft_overview(&mut self, i: usize, mut task: Task) {
+        (task.overview, task.unsent) = (true, true);
+        self.sections[i].unsent = Some(task.name.clone());
+        self.tasks.push(task);
+    }
+
+    /// An Overview's first message went out: its task is saved from now on. Returns whether
+    /// `name` was an unsent Overview.
+    pub fn overview_sent(&mut self, name: &str) -> bool {
+        let Some(task) = (self.tasks.iter_mut()).find(|t| t.unsent && t.name == name) else {
+            return false;
+        };
+        task.unsent = false;
+        for s in &mut self.sections {
+            if s.unsent.as_deref() == Some(name) {
+                s.overview = s.unsent.take();
+            }
+        }
+        true
+    }
+
+    /// Ends task `name` being a section's Overview: the section is a plain one again and the
+    /// task an ordinary one. Returns whether it was an Overview.
+    fn end_overview(&mut self, name: &str) -> bool {
+        let Some(i) = self.overview_section(name) else {
+            return false;
+        };
+        (self.sections[i].overview, self.sections[i].unsent) = (None, None);
+        self.link_overviews();
+        true
+    }
+
+    /// Removes section `i`: its tasks are ungrouped, and its Overview an ordinary task.
+    pub fn remove_section(&mut self, i: usize) -> Section {
+        let section = self.sections.remove(i);
+        self.link_overviews();
+        section
+    }
+
     /// Forgets task `name` everywhere the state lists it.
     pub fn remove_task(&mut self, name: &str) {
+        self.end_overview(name);
         self.tasks.retain(|w| w.name != name);
         self.reviewed.remove(name);
         self.merge_order.remove(name);
@@ -1593,8 +1450,14 @@ impl State {
         }
     }
 
-    /// Moves task `ws` into section `to`, or out of all sections for `None`.
+    /// Moves task `ws` into section `to`, or out of all sections for `None`. An Overview that
+    /// moves is an ordinary task from then on.
     pub fn move_to_section(&mut self, ws: &str, to: Option<usize>) {
+        // An Overview nobody has messaged is no task to move.
+        if self.tasks.iter().any(|t| t.unsent && t.name == ws) {
+            return;
+        }
+        self.end_overview(ws);
         let from = (self.sections.iter()).position(|s| s.tasks.iter().any(|w| w == ws));
         if from == to {
             return;
@@ -2562,6 +2425,8 @@ mod tests {
             sections: vec![Section {
                 name: "S".into(),
                 icon: "folder".into(),
+                overview: None,
+                unsent: None,
                 collapsed: false,
                 tasks: vec!["a".into(), "b".into()],
             }],
@@ -2683,6 +2548,8 @@ mod tests {
         let section = |n: &str, ws: &[&str]| Section {
             name: n.into(),
             icon: "folder".into(),
+            overview: None,
+            unsent: None,
             collapsed: false,
             tasks: ws.iter().map(|w| w.to_string()).collect(),
         };
@@ -2699,6 +2566,207 @@ mod tests {
         assert!(st.sections[1].tasks.is_empty());
     }
 
+    /// A state file from when Shark had Teams still loads: the team, goal and part data are
+    /// dropped, and a saved `goal` tab doesn't make the whole file unreadable.
+    #[test]
+    fn a_state_with_teams_data_loads_and_saves_without_it() {
+        let dir = std::env::temp_dir().join(format!("shark-teams-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let old = serde_json::json!({
+            "repos": [],
+            "teams": [{"slug": "core", "name": "Core", "lead": "ceo", "agents": ["coder"],
+                "limits": {"running": 3, "floor": 20, "minutes": 180, "tasks": 8}}],
+            "workspaces": [
+                {"name": "lead", "branch": "lead", "repos": [], "title": "Ship it",
+                 "tab_order": ["goal", {"chat": "lead"}, "diff"],
+                 "goal": {"team": "core", "brief": "Ship it", "state": {"paused": "time"},
+                     "rows": [{"key": "T1", "title": "One", "state": "started",
+                         "task": {"name": "worker", "instance_id": "i"}}]}},
+                {"name": "worker", "branch": "worker", "repos": [],
+                 "part": {"goal": "lead", "goal_title": "Ship it", "key": "T1", "after": []}},
+            ],
+            "sections": [{"name": "A", "icon": "folder", "workspaces": ["worker"]}],
+        });
+        fs::write(&path, old.to_string()).unwrap();
+        let st = State::load_at(&path);
+        assert!(
+            st.corrupt_backup.is_none() && !st.read_only,
+            "it wasn't reset"
+        );
+        let names: Vec<_> = st.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["lead", "worker"], "both are ordinary tasks now");
+        assert!(!st.tasks[0].tab_order.contains(&TabId::Goal));
+        assert!(st.tasks[0].tab_order.contains(&TabId::Chat("lead".into())));
+        assert_eq!(st.sections[0].tasks, ["worker"]);
+        st.save_at(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("teams").is_none());
+        let tasks = saved["workspaces"].as_array().unwrap();
+        assert!(tasks[0].get("goal").is_none() && tasks[1].get("part").is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn overview_state() -> State {
+        let task = |name: &str| Task {
+            name: name.into(),
+            branch: name.into(),
+            ..Default::default()
+        };
+        let mut st = State {
+            tasks: vec![task("x")],
+            sections: vec![Section {
+                name: "A".into(),
+                icon: "folder".into(),
+                overview: None,
+                unsent: None,
+                collapsed: false,
+                tasks: vec!["x".into()],
+            }],
+            ..Default::default()
+        };
+        st.draft_overview(0, task("over"));
+        st
+    }
+
+    /// The one saved thing is the section's field; the task's mark is read back from it. An
+    /// Overview nobody messaged isn't saved, and its section loads as a plain one.
+    #[test]
+    fn an_overview_is_saved_once_it_was_messaged() {
+        let dir = std::env::temp_dir().join(format!("shark-overview-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut st = overview_state();
+        let task = |st: &State, n: &str| st.tasks.iter().find(|t| t.name == n).cloned();
+        let over = task(&st, "over").unwrap();
+        assert!(
+            over.overview && over.unsent && over.ready(),
+            "an Overview needs no repository"
+        );
+        assert!(!st.tasks[0].overview && !st.tasks[0].ready());
+        assert_eq!(
+            (st.overview_of(0), st.overview_section("over")),
+            (Some("over"), Some(0))
+        );
+        st.save_at(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("over"),
+            "and nothing of it is saved: {saved}"
+        );
+        let back = State::load_at(&path);
+        assert_eq!((back.tasks.len(), back.overview_of(0)), (1, None));
+
+        assert!(st.overview_sent("over") && !st.overview_sent("over"));
+        assert!(!task(&st, "over").unwrap().unsent);
+        st.save_at(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["sections"][0]["overview"], "over");
+        let over = (saved["workspaces"].as_array().unwrap().iter())
+            .find(|t| t["name"] == "over")
+            .unwrap();
+        assert!(over.get("overview").is_none(), "nothing new on the task");
+        let back = State::load_at(&path);
+        assert_eq!(back.sections[0].overview.as_deref(), Some("over"));
+        assert_eq!(back.overview_section("over"), Some(0));
+        assert!(task(&back, "over").unwrap().overview && !task(&back, "x").unwrap().overview);
+        assert_eq!(
+            back.sections[0].tasks,
+            ["x"],
+            "it is not one of the section's tasks"
+        );
+        // A saved Overview whose task is gone loads as a plain section.
+        let mut gone = back;
+        gone.tasks.retain(|t| t.name != "over");
+        gone.save_at(&path).unwrap();
+        assert_eq!(State::load_at(&path).sections[0].overview, None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Moving the Overview out, or deleting it, leaves a plain section and its tasks alone.
+    #[test]
+    fn an_overview_that_leaves_makes_its_section_plain() {
+        let task = |st: &State, n: &str| st.tasks.iter().find(|t| t.name == n).cloned();
+        let sent = || {
+            let mut st = overview_state();
+            st.overview_sent("over");
+            st
+        };
+        for to in [None, Some(0)] {
+            let mut st = sent();
+            st.move_to_section("over", to);
+            assert_eq!(st.overview_of(0), None, "{to:?}");
+            assert!(
+                !task(&st, "over").unwrap().overview,
+                "an ordinary task again"
+            );
+            let listed = st.sections[0].tasks.iter().any(|t| t == "over");
+            assert_eq!(listed, to.is_some(), "{to:?}");
+            assert!(st.sections[0].tasks.iter().any(|t| t == "x"));
+        }
+        let mut st = sent();
+        st.remove_task("over");
+        assert_eq!(st.overview_of(0), None);
+        assert_eq!(st.sections[0].tasks, ["x"]);
+        // A section's own task moving is not the Overview's business.
+        let mut st = sent();
+        st.move_to_section("x", None);
+        assert_eq!(st.overview_of(0), Some("over"));
+        assert!(task(&st, "over").unwrap().overview);
+        // The section goes: a messaged Overview stays as an ordinary task, an unsent one doesn't.
+        let mut st = sent();
+        st.remove_section(0);
+        assert!(task(&st, "over").is_some_and(|t| !t.overview));
+        let mut st = overview_state();
+        st.remove_section(0);
+        assert!(
+            task(&st, "over").is_none(),
+            "nothing is left of one never messaged"
+        );
+        let mut st = overview_state();
+        st.remove_task("over");
+        assert!(task(&st, "over").is_none() && st.overview_of(0).is_none());
+        // Before its first message there is no task to move: the Overview stays where it is.
+        let mut st = overview_state();
+        st.move_to_section("over", None);
+        assert!(task(&st, "over").is_some_and(|t| t.unsent));
+        assert_eq!(st.overview_of(0), Some("over"));
+    }
+
+    /// A damaged or hand-edited file: an Overview claimed by two sections, or listed among the
+    /// tasks it oversees, loads as one section's Overview and as no task of any section.
+    #[test]
+    fn overview_links_are_repaired_on_load() {
+        let dir = std::env::temp_dir().join(format!("shark-overview-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let old = serde_json::json!({
+            "repos": [],
+            "workspaces": [
+                {"name": "over", "branch": "over", "repos": []},
+                {"name": "x", "branch": "x", "repos": []},
+            ],
+            "sections": [
+                {"name": "A", "icon": "folder", "overview": "over", "workspaces": ["over", "x"]},
+                {"name": "B", "icon": "folder", "overview": "over", "workspaces": ["over"]},
+            ],
+        });
+        fs::write(&path, old.to_string()).unwrap();
+        let st = State::load_at(&path);
+        assert_eq!(st.sections[0].overview.as_deref(), Some("over"));
+        assert_eq!(
+            st.sections[0].tasks,
+            ["x"],
+            "an Overview doesn't oversee itself"
+        );
+        assert_eq!(st.sections[1].overview, None, "one section per Overview");
+        assert!(st.sections[1].tasks.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn drop_task_reorders_and_regroups() {
         let task = |name: &str| Task {
@@ -2711,6 +2779,8 @@ mod tests {
             sections: vec![Section {
                 name: "S".into(),
                 icon: "folder".into(),
+                overview: None,
+                unsent: None,
                 collapsed: false,
                 tasks: vec!["c".into(), "d".into()],
             }],

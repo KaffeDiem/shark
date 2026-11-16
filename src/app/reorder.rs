@@ -186,22 +186,24 @@ impl Shark {
                 })
                 .unwrap_or_default()
         } else {
-            // Teams, goals and their tasks don't move by drag; a stack moves as one item, its
-            // bottom task's, even where that row isn't drawn (the rail hides Backlog).
+            // A stack moves as one item, its bottom task's, even where that row isn't
+            // drawn (the rail hides Backlog).
             let stacks = self.side_stacks();
             let mut items: Vec<Item> = vec![];
             for row in self.side_rows_in(false, &stacks) {
                 let item = match row {
+                    // An Overview stays its section's first row: it is no item to move or
+                    // to drop on.
+                    SideRow::Overview(_) => continue,
+                    SideRow::Task(i) if self.state.tasks[i].overview => continue,
                     SideRow::Task(i) | SideRow::Pr(i, _) => {
                         let at = (stacks.iter().find(|s| s.has(i) || s.anchor == i))
                             .map_or(i, |s| s.anchor);
-                        (self.team_of(&self.state.tasks[at]).is_none())
-                            .then(|| Item::Task(self.state.tasks[at].name.clone()))
+                        Item::Task(self.state.tasks[at].name.clone())
                     }
-                    SideRow::Section(i) => Some(Item::Section(i)),
-                    SideRow::Team(_) => None,
+                    SideRow::Section(i) => Item::Section(i),
                 };
-                if let Some(item) = item.filter(|it| items.last() != Some(it)) {
+                if items.last() != Some(&item) {
                     items.push(item);
                 }
             }
