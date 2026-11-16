@@ -91,7 +91,10 @@ impl Remote {
     }
 
     pub fn branch_url(&self, branch: &str) -> String {
-        format!("{}?version=GB{}", self.web(), encode(branch))
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("version", &format!("GB{branch}"))
+            .finish();
+        format!("{}?{query}", self.web())
     }
 
     fn work_item_url(&self, id: u64) -> String {
