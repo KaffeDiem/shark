@@ -4956,8 +4956,10 @@ done
         let emitted = std::rc::Rc::new(std::cell::Cell::new(0));
         let n = emitted.clone();
         cx.update(|cx| {
-            cx.subscribe(&chat, move |_, _, _| n.set(n.get() + 1))
-                .detach()
+            cx.subscribe(&chat, move |_, ev: &ChatEvent, _| {
+                n.set(n.get() + usize::from(matches!(ev, ChatEvent::TurnDone)))
+            })
+            .detach()
         });
         cx.update(|cx| {
             chat.update(cx, |c, cx| {

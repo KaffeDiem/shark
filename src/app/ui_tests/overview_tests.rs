@@ -45,6 +45,14 @@ fn chat_of(cx: &mut TestAppContext, shark: &Entity<Shark>, task: &str) -> Entity
     })
 }
 
+/// A fake agent of this file's own, so one a test before it started late doesn't write over
+/// what these tests read.
+fn own_claude() -> PathBuf {
+    let own = quiet_claude().with_file_name("overview-claude");
+    fs::copy(quiet_claude(), &own).unwrap();
+    own
+}
+
 /// What the fake agent was started with; it writes its arguments as it starts.
 fn started_with(quiet: &std::path::Path) -> String {
     let args = PathBuf::from(format!("{}.args", quiet.display()));
@@ -114,7 +122,7 @@ fn open_overview(
 async fn an_overview_is_its_sections_first_row_and_exists_from_its_first_message(
     cx: &mut TestAppContext,
 ) {
-    let quiet = quiet_claude();
+    let quiet = own_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _claude = ClaudeGuard::set(&quiet);
     let _ = crate::mcp::start();
@@ -247,7 +255,7 @@ async fn an_overview_is_its_sections_first_row_and_exists_from_its_first_message
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn an_overviews_tools_run_its_section(cx: &mut TestAppContext) {
-    let quiet = quiet_claude();
+    let quiet = own_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _claude = ClaudeGuard::set(&quiet);
     let home = test_home();
@@ -523,6 +531,83 @@ async fn an_unsent_overview_is_no_task_to_act_on(cx: &mut TestAppContext) {
             "the same task, at its new index"
         );
     });
+}
+
+/// On the real renderer: the Overview row answers the pointer like the rows around it, before
+/// it has a task and after.
+/// `SHARK_RENDER_OVERVIEW_ONLY=1 cargo test --features test-support --test rendering`
+pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    section_state(&home, &["one"]).save().unwrap();
+    let (window, shark) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(1280.), px(800.)),
+                    ))),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |w, cx| cx.new(|cx| Shark::new(w, cx)),
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // The row's background, sampled right of its text; `hover` puts the pointer on `id` first.
+    let row_color = |cx: &mut gpui_kit::HeadlessAppContext, hover: Option<&'static str>| {
+        let at = cx
+            .update_window(window, |_, w, cx| {
+                match hover {
+                    Some("overview") => w.hover(("overview", 0usize), cx),
+                    Some(other) => w.hover(other, cx),
+                    None => {}
+                }
+                w.render_frame(cx);
+                let b = w.find(("overview", 0usize)).bounds();
+                (f32::from(b.right()) - 12., f32::from(b.center().y))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| w.render_frame(cx))
+            .unwrap();
+        let shot = cx.capture_screenshot(window).expect("real renderer");
+        let scale = shot.width() as f32 / 1280.;
+        *shot.get_pixel((at.0 * scale) as u32, (at.1 * scale) as u32)
+    };
+    for sent in [false, true] {
+        if sent {
+            // Once it has a task, and another row is the open one.
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    s.open_overview(0, w, cx);
+                    let name = s.active.clone().unwrap();
+                    s.state.overview_sent(&name);
+                    s.open_task(0, w, cx);
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        let away = row_color(cx, Some("ws-header"));
+        let over = row_color(cx, Some("overview"));
+        assert_ne!(
+            away, over,
+            "hovering highlights the Overview row (sent: {sent})"
+        );
+        assert_eq!(
+            row_color(cx, Some("ws-header")),
+            away,
+            "and leaving ends it"
+        );
+    }
+    cx.update_window(window, |_, w, _| w.remove_window())
+        .unwrap();
+    cx.run_until_parked();
 }
 
 /// The whole thing against a real Claude, on the real renderer: an Overview starts a task with

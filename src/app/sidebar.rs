@@ -1249,8 +1249,9 @@ impl Shark {
             .role(gpui_kit::accesskit::Role::Button)
             .aria_label(format!("Overview of {name}"))
             .ml(px(32.))
-            .map(|d| cursor_row(d, true, selected, focused, theme))
-            .when(!bright, |d| d.bg(theme.transparent))
+            // The open row's pill, the cursor's ring, and a hover for the rest. Not a task
+            // row's hover: that one is its Quick Look card's, and an Overview has no card.
+            .map(|d| cursor_row(d, active, selected, focused, theme))
             .text_color(foreground)
             .child(div().size(ISZ).flex_none().child(icon))
             .child(
@@ -1270,25 +1271,31 @@ impl Shark {
                         .child(time),
                 )
             });
-        match (ix, task) {
-            // Once messaged, a task like any other to open, move out or delete.
-            (Some(ix), Some(task)) if !task.unsent => {
-                self.task_row_events(d, ix, task, cx).into_any_element()
-            }
-            _ => d
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |s, _, _, cx| {
-                        s.sel = row;
-                        cx.notify();
-                    }),
-                )
-                .on_click(cx.listener(move |s, _, window, cx| {
+        // Once messaged it is a task like any other to move out or delete.
+        let menu = task.filter(|t| !t.unsent).cloned();
+        d.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |s, _, _, cx| {
+                s.sel = row;
+                cx.notify();
+            }),
+        )
+        .on_click(cx.listener(move |s, _, window, cx| {
+            s.close_peek(cx);
+            s.open_overview(i, window, cx);
+        }))
+        .when_some(menu, |d, task| {
+            d.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                    s.sel = row;
+                    let entries = ws_menu(s, &task, cx);
                     s.close_peek(cx);
-                    s.open_overview(i, window, cx);
-                }))
-                .into_any_element(),
-        }
+                    s.show_menu(e.position, entries, w, cx);
+                }),
+            )
+        })
+        .into_any_element()
     }
 
     /// A section's header: icon, name and fold chevron. Folded, it shows one fact on the right:

@@ -1139,7 +1139,8 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
     })
     .unwrap();
-    press(cx, &["j", "m"]);
+    // Past the section's Overview row to the task.
+    press(cx, &["j", "j", "m"]);
     cx.run_until_parked();
     press(cx, &["enter"]);
     assert_eq!(sections(cx)[0].tasks, ["kb"]);
