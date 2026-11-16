@@ -790,3 +790,182 @@ fn a_failed_retarget_follows_github_again(cx: &mut TestAppContext) {
         assert_eq!(base_of(s, "tab-view"), "origin/anchor");
     });
 }
+
+/// Presses on the sidebar row `from` and drags it over `to`; returns the pointer.
+fn begin_drag(w: &mut Window, cx: &mut App, from: ElementId, to: ElementId) -> Point<Pixels> {
+    w.render_frame(cx);
+    let from = w.within("sidebar").find(from).bounds().center();
+    let to = w.within("sidebar").find(to).bounds().center();
+    w.pointer_down(from, MouseButton::Left, cx);
+    w.pointer_move(from + point(px(0.), px(8.)), Some(MouseButton::Left), cx);
+    w.pointer_move(to, Some(MouseButton::Left), cx);
+    w.render_frame(cx);
+    to
+}
+
+/// Where the sidebar draws `ids` now.
+fn bounds_of(w: &mut Window, ids: &[ElementId]) -> Vec<Bounds<Pixels>> {
+    (ids.iter())
+        .map(|id| w.within("sidebar").find(id.clone()).bounds())
+        .collect()
+}
+
+/// Releases at `at` and returns `ids`' bounds in the preview and after the drop.
+fn drop_at(
+    w: &mut Window,
+    cx: &mut App,
+    at: Point<Pixels>,
+    ids: &[ElementId],
+) -> (Vec<Bounds<Pixels>>, Vec<Bounds<Pixels>>) {
+    let preview = bounds_of(w, ids);
+    w.pointer_up(at, MouseButton::Left, cx);
+    w.render_frame(cx);
+    (preview, bounds_of(w, ids))
+}
+
+/// Drags the sidebar row `from` onto `to` with motion reduced, so the preview settles at
+/// once, and returns `ids`' bounds in the preview and after the release.
+fn drag_and_drop(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    from: ElementId,
+    to: ElementId,
+    ids: &[ElementId],
+) -> (Vec<Bounds<Pixels>>, Vec<Bounds<Pixels>>) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    cx.update_window(window, |_, w, cx| {
+        let at = begin_drag(w, cx, from, to);
+        drop_at(w, cx, at, ids)
+    })
+    .unwrap()
+}
+
+/// The preview takes a stack from where it was grabbed: grabbing a lower row of the block
+/// doesn't make the dragged block jump down to that row.
+#[gpui_kit::test]
+fn a_stack_drag_preview_starts_where_it_was_grabbed(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = booted(cx);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let api = ix(shark.read(cx), "api");
+        let block = w.within("sidebar").find("stack-api").bounds();
+        let row = w.within("sidebar").find(api).bounds();
+        assert!(
+            row.top() > block.top() + px(40.),
+            "api is the stack's lower row"
+        );
+        let grab = row.center();
+        w.pointer_down(grab, MouseButton::Left, cx);
+        w.pointer_move(grab + point(px(0.), px(8.)), Some(MouseButton::Left), cx);
+        w.render_frame(cx);
+        // GPUI starts the drag where the pointer crossed its threshold: the block stays put.
+        let preview = w.find("reorder-preview").bounds();
+        assert_eq!(preview.top(), block.top(), "the block starts where it is");
+        w.pointer_move(grab + point(px(0.), px(28.)), Some(MouseButton::Left), cx);
+        w.render_frame(cx);
+        let preview = w.find("reorder-preview").bounds();
+        assert_eq!(
+            preview.top(),
+            block.top() + px(20.),
+            "then follows the pointer"
+        );
+        assert_eq!(preview.size.height, block.size.height);
+        w.pointer_up(grab + point(px(0.), px(28.)), MouseButton::Left, cx);
+    })
+    .unwrap();
+}
+
+/// Around a stack, every row's preview spot is where the drop puts it: nothing jumps on release.
+#[gpui_kit::test]
+fn stack_drag_previews_land_where_the_drop_does(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = booted(cx);
+    let id = |s: &Entity<Shark>, cx: &mut TestAppContext, n: &str| {
+        ElementId::from(cx.read(|cx| ix(s.read(cx), n)))
+    };
+    let stack = ElementId::from("stack-api");
+    let (fix, readme) = (id(&shark, cx, "fix"), id(&shark, cx, "readme"));
+
+    // A task dropped on the stack: the stack's margin moves with it.
+    let ids = [stack.clone(), readme.clone()];
+    let (preview, after) = drag_and_drop(cx, window, fix.clone(), stack.clone(), &ids);
+    on_app(window, shark.clone())(cx, &|s, _, _| {
+        assert_eq!(s.state.sections[0].tasks, ["api", "fix"]);
+    });
+    assert_eq!(preview, after, "task onto stack");
+
+    // `ui` was a stack's bottom row before it joined api's: its old bounds aren't a row.
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let ui = ix(s, "ui");
+        s.state.tasks[ui].repos[0].base = "origin/main".into();
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        let ui = ix(s, "ui");
+        s.state.tasks[ui].repos[0].base = "origin/api".into();
+        cx.notify();
+    });
+    let ids = [fix.clone(), readme.clone()];
+    let (preview, after) = drag_and_drop(cx, window, stack.clone(), fix.clone(), &ids);
+    on_app(window, shark.clone())(cx, &|s, _, _| {
+        // The stack's other tasks follow it into the section.
+        assert_eq!(s.state.sections[0].tasks[..2], ["fix", "api"]);
+    });
+    assert_eq!(preview, after, "after a stack reshuffle");
+
+    // The stack last in the list, dragged up: its own spacing goes with it.
+    on_app(window, shark.clone())(cx, &|s, _, cx| s.move_to_section("api", None, cx));
+    let fix_now = id(&shark, cx, "fix");
+    let readme_now = id(&shark, cx, "readme");
+    on_app(window, shark.clone())(cx, &|s, _, _| {
+        assert_eq!(
+            *rows(s).last().unwrap(),
+            T(ix(s, "api")),
+            "the stack is last"
+        );
+    });
+    let ids = [fix_now.clone(), readme_now];
+    let (preview, after) = drag_and_drop(cx, window, stack.clone(), fix_now, &ids);
+    assert_eq!(preview, after, "last stack moved up");
+}
+
+/// A stack that changes mid-drag (a PR list came in) lays the preview out again, even with the
+/// pointer still over the same target.
+#[gpui_kit::test]
+fn a_stack_changing_mid_drag_lays_the_preview_out_again(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = booted(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (fix, ui, readme) = cx.read(|cx| {
+        let s = shark.read(cx);
+        (ix(s, "fix"), ix(s, "ui"), ix(s, "readme"))
+    });
+    // readme, last, dragged onto fix: fix and the stack below it make room.
+    let to = cx
+        .update_window(window, |_, w, cx| {
+            begin_drag(w, cx, readme.into(), fix.into())
+        })
+        .unwrap();
+    // `ui` leaves api's stack: `main ← ui ← wiring` now draws between api and readme.
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        s.state.tasks[ui].repos[0].base = "origin/main".into();
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.pointer_move(to, Some(MouseButton::Left), cx);
+        w.render_frame(cx);
+        let api = ix(shark.read(cx), "api");
+        let ids = [ElementId::from(fix), api.into(), "stack-ui".into()];
+        let (preview, after) = drop_at(w, cx, to, &ids);
+        assert_eq!(
+            shark.read(cx).state.sections[0].tasks,
+            ["readme", "fix", "api"]
+        );
+        assert_eq!(preview, after);
+    })
+    .unwrap();
+}

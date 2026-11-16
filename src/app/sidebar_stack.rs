@@ -81,6 +81,11 @@ const ICON: f32 = 16.;
 const SLIM_ICON: f32 = 12.;
 /// The rail stops this far short of each icon.
 const CLEAR: f32 = 3.;
+/// Space above and below a block outside the rail: padding, not margin, so the block's bounds
+/// hold it and a drag preview moves it with the block.
+fn pad(rail: bool) -> f32 {
+    if rail { 0. } else { 6. }
+}
 
 impl Shark {
     /// The stacks the sidebar shows, from the saved bases, the cached trunks and the open
@@ -378,7 +383,7 @@ impl Shark {
             bottom: f32,
         }
         let mut marks: Vec<Mark> = vec![];
-        let mut y = 0.;
+        let mut y = pad(rail);
         let mut mark = |node, icon: f32, height: f32, y: &mut f32| {
             let top = if rail { *y } else { *y + ICON_TOP };
             marks.push(Mark {
@@ -445,8 +450,9 @@ impl Shark {
                 "stack-{}",
                 tasks[st.anchor].name
             )))
+            .test_support()
             .relative()
-            .when(!rail, |d| d.my(px(6.)))
+            .py(px(pad(rail)))
             .children(children)
             .children(segments)
             .into_any_element()
@@ -467,11 +473,11 @@ impl Shark {
             SideRow::Task(ix) if !self.slim(ix) => (TASK_H + GAP, GAP),
             _ => (SLIM_H + GAP, GAP),
         };
-        let top = rows
-            .iter()
+        let above: f32 = (rows.iter())
             .take_while(|r| **r != row)
             .map(|r| pitch(r).0)
             .sum();
+        let top = pad(self.rail) + above;
         let (p, g) = pitch(&row);
         (top, p - g)
     }
