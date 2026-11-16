@@ -1354,6 +1354,12 @@ fn web_link(url: &str, ctx: Option<&DocContext>) -> Option<String> {
     let rev = ctx.rev.as_deref().unwrap_or("HEAD");
     // Segments are percent-encoded: `a#b.png` must not become a fragment.
     let mut link = url::Url::parse(ctx.web.as_deref()?).ok()?;
+    if link.path_segments()?.any(|segment| segment == "_git") {
+        link.query_pairs_mut()
+            .append_pair("path", &format!("/{path}"))
+            .append_pair("version", &format!("GC{rev}"));
+        return Some(link.into());
+    }
     (link.path_segments_mut().ok()?)
         .pop_if_empty()
         .extend(["blob", rev])
@@ -2650,6 +2656,15 @@ mod tests {
             link_url("../README.md#usage", Some(&ctx)).as_deref(),
             Some("https://github.com/o/r/blob/abc/README.md#usage")
         );
+        let azure = DocContext {
+            web: Some("https://dev.azure.com/o/p/_git/r".into()),
+            ..ctx.clone()
+        };
+        let link = url::Url::parse(&web_link("../README.md", Some(&azure)).unwrap()).unwrap();
+        let query: HashMap<_, _> = link.query_pairs().into_owned().collect();
+        assert_eq!(link.path(), "/o/p/_git/r");
+        assert_eq!(query["path"], "/README.md");
+        assert_eq!(query["version"], "GCabc");
         assert_eq!(
             link_url("https://x.test/a", Some(&ctx)).as_deref(),
             Some("https://x.test/a")

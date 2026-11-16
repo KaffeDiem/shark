@@ -329,6 +329,13 @@ impl GitSync {
                 cx.notify();
             }
         }
+        let reset_azure_votes = p
+            .prs
+            .as_deref()
+            .is_some_and(|prs| Self::reset_handled_azure_votes(&mut self.reviewed, prs));
+        if reset_azure_votes {
+            cx.emit(SyncEvent::Reviewed(self.reviewed.clone()));
+        }
         let bases: Vec<_> = self.repos.iter().map(repo_diff_base).collect();
         self.repos = repos_from(&self.ws, p.locals, p.prs, p.parents, &self.repos);
         let adopted: Vec<_> = self
@@ -367,6 +374,25 @@ impl GitSync {
             self.action = Some(action);
             cx.notify();
         }
+    }
+
+    fn reset_handled_azure_votes(
+        reviewed: &mut Vec<String>,
+        prs: &[Result<Option<Pr>, String>],
+    ) -> bool {
+        let azure_prs: Vec<&Pr> = prs
+            .iter()
+            .filter_map(|result| result.as_ref().ok()?.as_ref())
+            .filter(|pr| crate::azure::parse_pr_url(&pr.url).is_some())
+            .collect();
+        let before = reviewed.len();
+        reviewed.retain(|id| {
+            azure_prs.iter().all(|pr| {
+                let prefix = format!("az-vote-{}-", pr.url);
+                !id.starts_with(&prefix) || pr.change_requests.contains(id)
+            })
+        });
+        before != reviewed.len()
     }
 
     // ponytail: a closed chat's two subscriptions live until the task closes; they hold no
@@ -1375,6 +1401,42 @@ mod tests {
     use super::{
         Action, Instant, Job, Kind, Local, Pr, PrState, needs_you, repos_from, run_job, status,
     };
+
+    #[test]
+    fn approved_azure_votes_clear_handled_rejections() {
+        let url = "https://dev.azure.com/o/p/_git/r/pullrequest/12";
+        let stale = format!("az-vote-{url}-rev--5");
+        let active = format!("az-vote-{url}-other--5");
+        let mut handled = vec![stale.clone(), active.clone()];
+        let observed = Pr {
+            url: url.into(),
+            review: "CHANGES_REQUESTED".into(),
+            change_requests: vec![active.clone()],
+            ..super::open_pr("r", 12)
+        };
+        assert!(super::GitSync::reset_handled_azure_votes(
+            &mut handled,
+            &[Ok(Some(observed))]
+        ));
+        assert_eq!(handled, [active]);
+        assert!(super::GitSync::reset_handled_azure_votes(
+            &mut handled,
+            &[Ok(Some(Pr {
+                url: url.into(),
+                review: "APPROVED".into(),
+                ..super::open_pr("r", 12)
+            }))]
+        ));
+        assert!(handled.is_empty());
+        assert!(!super::GitSync::reset_handled_azure_votes(
+            &mut handled,
+            &[Ok(Some(Pr {
+                url: url.into(),
+                review: "APPROVED".into(),
+                ..super::open_pr("r", 12)
+            }))]
+        ));
+    }
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]

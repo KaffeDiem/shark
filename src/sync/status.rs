@@ -609,12 +609,20 @@ fn published_review(wt: &Path, branch: &str, url: &str, origin: Option<&str>, p:
 
 /// Sets `p.contains_head` to `head` when the merged PR's head holds it.
 fn mark_contains_head(wt: &Path, p: &mut Pr, head: &str) {
+    if crate::azure::parse_pr_url(&p.url).is_some()
+        && crate::azure::contains_pr_commit(wt, &p.url, head).unwrap_or(false)
+    {
+        p.contains_head = head.to_string();
+        return;
+    }
     // A head pushed on GitHub (Update branch) and auto-deleted right after the merge
     // may never have reached a fetch here; the PR ref keeps it.
     let have = format!("{}^{{commit}}", p.head);
     if git(wt, &["cat-file", "-e", &have]).is_err() {
-        let pull = format!("refs/pull/{}/head", p.number);
-        let _ = cmd_bounded(wt, "git", &["fetch", "--quiet", "origin", &pull], 20);
+        if crate::azure::parse_pr_url(&p.url).is_none() {
+            let pull = format!("refs/pull/{}/head", p.number);
+            let _ = cmd_bounded(wt, "git", &["fetch", "--quiet", "origin", &pull], 20);
+        }
     }
     if git(wt, &["merge-base", "--is-ancestor", head, &p.head]).is_ok() {
         p.contains_head = head.to_string();

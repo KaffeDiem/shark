@@ -339,6 +339,7 @@ fn status(wt: &Path, remote: &Remote, pr: &Value) -> Result<Pr, String> {
 /// What the PR itself says, mapped onto GitHub's vocabulary that `next_action` reads.
 fn pr_from(remote: &Remote, p: &Value) -> Pr {
     let number = p["pullRequestId"].as_u64().unwrap_or(0);
+    let url = remote.pr_url(number);
     let reviewers: Vec<&Value> = p["reviewers"].as_array().into_iter().flatten().collect();
     let vote = |r: &Value| r["vote"].as_i64().unwrap_or(0);
     // -5 waiting for the author, -10 rejected: both ask for changes until the reviewer re-votes.
@@ -348,7 +349,7 @@ fn pr_from(remote: &Remote, p: &Value) -> Pr {
         _ => "",
     };
     Pr {
-        url: remote.pr_url(number),
+        url: url.clone(),
         review_checkout: false,
         number,
         state: match str(p, "status") {
@@ -370,10 +371,10 @@ fn pr_from(remote: &Remote, p: &Value) -> Pr {
         checks: Checks::Passing,
         head: str(&p["lastMergeSourceCommit"], "commitId").into(),
         base: branch_name(str(p, "targetRefName")).into(),
-        // The vote is in the ID: a new rejection after a re-review is new work.
+        // The current vote is in the ID; sync clears stale IDs when the vote changes.
         change_requests: (reviewers.iter())
             .filter(|r| vote(r) < 0)
-            .map(|r| format!("az-vote-{number}-{}-{}", str(r, "id"), vote(r)))
+            .map(|r| format!("az-vote-{url}-{}-{}", str(r, "id"), vote(r)))
             .collect(),
         comments: vec![],
         contains_head: String::new(),
@@ -445,7 +446,7 @@ fn apply_threads(pr: &mut Pr, p: &Value, threads: &Value) {
         let last = text_comments(t).last().copied();
         if let Some(c) = last.filter(|c| str(&c["author"], "id") != author) {
             pr.comments
-                .push(format!("az-thread-{}-{}", t["id"], c["id"]));
+                .push(format!("az-thread-{}-{}-{}", pr.url, t["id"], c["id"]));
         }
     }
 }
@@ -544,10 +545,12 @@ pub fn find_or_create_pr(
     {
         return Ok(remote.pr_url(n));
     }
-    let (title, body) = match new.title.is_empty() {
-        true => fill(wt, branch, base),
-        false => (new.title.clone(), new.body.clone()),
+    let filled = if new.title.is_empty() || new.body.is_empty() {
+        fill(wt, branch, base)
+    } else {
+        (String::new(), String::new())
     };
+    let (title, body) = new_pr_text(new, filled);
     let created = remote.invoke(
         wt,
         "POST",
@@ -588,6 +591,21 @@ fn fill(wt: &Path, branch: &str, base: &str) -> (String, String) {
     }
 }
 
+fn new_pr_text(new: &crate::pr::NewPr, filled: (String, String)) -> (String, String) {
+    (
+        if new.title.is_empty() {
+            filled.0
+        } else {
+            new.title.clone()
+        },
+        if new.body.is_empty() {
+            filled.1
+        } else {
+            new.body.clone()
+        },
+    )
+}
+
 pub fn description(wt: &Path, url: &str) -> Result<String, String> {
     let (remote, n) = parse_pr_url(url).ok_or("Invalid Azure DevOps pull request URL")?;
     Ok(str(&remote.get_pr(wt, n)?, "description").into())
@@ -601,7 +619,7 @@ pub fn source_branch(wt: &Path, url: &str) -> Result<String, String> {
 
 pub fn is_cross_repository_pr(wt: &Path, url: &str) -> Result<bool, String> {
     let (remote, n) = parse_pr_url(url).ok_or("Invalid Azure DevOps pull request URL")?;
-    Ok(!remote.get_pr(wt, n)?["forkSource"].is_null())
+    Ok(is_fork(&remote.get_pr(wt, n)?))
 }
 
 /// Updates the PR at `url` with `body`'s fields (`description`, `status`, `isDraft`, `targetRefName`).
@@ -744,6 +762,26 @@ impl Target {
     }
 }
 
+fn is_fork(pr: &Value) -> bool {
+    !pr["forkSource"].is_null()
+}
+
+/// Whether `commit` appears in the source history of an Azure pull request.
+pub(crate) fn contains_pr_commit(wt: &Path, url: &str, commit: &str) -> Result<bool, String> {
+    let (remote, number) = parse_pr_url(url).ok_or("Invalid Azure DevOps pull request URL")?;
+    let id = ("pullRequestId", number.to_string());
+    let commits = remote.invoke(wt, "GET", "pullRequestCommits", &[id], None)?;
+    Ok(contains_commit(&commits["value"], commit))
+}
+
+fn contains_commit(commits: &Value, commit: &str) -> bool {
+    commits
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| str(c, "commitId") == commit)
+}
+
 pub fn discover(wt: &Path, remote: &Remote, branch: &str) -> Result<Option<Target>, String> {
     Ok(fetch_pr(wt, remote, branch)?.map(|p| Target::azure(remote, p.number)))
 }
@@ -756,12 +794,6 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
     let mut d = details_from(target, &pr)?;
     let id = ("pullRequestId", target.number.to_string());
     let threads = remote.invoke(wt, "GET", "pullRequestThreads", &[id], None)?;
-    let vote_label = |v: i64| match v {
-        10 => "APPROVED",
-        5 => "Approved with suggestions",
-        -5 => "Waiting for author",
-        _ => "Rejected",
-    };
     d.reviews = (pr["reviewers"].as_array().into_iter().flatten())
         .filter(|r| r["vote"].as_i64().is_some_and(|v| v != 0))
         .map(|r| Review {
@@ -776,7 +808,7 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
                 diff_hunk: None,
                 review_id: None,
             },
-            state: vote_label(r["vote"].as_i64().unwrap_or(0)).into(),
+            state: review_state(r["vote"].as_i64().unwrap_or(0)).into(),
         })
         .collect();
     for t in threads["value"].as_array().into_iter().flatten() {
@@ -817,6 +849,14 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
         });
     }
     Ok(d)
+}
+
+fn review_state(vote: i64) -> &'static str {
+    match vote {
+        5 | 10 => "APPROVED",
+        -5 | -10 => "CHANGES_REQUESTED",
+        _ => "PENDING",
+    }
 }
 
 fn details_from(target: &Target, pr: &Value) -> Result<Details, String> {

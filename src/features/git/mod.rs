@@ -1047,10 +1047,17 @@ impl GitFeature {
             repo: self.task.dir().join(&repo.name),
             rev: d.head_sha.clone(),
             dir: String::new(),
-            web: Some(format!(
-                "https://{}/{}/{}",
-                d.target.host, d.target.owner, d.target.repo
-            )),
+            web: Some(
+                d.target
+                    .remote()
+                    .map(|remote| remote.web())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "https://{}/{}/{}",
+                            d.target.host, d.target.owner, d.target.repo
+                        )
+                    }),
+            ),
             on_disk: false,
         })
     }

@@ -28,6 +28,10 @@ fn parses_every_remote_form() {
         r("o", "My Project", "My Project")
     );
     assert_eq!(
+        Remote::parse("https://dev.azure.com/o/DefaultCollection/_git/r"),
+        r("o", "DefaultCollection", "r")
+    );
+    assert_eq!(
         Remote::parse("https://dev.azure.com/o/_git/r"),
         r("o", "r", "r")
     );
@@ -60,6 +64,12 @@ fn parses_every_remote_form() {
     assert_eq!(target.url(), url, "drafts are keyed by this URL");
     assert_eq!(Target::from_url(&url), Ok(target.clone()));
     assert_eq!(target.remote(), Some(remote));
+    let remote = r("o", "p", "r").unwrap();
+    let url = url::Url::parse(&remote.branch_url("feature/a&b+c")).unwrap();
+    assert_eq!(
+        url.query_pairs().find(|(k, _)| k == "version").unwrap().1,
+        "GBfeature/a&b+c"
+    );
 }
 
 /// Read-only, against a real clone: `SHARK_AZURE_LIVE_REPO=<path> SHARK_AZURE_LIVE_BRANCH=<b>`.
@@ -132,7 +142,10 @@ fn maps_an_open_pr_onto_githubs_vocabulary() {
     );
     assert_eq!(p.url, "https://dev.azure.com/o/p/_git/r/pullrequest/12");
     assert_eq!(p.review, "CHANGES_REQUESTED");
-    assert_eq!(p.change_requests, ["az-vote-12-rev--5"]);
+    assert_eq!(
+        p.change_requests,
+        ["az-vote-https://dev.azure.com/o/p/_git/r/pullrequest/12-rev--5"]
+    );
     let policies = json!([
         {"status": "rejected", "configuration": {"isEnabled": true, "isBlocking": true,
             "type": {"displayName": "Build"}, "settings": {"buildDefinitionId": 7, "displayName": null}}},
@@ -163,7 +176,7 @@ fn maps_an_open_pr_onto_githubs_vocabulary() {
     apply_threads(&mut p, &pr, &threads);
     assert_eq!(
         p.comments,
-        ["az-thread-1-2"],
+        ["az-thread-https://dev.azure.com/o/p/_git/r/pullrequest/12-1-2"],
         "only threads awaiting the author"
     );
     let clean = pr_from(
@@ -174,6 +187,37 @@ fn maps_an_open_pr_onto_githubs_vocabulary() {
         (clean.state, clean.merge_state.as_str()),
         (PrState::Merged, "CLEAN")
     );
+}
+
+#[test]
+fn azure_votes_use_git_review_states() {
+    assert_eq!(review_state(10), "APPROVED");
+    assert_eq!(review_state(5), "APPROVED");
+    assert_eq!(review_state(-5), "CHANGES_REQUESTED");
+    assert_eq!(review_state(-10), "CHANGES_REQUESTED");
+}
+
+#[test]
+fn title_only_pr_creation_keeps_the_filled_commit_body() {
+    let new = crate::pr::NewPr::new("Custom title", false);
+    assert_eq!(
+        new_pr_text(&new, ("Commit title".into(), "Commit body".into())),
+        ("Custom title".into(), "Commit body".into())
+    );
+    let new = crate::pr::NewPr::new("Custom title\nCustom body", false);
+    assert_eq!(
+        new_pr_text(&new, ("Commit title".into(), "Commit body".into())),
+        ("Custom title".into(), "Custom body".into())
+    );
+}
+
+#[test]
+fn fork_and_commit_fallbacks_use_azure_response_data() {
+    assert!(is_fork(&json!({"forkSource": {"name": "fork"}})));
+    assert!(!is_fork(&json!({"forkSource": null})));
+    let commits = json!({"value": [{"commitId": "a"}, {"commitId": "b"}]});
+    assert!(contains_commit(&commits["value"], "b"));
+    assert!(!contains_commit(&commits["value"], "c"));
 }
 
 #[test]
