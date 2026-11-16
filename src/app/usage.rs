@@ -104,8 +104,7 @@ impl Shark {
 
     pub(super) fn usage_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
-        // A running goal starts tasks behind another window too, and needs the allowance for it.
-        let watching = window.is_window_active() || self.goals_running();
+        let watching = window.is_window_active();
         if self.usage_due.is_none() || (watching && self.usage_due.is_some_and(|due| due <= now)) {
             self.refresh_usage(cx);
             self.usage_due = Some(now + POLL_INTERVAL);

@@ -37,6 +37,8 @@ async fn new_agent_dialog_creates_on_create_or_enter_and_cancels_cleanly(cx: &mu
             sections: vec![Section {
                 name: "Designer".into(),
                 icon: "star".into(),
+                overview: None,
+                unsent: None,
                 collapsed: false,
                 tasks: vec![],
             }],

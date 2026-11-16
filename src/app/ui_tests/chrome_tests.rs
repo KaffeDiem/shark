@@ -317,6 +317,10 @@ pub(crate) fn render_pixels() {
         // Capture settled surfaces; motion behavior is covered by interaction tests.
         cx.set_reduce_motion(true);
     });
+    if std::env::var_os("SHARK_LIVE_OVERVIEW").is_some() {
+        super::overview_tests::live(&mut cx);
+        return;
+    }
     if std::env::var_os("SHARK_RENDER_TREE_ONLY").is_some() {
         super::tree_pixels::render_pixels(&mut cx);
         super::tree_pixels::render_artifact_pixels(&mut cx);
@@ -339,10 +343,6 @@ pub(crate) fn render_pixels() {
     }
     if std::env::var_os("SHARK_RENDER_README").is_some() {
         super::readme_pixels::render_pixels(&mut cx);
-        return;
-    }
-    if std::env::var_os("SHARK_RENDER_TEAMS_ONLY").is_some() {
-        super::team_pixels::render_pixels(&mut cx);
         return;
     }
     if std::env::var_os("SHARK_RENDER_AGENTS_ONLY").is_some() {

@@ -324,6 +324,8 @@ fn arrows_keep_browsing_across_section_headers(cx: &mut TestAppContext) {
     let section = |name: &str, task: &str| Section {
         name: name.into(),
         icon: "folder".into(),
+        overview: None,
+        unsent: None,
         collapsed: false,
         tasks: vec![task.into()],
     };

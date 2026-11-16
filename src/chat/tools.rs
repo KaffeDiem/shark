@@ -39,9 +39,10 @@ pub(super) fn group_summary(calls: &[Call]) -> String {
             "Bash" => ("ran", "command", "commands"),
             "Grep" | "Glob" => ("searched", "pattern", "patterns"),
             "WebSearch" | "WebFetch" => ("looked up", "page", "pages"),
+            "mcp__shark__read_task" => ("read", "task", "tasks"),
             _ => ("used", "tool", "tools"),
         };
-        match parts.iter_mut().find(|p| p.0 == verb) {
+        match parts.iter_mut().find(|p| p.0 == verb && p.1 == one) {
             Some(p) => p.3 += 1,
             None => parts.push((verb, one, many, 1)),
         }

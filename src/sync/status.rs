@@ -39,6 +39,9 @@ pub struct Local {
     /// HEAD holds parent commits the base doesn't: the parent was rewritten or squash-merged,
     /// so what follows `parent_tip` must be rebased onto the base.
     pub restack: bool,
+    /// The saved base is a local parent branch that origin has all of (`local_parent_pushed`):
+    /// the task takes `origin/<parent>` as its base.
+    pub parent_pushed: bool,
     /// Tracked lines against the Diff view base, refreshed on every probe.
     pub diff: Option<(u32, u32)>,
     pub(crate) diff_base: Option<(String, String, String)>,
@@ -280,6 +283,25 @@ pub fn compact_age(d: std::time::Duration) -> String {
     } else {
         ago(d).trim_end_matches(" ago").into()
     }
+}
+
+/// Whether `saved`, a task's base, is a local parent branch that origin has all of. Such a task
+/// was cut from a branch that wasn't pushed yet; from here on it stacks on `origin/<parent>`
+/// like any other. A parent whose local branch is gone counts once origin has it.
+pub fn local_parent_pushed(wt: &Path, saved: &str, trunk: &str) -> bool {
+    if saved.starts_with("origin/") {
+        return false;
+    }
+    let Some(parent) = crate::stack::parent_of(saved, trunk) else {
+        return false;
+    };
+    let oid = |r: &str| crate::git::ref_oid(wt, &format!("{r}/{parent}^{{commit}}"));
+    let Some(pushed) = oid("refs/remotes/origin") else {
+        return false;
+    };
+    oid("refs/heads").is_none_or(|local| {
+        local == pushed || git(wt, &["merge-base", "--is-ancestor", &local, &pushed]).is_ok()
+    })
 }
 
 /// The trunk the last probe found, else the repo's default branch.

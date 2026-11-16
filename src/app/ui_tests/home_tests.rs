@@ -649,6 +649,8 @@ async fn home_sections_keep_ungrouped_separate_and_mirror_sidebar(cx: &mut TestA
     let section = |name: &str, tasks: &[&str]| Section {
         name: name.into(),
         icon: "folder".into(),
+        overview: None,
+        unsent: None,
         tasks: tasks.iter().map(|t| t.to_string()).collect(),
         collapsed: false,
     };
@@ -1231,6 +1233,8 @@ async fn backlog_folds_last_and_mutes_attention(cx: &mut TestAppContext) {
             sections: vec![Section {
                 name: "First".into(),
                 icon: "folder".into(),
+                overview: None,
+                unsent: None,
                 tasks: vec!["parked".into()],
                 collapsed: false,
             }],
@@ -1527,6 +1531,8 @@ async fn sidebar_repository_filter_menu(cx: &mut TestAppContext) {
         s.state.sections = vec![Section {
             name: "Design".into(),
             icon: "folder".into(),
+            overview: None,
+            unsent: None,
             tasks: vec!["web-task".into(), "both".into()],
             collapsed: false,
         }];

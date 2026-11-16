@@ -34,6 +34,8 @@ fn checkout() -> Vec<Section> {
     vec![Section {
         name: "Checkout".into(),
         icon: "folder".into(),
+        overview: None,
+        unsent: None,
         collapsed: false,
         tasks: vec!["fix".into(), "api".into()],
     }]

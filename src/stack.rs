@@ -10,13 +10,20 @@ pub struct Node {
     pub ws: Option<String>,
 }
 
-/// The branch a base like `origin/logic` stacks on; `None` for the trunk, a review
-/// checkout's `refs/shark/…` base, or anything else not on origin.
+/// The branch a base stacks on: `logic` for `origin/logic`, and for the bare `logic` of a task
+/// cut from a branch that isn't pushed yet. `None` for the trunk and for a review checkout's
+/// `refs/shark/…` base.
 pub fn parent_of<'a>(base: &'a str, trunk: &str) -> Option<&'a str> {
-    (base != trunk)
-        .then(|| base.strip_prefix("origin/"))
-        .flatten()
-        .filter(|p| !p.is_empty())
+    match base.strip_prefix("origin/") {
+        Some(parent) => (!parent.is_empty() && base != trunk).then_some(parent),
+        // A local branch, and only with the trunk known: its own local branch is no parent.
+        None => (!base.is_empty()
+            && !trunk.is_empty()
+            && base != "HEAD"
+            && !base.starts_with("refs/")
+            && base != crate::git::short(trunk))
+        .then_some(base),
+    }
 }
 
 /// `branch`'s open PR among `prs`: not a fork's of the same name, and none when two disagree.
@@ -394,12 +401,33 @@ mod tests {
     }
 
     #[test]
-    fn parent_of_skips_trunk_reviews_and_local_refs() {
+    fn parent_of_skips_the_trunk_and_review_refs() {
         assert_eq!(parent_of("origin/logic", "origin/main"), Some("logic"));
         assert_eq!(parent_of("origin/main", "origin/main"), None);
         assert_eq!(parent_of("refs/shark/pull/7/base", "origin/main"), None);
         assert_eq!(parent_of("main", "main"), None);
         assert_eq!(parent_of("origin/", "origin/main"), None);
+    }
+
+    /// A task started from another task's unpushed branch has that bare branch as its base.
+    #[test]
+    fn parent_of_takes_a_local_branch() {
+        assert_eq!(parent_of("logic", "origin/main"), Some("logic"));
+        assert_eq!(
+            parent_of("kasper/abc-1-logic", "origin/main"),
+            Some("kasper/abc-1-logic")
+        );
+        // The trunk's own local branch is still the trunk.
+        assert_eq!(parent_of("main", "origin/main"), None);
+        assert_eq!(parent_of("", "origin/main"), None);
+        assert_eq!(parent_of("HEAD", "origin/main"), None, "no branch at all");
+        // Before a repo's trunk is known, a local base may be the trunk itself.
+        assert_eq!(parent_of("logic", ""), None);
+        assert_eq!(
+            parent_of("origin/logic", ""),
+            Some("logic"),
+            "as it always was"
+        );
     }
 
     /// Workspaces and PRs mix: logic is a task, ui a task on it, wiring only a PR.

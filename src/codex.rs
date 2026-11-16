@@ -49,6 +49,14 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
     // SHARK_CODEX swaps in another binary, like SHARK_CLAUDE.
     let mut cmd = Command::new(crate::proc::codex_bin());
     cmd.arg("app-server");
+    // Shark's tools, for an Overview: the overrides reach this chat's process only. Plan mode's
+    // read-only sandbox makes codex refuse the ones that aren't marked read-only.
+    if let Some((url, token)) = crate::mcp::for_task(ws) {
+        for c in crate::mcp::codex_config(&url) {
+            cmd.args(["-c", &c]);
+        }
+        cmd.env(crate::mcp::TOKEN_ENV, token);
+    }
     let st = Arc::new(Mutex::new(State {
         plan: chat.plan,
         fast: chat.fast,

@@ -1,20 +1,8 @@
 //! The README's screenshots: demo data on the real renderer, without touching the screen.
 //! `SHARK_RENDER_README=1 SHARK_RENDER_DIR=docs/images cargo test --features test-support --test rendering`
 //! rewrites `readme-*.png`.
-use super::team_pixels::{goal_task, row};
 use super::*;
-use crate::harness::Ev;
-use crate::state::{Agent, AgentLink, Goal, GoalState, RowState, TaskRepo, Team};
-
-const PLAN: &str = "# Audit the CSV export\n\nThe export builds every row in memory and drops the \
-timezone from `created_at`. Stream it, keep the offset, and cover both with tests.\n\n\
-1. Stream rows from the query instead of collecting them.\n\
-2. Write `created_at` as RFC 3339 with its offset.\n\
-3. Show progress in the web client while a large export runs.\n\n\
-## Tasks\n\
-- T1 @coder [api]: Stream the export instead of buffering it\n\
-- T2 @coder [api] after T1: Write created_at with its offset\n\
-- T3 @designer [web]: Progress state for large exports\n";
+use crate::state::{Agent, TaskRepo};
 
 const PATCH: &str = concat!(
     "diff --git a/api/internal/auth/login.go b/api/internal/auth/login.go\n",
@@ -86,88 +74,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         ..Default::default()
     };
     let agents = vec![
-        agent("lead", "Planner", "target"),
         agent("coder", "Coder", "code"),
         agent("designer", "Designer", "palette"),
     ];
-    let roster: Vec<AgentLink> = agents.iter().map(AgentLink::from).collect();
-    let goal = |state, rows| {
-        Goal {
-        team: "growth".into(),
-        brief: "Paginate the Saved list so it loads fast with thousands of items.\nKeep the page-size parameter working for old clients.\nShip the index with it.".into(),
-        roster: roster.clone(),
-        max_tasks: 8,
-        rows,
-        state,
-        secs: 72 * 60,
-        ..Default::default()
-    }
-    };
-    let paginate = goal(
-        GoalState::Running,
-        vec![
-            row(
-                "T1",
-                "Add cursor pagination to GET /saved",
-                "coder",
-                &[],
-                RowState::Finished,
-            ),
-            row(
-                "T2",
-                "Index saved_items by user and created_at",
-                "coder",
-                &["T1"],
-                RowState::Started,
-            ),
-            row(
-                "T3",
-                "Paging states for the Saved list",
-                "designer",
-                &[],
-                RowState::Started,
-            ),
-            row(
-                "T4",
-                "Load more on scroll in the web client",
-                "designer",
-                &["T3"],
-                RowState::Queued,
-            ),
-            row(
-                "T5",
-                "Document the cursor format",
-                "coder",
-                &["T2"],
-                RowState::Queued,
-            ),
-        ],
-    );
-    let parsed = crate::team::parse(PLAN, &[]);
-    let export = Goal {
-        draft: parsed.rows,
-        ..goal(GoalState::Review, vec![])
-    };
-    let done = Goal {
-        summary: Some("Both tasks merged. Nothing is left open.".into()),
-        ..goal(
-            GoalState::Done,
-            vec![row(
-                "T1",
-                "Fix the login redirect",
-                "coder",
-                &[],
-                RowState::Finished,
-            )],
-        )
-    };
-    // The lead's chat of the goal that waits: its plan and what was said.
-    let store = crate::plan::store_path("export");
-    fs::create_dir_all(store.parent().unwrap()).unwrap();
-    let versions =
-        serde_json::json!({"versions": [{"id": "plan-1", "text": PLAN}], "approved": null});
-    fs::write(store, versions.to_string()).unwrap();
-
     let mut state = State {
         agents,
         repos: ["api", "web", "ios"]
@@ -176,22 +85,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 path: home.join(name),
             })
             .to_vec(),
-        teams: vec![Team {
-            slug: "growth".into(),
-            name: "Growth".into(),
-            icon: "users".into(),
-            lead: "lead".into(),
-            agents: vec!["coder".into(), "designer".into()],
-            repos: vec!["api".into(), "web".into()],
-            limits: crate::state::Limits {
-                running: 2,
-                ..Default::default()
-            },
-            ..Default::default()
-        }],
         sections: vec![Section {
             name: "Mobile".into(),
             icon: "folder".into(),
+            overview: None,
+            unsent: None,
             collapsed: false,
             tasks: vec!["login".into(), "push".into()],
         }],
@@ -224,30 +122,35 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     // After launch has settled, so no row is taken for one a quit interrupted.
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            let repos = |names: &[&str]| -> Vec<TaskRepo> {
-                (names.iter())
-                    .map(|r| TaskRepo {
-                        name: r.to_string(),
-                        src: home.join(r),
-                        base: "origin/main".into(),
-                        branch: None,
-                    })
-                    .collect()
-            };
-            let goal = |name: &str, title: &str, goal: &Goal| {
-                let mut task = goal_task(name, title, goal.clone());
-                task.repos = repos(&["api", "web"]);
-                task.chats[0].title = title.into();
-                task
-            };
             s.state.tasks = vec![
-                task(&home, "login", "Rate-limit login and show Retry-After", "coder", &["api", "ios"]),
-                task(&home, "push", "Push notification settings screen", "designer", &["ios"]),
-                task(&home, "copy", "Shorten the onboarding copy", "designer", &["web"]),
-                task(&home, "flaky", "Find the flaky checkout test", "coder", &["web"]),
-                goal("paginate", "Paginate the Saved list", &paginate),
-                goal("export", "Audit the CSV export", &export),
-                goal("redirect", "Fix the login redirect", &done),
+                task(
+                    &home,
+                    "login",
+                    "Rate-limit login and show Retry-After",
+                    "coder",
+                    &["api", "ios"],
+                ),
+                task(
+                    &home,
+                    "push",
+                    "Push notification settings screen",
+                    "designer",
+                    &["ios"],
+                ),
+                task(
+                    &home,
+                    "copy",
+                    "Shorten the onboarding copy",
+                    "designer",
+                    &["web"],
+                ),
+                task(
+                    &home,
+                    "flaky",
+                    "Find the flaky checkout test",
+                    "coder",
+                    &["web"],
+                ),
             ];
             let agents = s.state.agents.clone();
             for task in &mut s.state.tasks {
@@ -258,9 +161,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 ("push", (112, 9), 1),
                 ("copy", (6, 6), 45),
                 ("flaky", (0, 0), 200),
-                ("paginate", (0, 0), 2),
-                ("export", (0, 0), 5),
-                ("redirect", (0, 0), 900),
             ];
             for (name, diff, ago) in facts {
                 let task = s.task(name).unwrap().clone();
@@ -280,24 +180,14 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 s.home.activity.insert(name.into(), at);
             }
             s.unread.insert("copy".into());
-            // One chat at work, and the lead's chat with its plan.
-            for name in ["push", "export"] {
-                let ws = s.task(name).unwrap().clone();
-                let chat = cx.new(|cx| Chat::new(ws.clone(), ws.chats[0].clone(), false, w, cx));
-                chat.update(cx, |c, cx| match name {
-                    "push" => {
-                        c.busy = true;
-                        c.started = Some(Instant::now() - Duration::from_secs(95));
-                    }
-                    _ => {
-                        c.play(Ev::User("Audit the CSV export: large exports time out and the dates lose their timezone.".into()), cx);
-                        c.play(Ev::Text("I read the export handler and its tests. It collects every row before writing, and formats `created_at` without its offset. The plan streams the rows, keeps the offset, and adds a progress state in the web client. Three tasks; the second builds on the first.".into()), cx);
-                        let (is_error, text, secs) = (false, String::new(), 74);
-                        c.play(Ev::Result { is_error, text, secs }, cx);
-                    }
-                });
-                s.chats.insert(ws.chats[0].id.clone(), chat);
-            }
+            // One chat at work.
+            let ws = s.task("push").unwrap().clone();
+            let chat = cx.new(|cx| Chat::new(ws.clone(), ws.chats[0].clone(), false, w, cx));
+            chat.update(cx, |c, _| {
+                c.busy = true;
+                c.started = Some(Instant::now() - Duration::from_secs(95));
+            });
+            s.chats.insert(ws.chats[0].id.clone(), chat);
             cx.notify();
         })
     })
@@ -305,18 +195,23 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     cx.run_until_parked();
 
     type Scene = fn(&mut Shark, &mut Window, &mut Context<Shark>);
-    let scenes: [(&str, Scene); 5] = [
+    let scenes: [(&str, Scene); 3] = [
         ("home", |s, w, cx| s.enter_home(w, cx)),
-        ("team", |s, w, cx| s.open_team("growth", w, cx)),
-        ("goal", |s, _, cx| {
-            // Shown without opening it: the demo has no worktrees for git to read.
-            s.active = Some("paginate".into());
-            (s.team_page, s.home.on, s.tab) = (None, false, Tab::Goal);
-            cx.notify();
-        }),
-        ("plan", |s, _, cx| {
-            s.active = Some("export".into());
-            (s.team_page, s.home.on, s.tab) = (None, false, Tab::Chat);
+        // A section's Overview after it started two tasks and messaged one.
+        ("overview", |s, w, cx| {
+            s.open_overview(0, w, cx);
+            let Some(name) = s.active.clone() else {
+                return;
+            };
+            s.state.overview_sent(&name);
+            s.home.on = false;
+            let title = |n: &str| s.task(n).unwrap().display_title().into_owned();
+            let (login, push) = (title("login"), title("push"));
+            if let Some(chat) = s.active_chat().cloned() {
+                chat.update(cx, |c, cx| {
+                    c.demo_overview([("login", &login), ("push", &push)], cx)
+                });
+            }
             cx.notify();
         }),
         ("diff", |s, w, cx| {
@@ -331,7 +226,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             });
             s.syncs.insert(ws.name.clone(), sync);
             s.active = Some(ws.name.clone());
-            (s.team_page, s.home.on, s.tab) = (None, false, Tab::Feature(Feature::Diff));
+            (s.home.on, s.tab) = (false, Tab::Feature(Feature::Diff));
             s.configure_differ(cx);
             s.differ.update(cx, |d, cx| {
                 *d.show_tree_mut() = true;

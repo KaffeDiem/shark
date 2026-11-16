@@ -264,6 +264,12 @@ impl Shark {
                     if let Some(chat) = s.chats.get(&id).cloned() {
                         chat.update(cx, |c, cx| {
                             c.attach_mention(&path, label, window, cx);
+                            // What an Overview keeps beyond one chat: its notes. The section's
+                            // tasks it reads again with `read_task`.
+                            let notes = git::OVERVIEW_NOTES;
+                            if c.ws.overview && c.ws.dir().join(notes).exists() {
+                                c.attach_mention(notes, "overview.md".into(), window, cx);
+                            }
                             c.focus_composer(window, cx);
                         });
                     }

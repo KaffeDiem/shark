@@ -1303,3 +1303,93 @@ fn diff_counts_skip_binary_files_and_survive_odd_names() {
     let local = status::probe(&f.wt, "feature", "main", None, false).unwrap();
     assert_eq!(local.diff, Some((3, 0)));
 }
+
+/// A base that is a local parent branch counts as pushed once origin has all of it.
+#[test]
+fn a_local_parent_is_pushed_when_origin_has_all_of_it() {
+    // The fixture swaps PATH for the whole process.
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("local-parent");
+    let pushed = |saved: &str| status::local_parent_pushed(&f.wt, saved, "origin/main");
+    assert!(pushed("release"), "origin has the whole branch");
+    assert!(!pushed("origin/release"), "already on origin's branch");
+    assert!(!pushed("main"), "the trunk is no parent");
+    assert!(!pushed("refs/shark/pull/7/base"));
+    assert!(
+        !status::local_parent_pushed(&f.wt, "release", ""),
+        "trunk not probed yet"
+    );
+    git(&f.wt, &["branch", "-q", "unpushed", "release"]).unwrap();
+    assert!(!pushed("unpushed"), "origin doesn't have it");
+    // A commit the parent made since its push: the child may sit on it.
+    let ahead = f.loose_commit("release");
+    git(&f.wt, &["update-ref", "refs/heads/release", &ahead]).unwrap();
+    assert!(!pushed("release"));
+    git(&f.wt, &["push", "-q", "origin", "release"]).unwrap();
+    assert!(pushed("release"));
+    // The parent's task was deleted with its local branch: origin's is what is left.
+    git(&f.wt, &["update-ref", "-d", "refs/heads/release"]).unwrap();
+    assert!(pushed("release"));
+}
+
+/// A task cut from a parent's unpushed branch moves to `origin/<parent>` once that is pushed,
+/// and says so, so the task's saved base follows.
+#[gpui_kit::test]
+fn a_local_base_becomes_origins_once_the_parent_is_pushed(cx: &mut gpui_kit::TestAppContext) {
+    use super::{GitSync, SyncEvent};
+    use gpui_kit::AppContext as _;
+    use std::{cell::RefCell, rc::Rc};
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cx.update(gpui_kit::init);
+    let mut f = Fixture::new("push-local-base");
+    git(&f.wt, &["config", "--unset", "branch.feature.shark-pr-url"]).unwrap();
+    git(&f.wt, &["branch", "-q", "parent", "release"]).unwrap();
+    f.ws.repos[0].base = "parent".into();
+    let (_, sync) = cx
+        .update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| GitSync::new(f.ws.clone(), window, cx))
+            })
+        })
+        .unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let _sub = cx.update(|cx| {
+        cx.subscribe(&sync, move |_, event, _| {
+            if let SyncEvent::PrBaseAdopted(moves) = event {
+                observed.borrow_mut().push(moves.clone());
+            }
+        })
+    });
+    let p = run_job(&f.job(false, false, &[]));
+    cx.update(|cx| {
+        sync.update(cx, |s, cx| {
+            s.apply(p, cx);
+            assert_eq!(
+                s.ws.repos[0].base, "parent",
+                "not pushed: the base stays local"
+            );
+        });
+    });
+    assert!(events.borrow().is_empty());
+    git(&f.wt, &["push", "-q", "origin", "parent"]).unwrap();
+    let p = run_job(&f.job(false, false, &[]));
+    cx.update(|cx| {
+        sync.update(cx, |s, cx| {
+            s.apply(p, cx);
+            assert_eq!(s.ws.repos[0].base, "origin/parent");
+        });
+    });
+    assert_eq!(
+        *events.borrow(),
+        vec![vec![(
+            "api".to_string(),
+            "parent".to_string(),
+            "origin/parent".to_string(),
+        )]]
+    );
+}

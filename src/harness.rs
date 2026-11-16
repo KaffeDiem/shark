@@ -216,12 +216,16 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
     // The chat's agent rides on every start, so a resumed session keeps it too.
     let prompt = crate::git::agent_prompt(ws, chat);
     let skills = crate::git::claude_skill_args(ws);
+    let (mcp, token) = crate::mcp::for_task(ws)
+        .map(|(url, token)| (crate::mcp::claude_config(&url), token))
+        .unzip();
     run(
         &ws.dir(),
         chat.model(),
         &chat.id,
-        launch_args(chat, prompt.as_deref(), &skills),
+        launch_args(chat, prompt.as_deref(), &skills, mcp.as_deref()),
         Some(transcript_path(&chat.id)),
+        token.as_deref(),
     )
 }
 
@@ -229,6 +233,7 @@ fn launch_args<'a>(
     chat: &'a ChatMeta,
     prompt: Option<&'a str>,
     skills: &'a [String],
+    mcp: Option<&'a str>,
 ) -> Vec<&'a str> {
     let resume = chat
         .session_id
@@ -248,6 +253,8 @@ fn launch_args<'a>(
         .chain(resume))
     .chain(agent)
     .chain(skills.iter().map(String::as_str))
+    // Shark's tools, for an Overview. On every start: a resumed session connects it again.
+    .chain(mcp.into_iter().flat_map(|config| ["--mcp-config", config]))
     .collect()
 }
 
@@ -290,6 +297,7 @@ pub fn spawn_side(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Recei
             .chain(effort(chat))
             .chain(fork),
         None,
+        None,
     )
 }
 
@@ -306,7 +314,7 @@ pub fn spawn_ask(model: &str, system: &str) -> std::io::Result<(Harness, Receive
     // --safe-mode: no user hooks, skills, plugins or CLAUDE.md (`claude --help`, 2.1.309). Not
     // `--setting-sources ""`: that also drops auth set in settings.json (apiKeyHelper, env).
     let args = bare(system).into_iter().chain(["--safe-mode"]);
-    run(&support_dir(), model, "ask", args, None)
+    run(&support_dir(), model, "ask", args, None, None)
 }
 
 fn run<'a>(
@@ -315,6 +323,7 @@ fn run<'a>(
     log_name: &str,
     extra: impl IntoIterator<Item = &'a str>,
     transcript: Option<PathBuf>,
+    mcp_token: Option<&str>,
 ) -> std::io::Result<(Harness, Receiver<Ev>)> {
     // SHARK_CLAUDE swaps in another binary; the UI tests use a fake that swallows stdin.
     let mut cmd = Command::new(crate::proc::claude_bin());
@@ -337,6 +346,10 @@ fn run<'a>(
         model,
     ]);
     cmd.args(extra);
+    // The `--mcp-config` entry names this variable, so the token stays out of `ps`.
+    if let Some(token) = mcp_token {
+        cmd.env(crate::mcp::TOKEN_ENV, token);
+    }
     start(cmd, cwd, log_name, transcript, None, None)
 }
 
@@ -912,9 +925,34 @@ not json"#;
     fn claude_launch_args_set_plans_directory() {
         let chat = ChatMeta::default();
         let skills = ["--add-dir".to_string(), "/t/api".to_string()];
-        let args = launch_args(&chat, Some("agent"), &skills);
+        let args = launch_args(&chat, Some("agent"), &skills, None);
         let at = args.iter().position(|a| *a == "--settings").unwrap();
         assert_eq!(args[at + 1], r#"{"plansDirectory":".context/plans"}"#);
         assert!(args.contains(&"--add-dir") && args.contains(&"agent"));
+        assert!(
+            !args.contains(&"--mcp-config"),
+            "an ordinary chat gets no Shark tools"
+        );
+    }
+
+    /// An Overview's chat gets Shark's server, on a first start and on a resume alike, next to
+    /// whatever servers the user has: nothing here is `--strict-mcp-config`.
+    #[test]
+    fn an_overviews_launch_args_carry_sharks_server() {
+        let config = crate::mcp::claude_config("http://127.0.0.1:9/mcp/over");
+        for session in [None, Some("s1".to_string())] {
+            let chat = ChatMeta {
+                session_id: session.clone(),
+                ..Default::default()
+            };
+            let args = launch_args(&chat, None, &[], Some(&config));
+            let at = args.iter().position(|a| *a == "--mcp-config").unwrap();
+            assert_eq!(args[at + 1], config);
+            assert_eq!(args.contains(&"--resume"), session.is_some());
+            assert!(!args.contains(&"--strict-mcp-config"));
+        }
+        // Only a section's Overview is given an endpoint at all.
+        let task = crate::state::Task::default();
+        assert_eq!(crate::mcp::for_task(&task), None);
     }
 }

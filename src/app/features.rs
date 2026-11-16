@@ -66,7 +66,9 @@ impl Feature {
 
 impl Shark {
     pub(super) fn right_rail_shown(&self) -> bool {
-        self.active.is_some() && !self.home_shown() && !self.zen_shown()
+        // An Overview has no repositories, so none of the features has anything to show.
+        (self.active.is_some() && !self.home_shown() && !self.zen_shown())
+            && self.shown_overview().is_none()
     }
 
     pub(super) fn render_features(

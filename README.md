@@ -1,6 +1,6 @@
 <h1 align="center">Shark</h1>
 
-<p align="center">A native macOS app for getting real work out of coding agents: every task on its own branch, every change reviewed before it ships, and teams of agents that work through a plan you approved.</p>
+<p align="center">A native macOS app for getting real work out of coding agents: every task on its own branch, every change reviewed before it ships, and an Overview chat in each section to see and hand out work.</p>
 
 <p align="center">
   <a href="https://github.com/KaffeDiem/shark/releases/latest"><img src="https://img.shields.io/github/v/release/KaffeDiem/shark" alt="Latest release"></a>
@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/readme-home.png" width="900" alt="Home: a prompt to start a task, and every task grouped by Needs you, Running, Unread and Idle, with a team and its goals in the sidebar">
+  <img src="docs/images/readme-home.png" width="900" alt="Home: a prompt to start a task, and every task grouped by Needs you, Running, Unread and Idle, with the sections and their tasks in the sidebar">
 </p>
 
 ## Why Shark
@@ -40,25 +40,11 @@ Differ shows one diff for every repository in the task, with the base on the lef
 
 In plan mode an agent reads and plans, and edits nothing until you approve. Each revision is a version with its changes marked, so you can see what your last reply changed. Approve it to build, or build it in a fresh chat that gets only the plan.
 
-### Teams that work through a plan
+### An Overview for each section
 
-A team is a lead agent and other agents, with repositories and limits. Give it a goal. The lead reads the code and writes a plan as a list of tasks, each with an agent and the tasks it comes after. You can reassign or remove tasks, then approve.
+Every sidebar section has an Overview chat as its first row. Ask it what the section's tasks are doing, or tell it to hand out work. It can start tasks, message them, read them and stop them, in any task of the section, whether it started them or you did. Any agent can run it.
 
-<p align="center">
-  <img src="docs/images/readme-plan.png" width="900" alt="A team lead's plan: prose on top, the tasks as rows with their agents below, and Approve and start">
-</p>
-
-Shark then starts each task on its own branch, in the background, and commits finished work locally. A task that comes after another starts from its branch, so the PRs stack. You are told when something needs you: a question, a stuck task, a limit reached. Nothing is pushed or merged without you.
-
-<p align="center">
-  <img src="docs/images/readme-goal.png" width="900" alt="A goal: its tasks grouped by Running, Queued and Ready for review, with agents and what each waits for">
-</p>
-
-Limits use what can be measured on a subscription: tasks running at once, how much of your plan allowance must be left, agent time per goal and tasks per goal. Work stops when Shark quits and never resumes on its own.
-
-<p align="center">
-  <img src="docs/images/readme-team.png" width="900" alt="A team's page: a prompt for the next goal, what needs you, and its goals with progress">
-</p>
+It runs only when you message it, and is then told what happened in the section since its last turn. Finished tasks still come to you first. Plan mode makes it propose first: it can only write a plan, and approving the plan lets it start tasks. **Stop all** stops every running chat in the section. Agent time is shown, with no limit, and nothing stops by itself. Nothing is pushed or merged without you.
 
 ### From branch to merge
 
@@ -76,11 +62,10 @@ The Git button always offers the next step: commit and push, create linked PRs a
 |---|---|
 | **Task** | One piece of work, with separate branches, worktrees, conversations and review state. |
 | **Agent** | A preset for a chat. A task has no agent; its chats do, and each chat can have a different one. |
-| **Team** | A lead agent plus other agents, with repositories and limits. It works on goals. |
-| **Goal** | What you ask a team for: a brief, a plan you approve, its tasks and a closing summary. |
 | **Section** | Optional grouping of tasks in the sidebar and on Home. |
+| **Overview** | One chat per section, over all its tasks. It can start, message, read and stop them. |
 
-You start each task and decide what ships. Shark does not schedule work. A team starts the tasks of a plan you approved.
+You start each task, or tell an Overview to. Nothing is pushed or merged without you.
 
 ## Install
 
@@ -100,7 +85,6 @@ Needs `git`, signed-in `gh` and `claude` on your login shell's PATH. For Codex m
 3. **Guide the work.** Use `shift-tab` for plan mode. Review the plan and approve it when ready; a task needs a repository before building. Plans and files agents produce are in **Artifacts** (`cmd-shift-a`).
 4. **Review and ship.** Open **Differ** (`cmd-shift-d`) to inspect changes and send comments back to a chat. Use **Git** (`cmd-shift-g`) for PR discussions and the git menu to create, update and merge PRs.
 5. **Finish the task.** Delete it when done; this removes its conversations, plans and worktrees. Agents stay available for the next chat.
-6. **Try a team.** Choose **New team…** in `cmd-k`, pick a lead, one or more agents and the repositories, then describe a goal on the team's page. Approve the plan and review the tasks as they finish.
 
 For existing branches or PRs, use **New task from branch or PR…** in `cmd-k`, or the [Chrome extension](extensions/chrome) on a GitHub PR page. A selected agent carries through to its first chat. Every command and its shortcut is discoverable in `cmd-k`.
 

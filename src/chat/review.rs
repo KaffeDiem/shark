@@ -14,13 +14,6 @@ pub(crate) fn split_notes(wire: &str) -> (&str, &str) {
     }
 }
 
-/// The rows context notes show as: their `[shark]` lines, without what a note goes on to quote.
-pub(super) fn info_notes(notes: &str) -> impl Iterator<Item = Block> {
-    (notes.lines())
-        .filter(|l| l.starts_with("[shark] "))
-        .map(|l| Block::Info(l.into()))
-}
-
 /// A chat started by a review: "Review · 3 comments".
 pub(super) fn review_title(r: &ReviewCard) -> String {
     let n = r.items.len();

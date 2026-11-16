@@ -734,3 +734,123 @@ fn claude_live_agent_skills() {
 fn codex_live_agent_skills() {
     agent_skills_live("codex-agent-skills", MODEL);
 }
+
+/// Shark's MCP server against a real CLI, as an Overview's chat is started: the tools are
+/// there on a fresh start and on a resumed session; `read_task` runs in plan mode; a tool that
+/// acts on tasks doesn't reach Shark there. One of these per run: the server starts once.
+fn overview_tools_live(tag: &str, model: &str) {
+    use std::sync::{Arc, Mutex};
+    let calls = crate::mcp::start().expect("the server starts once per process");
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        while let Ok(call) = calls.recv_blocking() {
+            log.lock().unwrap().push(call.tool.clone());
+            let answer = format!(
+                r#"{{"section":"Live","tasks":[],"marker":"MANGO-{}"}}"#,
+                call.tool
+            );
+            let _ = call.reply.send(Ok(answer));
+        }
+    });
+    let mut env = Env::new(tag, model);
+    env.ws.overview = true;
+    // Answers what the agent asks as the chat does, until the turn ends; returns what it asked about.
+    let turn = |r: &mut Run, prompt: &str, plan: bool| -> Vec<String> {
+        r.harness.send(prompt).unwrap();
+        let (mut asked, end) = (vec![], Instant::now() + Duration::from_secs(TURN));
+        while Instant::now() < end {
+            match r.rx.try_recv() {
+                Ok(Ev::Permission {
+                    request_id,
+                    tool,
+                    input,
+                    ..
+                }) => {
+                    eprintln!("  asked: {tool}");
+                    let refuse = plan && crate::mcp::acts(&tool);
+                    let _ = match refuse || tool.starts_with("item/") {
+                        true => r
+                            .harness
+                            .deny(&request_id, "Plan mode is on: this doesn't run."),
+                        false => r.harness.allow(&request_id, input),
+                    };
+                    asked.push(tool);
+                }
+                Ok(ev) => {
+                    eprintln!("  {:>6.2}s {}", r.t0.elapsed().as_secs_f64(), short(&ev));
+                    let done = is_result(&ev) || is_exit(&ev);
+                    r.evs.push(ev);
+                    if done {
+                        return asked;
+                    }
+                }
+                Err(e) if e.is_closed() => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        panic!("no Result");
+    };
+    let read = "Call the shark server's read_task tool once, with no arguments. Then reply with \
+        the marker value from its result and nothing else.";
+    let mut r = env.spawn(None);
+    turn(&mut r, read, false);
+    assert!(r.text().contains("MANGO-read_task"), "fresh: {}", r.text());
+    assert_eq!(*seen.lock().unwrap(), ["read_task"]);
+    let session = r.evs.iter().find_map(|e| match e {
+        Ev::Init { session_id, .. } => Some(session_id.clone()),
+        _ => None,
+    });
+    r.close();
+
+    // A resumed session is started with the server again.
+    let mut r = env.spawn(Some(session.expect("a session")));
+    turn(&mut r, read, false);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["read_task", "read_task"],
+        "resumed: {}",
+        r.text()
+    );
+
+    // Plan mode: a tool that acts is refused before it reaches Shark; reading still works.
+    r.harness.set_plan_mode(true).unwrap();
+    let spawn = "Call the shark server's spawn_task tool with brief \"x\", repos [\"api\"] and \
+        agent \"Coder\". Call nothing else. Then say in one word whether the call RAN or was REFUSED.";
+    let asked = turn(&mut r, spawn, true);
+    eprintln!("plan mode asked about: {asked:?}");
+    assert!(
+        !seen.lock().unwrap().iter().any(|t| t == "spawn_task"),
+        "spawn_task ran in plan mode"
+    );
+    let asked = turn(&mut r, read, true);
+    eprintln!("plan mode read asked about: {asked:?}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        3,
+        "read_task runs in plan mode: {}",
+        r.text()
+    );
+
+    // Out of plan mode the same call reaches Shark.
+    r.harness.set_plan_mode(false).unwrap();
+    turn(&mut r, spawn, false);
+    assert!(
+        seen.lock().unwrap().iter().any(|t| t == "spawn_task"),
+        "{}",
+        r.text()
+    );
+    r.close();
+}
+
+#[test]
+#[ignore = "uses a live Claude subscription"]
+fn claude_live_overview_tools() {
+    overview_tools_live("claude-overview", crate::models::MODELS[0]);
+}
+
+#[test]
+#[ignore = "uses a live Codex subscription"]
+fn codex_live_overview_tools() {
+    overview_tools_live("codex-overview", MODEL);
+}

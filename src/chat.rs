@@ -6,6 +6,7 @@ mod critters;
 mod handoff;
 pub(crate) use handoff::HandoffTarget;
 mod model;
+mod overview;
 mod planmode;
 mod question;
 mod queue;
@@ -46,9 +47,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
+pub(crate) use overview::{Glyph, News, NewsKind, SectionTask, one_line};
+use overview::{OVERVIEW_PLACEHOLDER, info_notes};
+pub(crate) use planmode::PLAN_ONLY;
+use planmode::PLAN_SHOWN;
 pub(crate) use review::split_notes;
-use review::{NOTES_END, info_notes, review_title};
+use review::{NOTES_END, review_title};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
@@ -74,6 +78,13 @@ enum Block {
     /// Skills and subagents stay visible on their own row: they say what the agent is doing.
     Tool(Call),
     Info(String),
+    /// What an Overview was told had happened in its section since its last turn: the note's
+    /// first line, and its line per task to open (`overview::since_note`).
+    Since {
+        head: SharedString,
+        rows: Vec<String>,
+        open: bool,
+    },
     /// A diff review (`send_review`); `true` while claude hasn't read it, like `User`.
     Review(Rc<ReviewCard>, bool),
 }
@@ -112,15 +123,13 @@ pub enum ChatEvent {
     Asking,
     /// `refuse_unready` said no: the app offers Attach repository.
     NeedsRepo,
-    /// Approve in a goal's lead chat: the app starts the plan's tasks; the lead stays in plan mode.
-    ApproveGoal,
-    /// The plan pane's agent menu on a goal's plan row.
-    ReassignRow {
-        key: String,
-        agent: String,
-    },
-    /// The plan pane's remove button on a goal's plan row.
-    RemoveRow(String),
+    /// An Overview's first message is going out: its task now has a directory, and is saved.
+    Born,
+    /// A message went out that the section's Overview didn't write: the user's, or one of
+    /// the app's prompts they asked for.
+    Said(String),
+    /// A task's row in an Overview's transcript: open that task.
+    OpenTask(String),
     /// A review card's "Review changes" row: show the diff.
     ShowChanges,
     /// A review card's comment link: show that comment in the diff.
@@ -170,6 +179,14 @@ pub struct Chat {
     pub attach_hold: bool,
     /// Set while the task's worktrees are being removed; sends are refused.
     pub archiving: bool,
+    /// An Overview's section as the app last saw it (`set_section`), for its task rows.
+    pub section: Vec<SectionTask>,
+    /// What happened in an Overview's section since its last turn; its next message says so.
+    news: Vec<News>,
+    /// The message being sent is the section's Overview's (`tell`), not the user's.
+    from_overview: bool,
+    /// The section's Overview started this task: its first message is the Overview's brief.
+    pub overview_brief: bool,
     /// What `ChatMeta::delivered` becomes once the agent echoes the message at a block: a message
     /// it never read leaves the context pending.
     told: Vec<(usize, std::collections::BTreeMap<String, u64>, String)>,
@@ -306,11 +323,13 @@ impl Chat {
     ) -> Self {
         // Every chat passes here, new, reopened or restored: none starts out of Plan mode
         // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
-        // A goal's lead plans for its whole life (`refuse_unready`).
-        meta.plan |= ws.repos.is_empty() || ws.goal.is_some();
+        // An Overview has none by design and works through its section's tasks.
+        meta.plan |= ws.repos.is_empty() && !ws.overview;
         let composer = cx.new(|cx| {
-            crate::task_composer::textarea(window, cx, 1)
-                .placeholder("Message the agent (@ to add files, / for skills)")
+            crate::task_composer::textarea(window, cx, 1).placeholder(match ws.overview {
+                true => OVERVIEW_PLACEHOLDER,
+                false => "Message the agent (@ to add files, / for skills)",
+            })
         });
         let _sub =
             cx.subscribe_in(
@@ -348,13 +367,10 @@ impl Chat {
             .iter()
             .flat_map(|r| complete::cached_repo_prs(&r.name, &r.src, false))
             .collect::<Vec<_>>();
-        let goal = ws.goal.is_some();
-        let plan = cx.new(|cx| PlanPane::new(&meta.id, goal, cx));
-        let _plan_sub = cx.subscribe(&plan, |_, _, ev: &plan::PlanEvent, cx| {
-            cx.emit(match ev.clone() {
-                plan::PlanEvent::Reassign { key, agent } => ChatEvent::ReassignRow { key, agent },
-                plan::PlanEvent::Remove(key) => ChatEvent::RemoveRow(key),
-            })
+        let plan = cx.new(|cx| {
+            let mut plan = PlanPane::new(&meta.id, cx);
+            plan.starts = ws.overview;
+            plan
         });
         let plan_open = meta.plan;
         let mut chat = Chat {
@@ -375,6 +391,10 @@ impl Chat {
             hold: false,
             attach_hold,
             archiving: false,
+            section: vec![],
+            news: vec![],
+            from_overview: false,
+            overview_brief: false,
             told: vec![],
             harness: None,
             composer,
@@ -428,9 +448,8 @@ impl Chat {
             plan_open,
             dropping: None,
             plan,
-            _subs: vec![_sub, _keys, _plan_sub],
+            _subs: vec![_sub, _keys],
         };
-        chat.hand_goal(cx);
         // Warm both sources now so the first `@` or `/` doesn't wait.
         chat.reindex(cx);
         chat.reprobe(cx);
@@ -520,7 +539,7 @@ impl Chat {
     }
 
     /// How long the running turn has taken; background tasks alone are no turn.
-    fn turn_secs(&self) -> u64 {
+    pub(crate) fn turn_secs(&self) -> u64 {
         (self.started.filter(|_| self.busy)).map_or(0, |t| t.elapsed().as_secs())
     }
 
@@ -729,6 +748,11 @@ impl Chat {
 
     /// Sends a host-written prompt together with any draft instructions.
     pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // The brief of a task an Overview started is the Overview's message, not the user's.
+        if self.overview_brief {
+            self.overview_brief = !self.tell(prompt, cx);
+            return !self.overview_brief;
+        }
         let mut draft = self.composer.read(cx).value().trim().to_string();
         let had_draft = !draft.is_empty();
         // The same prompt put back below after a failed start: retrying must not send it twice.
@@ -797,6 +821,14 @@ impl Chat {
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
         if self.harness.is_none() {
+            // An Overview's task has no directory until its first message (`Task::unsent`),
+            // and its agent starts in one.
+            if self.ws.unsent
+                && let Err(e) = crate::git::create_overview_dir(&self.ws)
+            {
+                self.push(Block::Info(format!("Couldn't start the Overview: {e}")), cx);
+                return false;
+            }
             // A session starting now reads the repos from the root docs and its agent from the
             // system prompt (`git::agent_prompt`), and has nothing else.
             if self.meta.session_id.is_none() {
@@ -836,11 +868,18 @@ impl Chat {
             }
         }
         // A `/command` must stay the whole message, and a steer lands mid-turn: the context waits
-        // for the next normal message.
-        let notes = match self.busy || text.trim_start().starts_with('/') {
-            true => vec![],
-            false => self.pending_context(),
+        // for the next normal message. An Overview says things; it runs no command here.
+        let command = !self.from_overview && text.trim_start().starts_with('/');
+        let context = !(self.busy || command);
+        let mut notes = match context {
+            true => self.pending_context(),
+            false => vec![],
         };
+        // A steer lands mid-turn: an Overview's news waits for the message that starts one.
+        let news = !command && !self.busy && !self.news.is_empty();
+        if !command {
+            notes.extend(self.message_notes(news));
+        }
         let wire = match notes.is_empty() {
             true => text.clone(),
             false => format!("{}{NOTES_END}{text}", notes.join("\n")),
@@ -849,10 +888,22 @@ impl Chat {
             self.push(Block::Info(format!("send failed: {e}")), cx);
             return false;
         }
+        if news {
+            self.news.clear();
+        }
+        // An Overview is a task once its first message has gone out, and saved from then on.
+        if std::mem::take(&mut self.ws.unsent) {
+            cx.emit(ChatEvent::Born);
+        }
         if !notes.is_empty() {
             self.blocks.extend(info_notes(&notes.join("\n")));
-            self.told
-                .push((self.blocks.len(), context_record(&self.context()), wire));
+            // The echo marks as read what this message carried: the task's notes only if they
+            // were in it, and an Overview's label into a running turn is not them.
+            let read = match context {
+                true => context_record(&self.context()),
+                false => self.meta.delivered.clone(),
+            };
+            self.told.push((self.blocks.len(), read, wire));
         }
         let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
@@ -887,26 +938,6 @@ impl Chat {
             .count()
     }
 
-    /// A goal's plan rows (the draft while one waits), problems and roster for its plan pane,
-    /// which can't see the app.
-    fn hand_goal(&self, cx: &mut Context<Self>) {
-        let Some(g) = &self.ws.goal else {
-            return (self.plan).update(cx, |p, cx| {
-                p.set_goal(false, vec![], false, vec![], vec![], cx)
-            });
-        };
-        let rows = if g.draft.is_empty() {
-            &g.rows
-        } else {
-            &g.draft
-        };
-        let (rows, problems, roster) = (rows.clone(), g.problems.clone(), g.roster.clone());
-        let editable = !g.draft.is_empty();
-        self.plan.update(cx, |p, cx| {
-            p.set_goal(true, rows, editable, problems, roster, cx)
-        });
-    }
-
     /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
     /// the agent hears of it with its next normal turn (`pending_context`). Ending the attachment
     /// hold sends what waited for it, unless a git step still holds it.
@@ -914,7 +945,6 @@ impl Chat {
         let grew = ws.repos.len() != self.ws.repos.len();
         let released = self.attach_hold && ws.attaching.is_empty();
         self.ws = ws.clone();
-        self.hand_goal(cx);
         self.attach_hold = !ws.attaching.is_empty();
         if grew {
             self.reindex(cx);
@@ -941,8 +971,10 @@ impl Chat {
         if !self.busy {
             return None;
         }
-        for block in self.blocks.iter().rev() {
+        for (bi, block) in self.blocks.iter().enumerate().rev() {
             let call = match block {
+                // The label of a message the Overview sent into this turn.
+                _ if self.overview_label(bi) => None,
                 Block::Tools { calls, .. } => calls.iter().rev().find(|c| c.result.is_none()),
                 Block::Tool(call) if call.result.is_none() => Some(call),
                 Block::Text { done: false, .. } => return Some("Writing".into()),
@@ -979,6 +1011,9 @@ impl Chat {
         self.list.set_follow_mode(FollowMode::Tail);
         if echoed {
             self.unread.push_back(self.blocks.len());
+        }
+        if !self.from_overview {
+            cx.emit(ChatEvent::Said(text.clone()));
         }
         self.push(
             match review {
@@ -1066,7 +1101,6 @@ impl Chat {
     /// Forgets the claude session and stops the agent; the next send starts a new conversation.
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
         let was_working = self.working();
-        // The cut-off turn's time still counts toward a goal's limit.
         let secs = self.turn_secs();
         self.meta.session_id = None;
         cx.emit(ChatEvent::Meta);
@@ -1107,6 +1141,10 @@ impl Chat {
     fn build_rows(&self) -> Vec<Row> {
         let mut rows = vec![];
         for (ix, b) in self.blocks.iter().enumerate() {
+            // The message after it shows this as its label.
+            if self.overview_label(ix) {
+                continue;
+            }
             rows.push((ix, None));
             if let Block::Tools { calls, open: true } = b {
                 rows.extend((0..calls.len()).map(|j| (ix, Some(j))));
@@ -1175,7 +1213,10 @@ impl Chat {
     /// The streaming text block a reply continues: the last block, looking past messages
     /// queued while it streams (they'd otherwise split the reply in two).
     fn live_text(&self) -> Option<usize> {
-        let bi = (self.blocks.iter()).rposition(|b| !matches!(b.message(), Some((_, true))))?;
+        let waiting = |bi: usize, b: &Block| {
+            matches!(b.message(), Some((_, true))) || self.overview_label(bi)
+        };
+        let bi = (0..self.blocks.len()).rfind(|&bi| !waiting(bi, &self.blocks[bi]))?;
         matches!(self.blocks[bi], Block::Text { done: false, .. }).then_some(bi)
     }
 
@@ -1373,6 +1414,9 @@ impl Chat {
             summary: match name.as_str() {
                 PLAN_TOOL => plan::title(input["plan"].as_str().unwrap_or_default()),
                 ASK_TOOL => crate::transcript::asked_summary(&input),
+                shark if shark.starts_with(crate::mcp::TOOL_PREFIX) => {
+                    overview::summarize(shark, &input).unwrap_or_default()
+                }
                 _ => summarize(&input, &self.ws.dir().to_string_lossy()),
             },
             input: full_input(&input),
@@ -1382,9 +1426,17 @@ impl Chat {
             is_error: false,
             open: false,
         };
+        // An Overview's calls that act on tasks group by tool, apart from the rest: "Started 3
+        // tasks" over a row per task.
+        let act = overview::act(&call.name);
         match self.blocks.last_mut() {
             _ if standalone(&call.name).is_some() => self.blocks.push(Block::Tool(call)),
-            Some(Block::Tools { calls, .. }) => calls.push(call),
+            Some(Block::Tools { calls, .. })
+                if act == overview::act(&calls[0].name)
+                    && (act.is_none() || calls[0].name == call.name) =>
+            {
+                calls.push(call)
+            }
             _ => self.blocks.push(Block::Tools {
                 calls: vec![call],
                 open: false,
@@ -1426,10 +1478,7 @@ impl Chat {
                 self.show_plan(tool_use_id, text, cx);
                 Some(PLAN_SHOWN)
             }
-            "EnterPlanMode" => Some(ENTER_PLAN),
-            // Plan mode asks for these too, and planning needs the web.
-            "WebSearch" | "WebFetch" => None,
-            _ => Some(NEEDS_APPROVAL),
+            tool => planmode::refusal(tool, self.meta.plan, self.active_codex()),
         };
         if let Some(a) = &mut self.harness
             && let Err(e) = match reason {
@@ -1652,6 +1701,9 @@ impl Chat {
                 .text_color(theme.secondary_foreground)
                 .text_size(px(14.))
                 .line_height(relative(1.5))
+                .when(self.from_overview(bi), |d| {
+                    d.child(Self::overview_tag(theme))
+                })
                 .child(
                     h_flex()
                         .items_start()
@@ -1683,6 +1735,12 @@ impl Chat {
             // Calls sit under the group's summary text, past its chevron and gap.
             (Block::Tools { calls, .. }, Some(j)) => {
                 column().text_sm().pl(px(22.)).child(tool_row(&calls[j]))
+            }
+            (Block::Tools { calls, .. }, None) if overview::act(&calls[0].name).is_some() => {
+                column().child(self.render_acts(bi, calls, cx))
+            }
+            (Block::Since { head, rows, open }, _) => {
+                column().child(self.render_since(bi, head, rows, *open, cx))
             }
             (Block::Tools { calls, open }, None) => {
                 let running = calls.iter().rev().find(|c| c.result.is_none());
@@ -1762,6 +1820,12 @@ impl Chat {
                 calls[j].result.as_ref().map(|r| r.to_string())
             }
             (Block::Tools { .. }, None) => None,
+            (Block::Since { head, rows, .. }, _) => Some(
+                std::iter::once(head.as_ref())
+                    .chain(rows.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
         };
         if let Some(text) = text {
             crate::ui::copy_with(text, "Copied", window, cx);
@@ -1787,7 +1851,9 @@ impl Chat {
         match (&mut self.blocks[bi], call) {
             (Block::Tool(c), _) => c.open = !c.open,
             (Block::Tools { calls, .. }, Some(j)) => calls[j].open = !calls[j].open,
-            (Block::Tools { open, .. }, None) => *open = !*open,
+            // A task list has rows of its own to click.
+            (Block::Tools { calls, .. }, None) if overview::act(&calls[0].name).is_some() => return,
+            (Block::Tools { open, .. }, None) | (Block::Since { open, .. }, _) => *open = !*open,
             _ => return,
         }
         self.sync_rows(Some(bi));
@@ -2230,7 +2296,12 @@ impl Render for Chat {
                         this.focus_composer(window, cx)
                     }))
                     .child(rows)
-                    .when(self.blocks.is_empty(), |d| d.child(self.empty_state(cx)))
+                    .when(self.blocks.is_empty(), |d| {
+                        d.child(match self.ws.overview {
+                            true => self.section_list(cx),
+                            false => self.empty_state(cx),
+                        })
+                    })
                     .vertical_scrollbar(&self.list),
             )
             .child(self.composer_bar(asked_card, window, cx))
@@ -2267,7 +2338,7 @@ pub(crate) mod ui_tests {
     use super::*;
     use crate::models::effort_of;
     use critters::HOP_INTERVAL;
-    use planmode::{APPROVED, BUILD_FRESH};
+    use planmode::{APPROVED, BUILD_FRESH, PLAN_ONLY};
 
     /// Feeds recorded protocol lines to the chat as its process would.
     pub(crate) fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
@@ -2939,14 +3010,26 @@ exec cat >>"$0.stdin"
                 })
             })
         };
-        // The web runs with its input as asked; other tools stay refused.
+        // Plan mode refuses only edits and the Overview's tools that act on tasks; the rest
+        // runs with its input as asked.
+        let allowed = [
+            ("web-1", "WebSearch"),
+            ("web-2", "WebFetch"),
+            ("bash-1", "Bash"),
+            ("mcp-1", "mcp__linear__save_issue"),
+            ("read-1", "mcp__shark__read_task"),
+        ];
+        let refused = [
+            ("edit-1", "Edit"),
+            ("write-1", "Write"),
+            ("notebook-1", "NotebookEdit"),
+            ("spawn-1", "mcp__shark__spawn_task"),
+            ("message-1", "mcp__shark__message_task"),
+            ("stop-1", "mcp__shark__stop_task"),
+        ];
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                for (id, tool) in [
-                    ("web-1", "WebSearch"),
-                    ("web-2", "WebFetch"),
-                    ("bash-1", "Bash"),
-                ] {
+                for (id, tool) in allowed.into_iter().chain(refused) {
                     let input = serde_json::json!({"query": id});
                     let (request_id, tool, tool_use_id) = (id.into(), tool.into(), id.into());
                     c.apply(
@@ -2975,12 +3058,19 @@ exec cat >>"$0.stdin"
             }
             panic!("no reply to {id}");
         };
-        for id in ["web-1", "web-2"] {
+        for (id, _) in allowed {
             let r = replied(id);
             assert_eq!(r["behavior"], "allow", "{r}");
             assert_eq!(r["updatedInput"]["query"], id, "{r}");
         }
-        assert_eq!(replied("bash-1")["message"], NEEDS_APPROVAL);
+        for (id, _) in refused {
+            let r = replied(id);
+            assert_eq!(
+                (&r["behavior"], &r["message"]),
+                (&"deny".into(), &PLAN_ONLY.into()),
+                "{id}"
+            );
+        }
         submit(cx, "t1", "# Cache\n\nUse a map.\n");
         submit(cx, "t2", "# Cache\n\nUse an LRU map.\n");
         act(cx, &|_, _| {});
@@ -4080,6 +4170,198 @@ done
         });
     }
 
+    /// An Overview's calls that act on tasks group by tool, apart from its other calls. The note
+    /// it got with a message is one row that opens, and a message it sent into a task shows
+    /// its label instead of the note's row, replayed as when it was sent.
+    #[gpui_kit::test]
+    fn overview_calls_group_and_its_notes_replay(cx: &mut TestAppContext) {
+        let chat = open_chat("overview-rows", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let call = |c: &mut Chat, id: &str, tool: &str, input: Value| {
+                    c.on_tool_use(id.into(), tool.into(), input)
+                };
+                let brief = |n: &str| serde_json::json!({"brief": format!("Task {n}\n\nMore.")});
+                call(c, "a", "mcp__shark__spawn_task", brief("a"));
+                call(c, "b", "mcp__shark__spawn_task", brief("b"));
+                call(c, "r", "mcp__shark__read_task", serde_json::json!({}));
+                call(c, "g", "Grep", serde_json::json!({"pattern": "x"}));
+                let to = serde_json::json!({"task": "one", "message": "Carry on."});
+                call(c, "m", "mcp__shark__message_task", to.clone());
+                call(c, "s", "mcp__shark__stop_task", to);
+                let groups: Vec<Vec<(&str, &str)>> = (c.blocks.iter())
+                    .filter_map(|b| match b {
+                        Block::Tools { calls, .. } => Some(
+                            (calls.iter().map(|c| (c.id.as_str(), c.summary.as_str()))).collect(),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    groups,
+                    [
+                        vec![("a", "Task a"), ("b", "Task b")],
+                        vec![("r", ""), ("g", "x")],
+                        vec![("m", "Carry on.")],
+                        vec![("s", "one")],
+                    ]
+                );
+                let Block::Tools { calls, .. } = &c.blocks[1] else {
+                    panic!("a group");
+                };
+                assert_eq!(group_summary(calls), "Read 1 task, searched 1 pattern");
+                // A list of tasks has rows of its own: clicking it opens nothing.
+                c.sync_rows(None);
+                c.sel = 0;
+                c.toggle(cx);
+                assert!(matches!(&c.blocks[0], Block::Tools { open: false, .. }));
+
+                let since = "[shark] Since last turn: 1 finished\n- One [task one]: finished: its turn ended";
+                let wire = format!(
+                    "{since}\n{}{NOTES_END}Start from the pushed parent.",
+                    overview::FROM_OVERVIEW
+                );
+                let at = c.blocks.len();
+                c.on_echo(wire, cx);
+                c.sync_rows(None);
+                let [Block::Since { head, rows, open: false }, Block::Info(label), Block::User(text, false)] =
+                    &c.blocks[at..]
+                else {
+                    panic!("the note, the label and the message");
+                };
+                assert_eq!(head, "Since last turn · 1 finished");
+                assert_eq!(rows, &["- One [task one]: finished: its turn ended"]);
+                assert_eq!(label, overview::FROM_OVERVIEW);
+                assert_eq!(text, "Start from the pushed parent.");
+                assert!(c.from_overview(at + 2) && !c.from_overview(at));
+                assert_eq!(c.overview_messages(), ["Start from the pushed parent."]);
+                let shown: Vec<usize> = c.rows.iter().map(|r| r.0).collect();
+                assert!(!shown.contains(&(at + 1)), "the label is no row of its own");
+                assert!(shown.contains(&at) && shown.contains(&(at + 2)));
+                // The note opens to what the Overview was told.
+                c.sel = c.rows.iter().position(|r| r.0 == at).unwrap();
+                c.toggle(cx);
+                assert!(matches!(&c.blocks[at], Block::Since { open: true, .. }));
+            })
+        });
+    }
+
+    /// An Overview's message into a running turn carries its label and nothing else: the
+    /// task's own pending notes weren't in it, so they stay pending; the reply it lands in
+    /// stays one block; and a message that starts like a command is labelled all the same.
+    #[gpui_kit::test]
+    fn an_overviews_message_into_a_turn_keeps_notes_pending_and_the_reply_whole(
+        cx: &mut TestAppContext,
+    ) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fake_claude();
+        let chat = open_chat("overview-steer", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let dir = c.ws.dir();
+                std::fs::create_dir_all(dir.join("api")).unwrap();
+                assert!(c.send_text("first".into(), false, cx));
+                c.apply(Ev::User("first".into()), cx);
+                let mut ws = c.ws.clone();
+                ws.repos.push(crate::state::TaskRepo {
+                    name: "api".into(),
+                    src: dir.join("api"),
+                    base: "HEAD".into(),
+                    branch: None,
+                });
+                c.task_changed(&ws, cx);
+                let pending = c.pending_context().len();
+                assert!(pending > 0, "the new repository is news to the agent");
+                c.apply(Ev::TextDelta("Work".into()), cx);
+                assert!(c.tell("Carry on.", cx));
+                assert_eq!(
+                    c.activity().as_deref(),
+                    Some("Writing"),
+                    "the label hides nothing"
+                );
+                c.apply(Ev::TextDelta("ing".into()), cx);
+                c.apply(Ev::Text("Working".into()), cx);
+                let wire = format!("{}{NOTES_END}Carry on.", overview::FROM_OVERVIEW);
+                c.apply(Ev::User(wire), cx);
+                assert_eq!(
+                    c.pending_context().len(),
+                    pending,
+                    "a note the agent never got isn't marked as read"
+                );
+                let replies: Vec<&str> = (c.blocks.iter())
+                    .filter_map(|b| match b {
+                        Block::Text { src, .. } => Some(src.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(replies, ["Working"], "one reply, not split at the message");
+                let done = Ev::Result {
+                    is_error: false,
+                    text: String::new(),
+                    secs: 0,
+                };
+                c.apply(done, cx);
+                // Not a command of the task's agent: the Overview only ever says things.
+                assert!(c.tell("/src/cache.rs: use the agreed change.", cx));
+                assert_eq!(
+                    c.overview_messages(),
+                    ["Carry on.", "/src/cache.rs: use the agreed change."]
+                );
+                c.reader = None;
+                c.harness = None;
+                std::fs::remove_dir_all(dir).unwrap();
+            })
+        });
+    }
+
+    /// An Overview becomes a task when its first message has gone out, not when it was tried:
+    /// an agent that didn't start leaves nothing saved.
+    #[gpui_kit::test]
+    fn an_overview_is_born_when_its_first_message_went_out(cx: &mut TestAppContext) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fake = fake_claude();
+        let chat = open_chat("overview-born", cx);
+        let born = Rc::new(std::cell::Cell::new(0));
+        let count = born.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&chat, move |_, ev: &ChatEvent, _| {
+                if matches!(ev, ChatEvent::Born) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                (c.ws.overview, c.ws.unsent) = (true, true);
+                // SAFETY: tests that start claude hold UI_LOCK.
+                unsafe { std::env::set_var("SHARK_CLAUDE", "/nonexistent/claude") };
+                assert!(
+                    !c.send_text("hi".into(), false, cx),
+                    "the agent can't start"
+                );
+                unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+                assert!(c.ws.unsent, "still no task");
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(born.get(), 0);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                assert!(c.send_text("hi".into(), false, cx));
+                assert!(!c.ws.unsent);
+                c.reader = None;
+                c.harness = None;
+                let _ = std::fs::remove_dir_all(c.ws.dir());
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(born.get(), 1);
+    }
+
     /// A replayed message that went out with task notes shows them as Info rows, not in
     /// the user's bubble.
     #[gpui_kit::test]
@@ -4652,7 +4934,6 @@ done
                 assert_eq!(c.last_reply, "");
                 assert_eq!(c.meta.session_id, None);
                 assert!(!c.working());
-                // A goal's time limit counts the turn it cut short.
                 assert!((90..95).contains(&c.last_secs), "{}", c.last_secs);
 
                 // Only background processes: no turn, so no time.

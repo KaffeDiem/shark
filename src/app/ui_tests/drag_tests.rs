@@ -22,6 +22,8 @@ fn fixture() -> State {
         state.sections.push(Section {
             name: format!("{name} section"),
             icon: "folder".into(),
+            overview: None,
+            unsent: None,
             collapsed: false,
             tasks: vec![name.into()],
         });
