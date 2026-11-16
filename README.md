@@ -46,6 +46,10 @@ Every sidebar section has an Overview chat as its first row. Ask it what the sec
 
 It runs only when you message it, and is then told what happened in the section since its last turn. Finished tasks still come to you first. Plan mode makes it propose first: it can only write a plan, and approving the plan lets it start tasks. **Stop all** stops every running chat in the section. Agent time is shown, with no limit, and nothing stops by itself. Nothing is pushed or merged without you.
 
+<p align="center">
+  <img src="docs/images/readme-overview.png" width="900" alt="An Overview: the tasks it started and the one it messaged, each row with the task's live status, agent and diff; the section's header shows what is running and Stop all">
+</p>
+
 ### From branch to merge
 
 The Git button always offers the next step: commit and push, create linked PRs across the task's repositories, update from base, fix failing checks, address review comments, merge. Stack a task on another and its PR targets the parent; when the parent merges, the tasks on top are moved onto its base.
@@ -105,7 +109,7 @@ cargo test -- --test-threads=1
 cargo test --features test-support -- --test-threads=1
 ```
 
-Tests run serially because some change process environment variables. The opt-in `--features test-support --test rendering` target checks real GPU output. The screenshots above come from it: `SHARK_RENDER_README=1 SHARK_RENDER_DIR=docs/images cargo test --features test-support --test rendering` rewrites `docs/images/readme-*.png` from demo data. Ignored `live_claude` and `live_codex` tests call real models and incur usage; `live_usage` checks signed-in allowances without inference.
+Tests run serially because some change process environment variables. The opt-in `--features test-support --test rendering` target checks real GPU output. The screenshots above come from it: `SHARK_RENDER_README=1 SHARK_RENDER_DIR=docs/images cargo test --features test-support --test rendering` rewrites `docs/images/readme-*.png` from demo data. Ignored `live_claude` and `live_codex` tests call real models and incur usage, as does `SHARK_LIVE_OVERVIEW=1` on the rendering target, which runs an Overview end to end against a real Claude; `live_usage` checks signed-in allowances without inference.
 
 To release, merge a PR labeled `release`. CI builds the DMG and updates the version in Cargo, the Homebrew cask and this README. See [release workflow](.github/workflows/release.yml).
 
