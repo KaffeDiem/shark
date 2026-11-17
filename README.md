@@ -78,7 +78,7 @@ brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
 brew install --cask KaffeDiem/shark/shark
 ```
 
-Or [Download Shark 0.1.48](https://github.com/KaffeDiem/shark/releases/download/v0.1.48/Shark-0.1.48.dmg) for Apple Silicon and drag it to Applications. The app isn't notarized: after first launch, allow it in System Settings → Privacy & Security → Open Anyway.
+Or [Download Shark 0.1.49](https://github.com/KaffeDiem/shark/releases/download/v0.1.49/Shark-0.1.49.dmg) for Apple Silicon and drag it to Applications. The app isn't notarized: after first launch, allow it in System Settings → Privacy & Security → Open Anyway.
 
 Needs `git`, signed-in `gh` and `claude` on your login shell's PATH. For Codex models, also install `codex` and run `codex login`.
 
