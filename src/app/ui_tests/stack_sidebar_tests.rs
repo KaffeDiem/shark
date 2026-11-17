@@ -318,6 +318,43 @@ fn probes_teach_trunks_and_prs(cx: &mut TestAppContext) {
     });
 }
 
+/// A task whose branch origin knows by another name is that branch in its stack: the name is
+/// learnt from a probe, saved, and forgotten once the branch goes by its own again.
+#[gpui_kit::test]
+fn a_branch_origin_knows_by_another_name_keeps_its_stack(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = booted(cx);
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        // `ui` was pushed as `kasper/ui`: its PR and wiring's base say so.
+        let wiring = ix(s, "wiring");
+        s.state.tasks[wiring].repos[0].base = "origin/kasper/ui".into();
+        let prs = vec![pr(5, "kasper/ui", "api"), pr(9, "polish", "wiring")];
+        s.stack_prs.insert("api".into(), prs.into());
+        let whole = vec![Sec(0), T(0), Pr(3, 9), T(4), T(1), T(3), T(2)];
+        assert!(s.state.origin_branches.is_empty());
+        assert_ne!(rows(s), whole, "`ui` isn't known as `kasper/ui` yet");
+        let t = s.state.tasks[ix(s, "ui")].clone();
+        let mut repo = crate::sync::Repo::fresh(&t.repos[0], &t);
+        let none = HashMap::new();
+        assert!(!s.learn_stacks(&[repo.clone()], &none, cx), "not probed");
+        repo.local.as_mut().unwrap().origin_branch = "kasper/ui".into();
+        assert!(s.learn_stacks(&[repo.clone()], &none, cx));
+        assert!(!s.learn_stacks(&[repo.clone()], &none, cx));
+        assert_eq!(rows(s), whole);
+        // Cut from `ui` before it was pushed, wiring's base is its local name: still on it.
+        s.state.tasks[wiring].repos[0].base = "ui".into();
+        assert_eq!(rows(s), whole);
+        assert_eq!(
+            State::load().origin_branches["api"]["ui"],
+            "kasper/ui",
+            "saved"
+        );
+        repo.local.as_mut().unwrap().origin_branch = "ui".into();
+        assert!(s.learn_stacks(&[repo], &none, cx));
+        assert!(State::load().origin_branches.is_empty(), "forgotten");
+    });
+}
+
 /// A stack on the real renderer, expanded and in the rail, dark and light: the rail is drawn
 /// between the icons, brighter below the open task. `SHARK_RENDER_STACKS_ONLY=1` runs just
 /// this; `SHARK_RENDER_DIR` keeps the screenshots.

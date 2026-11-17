@@ -64,7 +64,8 @@ pub(super) fn run_job(job: &Job) -> Probed {
             .fetch
             .then(|| cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60).err())
             .flatten();
-        let mut pr = ask_pr.then(|| fetch_pr(wt, branch, &head));
+        let on_origin = crate::git::origin_branch(wt, branch);
+        let mut pr = ask_pr.then(|| fetch_pr(wt, branch, &on_origin, &head));
         let review_url = crate::git::review_pr_url(wt, branch);
         if review_url.is_some()
             && let Some(Ok(Some(pr))) = &mut pr
@@ -98,10 +99,10 @@ pub(super) fn run_job(job: &Job) -> Probed {
             let refresh = if let Some(base) = own_base {
                 let source = format!("refs/heads/{base}");
                 let target = format!("+{source}:refs/remotes/origin/{base}");
-                let head = format!("refs/heads/{branch}");
-                let remote_head = format!("+{head}:refs/remotes/origin/{branch}");
+                let head = format!("refs/heads/{on_origin}");
+                let remote_head = format!("+{head}:refs/remotes/origin/{on_origin}");
                 let fetch_head =
-                    selected.is_some_and(|p| p.state == PrState::Open) && branch != base;
+                    selected.is_some_and(|p| p.state == PrState::Open) && on_origin != base;
                 crate::git::git(wt, &["check-ref-format", &source]).and_then(|_| {
                     if fetch_head {
                         crate::git::git(wt, &["check-ref-format", &head])?;
@@ -135,7 +136,11 @@ pub(super) fn run_job(job: &Job) -> Probed {
         let trunk = status::trunk_of(wt, prev_local);
         let parent = crate::stack::parent_of(&base, &trunk)
             .filter(|_| ask_pr && !review && !trunk.is_empty())
-            .map(|p| status::fetch_parent(wt, p));
+            .map(|p| match base.starts_with("origin/") {
+                true => status::fetch_parent(wt, p, p),
+                // A local parent branch: its PR is under the name origin has for it.
+                false => status::fetch_parent(wt, p, &crate::git::parent_origin_branch(wt, p)),
+            });
         let known_parent = match &parent {
             Some(Ok(parent)) => parent.as_ref(),
             None => previous

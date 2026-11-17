@@ -20,10 +20,14 @@ pub struct Local {
     pub head: String,
     /// `origin`'s URL; `None` if the repo has no origin remote.
     pub origin: Option<String>,
-    /// `(ahead, behind)` vs `origin/<branch>`; `None` if it isn't on the remote. Not `@{u}`:
-    /// a fresh worktree may track its base, and a deleted remote branch keeps a stale upstream.
+    /// The branch's name on origin (`git::origin_branch`): its own, unless `git push` sends it
+    /// to another. Empty until probed.
+    pub origin_branch: String,
+    /// `(ahead, behind)` vs `origin/<origin_branch>`; `None` if it isn't on the remote. Not
+    /// `@{u}`: a fresh worktree may track its base, and a deleted remote branch keeps a stale
+    /// upstream.
     pub remote: Option<(u32, u32)>,
-    /// `origin/<branch>` as probed; a force push leases exactly this commit.
+    /// `origin/<origin_branch>` as probed; a force push leases exactly this commit.
     pub remote_head: String,
     /// Diverged only because local history was rewritten: every remote-only commit has a
     /// patch-equivalent local one and the local tip is newer, so a lease-guarded force push
@@ -40,8 +44,8 @@ pub struct Local {
     /// so what follows `parent_tip` must be rebased onto the base.
     pub restack: bool,
     /// The saved base is a local parent branch that origin has all of (`local_parent_pushed`):
-    /// the task takes `origin/<parent>` as its base.
-    pub parent_pushed: bool,
+    /// the task takes this, the parent's branch on origin, as its base.
+    pub parent_pushed: Option<String>,
     /// Tracked lines against the Diff view base, refreshed on every probe.
     pub diff: Option<(u32, u32)>,
     pub(crate) diff_base: Option<(String, String, String)>,
@@ -155,7 +159,7 @@ fn counts(s: &str) -> (u32, u32) {
 
 /// Probes one worktree. `--no-optional-locks` keeps `git status` from taking
 /// `index.lock`, which would make the agent's own git commands fail. `prev` is the last probe:
-/// while HEAD and `origin/<branch>` haven't moved, its remote counts still hold.
+/// while HEAD and the branch on origin haven't moved, its remote counts still hold.
 /// Only an authoritative base may advance or clear the recorded parent boundary.
 pub fn probe(
     wt: &Path,
@@ -195,7 +199,8 @@ pub fn probe(
     l.op = crate::git::op_in_progress(wt)?;
     l.origin = git(wt, &["remote", "get-url", "origin"]).ok();
     l.trunk = trunk_of(wt, prev);
-    let remote = format!("refs/remotes/origin/{branch}");
+    l.origin_branch = crate::git::origin_branch(wt, branch);
+    let remote = format!("refs/remotes/origin/{}", l.origin_branch);
     if let Some(oid) = crate::git::ref_oid(wt, &remote) {
         if let Some(p) =
             prev.filter(|p| p.remote.is_some() && (&p.head, &p.remote_head) == (&l.head, &oid))
@@ -285,23 +290,23 @@ pub fn compact_age(d: std::time::Duration) -> String {
     }
 }
 
-/// Whether `saved`, a task's base, is a local parent branch that origin has all of. Such a task
-/// was cut from a branch that wasn't pushed yet; from here on it stacks on `origin/<parent>`
-/// like any other. A parent whose local branch is gone counts once origin has it.
-pub fn local_parent_pushed(wt: &Path, saved: &str, trunk: &str) -> bool {
+/// `origin/<name>`, the parent's branch on origin, when `saved`, a task's base, is a local parent
+/// branch that origin has all of. Such a task was cut from a branch that wasn't pushed yet; from
+/// here on it stacks on origin's like any other. A parent whose local branch is gone counts once
+/// origin has it.
+pub fn local_parent_pushed(wt: &Path, saved: &str, trunk: &str) -> Option<String> {
     if saved.starts_with("origin/") {
-        return false;
+        return None;
     }
-    let Some(parent) = crate::stack::parent_of(saved, trunk) else {
-        return false;
-    };
-    let oid = |r: &str| crate::git::ref_oid(wt, &format!("{r}/{parent}^{{commit}}"));
-    let Some(pushed) = oid("refs/remotes/origin") else {
-        return false;
-    };
-    oid("refs/heads").is_none_or(|local| {
-        local == pushed || git(wt, &["merge-base", "--is-ancestor", &local, &pushed]).is_ok()
-    })
+    let parent = crate::stack::parent_of(saved, trunk)?;
+    let on_origin = format!("origin/{}", crate::git::parent_origin_branch(wt, parent));
+    let oid = |r: &str| crate::git::ref_oid(wt, &format!("{r}^{{commit}}"));
+    let pushed = oid(&format!("refs/remotes/{on_origin}"))?;
+    oid(&format!("refs/heads/{parent}"))
+        .is_none_or(|local| {
+            local == pushed || git(wt, &["merge-base", "--is-ancestor", &local, &pushed]).is_ok()
+        })
+        .then_some(on_origin)
 }
 
 /// The trunk the last probe found, else the repo's default branch.
@@ -495,21 +500,28 @@ fn parse_pr(pick: &Value) -> Pr {
 /// A stacked repo's parent PR, when it tells the parent's state: open, or merged or closed with
 /// the head origin still has (or origin dropped the branch). A long-lived base like `develop`
 /// with an old merged PR has moved on since; that PR isn't about it.
-pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
-    let pr = fetch_pr(wt, parent, "")?;
-    let remote = format!("refs/remotes/origin/{parent}");
+/// `on_origin` is the parent's name there.
+pub fn fetch_parent(wt: &Path, parent: &str, on_origin: &str) -> Result<Option<Pr>, String> {
+    let pr = fetch_pr(wt, parent, on_origin, "")?;
+    let remote = format!("refs/remotes/origin/{on_origin}");
     let tip = crate::git::ref_oid(wt, &remote);
     Ok(pr.filter(|p| p.state == PrState::Open || tip.as_ref().is_none_or(|t| *t == p.head)))
 }
 
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
 /// so it can't be confused with being offline or logged out.
-/// `head` is the local HEAD as just probed.
-pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
+/// `on_origin` is `branch`'s name there (`git::origin_branch`), the head its PRs have; `head`
+/// is the local HEAD as just probed.
+pub fn fetch_pr(
+    wt: &Path,
+    branch: &str,
+    on_origin: &str,
+    head: &str,
+) -> Result<Option<Pr>, String> {
     let review = crate::git::review_pr_url(wt, branch);
     let origin = origin_repo(wt);
     let own = if review.is_none() || origin.is_some() {
-        let result = branch_prs(wt, branch, PR_FIELDS, 20)
+        let result = branch_prs(wt, on_origin, PR_FIELDS, 20)
             .map(|list| pick_pr(&list.iter().collect::<Vec<_>>()).map(parse_pr));
         match result {
             Ok(pr) => pr,
@@ -626,6 +638,19 @@ impl Repo {
         self.pr.as_ref()?.as_ref().ok()?.as_ref()
     }
 
+    /// The branch's name on origin, as probed; its own until then.
+    pub fn origin_branch(&self) -> &str {
+        (self.local.as_ref().ok())
+            .map(|l| l.origin_branch.as_str())
+            .filter(|b| !b.is_empty())
+            .unwrap_or(&self.branch)
+    }
+
+    /// What `prompts::render_each` names it by: the repo, its branch, the branch on origin.
+    pub fn prompt_names(&self) -> (&str, &str, &str) {
+        (&self.name, &self.branch, self.origin_branch())
+    }
+
     pub fn is_review(&self) -> bool {
         self.local.as_ref().is_ok_and(|l| l.review) || self.pr().is_some_and(|p| p.review_checkout)
     }
@@ -699,20 +724,18 @@ pub fn restack_prompt(repos: &[&Repo], onto: impl Fn(&Repo) -> String) -> String
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let pairs = repos.iter().map(|r| (&*r.name, &*r.branch));
-    prompts::render_each("restack", pairs, fill)
+    let named = repos.iter().map(|r| r.prompt_names());
+    prompts::render_each("restack", named, fill)
 }
 
 impl Repo {
-    /// `branch` on GitHub, e.g. `https://github.com/o/r/tree/feat`; `None` unless origin is
+    /// The branch on GitHub, e.g. `https://github.com/o/r/tree/feat`; `None` unless origin is
     /// GitHub and the branch is pushed (an unpushed branch would 404).
-    pub fn branch_url(&self, branch: &str) -> Option<String> {
+    pub fn branch_url(&self) -> Option<String> {
         let l = self.local.as_ref().ok()?;
         l.remote?;
-        Some(format!(
-            "{}/tree/{branch}",
-            github_url(l.origin.as_deref()?)?
-        ))
+        let github = github_url(l.origin.as_deref()?)?;
+        Some(format!("{github}/tree/{}", self.origin_branch()))
     }
 
     /// Its work is exactly what a merged PR landed.
@@ -902,7 +925,7 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     };
     // Prompt `key` for the repos in `rs`, once per branch; `fill` gives `{repos}`.
     let render = |key: &str, rs: &[String], fill: &dyn Fn(&[String]) -> String| {
-        prompts::render_each(key, among(repos, rs).map(|r| (&*r.name, &*r.branch)), fill)
+        prompts::render_each(key, among(repos, rs).map(Repo::prompt_names), fill)
     };
     // An agent step whose prompt `key` names the repos and their branch.
     let ask = |verb: &str, key: &str, rs: Vec<String>, attention| {
@@ -1157,6 +1180,8 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
         return Err(format!("{} is a local PR review checkout", r.name));
     }
     let b = r.branch.as_str();
+    let on_origin = r.origin_branch();
+    let to_origin = || crate::git::push_refspec(b, on_origin);
     let local = || r.local.clone();
     let on_branch = || {
         let l = local()?;
@@ -1168,7 +1193,7 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
     let args = |a: &[&str]| Ok(Some(a.iter().map(|s| s.to_string()).collect()));
     match kind {
         Kind::Pull => match on_branch()?.remote.is_some_and(|(_, n)| n > 0) {
-            true => args(&["pull", "--ff-only", "--no-rebase", "origin", b]),
+            true => args(&["pull", "--ff-only", "--no-rebase", "origin", on_origin]),
             false => Ok(None),
         },
         Kind::Push => {
@@ -1176,7 +1201,7 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             if l.remote.is_some_and(|(a, _)| a == 0) || (l.remote.is_none() && l.base.0 == 0) {
                 return Ok(None);
             }
-            args(&["push", "-u", "origin", b])
+            args(&["push", "-u", "origin", &to_origin()])
         }
         Kind::ForcePush => {
             let l = on_branch()?;
@@ -1184,8 +1209,8 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
                 return Ok(None);
             }
             // The commit whose patches were checked, not whatever a later fetch put there.
-            let lease = format!("--force-with-lease={b}:{}", l.remote_head);
-            args(&["push", &lease, "-u", "origin", b])
+            let lease = format!("--force-with-lease={on_origin}:{}", l.remote_head);
+            args(&["push", &lease, "-u", "origin", &to_origin()])
         }
         Kind::Merge => {
             let Some(p) = r.open_pr() else {
@@ -1987,6 +2012,24 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             ("Address comments", vec!["c1".to_string()])
         );
         assert_eq!(ask(&["c1".to_string()]).kind, Kind::Merge);
+    }
+
+    /// The branch link goes by origin's name for the branch, and only once it is pushed.
+    #[test]
+    fn branch_url_names_the_branch_on_origin() {
+        let url = |on_origin: &str, remote| {
+            let local = Local {
+                origin: Some("git@github.com:o/r.git".into()),
+                origin_branch: on_origin.into(),
+                remote,
+                ..Default::default()
+            };
+            repo("a", local, None).branch_url()
+        };
+        let tree = |b: &str| Some(format!("https://github.com/o/r/tree/{b}"));
+        assert_eq!(url("kd/feat", Some((0, 0))), tree("kd/feat"));
+        assert_eq!(url("feat", Some((1, 0))), tree("feat"));
+        assert_eq!(url("kd/feat", None), None, "not pushed");
     }
 
     #[test]

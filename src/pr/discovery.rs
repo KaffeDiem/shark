@@ -3,13 +3,14 @@ use crate::git::{cmd_bounded, git};
 use serde_json::Value;
 use std::path::Path;
 
-/// `branch`'s PRs of any state in origin's repo (`--repo`, so a fork's upstream never answers),
-/// as `gh pr list --json fields` gives them; same-named fork branches are left out.
-pub fn branch_prs(wt: &Path, branch: &str, fields: &str, secs: u64) -> Result<Vec<Value>, String> {
+/// The PRs of any state whose head is `head`, a branch of origin (`git::origin_branch`), in
+/// origin's repo (`--repo`, so a fork's upstream never answers), as `gh pr list --json fields`
+/// gives them; same-named fork branches are left out.
+pub fn branch_prs(wt: &Path, head: &str, fields: &str, secs: u64) -> Result<Vec<Value>, String> {
     let origin = origin_repo(wt);
     let args = super::with_repo(
         vec![
-            "pr", "list", "--head", branch, "--state", "all", "--json", fields, "--limit", "100",
+            "pr", "list", "--head", head, "--state", "all", "--json", fields, "--limit", "100",
         ],
         origin.as_deref(),
     );

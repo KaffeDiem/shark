@@ -308,6 +308,88 @@ fn group_timeout_kills_grandchildren() {
     fs::remove_file(&pidfile).ok();
 }
 
+/// A branch's name on origin is where `git push` sends it: an upstream of another name counts
+/// only when git would push there, and never when it is the trunk.
+#[test]
+fn origin_branch_is_where_git_push_goes() {
+    let root = std::env::temp_dir().join(format!("shark-origin-branch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let repo = init_repo(&root, "api");
+    let wt = &repo.path;
+    let remote = root.join("origin.git");
+    git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
+    git(wt, &["remote", "add", "origin", &remote.to_string_lossy()]).unwrap();
+    git(wt, &["push", "-q", "origin", "main"]).unwrap();
+    git(wt, &["remote", "set-head", "origin", "main"]).unwrap();
+    let track = |branch: &str, name: &str| {
+        let key = |k: &str| format!("branch.{branch}.{k}");
+        git(wt, &["config", &key("remote"), "origin"]).unwrap();
+        git(
+            wt,
+            &["config", &key("merge"), &format!("refs/heads/{name}")],
+        )
+        .unwrap();
+    };
+    let push_default = |mode: &str| git(wt, &["config", "push.default", mode]).unwrap();
+    git(wt, &["branch", "--no-track", "task", "main"]).unwrap();
+    push_default("simple");
+    assert_eq!(origin_branch(wt, "task"), "task", "no upstream");
+    track("task", "kasper/task");
+    assert_eq!(
+        origin_branch(wt, "task"),
+        "task",
+        "`simple` won't push there"
+    );
+    push_default("upstream");
+    assert_eq!(
+        origin_branch(wt, "task"),
+        "kasper/task",
+        "whether or not origin has it"
+    );
+    for key in ["branch.task.pushRemote", "remote.pushDefault"] {
+        git(wt, &["config", key, "fork"]).unwrap();
+        assert_eq!(origin_branch(wt, "task"), "task", "{key}: pushed elsewhere");
+        git(wt, &["config", "--unset", key]).unwrap();
+    }
+    track("task", "main");
+    assert_eq!(origin_branch(wt, "task"), "task", "tracking the trunk");
+    track("task", "task");
+    assert_eq!(origin_branch(wt, "task"), "task");
+    // No branch `kd` here: `kd/a`'s destination isn't its.
+    git(wt, &["branch", "--no-track", "kd/a", "main"]).unwrap();
+    track("kd/a", "other");
+    assert_eq!(origin_branch(wt, "kd/a"), "other");
+    assert_eq!(origin_branch(wt, "kd"), "kd");
+    // Set for one worktree only, as an agent does: asked there, also as a stack's parent.
+    push_default("simple");
+    git(wt, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+    let linked = root.join("linked");
+    git(
+        wt,
+        &["worktree", "add", "-q", &linked.to_string_lossy(), "kd/a"],
+    )
+    .unwrap();
+    git(
+        &linked,
+        &["config", "--worktree", "push.default", "upstream"],
+    )
+    .unwrap();
+    assert_eq!(origin_branch(&linked, "kd/a"), "other");
+    assert_eq!(origin_branch(wt, "kd/a"), "kd/a", "not its worktree");
+    assert_eq!(parent_origin_branch(wt, "kd/a"), "other");
+    assert_eq!(
+        parent_origin_branch(wt, "task"),
+        "task",
+        "checked out nowhere"
+    );
+    assert_eq!(parent_origin_branch(wt, "gone"), "gone");
+    // Its worktree's folder was deleted, not pruned: asked here.
+    fs::remove_dir_all(&linked).unwrap();
+    push_default("upstream");
+    assert_eq!(parent_origin_branch(wt, "kd/a"), "other");
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn init_repo(root: &Path, name: &str) -> Repo {
     let p = root.join("src").join(name);
     fs::create_dir_all(&p).unwrap();

@@ -833,7 +833,7 @@ const PAGES: &[(IconName, (&str, &str))] = &[
         IconName::MessageSquareText,
         (
             "Prompts",
-            "Sent to the agent by the git button; {repos} and {branch} are filled in when the step runs",
+            "Sent to the agent by the git button; {repos}, {branch} and {origin_branch} (its name on origin) are filled in when the step runs",
         ),
     ),
     (

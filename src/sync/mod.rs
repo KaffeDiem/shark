@@ -341,9 +341,9 @@ impl GitSync {
                 let review = |base: &str| base.starts_with("refs/shark/pull/");
                 let new = if review(&saved.base) && !review(&repo.base) && !local.review {
                     repo.base.clone()
-                } else if local.parent_pushed {
+                } else if let Some(pushed) = &local.parent_pushed {
                     // Cut from a parent that wasn't pushed then and is now.
-                    format!("origin/{}", saved.base)
+                    pushed.clone()
                 } else {
                     return None;
                 };
@@ -944,11 +944,11 @@ impl GitSync {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let branch_of = |name: &str| {
-            let r = self.repos.iter().find(|r| r.name == name);
-            r.map_or(self.ws.branch.as_str(), |r| r.branch.as_str())
-        };
-        let repos = moves.iter().map(|(r, ..)| (r.as_str(), branch_of(r)));
+        let branch = self.ws.branch.as_str();
+        let repos = moves.iter().map(|(name, ..)| {
+            let r = self.repos.iter().find(|r| r.name == *name);
+            r.map_or((name.as_str(), branch, branch), Repo::prompt_names)
+        });
         let prompt = crate::prompts::render_each("rebase_base", repos, fill);
         self.run_kind(Kind::Agent(prompt), "Rebase onto new base", window, cx)
     }
@@ -995,7 +995,7 @@ impl GitSync {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let repos = self.repos.iter().map(|r| (&*r.name, &*r.branch));
+        let repos = self.repos.iter().map(Repo::prompt_names);
         let prompt = crate::prompts::render_each("update_base", repos, bases);
         self.run_kind(Kind::Agent(prompt), "Update from base", window, cx)
     }
@@ -1174,8 +1174,8 @@ fn commit_step(repos: &[Repo]) -> (Vec<String>, String) {
     if rs.is_empty() {
         rs = repos.iter().map(|r| r.name.clone()).collect();
     }
-    let pairs = among(repos, &rs).map(|r| (&*r.name, &*r.branch));
-    let prompt = crate::prompts::render_each("commit", pairs, |rs| rs.join(", "));
+    let named = among(repos, &rs).map(Repo::prompt_names);
+    let prompt = crate::prompts::render_each("commit", named, |rs| rs.join(", "));
     (rs, prompt)
 }
 
@@ -2368,7 +2368,8 @@ esac
         .unwrap();
         let rs = probed(&job);
         let push = status::step_args(&Kind::Push, &rs[0]).unwrap().unwrap();
-        assert_eq!(push, ["push", "-u", "origin", "kd/x"]);
+        let kd = ["push", "-u", "origin", "refs/heads/kd/x:refs/heads/kd/x"];
+        assert_eq!(push, kd);
         assert!(status::step_args(&Kind::Push, &rs[1]).is_ok());
 
         // web wanders off its branch: only web is asked back, to `feat`.

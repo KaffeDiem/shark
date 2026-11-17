@@ -119,7 +119,14 @@ impl Shark {
             .map(|i| {
                 let t = &tasks[i];
                 let repos = (t.repos.iter())
-                    .map(|r| (r.name.as_str(), t.branch_of(r), r.base.as_str()))
+                    .map(|r| {
+                        (
+                            r.name.as_str(),
+                            self.state.origin_branch(t, r),
+                            // A local parent's branch too, for a task cut from it unpushed.
+                            self.state.on_origin(&r.name, &r.base),
+                        )
+                    })
                     .collect();
                 (t.name.as_str(), repos)
             })
@@ -194,9 +201,10 @@ impl Shark {
         }
     }
 
-    /// Keeps what a probe found that stacks need: the trunks (saved when they change) and
-    /// each repo's open PRs, unless older than the ones kept. A task follows its PR's base
-    /// when GitHub retargeted it. Whether anything changed.
+    /// Keeps what a probe found that stacks need: the trunks and the branches origin knows by
+    /// another name (both saved when they change), and each repo's open PRs, unless older than
+    /// the ones kept. A task follows its PR's base when GitHub retargeted it. Whether anything
+    /// changed.
     pub(crate) fn learn_stacks(
         &mut self,
         repos: &[crate::sync::Repo],
@@ -205,13 +213,12 @@ impl Shark {
     ) -> bool {
         let mut trunk = false;
         for r in repos {
-            if let Ok(l) = &r.local
-                && !l.trunk.is_empty()
-                && self.state.trunks.get(&r.name) != Some(&l.trunk)
-            {
+            let Ok(l) = &r.local else { continue };
+            if !l.trunk.is_empty() && self.state.trunks.get(&r.name) != Some(&l.trunk) {
                 self.state.trunks.insert(r.name.clone(), l.trunk.clone());
                 trunk = true;
             }
+            trunk |= self.learn_origin_branch(&r.name, &r.branch, &l.origin_branch);
         }
         if trunk {
             let _ = self.state.save();
@@ -229,13 +236,28 @@ impl Shark {
                 .flat_map(|t| t.repos.iter().map(move |r| (t, r)))
                 .filter(|(_, r)| r.name == *repo)
                 .filter_map(|(t, r)| {
-                    let pr = crate::stack::own_pr(&list.prs, t.branch_of(r))?;
+                    let pr = crate::stack::own_pr(&list.prs, self.state.origin_branch(t, r))?;
                     Some((t.name.clone(), r.name.clone(), pr.base_ref_name.clone()))
                 })
                 .collect();
             changed |= self.follow_prs(seen, at, cx);
         }
         changed
+    }
+
+    /// Keeps `on_origin`, the name a probe found origin has for `repo`'s `branch` (empty: not
+    /// probed), when it is another name, and forgets one that no longer is. Whether it changed.
+    fn learn_origin_branch(&mut self, repo: &str, branch: &str, on_origin: &str) -> bool {
+        if on_origin.is_empty() || self.state.on_origin(repo, branch) == on_origin {
+            return false;
+        }
+        let known = self.state.origin_branches.entry(repo.into()).or_default();
+        match on_origin == branch {
+            true => known.remove(branch),
+            false => known.insert(branch.into(), on_origin.into()),
+        };
+        (self.state.origin_branches).retain(|_, known| !known.is_empty());
+        true
     }
 
     /// Whether `list` is newer than `repo`'s open PRs kept; the disk cache only when none is.

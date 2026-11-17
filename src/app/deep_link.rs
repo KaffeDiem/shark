@@ -104,7 +104,7 @@ impl Shark {
         self.state.tasks.iter().find_map(|t| {
             let r = t.repos.iter().find(|r| r.src == repo.path)?;
             let branch = t.branch_of(r);
-            let found = head == Some(branch)
+            let found = head == Some(self.state.origin_branch(t, r))
                 || git::review_pr_url(&repo.path, branch).is_some_and(|u| same(&u))
                 || (self.syncs.get(&t.name)).is_some_and(|s| {
                     (s.read(cx).pr_urls().iter()).any(|(n, u)| *n == r.name && same(u))
