@@ -1047,7 +1047,8 @@ impl Shark {
             .filter(|r| r.base.starts_with("origin/"))
             .map(|r| match insert {
                 true => (r.name.clone(), crate::git::short(&r.base).to_string()),
-                false => (r.name.clone(), ws.branch_of(r).to_string()),
+                // `origin/<branch>` is the new task's base: by origin's name for it.
+                false => (r.name.clone(), self.state.origin_branch(&ws, r).to_string()),
             })
             .collect();
         if from.is_empty() {
@@ -1192,7 +1193,8 @@ impl Shark {
         let per_repo: Vec<git::RepoBranches> = (ws.repos.iter())
             .filter(|r| repos.contains(&r.name))
             .map(|r| {
-                let own = ws.branch_of(r).to_string();
+                // Left out of `origin/…` choices: by its name there.
+                let own = self.state.origin_branch(&ws, r).to_string();
                 (
                     r.name.clone(),
                     own,
@@ -1312,7 +1314,8 @@ impl Shark {
         let listed: Vec<Option<crate::prs::Pr>> = (moves.iter())
             .map(|(repo, ..)| {
                 let r = ws.repos.iter().find(|r| &r.name == repo)?;
-                crate::stack::own_pr(&self.stack_prs.get(repo)?.prs, ws.branch_of(r)).cloned()
+                let branch = self.state.origin_branch(&ws, r);
+                crate::stack::own_pr(&self.stack_prs.get(repo)?.prs, branch).cloned()
             })
             .collect();
         for ((repo, old, _), pr) in moves.iter().zip(&listed) {

@@ -171,13 +171,11 @@ pub fn create_linked_prs(
     let mut prs = vec![];
     for r in pending {
         let wt = dir.join(&r.name);
-        let branch = ws.branch_of(r);
-        cmd_bounded(
-            &wt,
-            "git",
-            &["push", "-u", "origin", &format!("refs/heads/{branch}")],
-            120,
-        )?;
+        // Under the name origin has for it, which is the PR's head.
+        let on_origin = crate::git::origin_branch(&wt, ws.branch_of(r));
+        let branch = on_origin.as_str();
+        let to_origin = crate::git::push_refspec(ws.branch_of(r), branch);
+        cmd_bounded(&wt, "git", &["push", "-u", "origin", &to_origin], 120)?;
         // Same `--repo` as polling, so a fork's upstream never answers for origin.
         let origin = origin_repo(&wt);
         let repo_flag = |a| with_repo(a, origin.as_deref());
@@ -489,6 +487,14 @@ mod tests {
                 &["commit", "-q", "--allow-empty", "-m", "work"],
             );
         }
+        // `web`'s branch goes by another name on origin (`push.default=upstream`).
+        for (key, value) in [
+            ("branch.feat.remote", "origin"),
+            ("branch.feat.merge", "refs/heads/kd/feat"),
+            ("push.default", "upstream"),
+        ] {
+            git(&dir.join("web"), &["config", key, value]).unwrap();
+        }
         let (bin, log) = (root.join("bin"), root.join("gh.log"));
         fs::create_dir_all(&bin).unwrap();
         let gh = bin.join("gh");
@@ -551,6 +557,22 @@ esac
                 );
             }
         }
+        // The renamed branch is pushed, looked up and opened under origin's name.
+        let web = |verb: &str| {
+            calls
+                .lines()
+                .find(|l| l.starts_with(&format!("web {verb}")))
+        };
+        for verb in ["pr list", "pr create"] {
+            assert!(
+                web(verb).is_some_and(|l| l.contains("--head kd/feat")),
+                "{verb}:\n{calls}"
+            );
+        }
+        let heads = git(&dir.join("web"), &["ls-remote", "--heads", "origin"]).unwrap();
+        let has = |name: &str| heads.lines().any(|l| l.ends_with(&format!("\t{name}")));
+        assert!(has("refs/heads/kd/feat"), "{heads}");
+        assert!(!has("refs/heads/feat"), "{heads}");
         fs::remove_dir_all(&root).unwrap();
     }
 

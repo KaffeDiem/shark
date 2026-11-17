@@ -255,14 +255,17 @@ async fn settings_apply_and_save(cx: &mut TestAppContext) {
         let saved = State::load();
         assert_eq!(saved.appearance.dark, "Sequoia");
         assert_eq!(saved.prompts["commit"], "ship {repos}");
-        assert_eq!(crate::prompts::render("commit", "api", "b"), "ship api");
+        assert_eq!(
+            crate::prompts::render("commit", "api", "b", "b"),
+            "ship api"
+        );
         // Clearing the editor is the default again, not an empty prompt.
         view.update(cx, |v, cx| v.set_prompt(0, Some("  \n".into()), cx));
         assert!(State::load().prompts.is_empty());
-        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        assert!(crate::prompts::render("commit", "api", "b", "b").starts_with("Commit and push"));
         // A blank override saved by an older version reads as the default too.
         crate::prompts::set_overrides(&[("commit".to_string(), " ".to_string())].into());
-        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        assert!(crate::prompts::render("commit", "api", "b", "b").starts_with("Commit and push"));
         view.update(cx, |v, cx| v.set_prompt(0, Some("ship {repos}".into()), cx));
 
         view.update(cx, |v, cx| {
@@ -273,7 +276,7 @@ async fn settings_apply_and_save(cx: &mut TestAppContext) {
         // The font override survives the mode switch.
         assert_eq!(mono(&cx.theme().light_theme).as_deref(), Some("Menlo"));
         assert!(State::load().prompts.is_empty());
-        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        assert!(crate::prompts::render("commit", "api", "b", "b").starts_with("Commit and push"));
     })
     .unwrap();
 }

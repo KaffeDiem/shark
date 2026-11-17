@@ -812,6 +812,43 @@ pub fn parent_tip_key(branch: &str) -> String {
     format!("branch.{branch}.shark-parent-tip")
 }
 
+/// `branch`'s name on origin: where `git push` sends it, when that is another branch of origin
+/// (an upstream of another name under `push.default=upstream`), else its own. Never the
+/// trunk: a branch that tracks the trunk it was cut from isn't it. Origin needn't have the
+/// branch (yet, or any more). `wt` must be its worktree: `push.default` may be set there alone.
+pub fn origin_branch(wt: &Path, branch: &str) -> String {
+    let local = format!("refs/heads/{branch}");
+    // The pattern also matches branches under `<branch>/`, hence the refname. `%(push)` names
+    // the upstream whatever remote is pushed to, hence the remote.
+    let fmt = "--format=%(refname) %(push:remotename) %(push)";
+    let out = git(wt, &["for-each-ref", fmt, &local]).unwrap_or_default();
+    (out.lines())
+        .find_map(|l| {
+            l.strip_prefix(&local)?
+                .strip_prefix(" origin refs/remotes/origin/")
+        })
+        .filter(|name| *name != branch && *name != short(&default_base(wt)))
+        .unwrap_or(branch)
+        .into()
+}
+
+/// The refspec that pushes `branch` to `on_origin`, its name there ([`origin_branch`]).
+pub fn push_refspec(branch: &str, on_origin: &str) -> String {
+    format!("refs/heads/{branch}:refs/heads/{on_origin}")
+}
+
+/// [`origin_branch`] of a stack's parent, which another task's worktree may have checked out:
+/// asked there, where its `push.default` is, unless that worktree's folder is gone.
+pub fn parent_origin_branch(wt: &Path, parent: &str) -> String {
+    let local = format!("refs/heads/{parent}");
+    let fmt = "--format=%(refname) %(worktreepath)";
+    let out = git(wt, &["for-each-ref", fmt, &local]).unwrap_or_default();
+    let at = (out.lines())
+        .find_map(|l| l.strip_prefix(&local)?.strip_prefix(' '))
+        .filter(|path| Path::new(path).is_dir());
+    origin_branch(at.map_or(wt, Path::new), parent)
+}
+
 /// A branch-local identity survives restarts without confusing same-named fork branches.
 pub fn review_pr_url(src: &Path, branch: &str) -> Option<String> {
     git(

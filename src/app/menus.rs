@@ -273,11 +273,14 @@ pub(super) fn stacks(this: &Shark, ws: &Task, cx: &App) -> Vec<RepoStack> {
             let local: Vec<(String, String, String)> = (this.state.tasks.iter())
                 .filter_map(|w| {
                     let wr = w.repos.iter().find(|x| x.src == r.src)?;
-                    Some((w.name.clone(), w.branch_of(wr).to_string(), wr.base.clone()))
+                    let branch = this.state.origin_branch(w, wr).to_string();
+                    let base = this.state.on_origin(&wr.name, &wr.base).to_string();
+                    Some((w.name.clone(), branch, base))
                 })
                 .collect();
             let prs = (this.stack_prs.get(&r.name)).map_or(&[][..], |l| l.prs.as_slice());
-            let (nodes, me) = crate::stack::chain(ws.branch_of(r), trunk, &local, prs);
+            let on_origin = this.state.origin_branch(ws, r);
+            let (nodes, me) = crate::stack::chain(on_origin, trunk, &local, prs);
             (nodes.len() > 1).then(|| RepoStack {
                 repo: r.name.clone(),
                 nodes,
@@ -418,7 +421,7 @@ pub(super) fn branch_entries(
         .unwrap_or_default()
         .iter()
         .filter(|r| repo.is_none_or(|name| name == r.name))
-        .filter_map(|r| Some((r.name.clone(), String::new(), r.branch_url(&r.branch)?)))
+        .filter_map(|r| Some((r.name.clone(), String::new(), r.branch_url()?)))
         .collect();
     let drifted = repo
         .and_then(|name| ws.repos.iter().find(|r| r.name == name))

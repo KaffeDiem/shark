@@ -55,6 +55,11 @@ pub struct State {
     /// the sidebar draws stacks at launch, before any task's probe.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trunks: BTreeMap<String, String>,
+    /// By repo name, then branch: the branch's name on origin where that is another
+    /// (`git::origin_branch`), as its last probe found it. Stacks match PRs by it. A deleted
+    /// task's entry stays until a task on that branch is probed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub origin_branches: BTreeMap<String, BTreeMap<String, String>>,
     /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
     #[serde(default)]
     pub stay_awake: bool,
@@ -1252,6 +1257,19 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 impl State {
+    /// `r`'s branch in `t`, by the name origin has for it.
+    pub fn origin_branch<'a>(&'a self, t: &'a Task, r: &'a TaskRepo) -> &'a str {
+        self.on_origin(&r.name, t.branch_of(r))
+    }
+
+    /// `branch` of `repo` by the name origin has for it; anything else (an `origin/…` base) as
+    /// it is. A stack is told by these names: its PRs' heads and bases are origin's.
+    pub fn on_origin<'a>(&'a self, repo: &str, branch: &'a str) -> &'a str {
+        (self.origin_branches.get(repo))
+            .and_then(|branches| branches.get(branch))
+            .map_or(branch, String::as_str)
+    }
+
     pub fn load() -> State {
         Self::load_at(&state_file())
     }

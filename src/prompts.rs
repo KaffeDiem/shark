@@ -20,8 +20,8 @@ pub const PROMPTS: &[Prompt] = &[
 In each repo review the diff and stage the files that \
 belong to this change. Never commit secrets or build output; if such files show up, add them to \
 .gitignore instead. Write a concise commit message in the repo's style, commit, then \
-`git push -u origin {branch}`. If the push is rejected because the remote moved, \
-`git pull --rebase origin {branch}` and push again.",
+`git push -u origin {branch}:{origin_branch}`. If the push is rejected because the remote moved, \
+`git pull --rebase origin {origin_branch}` and push again.",
     },
     Prompt {
         id: "conflicts",
@@ -56,9 +56,9 @@ finish it (`git rebase --continue`, `git commit`, …), then report what you did
         id: "diverged",
         title: "Sync with remote",
         repos: "repos whose branch diverged from origin",
-        default: "Branch `{branch}` has diverged from `origin/{branch}` in: {repos}. Rebase the local commits onto \
-`origin/{branch}` (`git pull --rebase origin {branch}`), resolve any conflicts, run a quick sanity \
-check, and push.",
+        default: "Branch `{branch}` has diverged from `origin/{origin_branch}` in: {repos}. Rebase the local commits onto \
+`origin/{origin_branch}` (`git pull --rebase origin {origin_branch}`), resolve any conflicts, run a quick sanity \
+check, and `git push origin {branch}:{origin_branch}`.",
     },
     Prompt {
         id: "pr_conflicts",
@@ -105,7 +105,7 @@ merge the base ({repos}), resolve conflicts, run a quick sanity check, commit an
         default: "The base of `{branch}` changed ({repos}). In each of those repos: `git fetch origin`, \
 then `git rebase --onto <new> $(git merge-base HEAD <old>)` so only this branch's own commits move. \
 Resolve conflicts keeping this branch's intent, run a quick sanity check, then \
-`git push --force-with-lease origin {branch}` if the branch is on origin.",
+`git push --force-with-lease origin {branch}:{origin_branch}` if the branch is on origin.",
     },
     Prompt {
         id: "restack",
@@ -115,7 +115,7 @@ Resolve conflicts keeping this branch's intent, run a quick sanity check, then \
 the given one belong to the parent, which may have new commits, been rewritten or been squash-merged since. In each of \
 those repos: `git fetch origin`, then `git rebase --onto <onto> <after>`. Resolve conflicts keeping this branch's \
 intent, check that `git log --oneline <onto>..HEAD` lists only this branch's own commits, run a quick sanity check, \
-then `git push --force-with-lease origin {branch}` if the branch is on origin.",
+then `git push --force-with-lease origin {branch}:{origin_branch}` if the branch is on origin.",
     },
 ];
 
@@ -144,29 +144,31 @@ pub fn get(id: &str) -> String {
         .into()
 }
 
-/// Fills `{repos}` and `{branch}`; other braces (gh's `{owner}`) stay as written.
-pub fn render(id: &str, repos: &str, branch: &str) -> String {
+/// Fills `{repos}`, `{branch}` and `{origin_branch}`, the branch's name on origin
+/// (`git::origin_branch`); other braces (gh's `{owner}`) stay as written.
+pub fn render(id: &str, repos: &str, branch: &str, on_origin: &str) -> String {
     get(id)
         .replace("{repos}", repos)
         .replace("{branch}", branch)
+        .replace("{origin_branch}", on_origin)
 }
 
-/// `render` for `(repo, branch)` pairs, once per branch they're on: `{branch}` sits inside git
-/// commands, so it must be one name. `fill` gives `{repos}` for each group's repos.
+/// `render` for `(repo, branch, its name on origin)`, once per branch they're on: the names sit
+/// inside git commands, so each must be one. `fill` gives `{repos}` for each group's repos.
 pub fn render_each<'a>(
     id: &str,
-    repos: impl IntoIterator<Item = (&'a str, &'a str)>,
+    repos: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
     fill: impl Fn(&[String]) -> String,
 ) -> String {
-    let mut groups: Vec<(&str, Vec<String>)> = vec![];
-    for (r, b) in repos {
-        match groups.iter_mut().find(|(g, _)| *g == b) {
+    let mut groups: Vec<((&str, &str), Vec<String>)> = vec![];
+    for (r, b, on_origin) in repos {
+        match groups.iter_mut().find(|(g, _)| *g == (b, on_origin)) {
             Some((_, rs)) => rs.push(r.into()),
-            None => groups.push((b, vec![r.into()])),
+            None => groups.push(((b, on_origin), vec![r.into()])),
         }
     }
     (groups.iter())
-        .map(|(b, rs)| render(id, &fill(rs), b))
+        .map(|((b, on_origin), rs)| render(id, &fill(rs), b, on_origin))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -177,17 +179,16 @@ mod tests {
     /// the global is shared with them, so this test only reads an id they never edit.
     #[test]
     fn fills_repos_and_branch() {
-        let p = super::render("review", "api", "b");
+        let p = super::render("review", "api", "b", "b");
         assert!(p.contains("in: api.") && p.contains("repos/{owner}/{repo}"));
-        let p = super::render("detached", "api, web", "feat");
+        let p = super::render("detached", "api, web", "feat", "feat");
         assert!(p.starts_with("HEAD is detached in: api, web.") && p.contains("`feat`"));
-        let one = super::render_each("detached", [("api", "feat"), ("web", "feat")], |rs| {
-            rs.join(", ")
-        });
+        let feat = [("api", "feat", "feat"), ("web", "feat", "feat")];
+        let one = super::render_each("detached", feat, |rs| rs.join(", "));
         assert_eq!(one, p, "one branch, one prompt");
         let two = super::render_each(
             "detached",
-            [("api", "a"), ("web", "b"), ("cli", "a")],
+            [("api", "a", "a"), ("web", "b", "b"), ("cli", "a", "a")],
             |rs| rs.join(", "),
         );
         let (a, b) = two.split_once("\n\n").unwrap();
@@ -198,5 +199,26 @@ mod tests {
         assert!(
             b.starts_with("HEAD is detached in: web.") && b.contains("`b`") && !b.contains("`a`")
         );
+        // A branch origin knows by another name is pushed and pulled under that name.
+        let join = |rs: &[String]| rs.join(", ");
+        let p = super::render_each("commit", [("api", "feat", "kd/feat")], join);
+        assert!(p.contains("`git push -u origin feat:kd/feat`"), "{p}");
+        assert!(p.contains("`git pull --rebase origin kd/feat`"), "{p}");
+        let named = [("api", "feat", "kd/feat"), ("web", "feat", "feat")];
+        let two = super::render_each("diverged", named, join);
+        let (a, b) = two
+            .split_once("\n\n")
+            .expect("one prompt per name on origin");
+        assert!(
+            a.starts_with("Branch `feat` has diverged from `origin/kd/feat` in: api."),
+            "{a}"
+        );
+        assert!(a.contains("`git push origin feat:kd/feat`"), "{a}");
+        assert!(b.contains("`origin/feat` in: web."), "{b}");
+        for id in ["rebase_base", "restack"] {
+            let p = super::render(id, "api", "feat", "kd/feat");
+            let push = "`git push --force-with-lease origin feat:kd/feat`";
+            assert!(p.contains(push), "{id}: {p}");
+        }
     }
 }

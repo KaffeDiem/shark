@@ -189,7 +189,8 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
         return Target::from_url(&url).map(Some);
     }
     super::origin_repo(wt).ok_or("Origin is not a GitHub repository")?;
-    let prs = super::branch_prs(wt, branch, "url,state,isCrossRepository,updatedAt", 30)?;
+    let on_origin = crate::git::origin_branch(wt, branch);
+    let prs = super::branch_prs(wt, &on_origin, "url,state,isCrossRepository,updatedAt", 30)?;
     super::pick_pr(&prs.iter().collect::<Vec<_>>())
         .map(|p| Target::from_url(string(p, "url")?))
         .transpose()

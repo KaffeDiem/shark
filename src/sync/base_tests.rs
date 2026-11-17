@@ -277,7 +277,7 @@ fn own_pr_replaces_review_identity_and_follows_retargets() {
 
     f.write("own.json", json!([f.pr(8, "main", "CLOSED")]));
     assert_eq!(
-        status::fetch_pr(&f.wt, "feature", &f.head)
+        status::fetch_pr(&f.wt, "feature", "feature", &f.head)
             .unwrap()
             .unwrap()
             .number,
@@ -326,7 +326,7 @@ fn review_identity_survives_absent_closed_fork_and_failed_own_pr_lookup() {
     review["url"] = json!(review_url);
     f.write("review.json", review);
     fs::write(f.root.join("fail"), "").unwrap();
-    let readable = status::fetch_pr(&f.wt, "feature", &f.head)
+    let readable = status::fetch_pr(&f.wt, "feature", "feature", &f.head)
         .unwrap()
         .unwrap();
     assert_eq!(readable.number, 7);
@@ -337,7 +337,7 @@ fn review_identity_survives_absent_closed_fork_and_failed_own_pr_lookup() {
     assert_eq!(review_pr_url(&f.wt, "feature").as_deref(), Some(review_url));
 
     fs::remove_file(f.root.join("review.json")).unwrap();
-    assert!(status::fetch_pr(&f.wt, "feature", &f.head).is_err());
+    assert!(status::fetch_pr(&f.wt, "feature", "feature", &f.head).is_err());
     assert_eq!(review_pr_url(&f.wt, "feature").as_deref(), Some(review_url));
 }
 
@@ -1312,13 +1312,15 @@ fn a_local_parent_is_pushed_when_origin_has_all_of_it() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new("local-parent");
-    let pushed = |saved: &str| status::local_parent_pushed(&f.wt, saved, "origin/main");
-    assert!(pushed("release"), "origin has the whole branch");
+    let on_origin = |saved: &str| status::local_parent_pushed(&f.wt, saved, "origin/main");
+    let pushed = |saved: &str| on_origin(saved).is_some();
+    assert_eq!(on_origin("release").as_deref(), Some("origin/release"));
     assert!(!pushed("origin/release"), "already on origin's branch");
     assert!(!pushed("main"), "the trunk is no parent");
     assert!(!pushed("refs/shark/pull/7/base"));
-    assert!(
-        !status::local_parent_pushed(&f.wt, "release", ""),
+    assert_eq!(
+        status::local_parent_pushed(&f.wt, "release", ""),
+        None,
         "trunk not probed yet"
     );
     git(&f.wt, &["branch", "-q", "unpushed", "release"]).unwrap();
@@ -1329,6 +1331,22 @@ fn a_local_parent_is_pushed_when_origin_has_all_of_it() {
     assert!(!pushed("release"));
     git(&f.wt, &["push", "-q", "origin", "release"]).unwrap();
     assert!(pushed("release"));
+    // A parent origin knows by another name is pushed once that branch has all of it.
+    for (key, value) in [
+        ("branch.release.remote", "origin"),
+        ("branch.release.merge", "refs/heads/kasper/release"),
+        ("push.default", "upstream"),
+    ] {
+        git(&f.wt, &["config", key, value]).unwrap();
+    }
+    assert!(!pushed("release"), "not under origin's name for it");
+    let renamed = "release:refs/heads/kasper/release";
+    git(&f.wt, &["push", "-q", "origin", renamed]).unwrap();
+    assert_eq!(
+        on_origin("release").as_deref(),
+        Some("origin/kasper/release")
+    );
+    git(&f.wt, &["config", "--unset", "branch.release.merge"]).unwrap();
     // The parent's task was deleted with its local branch: origin's is what is left.
     git(&f.wt, &["update-ref", "-d", "refs/heads/release"]).unwrap();
     assert!(pushed("release"));
@@ -1391,5 +1409,95 @@ fn a_local_base_becomes_origins_once_the_parent_is_pushed(cx: &mut gpui_kit::Tes
             "parent".to_string(),
             "origin/parent".to_string(),
         )]]
+    );
+}
+
+/// A branch that `git push` sends to another name on origin (`push.default=upstream`) is that
+/// branch there: its PR, its counts, its head fetch and its push all go by origin's name.
+#[test]
+fn a_branch_pushed_under_another_name_is_that_branch_on_origin() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut f = Fixture::new("renamed");
+    let wt = f.wt.clone();
+    git(&wt, &["config", "--unset", "branch.feature.shark-pr-url"]).unwrap();
+    f.ws.repos[0].base = "origin/main".into();
+    // Origin knows the branch as `kasper/feature` only.
+    let renamed = ["push", "-q", "origin", "feature:kasper/feature", ":feature"];
+    git(&wt, &renamed).unwrap();
+    for (key, value) in [
+        ("branch.feature.remote", "origin"),
+        ("branch.feature.merge", "refs/heads/kasper/feature"),
+        ("push.default", "upstream"),
+    ] {
+        git(&wt, &["config", key, value]).unwrap();
+    }
+    // The fake gh answers any head but `feature` from parent.json.
+    f.write("parent.json", json!([f.pr(8, "main", "OPEN")]));
+    let p = run_job(&f.job(true, true, &[]));
+    assert_eq!(p.fetch_error, None, "the head fetch asks for origin's name");
+    let repos = f.repos(p, &[]);
+    assert_eq!(repos[0].pr().map(|p| p.number), Some(8));
+    let calls = fs::read_to_string(f.root.join("calls")).unwrap();
+    assert!(calls.contains("--head kasper/feature"), "{calls}");
+    assert_eq!(repos[0].local.as_ref().unwrap().remote, Some((0, 0)));
+
+    let step = |kind, r: &Repo| status::step_args(&kind, r).unwrap().unwrap();
+    let with = |change: &dyn Fn(&mut status::Local)| {
+        let mut r = repos[0].clone();
+        change(r.local.as_mut().unwrap());
+        r
+    };
+    let pull = step(Kind::Pull, &with(&|l| l.remote = Some((0, 1))));
+    let origins = [
+        "pull",
+        "--ff-only",
+        "--no-rebase",
+        "origin",
+        "kasper/feature",
+    ];
+    assert_eq!(pull, origins);
+    let refspec = "refs/heads/feature:refs/heads/kasper/feature";
+    let lease = format!("--force-with-lease=kasper/feature:{}", f.head);
+    assert_eq!(
+        step(Kind::ForcePush, &with(&|l| l.rewritten = true)),
+        ["push", lease.as_str(), "-u", "origin", refspec]
+    );
+
+    crate::git::commit(&wt, &["--allow-empty", "-qm", "more"]);
+    let repos = f.repos(run_job(&f.job(false, false, &repos)), &repos);
+    assert_eq!(repos[0].local.as_ref().unwrap().remote, Some((1, 0)));
+    assert_eq!(status::next_action(&repos, &[]).kind, Kind::Push);
+    let push = step(Kind::Push, &repos[0]);
+    assert_eq!(push, ["push", "-u", "origin", refspec]);
+    git(&wt, &push.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+    let heads = git(&wt, &["ls-remote", "--heads", "origin"]).unwrap();
+    let pushed = format!("{}\trefs/heads/kasper/feature", f.oid("HEAD"));
+    assert!(heads.contains(&pushed), "{heads}");
+    assert!(
+        !heads.lines().any(|l| l.ends_with("\trefs/heads/feature")),
+        "no second branch under the local name: {heads}"
+    );
+    assert_eq!(
+        git(&wt, &["config", "branch.feature.merge"]).unwrap(),
+        "refs/heads/kasper/feature",
+        "the upstream stays"
+    );
+
+    // Cut from a local parent origin knows by another name: that is the parent asked about.
+    f.ws.repos[0].base = "release".into();
+    git(&wt, &["config", "branch.release.remote", "origin"]).unwrap();
+    let renamed = ["branch.release.merge", "refs/heads/kasper/release"];
+    git(&wt, &["config", renamed[0], renamed[1]]).unwrap();
+    git(&wt, &["push", "-q", "origin", "release:kasper/release"]).unwrap();
+    f.write("parent.json", json!([]));
+    fs::remove_file(f.root.join("calls")).unwrap();
+    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+    let calls = fs::read_to_string(f.root.join("calls")).unwrap();
+    assert!(calls.contains("--head kasper/release"), "{calls}");
+    assert_eq!(
+        repos[0].local.as_ref().unwrap().parent_pushed.as_deref(),
+        Some("origin/kasper/release")
     );
 }
