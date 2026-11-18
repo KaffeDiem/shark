@@ -1066,7 +1066,7 @@ mod tests {
         state.repo_settings.insert(
             "api".into(),
             crate::state::RepoSettings {
-                model: Some("codex:gpt-6.1-sol".into()),
+                model: Some("codex:gpt-6.2-sol".into()),
                 effort: Some("low".into()),
                 ..Default::default()
             },
@@ -1076,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
         let inherited = repo_defaults(&state, &agent).0;
-        assert_eq!(inherited, "codex:gpt-6.1-sol");
+        assert_eq!(inherited, "codex:gpt-6.2-sol");
         assert_eq!(repo_defaults(&state, &agent).1.as_deref(), Some("low"));
         assert!(efforts(&inherited).contains(&"ultra"));
         agent.model = Some("opus".into());

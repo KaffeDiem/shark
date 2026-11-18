@@ -628,11 +628,11 @@ mod tests {
             draft.defaults(&state, Some("worker")),
             ("opus".into(), Some("high".into()))
         );
-        draft.model = Some("codex:gpt-6.1-sol".into());
+        draft.model = Some("codex:gpt-6.2-sol".into());
         draft.effort = Some("ultra".into());
         assert_eq!(
             draft.defaults(&state, Some("worker")),
-            ("codex:gpt-6.1-sol".into(), Some("ultra".into()))
+            ("codex:gpt-6.2-sol".into(), Some("ultra".into()))
         );
         draft.model = Some("opus".into());
         assert_eq!(
@@ -655,14 +655,14 @@ mod tests {
         let mut draft = TaskDraft::for_agent(&state, Some("worker"));
         draft.text = "Existing task".into();
         let before = draft.defaults(&state, Some("worker"));
-        state.agents[0].model = Some("codex:gpt-6.1-sol".into());
+        state.agents[0].model = Some("codex:gpt-6.2-sol".into());
         state.agents[0].effort = Some("ultra".into());
         draft.preserve_defaults(&state, "worker", before.clone(), (true, true));
         assert_eq!(draft.defaults(&state, Some("worker")), before);
         assert_eq!(draft.text, "Existing task");
         assert_eq!(
             draft.inherited_defaults(&state, Some("worker")),
-            ("codex:gpt-6.1-sol".into(), Some("ultra".into()))
+            ("codex:gpt-6.2-sol".into(), Some("ultra".into()))
         );
         let fresh = TaskDraft::for_agent(&state, Some("worker"));
         assert_eq!(
@@ -684,7 +684,7 @@ mod tests {
         let mut state = State {
             agents: vec![crate::state::Agent {
                 slug: "worker".into(),
-                model: Some("codex:gpt-6.1-sol".into()),
+                model: Some("codex:gpt-6.2-sol".into()),
                 effort: Some("ultra".into()),
                 ..Default::default()
             }],
@@ -735,7 +735,7 @@ mod tests {
             "draft-context",
             "eng-412-draft-context",
             "Issue title",
-            "codex:gpt-6.1-sol",
+            "codex:gpt-6.2-sol",
             Some("medium".into()),
         )
         .unwrap();
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(task.primary_issue().unwrap().identifier, "ENG-412");
         assert_eq!(task.repos.len(), 1);
         assert!(task.chats[0].plan);
-        assert_eq!(task.chats[0].model.as_deref(), Some("codex:gpt-6.1-sol"));
+        assert_eq!(task.chats[0].model.as_deref(), Some("codex:gpt-6.2-sol"));
         assert_eq!(task.chats[0].effort.as_deref(), Some("medium"));
         assert!(
             task.context()

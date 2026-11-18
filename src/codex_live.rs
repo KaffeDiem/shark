@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MODEL: &str = "codex:gpt-6.1-sol";
+const MODEL: &str = "codex:gpt-6.2-sol";
 const TURN: u64 = 600; // secs a turn may take
 
 /// Two temp repos (api, web) in a task linked into `workspaces_dir()`; removed on drop.
