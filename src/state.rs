@@ -1312,12 +1312,9 @@ impl State {
             .chain(state.agents.iter_mut().map(|a| &mut a.model))
             .chain(state.repo_settings.values_mut().map(|s| &mut s.model))
         {
-            let replacement = match model.as_deref() {
-                Some("codex:gpt-6.1-sol") => "codex:gpt-6.2-sol",
-                Some("codex:gpt-6-astra") => "codex:gpt-6.2-astra",
-                _ => continue,
-            };
-            *model = Some(replacement.into());
+            if let Some(model) = model {
+                *model = crate::models::upgrade_model(model).into();
+            }
         }
         let migrate_agents = !state.chat_agents_migrated;
         let migrated_instances = state.tasks.iter().any(|ws| ws.instance_id.is_empty());
@@ -1375,7 +1372,11 @@ impl State {
     /// The model a new chat gets: the last one picked, else the first.
     pub fn new_model(&self) -> String {
         let models = crate::models::MODELS;
-        let last = self.last_model.as_deref().filter(|m| models.contains(m));
+        let last = self
+            .last_model
+            .as_deref()
+            .map(crate::models::upgrade_model)
+            .filter(|m| models.contains(m));
         last.unwrap_or(models[0]).into()
     }
 
@@ -2353,6 +2354,22 @@ mod tests {
             ..State::default()
         };
         assert_eq!(gone.new_model(), "fable", "a pick no longer listed");
+        // Changing an older chat's effort records its old model as the last pick.
+        for (old, current) in [
+            ("codex:gpt-6.1-sol", "codex:gpt-6.2-sol"),
+            ("codex:gpt-6-astra", "codex:gpt-6.2-astra"),
+        ] {
+            let st = State {
+                last_model: Some(old.into()),
+                ..State::default()
+            };
+            assert_eq!(
+                st.new_chat(&Task::default(), "new".into(), None)
+                    .model
+                    .as_deref(),
+                Some(current)
+            );
+        }
         // Replaced Codex defaults upgrade without changing existing chat models.
         fs::write(
             &path,

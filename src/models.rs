@@ -13,6 +13,15 @@ pub(crate) const MODELS: &[&str] = &[
     "codex:gpt-6.2-astra",
 ];
 
+/// Upgrade defaults for new chats while existing chats keep their selected model.
+pub(crate) fn upgrade_model(model: &str) -> &str {
+    match model {
+        "codex:gpt-6.1-sol" => "codex:gpt-6.2-sol",
+        "codex:gpt-6-astra" => "codex:gpt-6.2-astra",
+        model => model,
+    }
+}
+
 /// Thinking levels, lowest first: claude's `--effort`, codex's `effort` (both models take all six,
 /// per `model/list`). Haiku takes `--effort` too.
 const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
