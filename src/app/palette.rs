@@ -293,13 +293,13 @@ pub(super) const COMMANDS: &[Row] = &[
         "switch model haiku claude",
     ),
     Row::key(
-        "Model: GPT-6.1 Sol",
+        "Model: GPT-6.2 Sol",
         IconName::Sparkles,
         &SetModel(4),
         "switch model gpt sol codex openai",
     ),
     Row::key(
-        "Model: GPT-6 Astra",
+        "Model: GPT-6.2 Astra",
         IconName::Sparkles,
         &SetModel(5),
         "switch model gpt astra codex openai",

@@ -704,7 +704,7 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
     let closed = ChatMeta {
         id: id.clone(),
         title: "old".into(),
-        model: Some("codex:gpt-6.1-sol".into()),
+        model: Some("codex:gpt-6.2-sol".into()),
         ..Default::default()
     };
     on(cx, &|s, _, _| {

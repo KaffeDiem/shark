@@ -866,7 +866,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["cmd-shift-f"]);
     assert_eq!(saved(cx), (None, false), "not on a claude model");
     press(cx, &["ctrl-cmd-5"]);
-    assert_eq!(model(cx).as_deref(), Some("codex:gpt-6.1-sol"));
+    assert_eq!(model(cx).as_deref(), Some("codex:gpt-6.2-sol"));
     let by_config = cx.update(|cx| chat.read(cx).fast()); // this machine's codex config
     press(cx, &["cmd-shift-f"]);
     assert_eq!(saved(cx), (Some(!by_config), false));

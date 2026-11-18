@@ -354,7 +354,7 @@ async fn agent_model_chip_saves_and_clears_unsupported_thinking(cx: &mut TestApp
         cx,
         State {
             agents: vec![Agent {
-                model: Some("codex:gpt-6.1-sol".into()),
+                model: Some("codex:gpt-6.2-sol".into()),
                 effort: Some("ultra".into()),
                 ..designer()
             }],
@@ -373,7 +373,7 @@ async fn agent_model_chip_saves_and_clears_unsupported_thinking(cx: &mut TestApp
         w.render_frame(cx);
         assert_eq!(
             w.find("agent-model").label(),
-            Some("Model GPT-6.1 Sol, thinking ultra")
+            Some("Model GPT-6.2 Sol, thinking ultra")
         );
         w.click("agent-model", cx);
     })

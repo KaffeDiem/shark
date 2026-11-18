@@ -9,9 +9,18 @@ pub(crate) const MODELS: &[&str] = &[
     "opus",
     "sonnet",
     "haiku",
-    "codex:gpt-6.1-sol",
-    "codex:gpt-6-astra",
+    "codex:gpt-6.2-sol",
+    "codex:gpt-6.2-astra",
 ];
+
+/// Upgrade defaults for new chats while existing chats keep their selected model.
+pub(crate) fn upgrade_model(model: &str) -> &str {
+    match model {
+        "codex:gpt-6.1-sol" => "codex:gpt-6.2-sol",
+        "codex:gpt-6-astra" => "codex:gpt-6.2-astra",
+        model => model,
+    }
+}
 
 /// Thinking levels, lowest first: claude's `--effort`, codex's `effort` (both models take all six,
 /// per `model/list`). Haiku takes `--effort` too.
@@ -63,7 +72,7 @@ pub(crate) fn effort_label(level: &str) -> String {
     }
 }
 
-/// A model id as people read it: "opus" → "Opus", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
+/// A model id as people read it: "opus" → "Opus", "codex:gpt-6.2-sol" → "GPT-6.2 Sol".
 pub(crate) fn model_label(id: &str) -> String {
     let cap = |w: &str| {
         let mut w = w.to_string();
@@ -104,7 +113,7 @@ mod tests {
             (meta.model(), meta.is_codex(), effort_of(&meta)),
             (MODELS[0], false, "high")
         );
-        meta.model = Some("codex:gpt-6.1-sol".into());
+        meta.model = Some("codex:gpt-6.2-sol".into());
         meta.effort = Some("ultra".into());
         assert_eq!((meta.is_codex(), effort_of(&meta)), (true, "ultra"));
         meta.model = Some("opus".into());
@@ -114,7 +123,7 @@ mod tests {
     fn labels_read_like_names() {
         let l = super::model_label;
         assert_eq!(l("opus"), "Opus");
-        assert_eq!(l("codex:gpt-6.1-sol"), "GPT-6.1 Sol");
-        assert_eq!(l("codex:gpt-6-astra"), "GPT-6 Astra");
+        assert_eq!(l("codex:gpt-6.2-sol"), "GPT-6.2 Sol");
+        assert_eq!(l("codex:gpt-6.2-astra"), "GPT-6.2 Astra");
     }
 }

@@ -799,7 +799,7 @@ mod tests {
         fs::create_dir_all(ws.dir()).unwrap();
         let meta = ChatMeta {
             id: ws.name.clone(),
-            model: Some("codex:gpt-6.1-sol".into()),
+            model: Some("codex:gpt-6.2-sol".into()),
             effort: Some("low".into()),
             plan: true,
             ..Default::default()
@@ -1041,7 +1041,7 @@ mod tests {
             options Red and Blue. Then reply with only the color the user picked.";
         let pick: Answer = (vec!["Blue".into()], None);
         let own: Answer = (vec![], Some("Teal".into()));
-        for (model, plan) in [("sonnet", false), ("codex:gpt-6.1-sol", true)] {
+        for (model, plan) in [("sonnet", false), ("codex:gpt-6.2-sol", true)] {
             for (answer, want) in [(Some(pick.clone()), "Blue"), (Some(own.clone()), "Teal")] {
                 let (seen, text) = ask(model, plan, prompt, answer);
                 eprintln!("{model} said: {text}");

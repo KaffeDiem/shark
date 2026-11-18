@@ -2907,7 +2907,7 @@ exec cat >>"$0.stdin"
         // A question that can't start (codex has no side questions) keeps the draft.
         act(cx, &|w, cx| {
             chat.update(cx, |c, cx| {
-                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.meta.model = Some("codex:gpt-6.2-astra".into());
                 c.composer.update(cx, |i, cx| i.set_value("keep me", w, cx));
                 c.ask_draft_aside(w, cx);
             })
@@ -3157,7 +3157,7 @@ exec cat >>"$0.stdin"
             id: ws.name.clone(),
             title: "ask".into(),
             // codex: its answers get a row the test can read (claude's come with its result).
-            model: Some("codex:gpt-6.1-sol".into()),
+            model: Some("codex:gpt-6.2-sol".into()),
             ..Default::default()
         };
         let (window, chat) = cx
@@ -3468,7 +3468,7 @@ exec cat >>"$0.stdin"
                                         },
                                         ChatMeta {
                                             id: fixture,
-                                            model: Some("codex:gpt-6.1-sol".into()),
+                                            model: Some("codex:gpt-6.2-sol".into()),
                                             fast: Some(false),
                                             ..Default::default()
                                         },
@@ -3874,16 +3874,16 @@ exec cat >>"$0.stdin"
             chat.update(cx, |c, cx| {
                 c.meta.session_id = Some("s1".into());
                 c.set_plan_mode(true, cx);
-                c.set_model("codex:gpt-6-astra", cx);
+                c.set_model("codex:gpt-6.2-astra", cx);
                 assert_eq!(c.meta.session_id, None);
                 assert!(c.meta.plan, "plan mode stays");
                 c.meta.session_id = Some("th1".into());
-                c.set_model("codex:gpt-6.1-sol", cx);
+                c.set_model("codex:gpt-6.2-sol", cx);
                 assert_eq!(c.meta.session_id.as_deref(), Some("th1"));
                 c.set_model("opus", cx);
                 assert_eq!(c.meta.session_id, None);
                 // The codex process still running reports its thread: not opus's to resume.
-                c.harness_model = Some("codex:gpt-6.1-sol".into());
+                c.harness_model = Some("codex:gpt-6.2-sol".into());
                 let init =
                     r#"{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#;
                 for ev in harness::parse(init) {
@@ -3939,8 +3939,8 @@ done
             unsafe { std::env::set_var(key, &fake) };
         }
         for (running, selected, is_codex) in [
-            ("codex:gpt-6.1-sol", "opus", true),
-            ("opus", "codex:gpt-6.1-sol", false),
+            ("codex:gpt-6.2-sol", "opus", true),
+            ("opus", "codex:gpt-6.2-sol", false),
         ] {
             let chat = open_chat(
                 if is_codex {
@@ -4048,7 +4048,7 @@ done
                 );
                 assert_eq!(c.step_effort(-1, cx), "medium");
                 assert_eq!(c.step_effort(-5, cx), "low");
-                c.set_model("codex:gpt-6.1-sol", cx);
+                c.set_model("codex:gpt-6.2-sol", cx);
                 assert_eq!(
                     c.meta.effort.as_deref(),
                     Some("low"),
@@ -4126,7 +4126,7 @@ done
         let started = r#"{"method":"item/started","params":{"item":{"type":"plan","id":"t1-plan","text":""}}}"#;
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.set_model("codex:gpt-6.1-sol", cx);
+                c.set_model("codex:gpt-6.2-sol", cx);
                 c.harness_model = c.meta.model.clone();
                 c.fast_by_config = true;
                 assert!(c.fast() && c.meta.fast.is_none(), "codex's config, untouched");
@@ -4544,7 +4544,7 @@ done
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 std::fs::create_dir_all(c.ws.dir()).unwrap();
-                c.meta.model = Some("codex:gpt-6.1-sol".into());
+                c.meta.model = Some("codex:gpt-6.2-sol".into());
                 c.ws.repos.push(crate::state::TaskRepo { name: "api".into(), src: "/src/api".into(), base: "main".into(), branch: None });
                 let issue = crate::linear::Snapshot { org: "org".into(), id: "one".into(), identifier: "ENG-1".into(), title: "Fix login".into(), description: "Use the existing session".into(), ..Default::default() };
                 c.ws.linear.attach((&issue).into());
@@ -4777,7 +4777,7 @@ done
         };
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.meta.model = Some("codex:gpt-6.2-astra".into());
                 c.harness_model = c.meta.model.clone();
                 c.sent("first".into(), None, cx);
                 c.steered = true; // what a cmd-enter send does mid-turn
@@ -4828,7 +4828,7 @@ done
         };
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.meta.model = Some("codex:gpt-6.2-astra".into());
                 c.harness_model = c.meta.model.clone();
                 c.sent("/compact".into(), None, cx);
                 assert!(c.unread.is_empty(), "never echoed");

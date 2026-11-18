@@ -1306,6 +1306,16 @@ impl State {
                 ..State::default()
             }
         });
+        // Upgrade defaults when replacing picker entries, so a saved Codex preference
+        // doesn't fall back to Claude. Existing chats keep their explicit model.
+        for model in std::iter::once(&mut state.last_model)
+            .chain(state.agents.iter_mut().map(|a| &mut a.model))
+            .chain(state.repo_settings.values_mut().map(|s| &mut s.model))
+        {
+            if let Some(model) = model {
+                *model = crate::models::upgrade_model(model).into();
+            }
+        }
         let migrate_agents = !state.chat_agents_migrated;
         let migrated_instances = state.tasks.iter().any(|ws| ws.instance_id.is_empty());
         let (model, effort) = (state.new_model(), state.last_effort.clone());
@@ -1362,7 +1372,11 @@ impl State {
     /// The model a new chat gets: the last one picked, else the first.
     pub fn new_model(&self) -> String {
         let models = crate::models::MODELS;
-        let last = self.last_model.as_deref().filter(|m| models.contains(m));
+        let last = self
+            .last_model
+            .as_deref()
+            .map(crate::models::upgrade_model)
+            .filter(|m| models.contains(m));
         last.unwrap_or(models[0]).into()
     }
 
@@ -2340,6 +2354,45 @@ mod tests {
             ..State::default()
         };
         assert_eq!(gone.new_model(), "fable", "a pick no longer listed");
+        // Changing an older chat's effort records its old model as the last pick.
+        for (old, current) in [
+            ("codex:gpt-6.1-sol", "codex:gpt-6.2-sol"),
+            ("codex:gpt-6-astra", "codex:gpt-6.2-astra"),
+        ] {
+            let st = State {
+                last_model: Some(old.into()),
+                ..State::default()
+            };
+            assert_eq!(
+                st.new_chat(&Task::default(), "new".into(), None)
+                    .model
+                    .as_deref(),
+                Some(current)
+            );
+        }
+        // Replaced Codex defaults upgrade without changing existing chat models.
+        fs::write(
+            &path,
+            r#"{"repos":[],"last_model":"codex:gpt-6.1-sol",
+                "agents":[{"slug":"reviewer","name":"Reviewer","instructions":"","repos":[],
+                    "model":"codex:gpt-6-astra"}],
+                "repo_settings":{"api":{"model":"codex:gpt-6.1-sol","effort":"ultra"}},
+                "workspaces":[{"name":"w","branch":"w","repos":[],
+                    "chats":[{"id":"a","model":"codex:gpt-6-astra"}]}]}"#,
+        )
+        .unwrap();
+        let st = State::load_at(&path);
+        assert_eq!(st.new_model(), "codex:gpt-6.2-sol");
+        assert_eq!(st.agents[0].model.as_deref(), Some("codex:gpt-6.2-astra"));
+        assert_eq!(
+            st.repo_settings["api"].model.as_deref(),
+            Some("codex:gpt-6.2-sol")
+        );
+        assert_eq!(st.repo_settings["api"].effort.as_deref(), Some("ultra"));
+        assert_eq!(
+            st.tasks[0].chats[0].model.as_deref(),
+            Some("codex:gpt-6-astra")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

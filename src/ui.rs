@@ -564,7 +564,7 @@ mod model_menu_tests {
         for (model, saved, selected, ultra) in [
             ("sonnet", "xhigh", "Extra high", false),
             ("sonnet", "ultra", "Max", false),
-            ("codex:gpt-6.1-sol", "ultra", "Ultra", true),
+            ("codex:gpt-6.2-sol", "ultra", "Ultra", true),
         ] {
             let meta = ChatMeta {
                 model: Some(model.into()),
