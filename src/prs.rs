@@ -87,6 +87,10 @@ impl From<Vec<Pr>> for OpenPrs {
 /// `repo`'s open PRs on origin, which owns its branches, stamped with when gh was asked.
 pub fn fetch_open_prs(repo: &str, src: &Path) -> Option<OpenPrs> {
     let at = Some(std::time::Instant::now());
+    if crate::azure::Remote::of(src).is_some() {
+        let prs = fetch_repo_prs(repo, src, true).ok()?;
+        return Some(OpenPrs { at, prs });
+    }
     let origin = crate::pr::origin_repo(src);
     let prs = list_prs(repo, src, true, origin.as_deref()).ok()?;
     Some(OpenPrs { at, prs })
@@ -112,6 +116,12 @@ const PR_ARGS: [&str; 10] = [
 
 /// Recent PRs for chat, or open PRs for checkout; successful fetches replace this repo's cache.
 pub fn fetch_repo_prs(repo: &str, src: &Path, open: bool) -> Result<Vec<Pr>, String> {
+    if let Some(remote) = crate::azure::Remote::of(src) {
+        let mut prs = crate::azure::list_prs(src, &remote, open)?;
+        prs.iter_mut().for_each(|p| p.repo = repo.to_string());
+        save_repo_prs(src, open, &prs);
+        return Ok(prs);
+    }
     list_prs(repo, src, open, None)
 }
 
