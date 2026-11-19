@@ -179,10 +179,11 @@ struct BodyFile(String);
 
 impl BodyFile {
     fn new(body: &Value) -> Result<BodyFile, String> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("shark-az-{}-{n}.json", std::process::id()));
+        // Unguessable, so another user can't squat the name in a shared temp dir.
+        let mut rand = [0u8; 8];
+        getrandom::fill(&mut rand).map_err(|e| e.to_string())?;
+        let n = u64::from_le_bytes(rand);
+        let path = std::env::temp_dir().join(format!("shark-az-{n:016x}.json"));
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
