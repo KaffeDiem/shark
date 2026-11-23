@@ -17,6 +17,8 @@ pub struct Local {
     pub review_head: String,
     /// `None` when HEAD is detached (also mid-rebase).
     pub branch: Option<String>,
+    /// On another branch, and the expected one no longer exists here: it was renamed.
+    pub branch_gone: bool,
     pub head: String,
     /// `origin`'s URL; `None` if the repo has no origin remote.
     pub origin: Option<String>,
@@ -187,6 +189,8 @@ pub fn probe(
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     let mut l = parse_status(&out.stdout);
+    l.branch_gone = l.branch.as_deref().is_some_and(|b| b != branch)
+        && crate::git::ref_oid(wt, &format!("refs/heads/{branch}")).is_none();
     l.review = crate::git::review_pr_url(wt, branch).is_some();
     // A review checkout's saved base is `refs/shark/pull/N/base`.
     let pr_number = base

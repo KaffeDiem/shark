@@ -34,7 +34,6 @@ use run::{
 };
 #[cfg(test)]
 use run::{execute, execution_repos, planned_args};
-#[cfg(test)]
 use status::Local;
 use status::{Action, among, in_scope, next_action, pr_head_moved, pr_settling};
 use std::cell::Cell;
@@ -70,6 +69,11 @@ pub enum SyncEvent {
     },
     /// The PR target changed, or a fetch may have moved its base ref.
     DiffBaseChanged,
+    /// The task's branch was renamed in every repo following it: persist the new name.
+    BranchRenamed {
+        old: String,
+        new: String,
+    },
     /// A former review checkout now owns a PR: persist `(repo, old base, new base)`.
     PrBaseAdopted(Vec<(String, String, String)>),
     /// Create PRs succeeded.
@@ -305,10 +309,29 @@ impl GitSync {
         job
     }
 
+    /// One local check, without GitHub or a fetch, applied as a poll would.
+    #[cfg(test)]
+    pub(crate) fn check_now(&mut self, cx: &mut Context<Self>) {
+        let job = Job {
+            pr: false,
+            prev: self.repos.clone(),
+            ..Job::prs(&self.ws)
+        };
+        self.apply(run_job(&job), cx);
+    }
+
     fn apply(&mut self, p: Probed, cx: &mut Context<Self>) {
         // A base or repo changed while the worker ran; its answer belongs to the old task.
         if p.repos != worktrees(&self.ws) {
             self.kick(true, true);
+            return;
+        }
+        // Renamed in place (`git branch -m`): follow it instead of asking to switch back.
+        if let Some(new) = renamed_branch(&self.ws, &p.locals) {
+            let old = std::mem::replace(&mut self.ws.branch, new.clone());
+            cx.emit(SyncEvent::BranchRenamed { old, new });
+            self.kick(true, true);
+            cx.notify();
             return;
         }
         for (name, prs) in p.stack_prs {
@@ -1370,6 +1393,16 @@ impl Render for GitSync {
             .child(split)
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
     }
+}
+
+/// The one branch every repo on the task's branch moved to, when none of them still has the
+/// task's branch. A checkout of another branch leaves it behind, so that is no rename.
+fn renamed_branch(ws: &Task, locals: &[Result<Local, String>]) -> Option<String> {
+    let mut on = (ws.repos.iter().zip(locals))
+        .filter(|(r, _)| r.branch.is_none())
+        .map(|(_, l)| l.as_ref().ok().filter(|l| l.branch_gone)?.branch.as_deref());
+    let first = on.next()??;
+    on.all(|b| b == Some(first)).then(|| first.to_string())
 }
 
 /// Repo names in merge order: `saved` first (names no longer in the task dropped), then

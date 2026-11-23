@@ -24,6 +24,7 @@ mod attention_tests;
 mod audit_tests;
 mod base_adoption_tests;
 mod branch_name_tests;
+mod branch_rename_tests;
 pub(crate) mod chrome_tests;
 mod deep_link_tests;
 mod differ_review_fixes_tests;

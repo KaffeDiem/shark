@@ -988,6 +988,7 @@ async fn reference_attachment_changes_only_the_draft_and_paste_undo_cancels_pend
                     number: 93,
                     url: "https://github.com/org/api/pull/93".into(),
                     base: "main".into(),
+                    head: String::new(),
                 },
             },
             w,

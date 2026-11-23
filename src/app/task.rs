@@ -288,6 +288,14 @@ impl Shark {
             SyncEvent::DeleteRemote(on) => self.set_delete_remote(*on, cx),
             SyncEvent::Archive => self.archive_task(name.to_string(), false, window, cx),
             SyncEvent::PrsCreated => self.state.mark(|s| &mut s.opened_pr),
+            SyncEvent::BranchRenamed { old, new } => {
+                if let Some(ws) = self.task_mut(name).filter(|ws| ws.branch == *old) {
+                    ws.branch = new.clone();
+                    let _ = git::write_claude_md(ws);
+                }
+                let _ = self.state.save();
+                self.publish_task(name, cx);
+            }
             SyncEvent::PrBaseAdopted(moves) => {
                 if let Some(ws) = self.task_mut(name) {
                     for (repo, old, new) in moves {
