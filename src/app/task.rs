@@ -288,14 +288,7 @@ impl Shark {
             SyncEvent::DeleteRemote(on) => self.set_delete_remote(*on, cx),
             SyncEvent::Archive => self.archive_task(name.to_string(), false, window, cx),
             SyncEvent::PrsCreated => self.state.mark(|s| &mut s.opened_pr),
-            SyncEvent::BranchRenamed { old, new } => {
-                if let Some(ws) = self.task_mut(name).filter(|ws| ws.branch == *old) {
-                    ws.branch = new.clone();
-                    let _ = git::write_claude_md(ws);
-                }
-                let _ = self.state.save();
-                self.publish_task(name, cx);
-            }
+            SyncEvent::BranchRenamed { old, new } => self.adopt_branch(name, old, new, cx),
             SyncEvent::PrBaseAdopted(moves) => {
                 if let Some(ws) = self.task_mut(name) {
                     for (repo, old, new) in moves {
@@ -315,6 +308,27 @@ impl Shark {
                 self.restack(name, moves, prompt.clone(), window, cx)
             }
         }
+    }
+
+    /// Task `name`'s branch was renamed in place from `old`: save `new` and tell its agents.
+    pub(crate) fn adopt_branch(
+        &mut self,
+        name: &str,
+        old: &str,
+        new: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.task_mut(name).filter(|ws| ws.branch == old) else {
+            return;
+        };
+        ws.branch = new.into();
+        let _ = git::write_claude_md(ws);
+        let ws = ws.clone();
+        let _ = self.state.save();
+        if let Some(sync) = self.syncs.get(name) {
+            sync.update(cx, |g, cx| g.set_task(ws, cx));
+        }
+        self.publish_task(name, cx);
     }
 
     /// Refreshes the diff when `name` is the open task.

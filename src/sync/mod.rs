@@ -29,11 +29,12 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use run::{
-    Job, Probed, check_review_checkout, needs_you, repo_diff_base, repos_from, run_job, run_step,
-    worktrees,
+    Job, Probed, check_review_checkout, needs_you, renamed_branch, repo_diff_base, repos_from,
+    run_job, run_step, worktrees,
 };
 #[cfg(test)]
 use run::{execute, execution_repos, planned_args};
+#[cfg(test)]
 use status::Local;
 use status::{Action, among, in_scope, next_action, pr_head_moved, pr_settling};
 use std::cell::Cell;
@@ -209,6 +210,11 @@ impl GitSync {
     /// state) and re-probe.
     pub fn set_task(&mut self, ws: Task, cx: &mut Context<Self>) {
         let mut old = std::mem::take(&mut self.repos);
+        // Renamed: the last answer, and the action it gave, were about the old name.
+        if ws.branch != self.ws.branch {
+            old.clear();
+            self.action = None;
+        }
         self.repos = ws
             .repos
             .iter()
@@ -330,6 +336,8 @@ impl GitSync {
         if let Some(new) = renamed_branch(&self.ws, &p.locals) {
             let old = std::mem::replace(&mut self.ws.branch, new.clone());
             cx.emit(SyncEvent::BranchRenamed { old, new });
+            // The last action was worked out for the old name ("Switch to branch" back to it).
+            self.action = None;
             self.kick(true, true);
             cx.notify();
             return;
@@ -1393,16 +1401,6 @@ impl Render for GitSync {
             .child(split)
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
     }
-}
-
-/// The one branch every repo on the task's branch moved to, when none of them still has the
-/// task's branch. A checkout of another branch leaves it behind, so that is no rename.
-fn renamed_branch(ws: &Task, locals: &[Result<Local, String>]) -> Option<String> {
-    let mut on = (ws.repos.iter().zip(locals))
-        .filter(|(r, _)| r.branch.is_none())
-        .map(|(_, l)| l.as_ref().ok().filter(|l| l.branch_gone)?.branch.as_deref());
-    let first = on.next()??;
-    on.all(|b| b == Some(first)).then(|| first.to_string())
 }
 
 /// Repo names in merge order: `saved` first (names no longer in the task dropped), then

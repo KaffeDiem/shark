@@ -162,20 +162,26 @@ fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
             let Some((ws, last, gh, reviewed, lists)) = next else {
                 continue;
             };
-            let name = ws.name.clone();
-            let (label, repos, lists) = cx
+            let (name, old) = (ws.name.clone(), ws.branch.clone());
+            let (label, repos, lists, branch) = cx
                 .background_executor()
                 .spawn(async move {
-                    let (label, repos) = sync::check_in_background(&ws, &last, gh, &reviewed);
+                    let mut ws = ws;
+                    let (label, repos) = sync::check_in_background(&mut ws, &last, gh, &reviewed);
                     let lists: HashMap<_, _> = (lists.iter())
                         .filter_map(|(n, src)| {
                             Some((n.clone(), crate::prs::fetch_open_prs(n, src)?))
                         })
                         .collect();
-                    (label, repos, lists)
+                    (label, repos, lists, ws.branch)
                 })
                 .await;
             let ok = this.update(cx, |s, cx| {
+                if branch != old {
+                    // Its last label was about the old name; a failed gh would keep it.
+                    s.attn.checked.remove(&name);
+                    s.adopt_branch(&name, &old, &branch, cx);
+                }
                 let active = s.active.clone();
                 if s.learn_stacks(&repos, &lists, cx) {
                     cx.notify();

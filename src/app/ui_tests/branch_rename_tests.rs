@@ -86,3 +86,126 @@ fn repos_that_disagree_are_not_a_rename(cx: &mut TestAppContext) {
     assert!(check(cx, &sync).starts_with("Switch to branch"));
     assert_eq!(saved_branch(), "old");
 }
+
+#[gpui_kit::test]
+fn adoption_drops_the_switch_back_action(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, _, sync) = task(cx, "late", &["api", "web"]);
+    git::git(&dir.join("api"), &["branch", "-m", "new"]).unwrap();
+    assert_eq!(check(cx, &sync), "Switch to branch · api");
+
+    // web follows: the check that adopts the rename must not leave "switch back to old" clickable.
+    git::git(&dir.join("web"), &["branch", "-m", "new"]).unwrap();
+    sync.update(cx, |s, cx| s.check_now(cx));
+    cx.run_until_parked();
+    let label = cx.update(|cx| sync.read(cx).action.as_ref().map(|a| a.label.clone()));
+    assert!(
+        !label.as_deref().is_some_and(|l| l.starts_with("Switch")),
+        "{label:?}"
+    );
+    assert_eq!(saved_branch(), "new");
+}
+
+#[gpui_kit::test]
+fn moving_onto_the_base_is_not_a_rename(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, _, sync) = task(cx, "onto-base", &["api"]);
+    let api = dir.join("api");
+    git::git(&api, &["switch", "-q", "--ignore-other-worktrees", "main"]).unwrap();
+    git::git(&api, &["branch", "-q", "-D", "old"]).unwrap();
+
+    assert_eq!(check(cx, &sync), "Switch to branch");
+    assert_eq!(saved_branch(), "old");
+}
+
+#[gpui_kit::test]
+fn background_check_adopts_a_rename(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = super::repos(&home, &["api"]);
+    let root = home.join("shark/workspaces");
+    let make = |name: &str| {
+        git::create_task(&root.join(name), name, name, &git::on_branch(&repos, name)).unwrap()
+    };
+    let (shown, hidden) = (make("shown"), make("hidden"));
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            tasks: vec![shown, hidden],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_task(0, w, cx));
+    let dir = root.join("hidden");
+    git::git(&dir.join("api"), &["branch", "-m", "renamed"]).unwrap();
+
+    for _ in 0..3 {
+        cx.executor().advance_clock(Duration::from_secs(21));
+        cx.run_until_parked();
+    }
+
+    let hidden = |s: &State| {
+        s.tasks
+            .iter()
+            .find(|t| t.name == "hidden")
+            .unwrap()
+            .branch
+            .clone()
+    };
+    assert_eq!(hidden(&State::load()), "renamed");
+    let attn = cx.update(|cx| shark.read(cx).attention_of("hidden", cx));
+    assert!(
+        !matches!(attn, crate::attention::Attn::Needs(_)),
+        "{attn:?}"
+    );
+    let contents = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+    assert!(contents.contains("branch `renamed`"), "{contents}");
+}
+
+#[gpui_kit::test]
+fn background_adoption_reaches_a_retained_sync(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = super::repos(&home, &["api", "web"]);
+    let root = home.join("shark/workspaces");
+    let make = |name: &str| {
+        git::create_task(&root.join(name), name, name, &git::on_branch(&repos, name)).unwrap()
+    };
+    let (seen, other) = (make("seen"), make("other"));
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            tasks: vec![seen, other],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let open = on_app(window, shark.clone());
+    open(cx, &|s, w, cx| {
+        s.open_task(0, w, cx);
+        s.syncs["seen"].update(cx, |sync, cx| sync.set_active(false, cx));
+    });
+    let sync = cx.update(|cx| shark.read(cx).syncs["seen"].clone());
+    let dir = root.join("seen");
+    git::git(&dir.join("api"), &["branch", "-m", "new"]).unwrap();
+    assert_eq!(check(cx, &sync), "Switch to branch · api");
+
+    // Another task is shown while web catches up; the background check adopts the rename.
+    open(cx, &|s, w, cx| s.open_task(1, w, cx));
+    git::git(&dir.join("web"), &["branch", "-m", "new"]).unwrap();
+    for _ in 0..3 {
+        cx.executor().advance_clock(Duration::from_secs(21));
+        cx.run_until_parked();
+    }
+    assert_eq!(State::load().tasks[0].branch, "new");
+
+    // The retained GitSync shows when "seen" is reopened: it must not offer the way back.
+    let label = cx.update(|cx| sync.read(cx).action.as_ref().map(|a| a.label.clone()));
+    assert!(
+        !label.as_deref().is_some_and(|l| l.starts_with("Switch")),
+        "{label:?}"
+    );
+}
