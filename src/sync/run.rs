@@ -217,18 +217,44 @@ pub(super) fn run_job(job: &Job) -> Probed {
 /// repo's state. The local state is always fresh; a PR gh didn't give keeps `last`'s. The label
 /// is `Err` when gh wasn't asked or failed for any repo (offline, logged out, not GitHub), so
 /// the caller keeps the last label and may back off.
+///
+/// A branch renamed in place becomes `ws.branch`, and the answer is for the new name; the
+/// caller persists it.
 pub fn check_in_background(
-    ws: &Task,
+    ws: &mut Task,
     last: &[Repo],
     gh: bool,
     reviewed: &[String],
 ) -> (Result<Option<String>, String>, Vec<Repo>) {
-    let p = run_job(&Job {
-        pr: gh,
-        prev: last.to_vec(),
-        ..Job::prs(ws)
-    });
+    let probe = |ws: &Task| {
+        run_job(&Job {
+            pr: gh,
+            prev: last.to_vec(),
+            ..Job::prs(ws)
+        })
+    };
+    let mut p = probe(ws);
+    if let Some(new) = renamed_branch(ws, &p.locals) {
+        ws.branch = new;
+        p = probe(ws);
+    }
     background_answer(ws, p.locals, p.prs, p.parents, last, reviewed)
+}
+
+/// The one branch every repo on the task's branch moved to, when none of them still has the
+/// task's branch. A checkout of another branch leaves it behind, so that is no rename.
+pub(super) fn renamed_branch(ws: &Task, locals: &[Result<Local, String>]) -> Option<String> {
+    let mut on = (ws.repos.iter().zip(locals))
+        .filter(|(r, _)| r.branch.is_none())
+        .map(|(r, l)| {
+            let l = l.as_ref().ok().filter(|l| l.branch_gone)?;
+            let b = l.branch.as_deref()?;
+            // Deleted and back on its base: adopting that would push the task's work there.
+            let base = [&r.base, &l.trunk].map(|b| crate::git::short(b));
+            (!base.contains(&b)).then_some(b)
+        });
+    let first = on.next()??;
+    on.all(|b| b == Some(first)).then(|| first.to_string())
 }
 
 pub(super) fn background_answer(

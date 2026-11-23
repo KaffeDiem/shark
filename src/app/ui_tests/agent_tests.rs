@@ -819,8 +819,8 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
         cx.simulate_path_prompt_response(|_| None);
         cx.run_until_parked();
     }
-    let ws = active_task(cx, &shark);
-    let (label, repos) = crate::sync::check_in_background(&ws, &[], true, &[]);
+    let mut ws = active_task(cx, &shark);
+    let (label, repos) = crate::sync::check_in_background(&mut ws, &[], true, &[]);
     assert!(matches!(label, Ok(None)) && repos.is_empty(), "{label:?}");
     let refused = |cx: &mut TestAppContext, f: &AppUpdate<'_>, what: &str| {
         let before = toasts(cx, window);

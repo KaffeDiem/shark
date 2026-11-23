@@ -29,8 +29,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use run::{
-    Job, Probed, check_review_checkout, needs_you, repo_diff_base, repos_from, run_job, run_step,
-    worktrees,
+    Job, Probed, check_review_checkout, needs_you, renamed_branch, repo_diff_base, repos_from,
+    run_job, run_step, worktrees,
 };
 #[cfg(test)]
 use run::{execute, execution_repos, planned_args};
@@ -70,6 +70,11 @@ pub enum SyncEvent {
     },
     /// The PR target changed, or a fetch may have moved its base ref.
     DiffBaseChanged,
+    /// The task's branch was renamed in every repo following it: persist the new name.
+    BranchRenamed {
+        old: String,
+        new: String,
+    },
     /// A former review checkout now owns a PR: persist `(repo, old base, new base)`.
     PrBaseAdopted(Vec<(String, String, String)>),
     /// Create PRs succeeded.
@@ -205,6 +210,11 @@ impl GitSync {
     /// state) and re-probe.
     pub fn set_task(&mut self, ws: Task, cx: &mut Context<Self>) {
         let mut old = std::mem::take(&mut self.repos);
+        // Renamed: the last answer, and the action it gave, were about the old name.
+        if ws.branch != self.ws.branch {
+            old.clear();
+            self.action = None;
+        }
         self.repos = ws
             .repos
             .iter()
@@ -305,10 +315,31 @@ impl GitSync {
         job
     }
 
+    /// One local check, without GitHub or a fetch, applied as a poll would.
+    #[cfg(test)]
+    pub(crate) fn check_now(&mut self, cx: &mut Context<Self>) {
+        let job = Job {
+            pr: false,
+            prev: self.repos.clone(),
+            ..Job::prs(&self.ws)
+        };
+        self.apply(run_job(&job), cx);
+    }
+
     fn apply(&mut self, p: Probed, cx: &mut Context<Self>) {
         // A base or repo changed while the worker ran; its answer belongs to the old task.
         if p.repos != worktrees(&self.ws) {
             self.kick(true, true);
+            return;
+        }
+        // Renamed in place (`git branch -m`): follow it instead of asking to switch back.
+        if let Some(new) = renamed_branch(&self.ws, &p.locals) {
+            let old = std::mem::replace(&mut self.ws.branch, new.clone());
+            cx.emit(SyncEvent::BranchRenamed { old, new });
+            // The last action was worked out for the old name ("Switch to branch" back to it).
+            self.action = None;
+            self.kick(true, true);
+            cx.notify();
             return;
         }
         for (name, prs) in p.stack_prs {

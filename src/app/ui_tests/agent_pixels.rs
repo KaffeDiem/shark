@@ -217,6 +217,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     number: 89,
                     url: "https://github.com/acme/web/pull/89".into(),
                     base: "main".into(),
+                    head: String::new(),
                 });
             s.home.prompt.update(cx, |p, cx| p.insert("Keep the selected skill when changing repositories.\nCheck the keyboard flow too.", w, cx));
         }),
